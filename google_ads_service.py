@@ -36,7 +36,9 @@ def get_locations_for_country(country_code: str):
         raise Exception("Failed to initialize Google Ads client")
     
     try:
-        geo_service = client.get_service("GeoTargetConstantService")
+        # Use GoogleAdsService to search geo targets
+        googleads_service = client.get_service("GoogleAdsService")
+        customer_id = os.getenv("GOOGLE_ADS_CUSTOMER_ID", "").replace("-", "")
         
         # Build query to get locations for country
         query = f"""
@@ -52,8 +54,8 @@ def get_locations_for_country(country_code: str):
             ORDER BY geo_target_constant.name
         """
         
-        # Execute query using search method directly (no request object needed)
-        response = geo_service.search(query=query)
+        # Execute query using GoogleAdsService
+        response = googleads_service.search(customer_id=customer_id, query=query)
         
         regions = []
         cities = []
