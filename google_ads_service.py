@@ -52,11 +52,8 @@ def get_locations_for_country(country_code: str):
             ORDER BY geo_target_constant.name
         """
         
-        # Execute query
-        search_request = client.get_type("SearchGeoTargetConstantRequest")
-        search_request.query = query
-        
-        response = geo_service.search_geo_target_constants(request=search_request)
+        # Execute query using search method directly (no request object needed)
+        response = geo_service.search(query=query)
         
         regions = []
         cities = []
