@@ -109,7 +109,7 @@ class AutocompleteParser:
             suggestions = await self.fetch_suggestions(query, country, language)
             all_keywords.update(suggestions)
             
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.75)
         
         return list(all_keywords)
 
