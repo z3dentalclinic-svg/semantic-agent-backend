@@ -13,6 +13,7 @@ import yaml
 import httpx
 import asyncio
 import time
+import random
 
 app = FastAPI(title="Semantic Agent API", version="1.0.0")
 
@@ -54,6 +55,17 @@ class AutocompleteParser:
         self.base_url = "http://suggestqueries.google.com/complete/search"
         self.modifiers = list("abcdefghijklmnopqrstuvwxyz")
         
+        # Список разных User-Agent для ротации
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
+        ]
+        
     async def fetch_suggestions(
         self, 
         query: str, 
@@ -62,14 +74,15 @@ class AutocompleteParser:
     ) -> List[str]:
         """Получить подсказки для одного запроса"""
         params = {
-            "client": "toolbar",
+            "client": "firefox",
             "q": query,
             "gl": country.upper(),
             "hl": language.lower()
         }
         
+        # Случайный User-Agent для каждого запроса
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": random.choice(self.user_agents),
             "Accept": "application/json",
             "Accept-Language": f"{language.lower()},{language.lower()}-{country.upper()};q=0.9,en;q=0.8",
         }
@@ -109,7 +122,7 @@ class AutocompleteParser:
             suggestions = await self.fetch_suggestions(query, country, language)
             all_keywords.update(suggestions)
             
-            await asyncio.sleep(0.75)
+            await asyncio.sleep(0.1)
         
         return list(all_keywords)
 
