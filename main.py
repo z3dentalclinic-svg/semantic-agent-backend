@@ -142,7 +142,7 @@ class AutocompleteParser:
         language: str = "en",
         use_numbers: bool = False
     ) -> List[str]:
-        """Парсинг с модификаторами (базовые + языковые)"""
+        """Парсинг с модификаторами (базовые + языковые + INFIX для кириллицы)"""
         all_keywords = set()
         
         # Получаем модификаторы для выбранного языка
@@ -152,16 +152,45 @@ class AutocompleteParser:
         if not use_numbers:
             modifiers = [m for m in modifiers if not m.isdigit()]
         
+        # Определяем кириллические модификаторы (только языковые символы)
+        language_specific = self.language_modifiers.get(language.lower(), [])
+        cyrillic_modifiers = [m for m in modifiers if m in language_specific]
+        
+        # Разбиваем seed на слова для INFIX парсинга
+        seed_words = seed.split()
+        
         print(f"🌍 Language: {language.upper()} | Modifiers: {len(modifiers)} ({', '.join(modifiers[:10])}...)")
+        print(f"📍 INFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2 else 'DISABLED'} (cyrillic modifiers: {len(cyrillic_modifiers)})")
         
         for i, modifier in enumerate(modifiers):
+            # 1. SUFFIX (прямое) - для ВСЕХ модификаторов
             query = f"{seed} {modifier}"
             suggestions = await self.fetch_suggestions(query, country, language)
             all_keywords.update(suggestions)
             
+            suffix_count = len(suggestions)
+            
+            # 2. INFIX (внутрь) - ТОЛЬКО для кириллицы и если seed >= 2 слов
+            infix_count = 0
+            if modifier in cyrillic_modifiers and len(seed_words) >= 2:
+                # Вставляем модификатор после первого слова
+                infix_query = f"{seed_words[0]} {modifier} {' '.join(seed_words[1:])}"
+                infix_suggestions = await self.fetch_suggestions(infix_query, country, language)
+                all_keywords.update(infix_suggestions)
+                infix_count = len(infix_suggestions)
+                
+                # Дополнительная задержка после INFIX запроса
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+            
             # Случайная задержка между 0.5 и 2 секунд
             delay = random.uniform(0.5, 2.0)
-            print(f"[{i+1}/{len(modifiers)}] '{modifier}' → {len(suggestions)} results (wait {delay:.1f}s)")
+            
+            # Логирование с информацией о INFIX
+            if infix_count > 0:
+                print(f"[{i+1}/{len(modifiers)}] '{modifier}' → SUFFIX: {suffix_count}, INFIX: {infix_count} (wait {delay:.1f}s)")
+            else:
+                print(f"[{i+1}/{len(modifiers)}] '{modifier}' → {suffix_count} results (wait {delay:.1f}s)")
+            
             await asyncio.sleep(delay)
         
         return list(all_keywords)
