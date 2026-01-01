@@ -117,12 +117,15 @@ class AutocompleteParser:
         if use_numbers:
             modifiers.extend(list("0123456789"))
         
-        for modifier in modifiers:
+        for i, modifier in enumerate(modifiers):
             query = f"{seed} {modifier}"
             suggestions = await self.fetch_suggestions(query, country, language)
             all_keywords.update(suggestions)
             
-            await asyncio.sleep(0.1)
+            # Случайная задержка между 0.5 и 2 секунд
+            delay = random.uniform(0.5, 2.0)
+            print(f"[{i+1}/{len(modifiers)}] Parsed '{query}' → {len(suggestions)} results (waiting {delay:.1f}s)")
+            await asyncio.sleep(delay)
         
         return list(all_keywords)
 
