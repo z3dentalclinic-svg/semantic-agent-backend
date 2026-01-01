@@ -10,6 +10,9 @@ from pydantic import BaseModel
 from typing import Optional, List
 import os
 import yaml
+import httpx
+import asyncio
+import time
 
 app = FastAPI(title="Semantic Agent API", version="1.0.0")
 
@@ -40,7 +43,81 @@ def create_google_ads_config():
     
     return config
 
-# Models
+# ============================================
+# GOOGLE AUTOCOMPLETE PARSER
+# ============================================
+
+class AutocompleteParser:
+    """Парсер Google Autocomplete"""
+    
+    def __init__(self):
+        self.base_url = "http://suggestqueries.google.com/complete/search"
+        self.modifiers = list("abcdefghijklmnopqrstuvwxyz")
+        
+    async def fetch_suggestions(
+        self, 
+        query: str, 
+        country: str = "US", 
+        language: str = "en"
+    ) -> List[str]:
+        """Получить подсказки для одного запроса"""
+        params = {
+            "client": "toolbar",
+            "q": query,
+            "gl": country.upper(),
+            "hl": language.lower()
+        }
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": f"{language.lower()},{language.lower()}-{country.upper()};q=0.9,en;q=0.8",
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+                response = await client.get(self.base_url, params=params)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                if len(data) >= 2 and isinstance(data[1], list):
+                    return data[1]
+                
+                return []
+                
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return []
+    
+    async def parse_with_modifiers(
+        self,
+        seed: str,
+        country: str = "US",
+        language: str = "en",
+        use_numbers: bool = False
+    ) -> List[str]:
+        """Парсинг с модификаторами (a-z, опционально 0-9)"""
+        all_keywords = set()
+        modifiers = self.modifiers.copy()
+        
+        if use_numbers:
+            modifiers.extend(list("0123456789"))
+        
+        for modifier in modifiers:
+            query = f"{seed} {modifier}"
+            suggestions = await self.fetch_suggestions(query, country, language)
+            all_keywords.update(suggestions)
+            
+            await asyncio.sleep(0.1)
+        
+        return list(all_keywords)
+
+
+# ============================================
+# MODELS
+# ============================================
+
 class LocationRequest(BaseModel):
     country_code: str
 
@@ -48,6 +125,24 @@ class LocationResponse(BaseModel):
     id: str
     name: str
     type: str
+
+class ParseRequest(BaseModel):
+    seed: str
+    country: str = "IE"
+    language: str = "en"
+    use_numbers: bool = False
+
+class ParseResponse(BaseModel):
+    seed: str
+    keywords: List[str]
+    count: int
+    requests_made: int
+    parsing_time: float
+
+
+# ============================================
+# ENDPOINTS
+# ============================================
 
 @app.get("/")
 async def root():
@@ -66,7 +161,9 @@ async def root():
         "endpoints": {
             "health": "/health",
             "locations": "/api/locations/{country_code}",
-            "countries": "/api/countries"
+            "countries": "/api/countries",
+            "test_parser_quick": "/api/test-parser/quick",
+            "test_parser_full": "/api/test-parser"
         }
     }
 
@@ -157,6 +254,76 @@ async def get_locations(country_code: str):
                 "source": "mock_fallback",
                 "error": str(e)
             }
+
+
+# ============================================
+# PARSER TEST ENDPOINTS
+# ============================================
+
+@app.get("/api/test-parser/quick")
+async def quick_test():
+    """
+    Быстрый тест парсера - один запрос к Google Autocomplete
+    
+    Пример: GET /api/test-parser/quick
+    """
+    parser = AutocompleteParser()
+    
+    suggestions = await parser.fetch_suggestions(
+        query="vacuum repair",
+        country="IE",
+        language="en"
+    )
+    
+    return {
+        "query": "vacuum repair",
+        "country": "IE",
+        "language": "en",
+        "suggestions": suggestions,
+        "count": len(suggestions),
+        "status": "success" if suggestions else "no_results"
+    }
+
+
+@app.post("/api/test-parser", response_model=ParseResponse)
+async def test_parser(request: ParseRequest):
+    """
+    Полный парсинг с модификаторами (a-z, опционально 0-9)
+    
+    Пример запроса:
+    POST /api/test-parser
+    {
+        "seed": "vacuum repair",
+        "country": "IE",
+        "language": "en",
+        "use_numbers": false
+    }
+    """
+    parser = AutocompleteParser()
+    
+    start_time = time.time()
+    
+    keywords = await parser.parse_with_modifiers(
+        seed=request.seed,
+        country=request.country,
+        language=request.language,
+        use_numbers=request.use_numbers
+    )
+    
+    parsing_time = time.time() - start_time
+    
+    modifiers_count = 26  # a-z
+    if request.use_numbers:
+        modifiers_count += 10  # 0-9
+    
+    return ParseResponse(
+        seed=request.seed,
+        keywords=keywords,
+        count=len(keywords),
+        requests_made=modifiers_count,
+        parsing_time=round(parsing_time, 2)
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
