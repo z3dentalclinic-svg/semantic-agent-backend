@@ -53,7 +53,21 @@ class AutocompleteParser:
     
     def __init__(self):
         self.base_url = "http://suggestqueries.google.com/complete/search"
-        self.modifiers = list("abcdefghijklmnopqrstuvwxyz")
+        
+        # Базовые модификаторы (для всех языков)
+        self.base_modifiers = list("abcdefghijklmnopqrstuvwxyz0123456789")
+        
+        # Языковые модификаторы (специфичные символы)
+        self.language_modifiers = {
+            'en': [],  # Английский - только базовые
+            'ru': list("абвгдежзийклмнопрстуфхцчшщэюя"),  # Русский
+            'uk': list("абвгдежзийклмнопрстуфхцчшщьюяіїєґ"),  # Украинский
+            'de': list("äöüß"),  # Немецкий
+            'fr': list("àâäæçéèêëïîôùûüÿ"),  # Французский
+            'es': list("áéíñóúü"),  # Испанский
+            'pl': list("ąćęłńóśźż"),  # Польский
+            'it': list("àèéìíîòóùú"),  # Итальянский
+        }
         
         # Список разных User-Agent для ротации
         self.user_agents = [
@@ -65,6 +79,24 @@ class AutocompleteParser:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
         ]
+    
+    def get_modifiers(self, language: str) -> List[str]:
+        """
+        Получить модификаторы для конкретного языка
+        
+        Args:
+            language: Код языка (en, ru, uk, de, fr, es, pl, it)
+            
+        Returns:
+            List[str]: Базовые (a-z + 0-9) + языковые модификаторы
+        """
+        modifiers = self.base_modifiers.copy()
+        
+        # Добавляем языковые модификаторы если есть
+        lang_mods = self.language_modifiers.get(language.lower(), [])
+        modifiers.extend(lang_mods)
+        
+        return modifiers
         
     async def fetch_suggestions(
         self, 
@@ -110,12 +142,17 @@ class AutocompleteParser:
         language: str = "en",
         use_numbers: bool = False
     ) -> List[str]:
-        """Парсинг с модификаторами (a-z, опционально 0-9)"""
+        """Парсинг с модификаторами (базовые + языковые)"""
         all_keywords = set()
-        modifiers = self.modifiers.copy()
         
-        if use_numbers:
-            modifiers.extend(list("0123456789"))
+        # Получаем модификаторы для выбранного языка
+        modifiers = self.get_modifiers(language)
+        
+        # Если use_numbers=False, убираем цифры из базовых
+        if not use_numbers:
+            modifiers = [m for m in modifiers if not m.isdigit()]
+        
+        print(f"🌍 Language: {language.upper()} | Modifiers: {len(modifiers)} ({', '.join(modifiers[:10])}...)")
         
         for i, modifier in enumerate(modifiers):
             query = f"{seed} {modifier}"
@@ -124,7 +161,7 @@ class AutocompleteParser:
             
             # Случайная задержка между 0.5 и 2 секунд
             delay = random.uniform(0.5, 2.0)
-            print(f"[{i+1}/{len(modifiers)}] Parsed '{query}' → {len(suggestions)} results (waiting {delay:.1f}s)")
+            print(f"[{i+1}/{len(modifiers)}] '{modifier}' → {len(suggestions)} results (wait {delay:.1f}s)")
             await asyncio.sleep(delay)
         
         return list(all_keywords)
@@ -310,14 +347,19 @@ async def full_test(
     seed: str = "vacuum repair",
     country: str = "IE",
     language: str = "en",
-    use_numbers: bool = False
+    use_numbers: bool = True
 ):
     """
-    Полный парсинг с модификаторами (a-z, опционально 0-9)
+    Полный парсинг с модификаторами (базовые a-z + языковые + опционально 0-9)
     
-    Пример: GET /api/test-parser/full?seed=ремонт пылесосов&country=UA&language=ru
+    Пример: GET /api/test-parser/full?seed=ремонт пылесосов&country=UA&language=ru&use_numbers=true
     """
     parser = AutocompleteParser()
+    
+    # Получаем список модификаторов для информации
+    modifiers = parser.get_modifiers(language)
+    if not use_numbers:
+        modifiers = [m for m in modifiers if not m.isdigit()]
     
     start_time = time.time()
     
@@ -330,17 +372,18 @@ async def full_test(
     
     parsing_time = time.time() - start_time
     
-    modifiers_count = 26  # a-z
-    if use_numbers:
-        modifiers_count += 10  # 0-9
-    
     return {
         "seed": seed,
         "country": country,
         "language": language,
+        "modifiers_info": {
+            "total": len(modifiers),
+            "base": "a-z" + (" + 0-9" if use_numbers else ""),
+            "language_specific": "".join(parser.language_modifiers.get(language.lower(), [])) or "none"
+        },
         "keywords": keywords,
         "count": len(keywords),
-        "requests_made": modifiers_count,
+        "requests_made": len(modifiers),
         "parsing_time": round(parsing_time, 2)
     }
 
