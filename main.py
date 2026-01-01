@@ -62,7 +62,7 @@ class AutocompleteParser:
     ) -> List[str]:
         """Получить подсказки для одного запроса"""
         params = {
-            "client": "firefox",
+            "client": "toolbar",
             "q": query,
             "gl": country.upper(),
             "hl": language.lower()
@@ -286,6 +286,46 @@ async def quick_test(
         "suggestions": suggestions,
         "count": len(suggestions),
         "status": "success" if suggestions else "no_results"
+    }
+
+
+@app.get("/api/test-parser/full")
+async def full_test(
+    seed: str = "vacuum repair",
+    country: str = "IE",
+    language: str = "en",
+    use_numbers: bool = False
+):
+    """
+    Полный парсинг с модификаторами (a-z, опционально 0-9)
+    
+    Пример: GET /api/test-parser/full?seed=ремонт пылесосов&country=UA&language=ru
+    """
+    parser = AutocompleteParser()
+    
+    start_time = time.time()
+    
+    keywords = await parser.parse_with_modifiers(
+        seed=seed,
+        country=country,
+        language=language,
+        use_numbers=use_numbers
+    )
+    
+    parsing_time = time.time() - start_time
+    
+    modifiers_count = 26  # a-z
+    if use_numbers:
+        modifiers_count += 10  # 0-9
+    
+    return {
+        "seed": seed,
+        "country": country,
+        "language": language,
+        "keywords": keywords,
+        "count": len(keywords),
+        "requests_made": modifiers_count,
+        "parsing_time": round(parsing_time, 2)
     }
 
 
