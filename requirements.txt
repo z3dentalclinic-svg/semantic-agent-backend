@@ -1,6 +1,6 @@
-fastapi==0.104.1
-uvicorn==0.24.0
+fastapi==0.115.0
+uvicorn==0.32.1
 google-ads==28.4.1
-pyyaml==6.0.1
-pydantic==2.5.2
-httpx==0.25.2
+pyyaml==6.0.2
+pydantic==2.10.3
+httpx==0.28.1
