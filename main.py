@@ -105,7 +105,7 @@ class AutocompleteParser:
             modifiers.extend(list("0123456789"))
         
         for modifier in modifiers:
-            query = f"{seed} {modifier}"
+            query = f"{seed}{modifier}"
             suggestions = await self.fetch_suggestions(query, country, language)
             all_keywords.update(suggestions)
             
