@@ -261,24 +261,28 @@ async def get_locations(country_code: str):
 # ============================================
 
 @app.get("/api/test-parser/quick")
-async def quick_test():
+async def quick_test(
+    query: str = "vacuum repair",
+    country: str = "IE",
+    language: str = "en"
+):
     """
     Быстрый тест парсера - один запрос к Google Autocomplete
     
-    Пример: GET /api/test-parser/quick
+    Пример: GET /api/test-parser/quick?query=ремонт пылесосов&country=UA&language=ru
     """
     parser = AutocompleteParser()
     
     suggestions = await parser.fetch_suggestions(
-        query="vacuum repair",
-        country="IE",
-        language="en"
+        query=query,
+        country=country,
+        language=language
     )
     
     return {
-        "query": "vacuum repair",
-        "country": "IE",
-        "language": "en",
+        "query": query,
+        "country": country,
+        "language": language,
         "suggestions": suggestions,
         "count": len(suggestions),
         "status": "success" if suggestions else "no_results"
