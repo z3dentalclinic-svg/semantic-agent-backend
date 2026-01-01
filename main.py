@@ -62,7 +62,7 @@ class AutocompleteParser:
     ) -> List[str]:
         """Получить подсказки для одного запроса"""
         params = {
-            "client": "toolbar",
+            "client": "firefox",
             "q": query,
             "gl": country.upper(),
             "hl": language.lower()
