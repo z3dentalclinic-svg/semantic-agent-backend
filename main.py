@@ -320,27 +320,35 @@ class AutocompleteParser:
         cyrillic_modifiers = [m for m in all_modifiers if m in language_specific]
         latin_digit_modifiers = [m for m in all_modifiers if m not in language_specific]
         
+        # МОРФОЛОГИЯ ЗАКОММЕНТИРОВАНА ДЛЯ ТЕСТИРОВАНИЯ PREFIX
         # Seed вариации ТОЛЬКО если включена морфология
+        # seed_variations = [seed]
+        # if use_morphology:
+        #     seed_variations = self.get_seed_variations(seed, language)
+        #     print(f"🔤 MORPH mode: ENABLED | Seed variations: {len(seed_variations)}")
+        #     for var in seed_variations[:5]:
+        #         print(f"   - {var}")
+        #     if len(seed_variations) > 5:
+        #         print(f"   ... и ещё {len(seed_variations) - 5}")
+        
+        # ВРЕМЕННО: используем только исходный seed
         seed_variations = [seed]
         if use_morphology:
-            seed_variations = self.get_seed_variations(seed, language)
-            print(f"🔤 MORPH mode: ENABLED | Seed variations: {len(seed_variations)}")
-            for var in seed_variations[:5]:
-                print(f"   - {var}")
-            if len(seed_variations) > 5:
-                print(f"   ... и ещё {len(seed_variations) - 5}")
+            print(f"⚠️ MORPH mode: ВРЕМЕННО ОТКЛЮЧЕНА ДЛЯ ТЕСТИРОВАНИЯ PREFIX")
         
         seed_words = seed.split()
         
         print(f"🌍 Language: {language.upper()}")
         print(f"📊 Modifiers: Latin/Digits={len(latin_digit_modifiers)}, Cyrillic={len(cyrillic_modifiers)}")
         print(f"📍 INFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2 else 'DISABLED'}")
+        print(f"📍 PREFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 else 'DISABLED'}")
+
         
         # ========================================
         # 1. SUFFIX с ЛАТИНИЦЕЙ и ЦИФРАМИ (БЕЗ морфологии!)
         # ========================================
         print(f"\n{'='*60}")
-        print(f"🔤 [1/3] SUFFIX Latin/Digits (исходный seed только)")
+        print(f"🔤 [1/4] SUFFIX Latin/Digits (исходный seed только)")
         print(f"{'='*60}")
         print(f"Пример запроса: '{seed} a'")
         print(f"Модификаторов: {len(latin_digit_modifiers)}")
@@ -360,10 +368,10 @@ class AutocompleteParser:
         print(f"✅ SUFFIX Latin/Digits завершен: {latin_results} результатов")
         
         # ========================================
-        # 2. SUFFIX с КИРИЛЛИЦЕЙ (С морфологией если включена!)
+        # 2. SUFFIX с КИРИЛЛИЦЕЙ (МОРФОЛОГИЯ ЗАКОММЕНТИРОВАНА!)
         # ========================================
         print(f"\n{'='*60}")
-        print(f"🔤 [2/3] SUFFIX Cyrillic ({'с морфологией' if use_morphology else 'исходный seed'})")
+        print(f"🔤 [2/4] SUFFIX Cyrillic (БЕЗ морфологии - ВРЕМЕННО)")
         print(f"{'='*60}")
         print(f"Seed вариаций: {len(seed_variations)}")
         print(f"Модификаторов на вариацию: {len(cyrillic_modifiers)}")
@@ -394,7 +402,7 @@ class AutocompleteParser:
         # ========================================
         if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2:
             print(f"\n{'='*60}")
-            print(f"🔤 [3/3] INFIX Cyrillic (исходный seed только)")
+            print(f"🔤 [3/4] INFIX Cyrillic (исходный seed только)")
             print(f"{'='*60}")
             print(f"Исходный seed: '{seed}'")
             print(f"Слов в seed: {len(seed_words)}")
@@ -418,6 +426,35 @@ class AutocompleteParser:
             print(f"✅ INFIX завершен: {infix_results} результатов")
         else:
             print(f"\n⚠️ INFIX DISABLED (требуется: кириллические модификаторы + seed из 2+ слов)")
+        
+        # ========================================
+        # 4. PREFIX с КИРИЛЛИЦЕЙ (БЕЗ морфологии!) - НОВОЕ!
+        # ========================================
+        if len(cyrillic_modifiers) > 0:
+            print(f"\n{'='*60}")
+            print(f"🔤 [4/4] PREFIX Cyrillic (исходный seed только) - НОВОЕ!")
+            print(f"{'='*60}")
+            print(f"Исходный seed: '{seed}'")
+            print(f"Шаблон: '[модификатор] {seed}'")
+            print(f"Пример запроса: 'а {seed}'")
+            print(f"Модификаторов: {len(cyrillic_modifiers)}")
+            
+            prefix_results = 0
+            for i, modifier in enumerate(cyrillic_modifiers):
+                # Ставим модификатор ПЕРЕД seed
+                prefix_query = f"{modifier} {seed}"
+                prefix_suggestions = await self.fetch_suggestions(prefix_query, country, language)
+                all_keywords.update(prefix_suggestions)
+                prefix_results += len(prefix_suggestions)
+                
+                delay = random.uniform(0.5, 2.0)
+                if i < 3 or len(prefix_suggestions) > 0:
+                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{prefix_query}' → {len(prefix_suggestions)} results (wait {delay:.1f}s)")
+                await asyncio.sleep(delay)
+            
+            print(f"✅ PREFIX завершен: {prefix_results} результатов")
+        else:
+            print(f"\n⚠️ PREFIX DISABLED (требуется: кириллические модификаторы)")
         
         print(f"\n{'='*60}")
         print(f"🎉 ПАРСИНГ ЗАВЕРШЕН")
@@ -753,28 +790,33 @@ async def full_test(
     # Получаем seed вариации если морфология включена
     seed_variations = 1
     morph_available = False
-    if use_morphology:
-        if language.lower() == 'ru' and PYMORPHY_AVAILABLE:
-            morph_available = True
-        elif language.lower() == 'en' and INFLECT_AVAILABLE:
-            morph_available = True
-        
-        if morph_available:
-            variations = parser.get_seed_variations(seed, language)
-            seed_variations = len(variations)
+    # МОРФОЛОГИЯ ЗАКОММЕНТИРОВАНА ДЛЯ ТЕСТИРОВАНИЯ PREFIX  
+    # if use_morphology:
+    #     if language.lower() == 'ru' and PYMORPHY_AVAILABLE:
+    #         morph_available = True
+    #     elif language.lower() == 'en' and INFLECT_AVAILABLE:
+    #         morph_available = True
+    #     
+    #     if morph_available:
+    #         variations = parser.get_seed_variations(seed, language)
+    #         seed_variations = len(variations)
     
-    # ПРАВИЛЬНЫЙ РАСЧЕТ:
+    # ПРАВИЛЬНЫЙ РАСЧЕТ (МОРФОЛОГИЯ ВРЕМЕННО ОТКЛЮЧЕНА):
     # 1. SUFFIX латиница/цифры (БЕЗ морфологии)
     suffix_latin_requests = len(latin_digit_modifiers)
     
-    # 2. SUFFIX кириллица (С морфологией если включена)
+    # 2. SUFFIX кириллица (БЕЗ морфологии - ВРЕМЕННО!)
     suffix_cyrillic_requests = len(cyrillic_modifiers) * seed_variations
     
     # 3. INFIX кириллица (БЕЗ морфологии!)
     infix_requests = len(cyrillic_modifiers) if len(seed_words) >= 2 else 0
     
+    # 4. PREFIX кириллица (БЕЗ морфологии!) - НОВОЕ!
+    prefix_requests = len(cyrillic_modifiers)
+    
     # ВСЕГО запросов
-    total_requests = suffix_latin_requests + suffix_cyrillic_requests + infix_requests
+    total_requests = suffix_latin_requests + suffix_cyrillic_requests + infix_requests + prefix_requests
+
     
     start_time = time.time()
     
@@ -809,8 +851,9 @@ async def full_test(
             "suffix_latin_digit": suffix_latin_requests,
             "suffix_cyrillic": suffix_cyrillic_requests,
             "infix": infix_requests,
+            "prefix": prefix_requests,
             "total_requests": total_requests,
-            "formula": f"{suffix_latin_requests} (latin/digit) + {suffix_cyrillic_requests} (cyrillic×{seed_variations}) + {infix_requests} (infix) = {total_requests}"
+            "formula": f"{suffix_latin_requests} (latin/digit) + {suffix_cyrillic_requests} (cyrillic×{seed_variations}) + {infix_requests} (infix) + {prefix_requests} (prefix) = {total_requests}"
         },
         "keywords": keywords,
         "count": len(keywords),
@@ -859,20 +902,22 @@ async def test_parser(request: ParseRequest):
     latin_digit_modifiers = [m for m in all_modifiers if m not in language_specific]
     seed_words = request.seed.split()
     
+    # МОРФОЛОГИЯ ЗАКОММЕНТИРОВАНА ДЛЯ ТЕСТИРОВАНИЯ PREFIX
     # Seed вариации если морфология включена
     seed_variations = 1
-    if request.use_morphology:
-        morph_available = (request.language.lower() == 'ru' and PYMORPHY_AVAILABLE) or \
-                         (request.language.lower() == 'en' and INFLECT_AVAILABLE)
-        if morph_available:
-            variations = parser.get_seed_variations(request.seed, request.language)
-            seed_variations = len(variations)
+    # if request.use_morphology:
+    #     morph_available = (request.language.lower() == 'ru' and PYMORPHY_AVAILABLE) or \
+    #                      (request.language.lower() == 'en' and INFLECT_AVAILABLE)
+    #     if morph_available:
+    #         variations = parser.get_seed_variations(request.seed, request.language)
+    #         seed_variations = len(variations)
     
-    # Расчет запросов
+    # Расчет запросов (МОРФОЛОГИЯ ОТКЛЮЧЕНА, ДОБАВЛЕН PREFIX)
     suffix_latin = len(latin_digit_modifiers)
     suffix_cyrillic = len(cyrillic_modifiers) * seed_variations
     infix = len(cyrillic_modifiers) if len(seed_words) >= 2 else 0
-    total_requests = suffix_latin + suffix_cyrillic + infix
+    prefix = len(cyrillic_modifiers)  # НОВОЕ!
+    total_requests = suffix_latin + suffix_cyrillic + infix + prefix
     
     return ParseResponse(
         seed=request.seed,
