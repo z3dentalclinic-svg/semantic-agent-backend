@@ -431,73 +431,49 @@ class AutocompleteParser:
         # else:
         #     print(f"\n⚠️ INFIX DISABLED (требуется: кириллические модификаторы + seed из 2+ слов)")
         
-        print(f"\n⚠️ INFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
+        print(f"\n⚠️ INFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА PREFIX")
         infix_results = 0
         
         # ========================================
         # 4. PREFIX - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
         # ========================================
-        # if len(cyrillic_modifiers) > 0:
-        #     print(f"\n{'='*60}")
-        #     print(f"🔤 [4/4] PREFIX Cyrillic (исходный seed только)")
-        #     print(f"{'='*60}")
-        #     print(f"Исходный seed: '{seed}'")
-        #     print(f"Шаблон: '[модификатор] {seed}'")
-        #     print(f"Пример запроса: 'а {seed}'")
-        #     print(f"Модификаторов: {len(cyrillic_modifiers)}")
-        #     
-        #     prefix_results = 0
-        #     for i, modifier in enumerate(cyrillic_modifiers):
-        #         prefix_query = f"{modifier} {seed}"
-        #         prefix_suggestions = await self.fetch_suggestions(prefix_query, country, language)
-        #         all_keywords.update(prefix_suggestions)
-        #         prefix_results += len(prefix_suggestions)
-        #         
-        #         delay = random.uniform(0.5, 2.0)
-        #         if i < 3 or len(prefix_suggestions) > 0:
-        #             print(f"[{i+1}/{len(cyrillic_modifiers)}] '{prefix_query}' → {len(prefix_suggestions)} results (wait {delay:.1f}s)")
-        #         await asyncio.sleep(delay)
-        #     
-        #     print(f"✅ PREFIX завершен: {prefix_results} результатов")
-        # else:
-        #     print(f"\n⚠️ PREFIX DISABLED (требуется: кириллические модификаторы)")
-        
-        print(f"\n⚠️ PREFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
+        print(f"\n⚠️ PREFIX (односимвольный) ОТКЛЮЧЕН ДЛЯ ТЕСТА")
         prefix_results = 0
         
         # ========================================
-        # 5. REVERSE SUFFIX с КИРИЛЛИЦЕЙ (БЕЗ морфологии!) - ТЕСТ!
+        # 5. PREFIX с ЧАСТОТНЫМИ БИГРАММАМИ - ТЕСТ!
         # ========================================
-        if len(cyrillic_modifiers) > 0:
-            # Создаем обратный seed: "пылесосов ремонт" вместо "ремонт пылесосов"
-            reversed_seed = ' '.join(reversed(seed_words))
+        # Топ-50 самых частых начальных биграмм в русском языке
+        frequent_bigrams = [
+            "пр", "по", "ра", "за", "на", "не", "ко", "об", "от", "до",
+            "во", "со", "ре", "ма", "ст", "де", "ка", "то", "мо", "го",
+            "се", "ве", "ме", "те", "ле", "бе", "че", "же", "ша", "це",
+            "ас", "ал", "ав", "ми", "ки", "од", "ха", "но", "са", "ту",
+            "ул", "ир", "ек", "кр", "пе", "ба", "ви", "бо", "ро", "си"
+        ]
+        
+        print(f"\n{'='*60}")
+        print(f"🔤 [ТЕСТ] PREFIX с ЧАСТОТНЫМИ БИГРАММАМИ - НОВЫЙ МЕТОД!")
+        print(f"{'='*60}")
+        print(f"Исходный seed: '{seed}'")
+        print(f"Шаблон: '[биграмма] {seed}'")
+        print(f"Пример запроса: 'пр {seed}', 'се {seed}', 'це {seed}'")
+        print(f"Биграмм: {len(frequent_bigrams)}")
+        
+        bigram_results = 0
+        for i, bigram in enumerate(frequent_bigrams):
+            # Ставим биграмму ПЕРЕД seed
+            bigram_query = f"{bigram} {seed}"
+            bigram_suggestions = await self.fetch_suggestions(bigram_query, country, language)
+            all_keywords.update(bigram_suggestions)
+            bigram_results += len(bigram_suggestions)
             
-            print(f"\n{'='*60}")
-            print(f"🔤 [ТЕСТ] REVERSE SUFFIX Cyrillic - НОВЫЙ МЕТОД!")
-            print(f"{'='*60}")
-            print(f"Исходный seed: '{seed}'")
-            print(f"Обратный seed: '{reversed_seed}'")
-            print(f"Шаблон: '{reversed_seed} [модификатор]'")
-            print(f"Пример запроса: '{reversed_seed} а'")
-            print(f"Модификаторов: {len(cyrillic_modifiers)}")
-            
-            reverse_results = 0
-            for i, modifier in enumerate(cyrillic_modifiers):
-                # Делаем SUFFIX с обратным seed
-                reverse_query = f"{reversed_seed} {modifier}"
-                reverse_suggestions = await self.fetch_suggestions(reverse_query, country, language)
-                all_keywords.update(reverse_suggestions)
-                reverse_results += len(reverse_suggestions)
-                
-                delay = random.uniform(0.5, 2.0)
-                if i < 3 or len(reverse_suggestions) > 0:
-                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{reverse_query}' → {len(reverse_suggestions)} results (wait {delay:.1f}s)")
-                await asyncio.sleep(delay)
-            
-            print(f"✅ REVERSE SUFFIX завершен: {reverse_results} результатов")
-        else:
-            print(f"\n⚠️ REVERSE SUFFIX DISABLED (требуется: кириллические модификаторы)")
-            reverse_results = 0
+            delay = random.uniform(0.5, 2.0)
+            if i < 5 or len(bigram_suggestions) > 0:
+                print(f"[{i+1}/{len(frequent_bigrams)}] '{bigram_query}' → {len(bigram_suggestions)} results (wait {delay:.1f}s)")
+            await asyncio.sleep(delay)
+        
+        print(f"✅ PREFIX BIGRAMS завершен: {bigram_results} результатов")
         
         print(f"\n{'='*60}")
         print(f"🎉 ПАРСИНГ ЗАВЕРШЕН")
