@@ -217,18 +217,29 @@ class AutocompleteParser:
         Returns:
             List[str]: Все вариации фразы
         """
+        print(f"🔍 get_seed_variations вызван: seed='{seed}', language='{language}'")
+        
         words = seed.split()
+        print(f"🔍 Слов в seed: {len(words)}")
+        
         if len(words) < 2:
+            print(f"⚠️ Меньше 2 слов, возвращаем исходный seed")
             return [seed]
         
         # Получаем формы для последнего слова (обычно существительное)
         last_word = words[-1]
+        print(f"🔍 Последнее слово: '{last_word}'")
         
         if language.lower() == 'ru':
+            print(f"🔍 Вызываем get_word_forms_ru('{last_word}')")
             word_forms = self.get_word_forms_ru(last_word)
+            print(f"🔍 Получено форм от get_word_forms_ru: {len(word_forms)}")
         elif language.lower() == 'en':
+            print(f"🔍 Вызываем get_word_forms_en('{last_word}')")
             word_forms = self.get_word_forms_en(last_word)
+            print(f"🔍 Получено форм от get_word_forms_en: {len(word_forms)}")
         else:
+            print(f"⚠️ Неизвестный язык '{language}', возвращаем исходный seed")
             return [seed]
         
         # Создаем вариации
@@ -237,6 +248,9 @@ class AutocompleteParser:
         
         for form in word_forms:
             variations.append(f"{base} {form}")
+        
+        print(f"✅ Создано вариаций: {len(variations)}")
+        print(f"   Первые 3: {variations[:3]}")
         
         return variations
         
