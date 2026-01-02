@@ -391,14 +391,33 @@ async def root():
         os.getenv('GOOGLE_ADS_CUSTOMER_ID')
     ])
     
+    # Проверяем доступность морфологии
+    morph_status = {
+        "russian": {
+            "available": PYMORPHY_AVAILABLE,
+            "library": "pymorphy2",
+            "features": "все падежи и числа" if PYMORPHY_AVAILABLE else "не установлено"
+        },
+        "english": {
+            "available": INFLECT_AVAILABLE,
+            "library": "inflect",
+            "features": "singular/plural" if INFLECT_AVAILABLE else "не установлено"
+        }
+    }
+    
     return {
         "service": "Semantic Agent API",
-        "version": "2.0.0 (INFIX + SUFFIX + SINGLE)",
+        "version": "3.0.0 (SUFFIX + INFIX + MORPHOLOGY)",
         "status": "running",
         "credentials_loaded": credentials_loaded,
+        "morphology": {
+            "status": "enabled" if (PYMORPHY_AVAILABLE or INFLECT_AVAILABLE) else "disabled",
+            "languages": morph_status
+        },
         "parsing_modes": {
             "suffix": "seed + modifier (all modifiers)",
-            "infix": "word1 + modifier + word2 (cyrillic only, 1-char)"
+            "infix": "word1 + modifier + word2 (cyrillic only, 1-char)",
+            "morphology": "all word forms (pymorphy2 for RU, inflect for EN)"
         },
         "endpoints": {
             "health": "/health",
@@ -406,7 +425,7 @@ async def root():
             "countries": "/api/countries",
             "test_parser_single": "/api/test-parser/single?query={query}&country={country}&language={language}",
             "test_parser_quick": "/api/test-parser/quick?query={query}&country={country}&language={language}",
-            "test_parser_full": "/api/test-parser/full?seed={seed}&country={country}&language={language}&use_numbers={bool}"
+            "test_parser_full": "/api/test-parser/full?seed={seed}&country={country}&language={language}&use_numbers={bool}&use_morphology={bool}"
         }
     }
 
@@ -415,7 +434,11 @@ async def health():
     return {
         "status": "healthy",
         "credentials": "loaded" if os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN") else "missing",
-        "parser": "enabled (SUFFIX + INFIX)"
+        "parser": "enabled (SUFFIX + INFIX + MORPHOLOGY)",
+        "morphology": {
+            "russian": "enabled ✅" if PYMORPHY_AVAILABLE else "disabled ❌",
+            "english": "enabled ✅" if INFLECT_AVAILABLE else "disabled ❌"
+        }
     }
 
 @app.get("/api/countries")
