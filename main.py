@@ -431,49 +431,84 @@ class AutocompleteParser:
         # else:
         #     print(f"\n⚠️ INFIX DISABLED (требуется: кириллические модификаторы + seed из 2+ слов)")
         
-        print(f"\n⚠️ INFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА PREFIX")
+        print(f"\n⚠️ INFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА WILDCARD")
         infix_results = 0
         
         # ========================================
         # 4. PREFIX - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
         # ========================================
-        print(f"\n⚠️ PREFIX (односимвольный) ОТКЛЮЧЕН ДЛЯ ТЕСТА")
+        print(f"\n⚠️ PREFIX (односимвольный) ОТКЛЮЧЕН ДЛЯ ТЕСТА WILDCARD")
         prefix_results = 0
         
         # ========================================
-        # 5. PREFIX с ЧАСТОТНЫМИ БИГРАММАМИ - ТЕСТ!
+        # 5. WILDCARD PREFIX TEST - ТЕСТ ПОДСТАНОВОЧНЫХ ЗНАКОВ!
         # ========================================
-        # Топ-50 самых частых начальных биграмм в русском языке
-        frequent_bigrams = [
-            "пр", "по", "ра", "за", "на", "не", "ко", "об", "от", "до",
-            "во", "со", "ре", "ма", "ст", "де", "ка", "то", "мо", "го",
-            "се", "ве", "ме", "те", "ле", "бе", "че", "же", "ша", "це",
-            "ас", "ал", "ав", "ми", "ки", "од", "ха", "но", "са", "ту",
-            "ул", "ир", "ек", "кр", "пе", "ба", "ви", "бо", "ро", "си"
+        wildcard_symbols = [
+            ("*", "звёздочка"),
+            ("_", "одно подчёркивание"),
+            ("__", "два подчёркивания"),
+            ("___", "три подчёркивания"),
+            ("____", "четыре подчёркивания"),
+            ("_____", "пять подчёркиваний"),
         ]
         
         print(f"\n{'='*60}")
-        print(f"🔤 [ТЕСТ] PREFIX с ЧАСТОТНЫМИ БИГРАММАМИ - НОВЫЙ МЕТОД!")
+        print(f"🔤 [ТЕСТ] WILDCARD PREFIX - ПОДСТАНОВОЧНЫЕ ЗНАКИ!")
         print(f"{'='*60}")
         print(f"Исходный seed: '{seed}'")
-        print(f"Шаблон: '[биграмма] {seed}'")
-        print(f"Пример запроса: 'пр {seed}', 'се {seed}', 'це {seed}'")
-        print(f"Биграмм: {len(frequent_bigrams)}")
+        print(f"Цель: найти 'астана ремонт пылесосов', 'сервис ремонт пылесосов'")
+        print(f"Тестируем: * _ __ ___ ____ _____")
+        print(f"Символов для теста: {len(wildcard_symbols)}\n")
         
-        bigram_results = 0
-        for i, bigram in enumerate(frequent_bigrams):
-            # Ставим биграмму ПЕРЕД seed
-            bigram_query = f"{bigram} {seed}"
-            bigram_suggestions = await self.fetch_suggestions(bigram_query, country, language)
-            all_keywords.update(bigram_suggestions)
-            bigram_results += len(bigram_suggestions)
+        wildcard_total_results = 0
+        wildcard_total_keywords = set()
+        
+        for i, (symbol, description) in enumerate(wildcard_symbols):
+            # Ставим wildcard символ ПЕРЕД seed
+            wildcard_query = f"{symbol} {seed}"
+            wildcard_suggestions = await self.fetch_suggestions(wildcard_query, country, language)
+            
+            # Проверяем есть ли РЕАЛЬНОЕ расширение (не просто symbol + seed)
+            real_expansions = []
+            for suggestion in wildcard_suggestions:
+                # Если результат НЕ начинается с нашего символа, значит расширился!
+                if not suggestion.startswith(symbol):
+                    real_expansions.append(suggestion)
+            
+            all_keywords.update(real_expansions)
+            wildcard_total_keywords.update(real_expansions)
+            wildcard_total_results += len(real_expansions)
             
             delay = random.uniform(0.5, 2.0)
-            if i < 5 or len(bigram_suggestions) > 0:
-                print(f"[{i+1}/{len(frequent_bigrams)}] '{bigram_query}' → {len(bigram_suggestions)} results (wait {delay:.1f}s)")
+            
+            # Показываем все результаты для wildcard тестов
+            status = "✅ РАСШИРЕНИЕ!" if len(real_expansions) > 0 else "❌ нет расширения"
+            print(f"[{i+1}/{len(wildcard_symbols)}] '{wildcard_query}' ({description})")
+            print(f"    Всего: {len(wildcard_suggestions)} | Расширений: {len(real_expansions)} | {status}")
+            
+            if len(real_expansions) > 0:
+                print(f"    Примеры расширений:")
+                for exp in real_expansions[:5]:
+                    print(f"      • {exp}")
+            
+            print(f"    Задержка: {delay:.1f}s\n")
             await asyncio.sleep(delay)
         
-        print(f"✅ PREFIX BIGRAMS завершен: {bigram_results} результатов")
+        print(f"{'='*60}")
+        print(f"✅ WILDCARD PREFIX тест завершен!")
+        print(f"{'='*60}")
+        print(f"Всего расширений найдено: {wildcard_total_results}")
+        print(f"Уникальных ключевых слов: {len(wildcard_total_keywords)}")
+        
+        if wildcard_total_results > 0:
+            print(f"\n🎉 WILDCARD РАБОТАЕТ! Найдено {wildcard_total_results} PREFIX запросов!")
+            print(f"\nВсе найденные PREFIX запросы:")
+            for kw in sorted(wildcard_total_keywords)[:20]:
+                print(f"  • {kw}")
+            if len(wildcard_total_keywords) > 20:
+                print(f"  ... и ещё {len(wildcard_total_keywords) - 20}")
+        else:
+            print(f"\n❌ WILDCARD НЕ РАБОТАЕТ в Google Autocomplete API")
         
         print(f"\n{'='*60}")
         print(f"🎉 ПАРСИНГ ЗАВЕРШЕН")
