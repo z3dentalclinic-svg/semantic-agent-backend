@@ -441,6 +441,20 @@ async def full_test(
     if not use_numbers:
         modifiers = [m for m in modifiers if not m.isdigit()]
     
+    # Считаем INFIX модификаторы (только кириллица для seed с 2+ словами)
+    language_specific = parser.language_modifiers.get(language.lower(), [])
+    cyrillic_modifiers = [m for m in modifiers if m in language_specific]
+    seed_words = seed.split()
+    
+    # SUFFIX запросов = все модификаторы
+    suffix_requests = len(modifiers)
+    
+    # INFIX запросов = кириллические модификаторы (если seed >= 2 слов)
+    infix_requests = len(cyrillic_modifiers) if len(seed_words) >= 2 else 0
+    
+    # ВСЕГО запросов
+    total_requests = suffix_requests + infix_requests
+    
     start_time = time.time()
     
     keywords = await parser.parse_with_modifiers(
@@ -457,13 +471,20 @@ async def full_test(
         "country": country,
         "language": language,
         "modifiers_info": {
-            "total": len(modifiers),
+            "total_modifiers": len(modifiers),
+            "suffix_modifiers": len(modifiers),
+            "infix_modifiers": len(cyrillic_modifiers) if len(seed_words) >= 2 else 0,
             "base": "a-z" + (" + 0-9" if use_numbers else ""),
-            "language_specific": "".join(parser.language_modifiers.get(language.lower(), [])) or "none"
+            "language_specific": "".join(language_specific) or "none"
+        },
+        "requests_info": {
+            "suffix_requests": suffix_requests,
+            "infix_requests": infix_requests,
+            "total_requests": total_requests
         },
         "keywords": keywords,
         "count": len(keywords),
-        "requests_made": len(modifiers),
+        "requests_made": total_requests,
         "parsing_time": round(parsing_time, 2)
     }
 
@@ -495,15 +516,25 @@ async def test_parser(request: ParseRequest):
     
     parsing_time = time.time() - start_time
     
-    modifiers_count = 26  # a-z
-    if request.use_numbers:
-        modifiers_count += 10  # 0-9
+    # Получаем модификаторы
+    modifiers = parser.get_modifiers(request.language)
+    if not request.use_numbers:
+        modifiers = [m for m in modifiers if not m.isdigit()]
+    
+    # Считаем INFIX (кириллица для seed с 2+ словами)
+    language_specific = parser.language_modifiers.get(request.language.lower(), [])
+    cyrillic_modifiers = [m for m in modifiers if m in language_specific]
+    seed_words = request.seed.split()
+    
+    suffix_requests = len(modifiers)
+    infix_requests = len(cyrillic_modifiers) if len(seed_words) >= 2 else 0
+    total_requests = suffix_requests + infix_requests
     
     return ParseResponse(
         seed=request.seed,
         keywords=keywords,
         count=len(keywords),
-        requests_made=modifiers_count,
+        requests_made=total_requests,
         parsing_time=round(parsing_time, 2)
     )
 
