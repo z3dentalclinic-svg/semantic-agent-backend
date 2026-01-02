@@ -446,28 +446,147 @@ class AutocompleteParser:
         
         latin_results = 0
         cyrillic_results = 0
-                # 
-        # cyrillic_results = 0
-        # for var_idx, current_seed in enumerate(seed_variations):
-        #     if use_morphology and var_idx > 0:
-        #         print(f"\n🔄 Вариация {var_idx + 1}/{len(seed_variations)}: '{current_seed}'")
-        #     elif var_idx == 0:
-        #         print(f"Пример запроса: '{current_seed} а'")
-        #     
-        #     for i, modifier in enumerate(cyrillic_modifiers):
-        #         query = f"{current_seed} {modifier}"
-        #         suggestions = await self.fetch_suggestions(query, country, language)
-        #         all_keywords.update(suggestions)
-        #         cyrillic_results += len(suggestions)
-        #         
-        #         delay = random.uniform(0.5, 2.0)
-        #         if i < 3 or len(suggestions) > 0:
-        #             print(f"[{i+1}/{len(cyrillic_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
-        #         await asyncio.sleep(delay)
-        # 
-        # print(f"✅ SUFFIX Cyrillic завершен: {cyrillic_results} результатов")
         
-        print(f"\n⚠️ SUFFIX Cyrillic ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
+        # ========================================
+        # ADAPTIVE PREFIX - ДВУХЭТАПНЫЙ ПОДХОД!
+        # ========================================
+        print(f"\n{'='*60}")
+        print(f"🔤 [ТЕСТ] ADAPTIVE PREFIX - ДВУХЭТАПНЫЙ ПОДХОД!")
+        print(f"{'='*60}")
+        print(f"Исходный seed: '{seed}'")
+        print(f"")
+        print(f"ЭТАП 1: Парсим SUFFIX 'ремонт пылесосов а/б/в...'")
+        print(f"        → Извлекаем последние слова из результатов")
+        print(f"ЭТАП 2: Проверяем обратные запросы '[слово] ремонт пылесосов'")
+        print(f"        → Находим реальные PREFIX запросы!")
+        print(f"")
+        
+        # ========================================
+        # ЭТАП 1: SUFFIX парсинг для извлечения потенциальных слов
+        # ========================================
+        print(f"{'='*60}")
+        print(f"ЭТАП 1: SUFFIX парсинг (извлечение кандидатов)")
+        print(f"{'='*60}")
+        
+        potential_prefix_words = set()
+        stage1_keywords = set()
+        stage1_count = 0
+        
+        for i, modifier in enumerate(cyrillic_modifiers):
+            query = f"{seed} {modifier}"
+            suggestions = await self.fetch_suggestions(query, country, language)
+            stage1_keywords.update(suggestions)
+            stage1_count += len(suggestions)
+            
+            # Извлекаем ПОСЛЕДНЕЕ слово из каждого результата
+            for suggestion in suggestions:
+                words = suggestion.split()
+                if len(words) > len(seed.split()):
+                    # Берём слово после seed
+                    last_word = words[-1]
+                    # Фильтруем: только слова длиннее 2 символов
+                    if len(last_word) > 2 and last_word.replace('-', '').isalpha():
+                        potential_prefix_words.add(last_word.lower())
+            
+            delay = random.uniform(0.5, 2.0)
+            if i < 3 or len(suggestions) > 0:
+                print(f"[{i+1}/{len(cyrillic_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
+            await asyncio.sleep(delay)
+        
+        print(f"\n✅ ЭТАП 1 завершен!")
+        print(f"Найдено SUFFIX результатов: {stage1_count}")
+        print(f"Извлечено потенциальных PREFIX слов: {len(potential_prefix_words)}")
+        print(f"\nПримеры извлечённых слов:")
+        for word in sorted(potential_prefix_words)[:15]:
+            print(f"  • {word}")
+        if len(potential_prefix_words) > 15:
+            print(f"  ... и ещё {len(potential_prefix_words) - 15}")
+        
+        # ========================================
+        # ЭТАП 2: PREFIX проверка извлечённых слов
+        # ========================================
+        print(f"\n{'='*60}")
+        print(f"ЭТАП 2: PREFIX проверка (обратные запросы)")
+        print(f"{'='*60}")
+        print(f"Проверяем: '[слово] {seed}'")
+        print(f"Слов для проверки: {len(potential_prefix_words)}\n")
+        
+        stage2_keywords = set()
+        stage2_count = 0
+        successful_prefix = []
+        
+        for i, word in enumerate(sorted(potential_prefix_words)):
+            # Делаем PREFIX запрос
+            prefix_query = f"{word} {seed}"
+            prefix_suggestions = await self.fetch_suggestions(prefix_query, country, language)
+            
+            # Проверяем есть ли РЕАЛЬНОЕ расширение (не просто word + seed)
+            real_prefix = []
+            for suggestion in prefix_suggestions:
+                # Если результат начинается с нашего слова и содержит seed - это PREFIX!
+                if suggestion.lower().startswith(word) and seed.lower() in suggestion.lower():
+                    real_prefix.append(suggestion)
+            
+            if len(real_prefix) > 0:
+                stage2_keywords.update(real_prefix)
+                stage2_count += len(real_prefix)
+                successful_prefix.append(word)
+                all_keywords.update(real_prefix)
+                
+                print(f"[{i+1}/{len(potential_prefix_words)}] '{prefix_query}' → ✅ {len(real_prefix)} PREFIX найдено!")
+                for exp in real_prefix[:3]:
+                    print(f"    • {exp}")
+            elif i < 5:  # Показываем первые 5 даже без результатов
+                print(f"[{i+1}/{len(potential_prefix_words)}] '{prefix_query}' → ❌ нет PREFIX")
+            
+            delay = random.uniform(0.5, 2.0)
+            await asyncio.sleep(delay)
+        
+        print(f"\n✅ ЭТАП 2 завершен!")
+        print(f"Проверено слов: {len(potential_prefix_words)}")
+        print(f"Успешных PREFIX слов: {len(successful_prefix)}")
+        print(f"Найдено PREFIX запросов: {stage2_count}")
+        
+        # ========================================
+        # ИТОГОВАЯ СТАТИСТИКА
+        # ========================================
+        print(f"\n{'='*60}")
+        print(f"📊 ИТОГОВАЯ СТАТИСТИКА ADAPTIVE PREFIX")
+        print(f"{'='*60}")
+        print(f"")
+        print(f"ЭТАП 1 (SUFFIX парсинг):")
+        print(f"  Запросов: {len(cyrillic_modifiers)}")
+        print(f"  Результатов: {stage1_count}")
+        print(f"  Извлечено слов: {len(potential_prefix_words)}")
+        print(f"")
+        print(f"ЭТАП 2 (PREFIX проверка):")
+        print(f"  Запросов: {len(potential_prefix_words)}")
+        print(f"  Успешных: {len(successful_prefix)}")
+        print(f"  PREFIX запросов: {stage2_count}")
+        print(f"")
+        print(f"ВСЕГО:")
+        print(f"  Запросов: {len(cyrillic_modifiers) + len(potential_prefix_words)}")
+        print(f"  Уникальных ключей: {len(all_keywords)}")
+        print(f"")
+        
+        if len(successful_prefix) > 0:
+            print(f"🎉 ADAPTIVE PREFIX РАБОТАЕТ!")
+            print(f"\nУспешные PREFIX слова:")
+            for word in successful_prefix[:20]:
+                print(f"  • {word}")
+            if len(successful_prefix) > 20:
+                print(f"  ... и ещё {len(successful_prefix) - 20}")
+            
+            print(f"\nПримеры PREFIX запросов:")
+            for kw in sorted(stage2_keywords)[:15]:
+                print(f"  • {kw}")
+            if len(stage2_keywords) > 15:
+                print(f"  ... и ещё {len(stage2_keywords) - 15}")
+        else:
+            print(f"❌ ADAPTIVE PREFIX не нашёл результатов")
+        
+        print(f"\n⚠️ SUFFIX Cyrillic ОТКЛЮЧЕН ДЛЯ ТЕСТА ADAPTIVE")
+
         cyrillic_results = 0
         
         # ========================================
