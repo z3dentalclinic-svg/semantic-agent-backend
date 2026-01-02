@@ -342,119 +342,162 @@ class AutocompleteParser:
         print(f"📊 Modifiers: Latin/Digits={len(latin_digit_modifiers)}, Cyrillic={len(cyrillic_modifiers)}")
         print(f"📍 INFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2 else 'DISABLED'}")
         print(f"📍 PREFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 else 'DISABLED'}")
-
         
         # ========================================
-        # 1. SUFFIX с ЛАТИНИЦЕЙ и ЦИФРАМИ (БЕЗ морфологии!)
+        # 1. SUFFIX с ЛАТИНИЦЕЙ и ЦИФРАМИ - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
         # ========================================
-        print(f"\n{'='*60}")
-        print(f"🔤 [1/4] SUFFIX Latin/Digits (исходный seed только)")
-        print(f"{'='*60}")
-        print(f"Пример запроса: '{seed} a'")
-        print(f"Модификаторов: {len(latin_digit_modifiers)}")
+        # print(f"\n{'='*60}")
+        # print(f"🔤 [1/4] SUFFIX Latin/Digits (исходный seed только)")
+        # print(f"{'='*60}")
+        # print(f"Пример запроса: '{seed} a'")
+        # print(f"Модификаторов: {len(latin_digit_modifiers)}")
+        # 
+        # latin_results = 0
+        # for i, modifier in enumerate(latin_digit_modifiers):
+        #     query = f"{seed} {modifier}"
+        #     suggestions = await self.fetch_suggestions(query, country, language)
+        #     all_keywords.update(suggestions)
+        #     latin_results += len(suggestions)
+        #     
+        #     delay = random.uniform(0.5, 2.0)
+        #     if i < 3 or len(suggestions) > 0:
+        #         print(f"[{i+1}/{len(latin_digit_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
+        #     await asyncio.sleep(delay)
+        # 
+        # print(f"✅ SUFFIX Latin/Digits завершен: {latin_results} результатов")
         
+        print(f"\n⚠️ SUFFIX Latin/Digits ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
         latin_results = 0
-        for i, modifier in enumerate(latin_digit_modifiers):
-            query = f"{seed} {modifier}"
-            suggestions = await self.fetch_suggestions(query, country, language)
-            all_keywords.update(suggestions)
-            latin_results += len(suggestions)
-            
-            delay = random.uniform(0.5, 2.0)
-            if i < 3 or len(suggestions) > 0:  # Показываем первые 3 или с результатами
-                print(f"[{i+1}/{len(latin_digit_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
-            await asyncio.sleep(delay)
-        
-        print(f"✅ SUFFIX Latin/Digits завершен: {latin_results} результатов")
         
         # ========================================
-        # 2. SUFFIX с КИРИЛЛИЦЕЙ (МОРФОЛОГИЯ ЗАКОММЕНТИРОВАНА!)
+        # 2. SUFFIX с КИРИЛЛИЦЕЙ - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
         # ========================================
-        print(f"\n{'='*60}")
-        print(f"🔤 [2/4] SUFFIX Cyrillic (БЕЗ морфологии - ВРЕМЕННО)")
-        print(f"{'='*60}")
-        print(f"Seed вариаций: {len(seed_variations)}")
-        print(f"Модификаторов на вариацию: {len(cyrillic_modifiers)}")
-        print(f"Всего запросов: {len(seed_variations)} × {len(cyrillic_modifiers)} = {len(seed_variations) * len(cyrillic_modifiers)}")
+        # print(f"\n{'='*60}")
+        # print(f"🔤 [2/4] SUFFIX Cyrillic (БЕЗ морфологии - ВРЕМЕННО)")
+        # print(f"{'='*60}")
+        # print(f"Seed вариаций: {len(seed_variations)}")
+        # print(f"Модификаторов на вариацию: {len(cyrillic_modifiers)}")
+        # print(f"Всего запросов: {len(seed_variations)} × {len(cyrillic_modifiers)} = {len(seed_variations) * len(cyrillic_modifiers)}")
+        # 
+        # cyrillic_results = 0
+        # for var_idx, current_seed in enumerate(seed_variations):
+        #     if use_morphology and var_idx > 0:
+        #         print(f"\n🔄 Вариация {var_idx + 1}/{len(seed_variations)}: '{current_seed}'")
+        #     elif var_idx == 0:
+        #         print(f"Пример запроса: '{current_seed} а'")
+        #     
+        #     for i, modifier in enumerate(cyrillic_modifiers):
+        #         query = f"{current_seed} {modifier}"
+        #         suggestions = await self.fetch_suggestions(query, country, language)
+        #         all_keywords.update(suggestions)
+        #         cyrillic_results += len(suggestions)
+        #         
+        #         delay = random.uniform(0.5, 2.0)
+        #         if i < 3 or len(suggestions) > 0:
+        #             print(f"[{i+1}/{len(cyrillic_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
+        #         await asyncio.sleep(delay)
+        # 
+        # print(f"✅ SUFFIX Cyrillic завершен: {cyrillic_results} результатов")
         
+        print(f"\n⚠️ SUFFIX Cyrillic ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
         cyrillic_results = 0
-        for var_idx, current_seed in enumerate(seed_variations):
-            if use_morphology and var_idx > 0:
-                print(f"\n🔄 Вариация {var_idx + 1}/{len(seed_variations)}: '{current_seed}'")
-            elif var_idx == 0:
-                print(f"Пример запроса: '{current_seed} а'")
-            
-            for i, modifier in enumerate(cyrillic_modifiers):
-                query = f"{current_seed} {modifier}"
-                suggestions = await self.fetch_suggestions(query, country, language)
-                all_keywords.update(suggestions)
-                cyrillic_results += len(suggestions)
-                
-                delay = random.uniform(0.5, 2.0)
-                if i < 3 or len(suggestions) > 0:  # Показываем первые 3 или с результатами
-                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
-                await asyncio.sleep(delay)
-        
-        print(f"✅ SUFFIX Cyrillic завершен: {cyrillic_results} результатов")
         
         # ========================================
-        # 3. INFIX с КИРИЛЛИЦЕЙ (БЕЗ морфологии!)
+        # 3. INFIX с КИРИЛЛИЦЕЙ - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
         # ========================================
-        if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2:
-            print(f"\n{'='*60}")
-            print(f"🔤 [3/4] INFIX Cyrillic (исходный seed только)")
-            print(f"{'='*60}")
-            print(f"Исходный seed: '{seed}'")
-            print(f"Слов в seed: {len(seed_words)}")
-            print(f"Шаблон: '{seed_words[0]} [модификатор] {' '.join(seed_words[1:])}'")
-            print(f"Пример запроса: '{seed_words[0]} а {' '.join(seed_words[1:])}'")
-            print(f"Модификаторов: {len(cyrillic_modifiers)}")
-            
-            infix_results = 0
-            for i, modifier in enumerate(cyrillic_modifiers):
-                # Вставляем модификатор после первого слова ИСХОДНОГО seed
-                infix_query = f"{seed_words[0]} {modifier} {' '.join(seed_words[1:])}"
-                infix_suggestions = await self.fetch_suggestions(infix_query, country, language)
-                all_keywords.update(infix_suggestions)
-                infix_results += len(infix_suggestions)
-                
-                delay = random.uniform(0.5, 2.0)
-                if i < 3 or len(infix_suggestions) > 0:  # Показываем первые 3 или с результатами
-                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{infix_query}' → {len(infix_suggestions)} results (wait {delay:.1f}s)")
-                await asyncio.sleep(delay)
-            
-            print(f"✅ INFIX завершен: {infix_results} результатов")
-        else:
-            print(f"\n⚠️ INFIX DISABLED (требуется: кириллические модификаторы + seed из 2+ слов)")
+        # if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2:
+        #     print(f"\n{'='*60}")
+        #     print(f"🔤 [3/4] INFIX Cyrillic (исходный seed только)")
+        #     print(f"{'='*60}")
+        #     print(f"Исходный seed: '{seed}'")
+        #     print(f"Слов в seed: {len(seed_words)}")
+        #     print(f"Шаблон: '{seed_words[0]} [модификатор] {' '.join(seed_words[1:])}'")
+        #     print(f"Пример запроса: '{seed_words[0]} а {' '.join(seed_words[1:])}'")
+        #     print(f"Модификаторов: {len(cyrillic_modifiers)}")
+        #     
+        #     infix_results = 0
+        #     for i, modifier in enumerate(cyrillic_modifiers):
+        #         infix_query = f"{seed_words[0]} {modifier} {' '.join(seed_words[1:])}"
+        #         infix_suggestions = await self.fetch_suggestions(infix_query, country, language)
+        #         all_keywords.update(infix_suggestions)
+        #         infix_results += len(infix_suggestions)
+        #         
+        #         delay = random.uniform(0.5, 2.0)
+        #         if i < 3 or len(infix_suggestions) > 0:
+        #             print(f"[{i+1}/{len(cyrillic_modifiers)}] '{infix_query}' → {len(infix_suggestions)} results (wait {delay:.1f}s)")
+        #         await asyncio.sleep(delay)
+        #     
+        #     print(f"✅ INFIX завершен: {infix_results} результатов")
+        # else:
+        #     print(f"\n⚠️ INFIX DISABLED (требуется: кириллические модификаторы + seed из 2+ слов)")
+        
+        print(f"\n⚠️ INFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
+        infix_results = 0
         
         # ========================================
-        # 4. PREFIX с КИРИЛЛИЦЕЙ (БЕЗ морфологии!) - НОВОЕ!
+        # 4. PREFIX - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
+        # ========================================
+        # if len(cyrillic_modifiers) > 0:
+        #     print(f"\n{'='*60}")
+        #     print(f"🔤 [4/4] PREFIX Cyrillic (исходный seed только)")
+        #     print(f"{'='*60}")
+        #     print(f"Исходный seed: '{seed}'")
+        #     print(f"Шаблон: '[модификатор] {seed}'")
+        #     print(f"Пример запроса: 'а {seed}'")
+        #     print(f"Модификаторов: {len(cyrillic_modifiers)}")
+        #     
+        #     prefix_results = 0
+        #     for i, modifier in enumerate(cyrillic_modifiers):
+        #         prefix_query = f"{modifier} {seed}"
+        #         prefix_suggestions = await self.fetch_suggestions(prefix_query, country, language)
+        #         all_keywords.update(prefix_suggestions)
+        #         prefix_results += len(prefix_suggestions)
+        #         
+        #         delay = random.uniform(0.5, 2.0)
+        #         if i < 3 or len(prefix_suggestions) > 0:
+        #             print(f"[{i+1}/{len(cyrillic_modifiers)}] '{prefix_query}' → {len(prefix_suggestions)} results (wait {delay:.1f}s)")
+        #         await asyncio.sleep(delay)
+        #     
+        #     print(f"✅ PREFIX завершен: {prefix_results} результатов")
+        # else:
+        #     print(f"\n⚠️ PREFIX DISABLED (требуется: кириллические модификаторы)")
+        
+        print(f"\n⚠️ PREFIX ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
+        prefix_results = 0
+        
+        # ========================================
+        # 5. REVERSE SUFFIX с КИРИЛЛИЦЕЙ (БЕЗ морфологии!) - ТЕСТ!
         # ========================================
         if len(cyrillic_modifiers) > 0:
+            # Создаем обратный seed: "пылесосов ремонт" вместо "ремонт пылесосов"
+            reversed_seed = ' '.join(reversed(seed_words))
+            
             print(f"\n{'='*60}")
-            print(f"🔤 [4/4] PREFIX Cyrillic (исходный seed только) - НОВОЕ!")
+            print(f"🔤 [ТЕСТ] REVERSE SUFFIX Cyrillic - НОВЫЙ МЕТОД!")
             print(f"{'='*60}")
             print(f"Исходный seed: '{seed}'")
-            print(f"Шаблон: '[модификатор] {seed}'")
-            print(f"Пример запроса: 'а {seed}'")
+            print(f"Обратный seed: '{reversed_seed}'")
+            print(f"Шаблон: '{reversed_seed} [модификатор]'")
+            print(f"Пример запроса: '{reversed_seed} а'")
             print(f"Модификаторов: {len(cyrillic_modifiers)}")
             
-            prefix_results = 0
+            reverse_results = 0
             for i, modifier in enumerate(cyrillic_modifiers):
-                # Ставим модификатор ПЕРЕД seed
-                prefix_query = f"{modifier} {seed}"
-                prefix_suggestions = await self.fetch_suggestions(prefix_query, country, language)
-                all_keywords.update(prefix_suggestions)
-                prefix_results += len(prefix_suggestions)
+                # Делаем SUFFIX с обратным seed
+                reverse_query = f"{reversed_seed} {modifier}"
+                reverse_suggestions = await self.fetch_suggestions(reverse_query, country, language)
+                all_keywords.update(reverse_suggestions)
+                reverse_results += len(reverse_suggestions)
                 
                 delay = random.uniform(0.5, 2.0)
-                if i < 3 or len(prefix_suggestions) > 0:
-                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{prefix_query}' → {len(prefix_suggestions)} results (wait {delay:.1f}s)")
+                if i < 3 or len(reverse_suggestions) > 0:
+                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{reverse_query}' → {len(reverse_suggestions)} results (wait {delay:.1f}s)")
                 await asyncio.sleep(delay)
             
-            print(f"✅ PREFIX завершен: {prefix_results} результатов")
+            print(f"✅ REVERSE SUFFIX завершен: {reverse_results} результатов")
         else:
-            print(f"\n⚠️ PREFIX DISABLED (требуется: кириллические модификаторы)")
+            print(f"\n⚠️ REVERSE SUFFIX DISABLED (требуется: кириллические модификаторы)")
+            reverse_results = 0
         
         print(f"\n{'='*60}")
         print(f"🎉 ПАРСИНГ ЗАВЕРШЕН")
