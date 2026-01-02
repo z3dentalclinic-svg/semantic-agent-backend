@@ -24,11 +24,11 @@ import random
 
 # Морфологические анализаторы
 try:
-    import pymorphy2
+    import pymorphy3
     PYMORPHY_AVAILABLE = True
 except ImportError:
     PYMORPHY_AVAILABLE = False
-    print("⚠️ pymorphy2 не установлен! Морфологический парсинг недоступен.")
+    print("⚠️ pymorphy3 не установлен! Морфологический парсинг недоступен.")
 
 try:
     import inflect
@@ -108,10 +108,10 @@ class AutocompleteParser:
         
         if PYMORPHY_AVAILABLE:
             try:
-                self.morph_ru = pymorphy2.MorphAnalyzer()
-                print("✅ pymorphy2 (русский) инициализирован")
+                self.morph_ru = pymorphy3.MorphAnalyzer()
+                print("✅ pymorphy3 (русский) инициализирован")
             except Exception as e:
-                print(f"⚠️ Ошибка инициализации pymorphy2: {e}")
+                print(f"⚠️ Ошибка инициализации pymorphy3: {e}")
         
         if INFLECT_AVAILABLE:
             try:
@@ -521,7 +521,7 @@ async def health():
 async def debug():
     """Отладочная информация о библиотеках"""
     debug_info = {
-        "pymorphy2": {
+        "pymorphy3": {
             "imported": PYMORPHY_AVAILABLE,
             "error": None
         },
@@ -533,11 +533,11 @@ async def debug():
     
     # Пытаемся импортировать и проверить версии
     try:
-        import pymorphy2
-        debug_info["pymorphy2"]["version"] = pymorphy2.__version__ if hasattr(pymorphy2, '__version__') else "unknown"
-        debug_info["pymorphy2"]["module_path"] = str(pymorphy2.__file__)
+        import pymorphy3
+        debug_info["pymorphy3"]["version"] = pymorphy3.__version__ if hasattr(pymorphy3, '__version__') else "unknown"
+        debug_info["pymorphy3"]["module_path"] = str(pymorphy3.__file__)
     except Exception as e:
-        debug_info["pymorphy2"]["error"] = str(e)
+        debug_info["pymorphy3"]["error"] = str(e)
     
     try:
         import inflect
