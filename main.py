@@ -503,6 +503,63 @@ async def health():
         }
     }
 
+@app.get("/debug")
+async def debug():
+    """Отладочная информация о библиотеках"""
+    debug_info = {
+        "pymorphy2": {
+            "imported": PYMORPHY_AVAILABLE,
+            "error": None
+        },
+        "inflect": {
+            "imported": INFLECT_AVAILABLE,
+            "error": None
+        }
+    }
+    
+    # Пытаемся импортировать и проверить версии
+    try:
+        import pymorphy2
+        debug_info["pymorphy2"]["version"] = pymorphy2.__version__ if hasattr(pymorphy2, '__version__') else "unknown"
+        debug_info["pymorphy2"]["module_path"] = str(pymorphy2.__file__)
+    except Exception as e:
+        debug_info["pymorphy2"]["error"] = str(e)
+    
+    try:
+        import inflect
+        debug_info["inflect"]["version"] = inflect.__version__ if hasattr(inflect, '__version__') else "unknown"
+        debug_info["inflect"]["module_path"] = str(inflect.__file__)
+    except Exception as e:
+        debug_info["inflect"]["error"] = str(e)
+    
+    # Проверяем pkg_resources
+    try:
+        import pkg_resources
+        debug_info["pkg_resources"] = {
+            "available": True,
+            "version": pkg_resources.__version__ if hasattr(pkg_resources, '__version__') else "unknown"
+        }
+    except Exception as e:
+        debug_info["pkg_resources"] = {
+            "available": False,
+            "error": str(e)
+        }
+    
+    # Проверяем setuptools
+    try:
+        import setuptools
+        debug_info["setuptools"] = {
+            "available": True,
+            "version": setuptools.__version__ if hasattr(setuptools, '__version__') else "unknown"
+        }
+    except Exception as e:
+        debug_info["setuptools"] = {
+            "available": False,
+            "error": str(e)
+        }
+    
+    return debug_info
+
 @app.get("/api/countries")
 async def get_countries():
     countries = [
