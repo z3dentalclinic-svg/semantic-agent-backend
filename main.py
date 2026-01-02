@@ -5,7 +5,8 @@ Credentials from environment variables
 
 ФИНАЛЬНАЯ ВЕРСИЯ:
 - SUFFIX парсинг (a-z + а-я + 0-9) = 65 модификаторов
-- INFIX парсинг (только кириллица а-я) = 33 модификатора
+- INFIX парсинг (только кириллица а-я) = 29 модификаторов
+- MORPH парсинг (все формы слов через pymorphy2)
 - /api/test-parser/single - тестирование одиночных запросов
 - /api/test-parser/full - полный парсинг
 """
@@ -13,13 +14,28 @@ Credentials from environment variables
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Set
 import os
 import yaml
 import httpx
 import asyncio
 import time
 import random
+
+# Морфологические анализаторы
+try:
+    import pymorphy2
+    PYMORPHY_AVAILABLE = True
+except ImportError:
+    PYMORPHY_AVAILABLE = False
+    print("⚠️ pymorphy2 не установлен! Морфологический парсинг недоступен.")
+
+try:
+    import inflect
+    INFLECT_AVAILABLE = True
+except ImportError:
+    INFLECT_AVAILABLE = False
+    print("⚠️ inflect не установлен! Морфология для английского недоступна.")
 
 app = FastAPI(title="Semantic Agent API", version="2.0.0")
 
@@ -66,7 +82,7 @@ class AutocompleteParser:
         # Языковые модификаторы (специфичные символы)
         self.language_modifiers = {
             'en': [],  # Английский - только базовые
-            'ru': list("абвгдежзийклмнопрстуфхцчшщэюя"),  # Русский
+            'ru': list("абвгдежзийклмнопрстуфхцчшщэюя"),  # Русский (29 букв без ё,ъ,ы,ь)
             'uk': list("абвгдежзийклмнопрстуфхцчшщьюяіїєґ"),  # Украинский
             'de': list("äöüß"),  # Немецкий
             'fr': list("àâäæçéèêëïîôùûüÿ"),  # Французский
@@ -85,6 +101,24 @@ class AutocompleteParser:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
         ]
+        
+        # Морфологические анализаторы
+        self.morph_ru = None
+        self.morph_en = None
+        
+        if PYMORPHY_AVAILABLE:
+            try:
+                self.morph_ru = pymorphy2.MorphAnalyzer()
+                print("✅ pymorphy2 (русский) инициализирован")
+            except Exception as e:
+                print(f"⚠️ Ошибка инициализации pymorphy2: {e}")
+        
+        if INFLECT_AVAILABLE:
+            try:
+                self.morph_en = inflect.engine()
+                print("✅ inflect (английский) инициализирован")
+            except Exception as e:
+                print(f"⚠️ Ошибка инициализации inflect: {e}")
     
     def get_modifiers(self, language: str) -> List[str]:
         """
@@ -103,6 +137,97 @@ class AutocompleteParser:
         modifiers.extend(lang_mods)
         
         return modifiers
+        
+    def get_word_forms_ru(self, word: str) -> Set[str]:
+        """
+        Получить все морфологические формы русского слова
+        
+        Args:
+            word: Русское слово
+            
+        Returns:
+            Set[str]: Все формы слова (пылесос, пылесоса, пылесосу, ...)
+        """
+        if not self.morph_ru:
+            return {word}
+        
+        forms = set()
+        try:
+            parsed = self.morph_ru.parse(word)
+            if parsed:
+                # Берем первый вариант разбора
+                p = parsed[0]
+                # Получаем все формы из лексемы
+                for form in p.lexeme:
+                    forms.add(form.word)
+        except Exception as e:
+            print(f"⚠️ Ошибка получения форм для '{word}': {e}")
+            forms.add(word)
+        
+        return forms
+    
+    def get_word_forms_en(self, word: str) -> Set[str]:
+        """
+        Получить формы английского слова (singular/plural)
+        
+        Args:
+            word: Английское слово
+            
+        Returns:
+            Set[str]: Единственное и множественное число
+        """
+        if not self.morph_en:
+            return {word}
+        
+        forms = {word}
+        try:
+            # Множественное число
+            plural = self.morph_en.plural(word)
+            if plural:
+                forms.add(plural)
+            
+            # Единственное число (если дали plural)
+            singular = self.morph_en.singular_noun(word)
+            if singular:
+                forms.add(singular)
+        except Exception as e:
+            print(f"⚠️ Ошибка получения форм для '{word}': {e}")
+        
+        return forms
+    
+    def get_seed_variations(self, seed: str, language: str) -> List[str]:
+        """
+        Получить вариации seed фразы с разными морфологическими формами
+        
+        Args:
+            seed: Исходная фраза (например "ремонт пылесосов")
+            language: Язык (ru, en)
+            
+        Returns:
+            List[str]: Все вариации фразы
+        """
+        words = seed.split()
+        if len(words) < 2:
+            return [seed]
+        
+        # Получаем формы для последнего слова (обычно существительное)
+        last_word = words[-1]
+        
+        if language.lower() == 'ru':
+            word_forms = self.get_word_forms_ru(last_word)
+        elif language.lower() == 'en':
+            word_forms = self.get_word_forms_en(last_word)
+        else:
+            return [seed]
+        
+        # Создаем вариации
+        variations = []
+        base = ' '.join(words[:-1])  # все слова кроме последнего
+        
+        for form in word_forms:
+            variations.append(f"{base} {form}")
+        
+        return variations
         
     async def fetch_suggestions(
         self, 
@@ -146,15 +271,28 @@ class AutocompleteParser:
         seed: str,
         country: str = "US",
         language: str = "en",
-        use_numbers: bool = False
+        use_numbers: bool = False,
+        use_morphology: bool = False
     ) -> List[str]:
         """
-        Парсинг с модификаторами (SUFFIX + INFIX для кириллицы)
+        Парсинг с модификаторами (SUFFIX + INFIX + MORPH)
         
         МЕТОД 1: SUFFIX - "seed модификатор" (все модификаторы)
         МЕТОД 2: INFIX - "слово1 модификатор слово2" (только кириллица, 1-символьный)
+        МЕТОД 3: MORPH - парсинг всех морфологических форм seed фразы
         """
         all_keywords = set()
+        
+        # Получаем seed вариации если включена морфология
+        seeds_to_parse = [seed]
+        if use_morphology:
+            seed_variations = self.get_seed_variations(seed, language)
+            seeds_to_parse = seed_variations
+            print(f"🔤 MORPH mode: ENABLED | Seed variations: {len(seed_variations)}")
+            for var in seed_variations[:5]:
+                print(f"   - {var}")
+            if len(seed_variations) > 5:
+                print(f"   ... и ещё {len(seed_variations) - 5}")
         
         # Получаем модификаторы для выбранного языка
         modifiers = self.get_modifiers(language)
@@ -167,42 +305,48 @@ class AutocompleteParser:
         language_specific = self.language_modifiers.get(language.lower(), [])
         cyrillic_modifiers = [m for m in modifiers if m in language_specific]
         
-        # Разбиваем seed на слова для INFIX парсинга
-        seed_words = seed.split()
-        
         print(f"🌍 Language: {language.upper()} | Modifiers: {len(modifiers)} ({', '.join(modifiers[:10])}...)")
-        print(f"📍 INFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2 else 'DISABLED'} (cyrillic modifiers: {len(cyrillic_modifiers)})")
         
-        for i, modifier in enumerate(modifiers):
-            # 1. SUFFIX (прямое) - для ВСЕХ модификаторов
-            query = f"{seed} {modifier}"
-            suggestions = await self.fetch_suggestions(query, country, language)
-            all_keywords.update(suggestions)
+        # Парсим каждую вариацию seed
+        for seed_idx, current_seed in enumerate(seeds_to_parse):
+            seed_words = current_seed.split()
             
-            suffix_count = len(suggestions)
+            if seed_idx == 0:
+                print(f"📍 INFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2 else 'DISABLED'} (cyrillic modifiers: {len(cyrillic_modifiers)})")
             
-            # 2. INFIX (внутрь) - ТОЛЬКО для кириллицы и если seed >= 2 слов
-            infix_count = 0
-            if modifier in cyrillic_modifiers and len(seed_words) >= 2:
-                # Вставляем модификатор после первого слова
-                infix_query = f"{seed_words[0]} {modifier} {' '.join(seed_words[1:])}"
-                infix_suggestions = await self.fetch_suggestions(infix_query, country, language)
-                all_keywords.update(infix_suggestions)
-                infix_count = len(infix_suggestions)
+            if use_morphology and seed_idx > 0:
+                print(f"\n🔄 Парсинг вариации {seed_idx + 1}/{len(seeds_to_parse)}: '{current_seed}'")
+            
+            for i, modifier in enumerate(modifiers):
+                # 1. SUFFIX (прямое) - для ВСЕХ модификаторов
+                query = f"{current_seed} {modifier}"
+                suggestions = await self.fetch_suggestions(query, country, language)
+                all_keywords.update(suggestions)
                 
-                # Дополнительная задержка после INFIX запроса
-                await asyncio.sleep(random.uniform(0.3, 0.8))
-            
-            # Случайная задержка между 0.5 и 2 секунд
-            delay = random.uniform(0.5, 2.0)
-            
-            # Логирование с информацией о INFIX
-            if infix_count > 0:
-                print(f"[{i+1}/{len(modifiers)}] '{modifier}' → SUFFIX: {suffix_count}, INFIX: {infix_count} (wait {delay:.1f}s)")
-            else:
-                print(f"[{i+1}/{len(modifiers)}] '{modifier}' → {suffix_count} results (wait {delay:.1f}s)")
-            
-            await asyncio.sleep(delay)
+                suffix_count = len(suggestions)
+                
+                # 2. INFIX (внутрь) - ТОЛЬКО для кириллицы и если seed >= 2 слов
+                infix_count = 0
+                if modifier in cyrillic_modifiers and len(seed_words) >= 2:
+                    # Вставляем модификатор после первого слова
+                    infix_query = f"{seed_words[0]} {modifier} {' '.join(seed_words[1:])}"
+                    infix_suggestions = await self.fetch_suggestions(infix_query, country, language)
+                    all_keywords.update(infix_suggestions)
+                    infix_count = len(infix_suggestions)
+                    
+                    # Дополнительная задержка после INFIX запроса
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+                
+                # Случайная задержка между 0.5 и 2 секунд
+                delay = random.uniform(0.5, 2.0)
+                
+                # Логирование с информацией о INFIX
+                if infix_count > 0:
+                    print(f"[{i+1}/{len(modifiers)}] '{modifier}' → SUFFIX: {suffix_count}, INFIX: {infix_count} (wait {delay:.1f}s)")
+                else:
+                    print(f"[{i+1}/{len(modifiers)}] '{modifier}' → {suffix_count} results (wait {delay:.1f}s)")
+                
+                await asyncio.sleep(delay)
         
         return list(all_keywords)
 
@@ -224,6 +368,7 @@ class ParseRequest(BaseModel):
     country: str = "IE"
     language: str = "en"
     use_numbers: bool = False
+    use_morphology: bool = False
 
 class ParseResponse(BaseModel):
     seed: str
@@ -424,15 +569,17 @@ async def full_test(
     seed: str = "vacuum repair",
     country: str = "IE",
     language: str = "en",
-    use_numbers: bool = True
+    use_numbers: bool = True,
+    use_morphology: bool = False
 ):
     """
-    Полный парсинг с модификаторами (SUFFIX + INFIX)
+    Полный парсинг с модификаторами (SUFFIX + INFIX + MORPH)
     
     SUFFIX: seed + модификатор (все модификаторы a-z + а-я + 0-9)
     INFIX: слово1 + модификатор + слово2 (только кириллица а-я)
+    MORPH: парсинг всех морфологических форм seed фразы
     
-    Пример: GET /api/test-parser/full?seed=ремонт пылесосов&country=UA&language=ru&use_numbers=true
+    Пример: GET /api/test-parser/full?seed=ремонт пылесосов&country=UA&language=ru&use_numbers=true&use_morphology=true
     """
     parser = AutocompleteParser()
     
@@ -446,11 +593,17 @@ async def full_test(
     cyrillic_modifiers = [m for m in modifiers if m in language_specific]
     seed_words = seed.split()
     
-    # SUFFIX запросов = все модификаторы
-    suffix_requests = len(modifiers)
+    # Получаем seed вариации если морфология включена
+    seed_variations = 1
+    if use_morphology:
+        variations = parser.get_seed_variations(seed, language)
+        seed_variations = len(variations)
     
-    # INFIX запросов = кириллические модификаторы (если seed >= 2 слов)
-    infix_requests = len(cyrillic_modifiers) if len(seed_words) >= 2 else 0
+    # SUFFIX запросов = все модификаторы × количество seed вариаций
+    suffix_requests = len(modifiers) * seed_variations
+    
+    # INFIX запросов = кириллические модификаторы (если seed >= 2 слов) × количество вариаций
+    infix_requests = (len(cyrillic_modifiers) if len(seed_words) >= 2 else 0) * seed_variations
     
     # ВСЕГО запросов
     total_requests = suffix_requests + infix_requests
@@ -461,7 +614,8 @@ async def full_test(
         seed=seed,
         country=country,
         language=language,
-        use_numbers=use_numbers
+        use_numbers=use_numbers,
+        use_morphology=use_morphology
     )
     
     parsing_time = time.time() - start_time
@@ -476,6 +630,11 @@ async def full_test(
             "infix_modifiers": len(cyrillic_modifiers) if len(seed_words) >= 2 else 0,
             "base": "a-z" + (" + 0-9" if use_numbers else ""),
             "language_specific": "".join(language_specific) or "none"
+        },
+        "morphology_info": {
+            "enabled": use_morphology,
+            "seed_variations": seed_variations,
+            "available": PYMORPHY_AVAILABLE if language.lower() == 'ru' else INFLECT_AVAILABLE
         },
         "requests_info": {
             "suffix_requests": suffix_requests,
@@ -492,15 +651,16 @@ async def full_test(
 @app.post("/api/test-parser", response_model=ParseResponse)
 async def test_parser(request: ParseRequest):
     """
-    Полный парсинг с модификаторами (a-z, опционально 0-9)
+    Полный парсинг с модификаторами (a-z, опционально 0-9, морфология)
     
     Пример запроса:
     POST /api/test-parser
     {
-        "seed": "vacuum repair",
-        "country": "IE",
-        "language": "en",
-        "use_numbers": false
+        "seed": "ремонт пылесосов",
+        "country": "UA",
+        "language": "ru",
+        "use_numbers": false,
+        "use_morphology": true
     }
     """
     parser = AutocompleteParser()
@@ -511,7 +671,8 @@ async def test_parser(request: ParseRequest):
         seed=request.seed,
         country=request.country,
         language=request.language,
-        use_numbers=request.use_numbers
+        use_numbers=request.use_numbers,
+        use_morphology=request.use_morphology
     )
     
     parsing_time = time.time() - start_time
@@ -526,8 +687,14 @@ async def test_parser(request: ParseRequest):
     cyrillic_modifiers = [m for m in modifiers if m in language_specific]
     seed_words = request.seed.split()
     
-    suffix_requests = len(modifiers)
-    infix_requests = len(cyrillic_modifiers) if len(seed_words) >= 2 else 0
+    # Seed вариации если морфология включена
+    seed_variations = 1
+    if request.use_morphology:
+        variations = parser.get_seed_variations(request.seed, request.language)
+        seed_variations = len(variations)
+    
+    suffix_requests = len(modifiers) * seed_variations
+    infix_requests = (len(cyrillic_modifiers) if len(seed_words) >= 2 else 0) * seed_variations
     total_requests = suffix_requests + infix_requests
     
     return ParseResponse(
