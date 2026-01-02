@@ -8,4 +8,4 @@ setuptools>=65.0.0
 dawg-python
 pymorphy3
 pymorphy3-dicts-ru
-
+inflect
