@@ -344,41 +344,109 @@ class AutocompleteParser:
         print(f"📍 PREFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 else 'DISABLED'}")
         
         # ========================================
-        # 1. SUFFIX с ЛАТИНИЦЕЙ и ЦИФРАМИ - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
+        # WILDCARD SUFFIX COMBO TEST - КОРОТКИЕ И ДЛИННЫЕ ЗАПРОСЫ!
         # ========================================
-        # print(f"\n{'='*60}")
-        # print(f"🔤 [1/4] SUFFIX Latin/Digits (исходный seed только)")
-        # print(f"{'='*60}")
-        # print(f"Пример запроса: '{seed} a'")
-        # print(f"Модификаторов: {len(latin_digit_modifiers)}")
-        # 
-        # latin_results = 0
-        # for i, modifier in enumerate(latin_digit_modifiers):
-        #     query = f"{seed} {modifier}"
-        #     suggestions = await self.fetch_suggestions(query, country, language)
-        #     all_keywords.update(suggestions)
-        #     latin_results += len(suggestions)
-        #     
-        #     delay = random.uniform(0.5, 2.0)
-        #     if i < 3 or len(suggestions) > 0:
-        #         print(f"[{i+1}/{len(latin_digit_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
-        #     await asyncio.sleep(delay)
-        # 
-        # print(f"✅ SUFFIX Latin/Digits завершен: {latin_results} результатов")
+        print(f"\n{'='*60}")
+        print(f"🔤 [ТЕСТ] WILDCARD SUFFIX - КОРОТКИЕ И ДЛИННЫЕ ЗАПРОСЫ!")
+        print(f"{'='*60}")
+        print(f"Исходный seed: '{seed}'")
+        print(f"")
+        print(f"Сравниваем:")
+        print(f"  Старый метод: 'ремонт пылесосов а/б/в...' (29 запросов)")
+        print(f"  Новый метод:  'ремонт пылесосов */__/___' (6 запросов)")
+        print(f"")
+        print(f"Цель 1: Короткие - 'ремонт пылесосов киев'")
+        print(f"Цель 2: Длинные - 'ремонт пылесосов самсунг левый берег'")
+        print(f"")
         
-        print(f"\n⚠️ SUFFIX Latin/Digits ОТКЛЮЧЕН ДЛЯ ТЕСТА REVERSE")
+        # Wildcard символы: от 1 до 5 подчёркиваний + звёздочка
+        wildcard_symbols = [
+            ("*", "звёздочка (любое количество слов)"),
+            ("_", "1 подчёркивание (1 слово)"),
+            ("__", "2 подчёркивания (2 слова)"),
+            ("___", "3 подчёркивания (3 слова)"),
+            ("____", "4 подчёркивания (4 слова)"),
+            ("_____", "5 подчёркиваний (5 слов)"),
+        ]
+        
+        wildcard_total_results = 0
+        wildcard_all_keywords = set()
+        
+        for i, (symbol, description) in enumerate(wildcard_symbols):
+            # Ставим wildcard символ ПОСЛЕ seed (SUFFIX!)
+            wildcard_query = f"{seed} {symbol}"
+            wildcard_suggestions = await self.fetch_suggestions(wildcard_query, country, language)
+            
+            # Добавляем к общим результатам
+            all_keywords.update(wildcard_suggestions)
+            wildcard_all_keywords.update(wildcard_suggestions)
+            wildcard_total_results += len(wildcard_suggestions)
+            
+            # Анализируем длину результатов
+            short_results = [s for s in wildcard_suggestions if len(s.split()) <= 3]  # seed + 1 слово
+            long_results = [s for s in wildcard_suggestions if len(s.split()) > 3]    # seed + 2+ слова
+            
+            delay = random.uniform(0.5, 2.0)
+            
+            print(f"[{i+1}/{len(wildcard_symbols)}] '{wildcard_query}'")
+            print(f"    {description}")
+            print(f"    Всего: {len(wildcard_suggestions)} | Коротких: {len(short_results)} | Длинных: {len(long_results)}")
+            
+            if len(wildcard_suggestions) > 0:
+                print(f"    Примеры коротких:")
+                for exp in short_results[:3]:
+                    print(f"      • {exp}")
+                
+                if len(long_results) > 0:
+                    print(f"    Примеры длинных:")
+                    for exp in long_results[:3]:
+                        print(f"      • {exp}")
+            else:
+                print(f"    ❌ Нет результатов")
+            
+            print(f"    Задержка: {delay:.1f}s")
+            print()
+            await asyncio.sleep(delay)
+        
+        # Анализ всех результатов
+        all_short = [s for s in wildcard_all_keywords if len(s.split()) <= 3]
+        all_long = [s for s in wildcard_all_keywords if len(s.split()) > 3]
+        
+        print(f"{'='*60}")
+        print(f"✅ WILDCARD SUFFIX комбо-тест завершен!")
+        print(f"{'='*60}")
+        print(f"Всего результатов: {wildcard_total_results}")
+        print(f"Уникальных ключей: {len(wildcard_all_keywords)}")
+        print(f"  - Коротких (seed + 1 слово): {len(all_short)}")
+        print(f"  - Длинных (seed + 2+ слова): {len(all_long)}")
+        print(f"")
+        print(f"📊 СРАВНЕНИЕ С МОДИФИКАТОРАМИ:")
+        print(f"  Старый метод: 29 запросов → ~250 результатов → ~30-40 сек")
+        print(f"  Новый метод:  {len(wildcard_symbols)} запросов → {len(wildcard_all_keywords)} результатов → ~{len(wildcard_symbols)*1.5:.0f} сек")
+        print(f"")
+        
+        if len(wildcard_all_keywords) >= 200:
+            efficiency = 29 / len(wildcard_symbols)
+            print(f"🎉 WILDCARD СУПЕР-ЭФФЕКТИВЕН!")
+            print(f"⚡ Ускорение: в {efficiency:.1f}x раз меньше запросов!")
+            print(f"✅ Покрытие: {len(wildcard_all_keywords)} ключей (отлично!)")
+        elif len(wildcard_all_keywords) >= 100:
+            print(f"✅ WILDCARD РАБОТАЕТ ХОРОШО!")
+            print(f"⚡ Меньше запросов, хорошее покрытие")
+            print(f"⚠️ Но немного меньше результатов чем модификаторы")
+        else:
+            print(f"⚠️ WILDCARD ДАЁТ МАЛО РЕЗУЛЬТАТОВ")
+            print(f"❌ Лучше использовать модификаторы а/б/в...")
+        
+        print(f"")
+        print(f"Примеры ДЛИННЫХ запросов:")
+        for kw in sorted(all_long, key=lambda x: len(x), reverse=True)[:10]:
+            word_count = len(kw.split())
+            print(f"  [{word_count} слов] {kw}")
+        
         latin_results = 0
-        
-        # ========================================
-        # 2. SUFFIX с КИРИЛЛИЦЕЙ - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
-        # ========================================
-        # print(f"\n{'='*60}")
-        # print(f"🔤 [2/4] SUFFIX Cyrillic (БЕЗ морфологии - ВРЕМЕННО)")
-        # print(f"{'='*60}")
-        # print(f"Seed вариаций: {len(seed_variations)}")
-        # print(f"Модификаторов на вариацию: {len(cyrillic_modifiers)}")
-        # print(f"Всего запросов: {len(seed_variations)} × {len(cyrillic_modifiers)} = {len(seed_variations) * len(cyrillic_modifiers)}")
-        # 
+        cyrillic_results = 0
+                # 
         # cyrillic_results = 0
         # for var_idx, current_seed in enumerate(seed_variations):
         #     if use_morphology and var_idx > 0:
