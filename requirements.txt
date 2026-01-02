@@ -4,6 +4,7 @@ google-ads==28.4.1
 pyyaml==6.0.2
 pydantic==2.10.3
 httpx==0.28.1
+setuptools>=65.0.0
 dawg-python
 pymorphy2
 pymorphy2-dicts-ru
