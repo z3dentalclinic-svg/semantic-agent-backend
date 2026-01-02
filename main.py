@@ -149,19 +149,30 @@ class AutocompleteParser:
             Set[str]: Все формы слова (пылесос, пылесоса, пылесосу, ...)
         """
         if not self.morph_ru:
+            print(f"⚠️ morph_ru не инициализирован!")
             return {word}
         
         forms = set()
         try:
             parsed = self.morph_ru.parse(word)
+            print(f"🔍 Разбор слова '{word}': найдено {len(parsed)} вариантов")
+            
             if parsed:
                 # Берем первый вариант разбора
                 p = parsed[0]
+                print(f"🔍 Первый разбор: {p.tag}")
+                
                 # Получаем все формы из лексемы
                 for form in p.lexeme:
                     forms.add(form.word)
+                
+                print(f"✅ Получено {len(forms)} форм: {list(forms)[:5]}...")
         except Exception as e:
             print(f"⚠️ Ошибка получения форм для '{word}': {e}")
+            forms.add(word)
+        
+        if len(forms) == 0:
+            print(f"⚠️ Не получено ни одной формы для '{word}', возвращаем исходное")
             forms.add(word)
         
         return forms
@@ -314,47 +325,90 @@ class AutocompleteParser:
         # ========================================
         # 1. SUFFIX с ЛАТИНИЦЕЙ и ЦИФРАМИ (БЕЗ морфологии!)
         # ========================================
-        print(f"\n🔤 [1/3] SUFFIX Latin/Digits (исходный seed только)...")
+        print(f"\n{'='*60}")
+        print(f"🔤 [1/3] SUFFIX Latin/Digits (исходный seed только)")
+        print(f"{'='*60}")
+        print(f"Пример запроса: '{seed} a'")
+        print(f"Модификаторов: {len(latin_digit_modifiers)}")
+        
+        latin_results = 0
         for i, modifier in enumerate(latin_digit_modifiers):
             query = f"{seed} {modifier}"
             suggestions = await self.fetch_suggestions(query, country, language)
             all_keywords.update(suggestions)
+            latin_results += len(suggestions)
             
             delay = random.uniform(0.5, 2.0)
-            print(f"[{i+1}/{len(latin_digit_modifiers)}] '{modifier}' → {len(suggestions)} results (wait {delay:.1f}s)")
+            if i < 3 or len(suggestions) > 0:  # Показываем первые 3 или с результатами
+                print(f"[{i+1}/{len(latin_digit_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
             await asyncio.sleep(delay)
+        
+        print(f"✅ SUFFIX Latin/Digits завершен: {latin_results} результатов")
         
         # ========================================
         # 2. SUFFIX с КИРИЛЛИЦЕЙ (С морфологией если включена!)
         # ========================================
-        print(f"\n🔤 [2/3] SUFFIX Cyrillic ({'с морфологией' if use_morphology else 'исходный seed'})...")
+        print(f"\n{'='*60}")
+        print(f"🔤 [2/3] SUFFIX Cyrillic ({'с морфологией' if use_morphology else 'исходный seed'})")
+        print(f"{'='*60}")
+        print(f"Seed вариаций: {len(seed_variations)}")
+        print(f"Модификаторов на вариацию: {len(cyrillic_modifiers)}")
+        print(f"Всего запросов: {len(seed_variations)} × {len(cyrillic_modifiers)} = {len(seed_variations) * len(cyrillic_modifiers)}")
+        
+        cyrillic_results = 0
         for var_idx, current_seed in enumerate(seed_variations):
             if use_morphology and var_idx > 0:
                 print(f"\n🔄 Вариация {var_idx + 1}/{len(seed_variations)}: '{current_seed}'")
+            elif var_idx == 0:
+                print(f"Пример запроса: '{current_seed} а'")
             
             for i, modifier in enumerate(cyrillic_modifiers):
                 query = f"{current_seed} {modifier}"
                 suggestions = await self.fetch_suggestions(query, country, language)
                 all_keywords.update(suggestions)
+                cyrillic_results += len(suggestions)
                 
                 delay = random.uniform(0.5, 2.0)
-                print(f"[{i+1}/{len(cyrillic_modifiers)}] '{modifier}' → {len(suggestions)} results (wait {delay:.1f}s)")
+                if i < 3 or len(suggestions) > 0:  # Показываем первые 3 или с результатами
+                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{query}' → {len(suggestions)} results (wait {delay:.1f}s)")
                 await asyncio.sleep(delay)
+        
+        print(f"✅ SUFFIX Cyrillic завершен: {cyrillic_results} результатов")
         
         # ========================================
         # 3. INFIX с КИРИЛЛИЦЕЙ (БЕЗ морфологии!)
         # ========================================
         if len(cyrillic_modifiers) > 0 and len(seed_words) >= 2:
-            print(f"\n🔤 [3/3] INFIX Cyrillic (исходный seed только)...")
+            print(f"\n{'='*60}")
+            print(f"🔤 [3/3] INFIX Cyrillic (исходный seed только)")
+            print(f"{'='*60}")
+            print(f"Исходный seed: '{seed}'")
+            print(f"Слов в seed: {len(seed_words)}")
+            print(f"Шаблон: '{seed_words[0]} [модификатор] {' '.join(seed_words[1:])}'")
+            print(f"Пример запроса: '{seed_words[0]} а {' '.join(seed_words[1:])}'")
+            print(f"Модификаторов: {len(cyrillic_modifiers)}")
+            
+            infix_results = 0
             for i, modifier in enumerate(cyrillic_modifiers):
                 # Вставляем модификатор после первого слова ИСХОДНОГО seed
                 infix_query = f"{seed_words[0]} {modifier} {' '.join(seed_words[1:])}"
                 infix_suggestions = await self.fetch_suggestions(infix_query, country, language)
                 all_keywords.update(infix_suggestions)
+                infix_results += len(infix_suggestions)
                 
                 delay = random.uniform(0.5, 2.0)
-                print(f"[{i+1}/{len(cyrillic_modifiers)}] '{modifier}' → {len(infix_suggestions)} results (wait {delay:.1f}s)")
+                if i < 3 or len(infix_suggestions) > 0:  # Показываем первые 3 или с результатами
+                    print(f"[{i+1}/{len(cyrillic_modifiers)}] '{infix_query}' → {len(infix_suggestions)} results (wait {delay:.1f}s)")
                 await asyncio.sleep(delay)
+            
+            print(f"✅ INFIX завершен: {infix_results} результатов")
+        else:
+            print(f"\n⚠️ INFIX DISABLED (требуется: кириллические модификаторы + seed из 2+ слов)")
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 ПАРСИНГ ЗАВЕРШЕН")
+        print(f"{'='*60}")
+        print(f"Всего уникальных ключевых слов: {len(all_keywords)}")
         
         return list(all_keywords)
 
