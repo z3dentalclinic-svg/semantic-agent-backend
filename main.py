@@ -2,9 +2,15 @@
 Semantic Agent Backend
 FastAPI server with Google Ads API integration
 Credentials from environment variables
+
+ФИНАЛЬНАЯ ВЕРСИЯ:
+- SUFFIX парсинг (a-z + а-я + 0-9) = 65 модификаторов
+- INFIX парсинг (только кириллица а-я) = 33 модификатора
+- /api/test-parser/single - тестирование одиночных запросов
+- /api/test-parser/full - полный парсинг
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -15,7 +21,7 @@ import asyncio
 import time
 import random
 
-app = FastAPI(title="Semantic Agent API", version="1.0.0")
+app = FastAPI(title="Semantic Agent API", version="2.0.0")
 
 # CORS
 app.add_middleware(
@@ -142,7 +148,12 @@ class AutocompleteParser:
         language: str = "en",
         use_numbers: bool = False
     ) -> List[str]:
-        """Парсинг с модификаторами (базовые + языковые + INFIX для кириллицы)"""
+        """
+        Парсинг с модификаторами (SUFFIX + INFIX для кириллицы)
+        
+        МЕТОД 1: SUFFIX - "seed модификатор" (все модификаторы)
+        МЕТОД 2: INFIX - "слово1 модификатор слово2" (только кириллица, 1-символьный)
+        """
         all_keywords = set()
         
         # Получаем модификаторы для выбранного языка
@@ -237,15 +248,20 @@ async def root():
     
     return {
         "service": "Semantic Agent API",
-        "version": "1.0.0",
+        "version": "2.0.0 (INFIX + SUFFIX + SINGLE)",
         "status": "running",
         "credentials_loaded": credentials_loaded,
+        "parsing_modes": {
+            "suffix": "seed + modifier (all modifiers)",
+            "infix": "word1 + modifier + word2 (cyrillic only, 1-char)"
+        },
         "endpoints": {
             "health": "/health",
             "locations": "/api/locations/{country_code}",
             "countries": "/api/countries",
-            "test_parser_quick": "/api/test-parser/quick",
-            "test_parser_full": "/api/test-parser"
+            "test_parser_single": "/api/test-parser/single?query={query}&country={country}&language={language}",
+            "test_parser_quick": "/api/test-parser/quick?query={query}&country={country}&language={language}",
+            "test_parser_full": "/api/test-parser/full?seed={seed}&country={country}&language={language}&use_numbers={bool}"
         }
     }
 
@@ -253,7 +269,8 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "credentials": "loaded" if os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN") else "missing"
+        "credentials": "loaded" if os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN") else "missing",
+        "parser": "enabled (SUFFIX + INFIX)"
     }
 
 @app.get("/api/countries")
@@ -342,6 +359,37 @@ async def get_locations(country_code: str):
 # PARSER TEST ENDPOINTS
 # ============================================
 
+@app.get("/api/test-parser/single")
+async def single_test(
+    query: str = Query(..., description="Search query to test"),
+    country: str = Query("UA", description="Country code (e.g., UA, US)"),
+    language: str = Query("ru", description="Language code (e.g., ru, en)")
+):
+    """
+    Тест одиночного запроса к Google Autocomplete
+    
+    Пример: 
+    GET /api/test-parser/single?query=купить%20бе%20вино&country=UA&language=ru
+    GET /api/test-parser/single?query=ремонт%20а%20пылесосов&country=UA&language=ru
+    """
+    parser = AutocompleteParser()
+    
+    suggestions = await parser.fetch_suggestions(
+        query=query,
+        country=country,
+        language=language
+    )
+    
+    return {
+        "query": query,
+        "country": country,
+        "language": language,
+        "suggestions": suggestions,
+        "count": len(suggestions),
+        "status": "success" if suggestions else "no_results"
+    }
+
+
 @app.get("/api/test-parser/quick")
 async def quick_test(
     query: str = "vacuum repair",
@@ -379,7 +427,10 @@ async def full_test(
     use_numbers: bool = True
 ):
     """
-    Полный парсинг с модификаторами (базовые a-z + языковые + опционально 0-9)
+    Полный парсинг с модификаторами (SUFFIX + INFIX)
+    
+    SUFFIX: seed + модификатор (все модификаторы a-z + а-я + 0-9)
+    INFIX: слово1 + модификатор + слово2 (только кириллица а-я)
     
     Пример: GET /api/test-parser/full?seed=ремонт пылесосов&country=UA&language=ru&use_numbers=true
     """
