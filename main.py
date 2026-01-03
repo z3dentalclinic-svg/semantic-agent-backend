@@ -1,18 +1,19 @@
 """
-GEMINI BIGRAM TEST - ИСПРАВЛЕННАЯ ВЕРСИЯ
-С User-Agent ротацией и задержками
+ChatGPT PPM TEST - ИСПРАВЛЕННАЯ ВЕРСИЯ
+PREFIX Projection Method с User-Agent и задержками
 """
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
+from collections import Counter
 import os
 import httpx
 import asyncio
 import time
 import random
 
-app = FastAPI(title="Gemini Bigram Test Fixed", version="1.0")
+app = FastAPI(title="ChatGPT PPM Test Fixed", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# User-Agent ротация для избежания блокировки
+# User-Agent ротация
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -42,7 +43,6 @@ class AutocompleteParser:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(self.base_url, params=params, headers=headers)
-                
                 if response.status_code == 200:
                     data = response.json()
                     if isinstance(data, list) and len(data) > 1:
@@ -52,136 +52,193 @@ class AutocompleteParser:
             print(f"Error: {e}")
             return []
     
-    async def gemini_bigram_test(self, seed: str, country: str, language: str) -> List[str]:
+    async def chatgpt_ppm_test(self, seed: str, country: str, language: str) -> List[str]:
         all_keywords = set()
+        seed_words = set(seed.lower().split())
         
         print(f"\n{'='*60}")
-        print(f"🔬 GEMINI BIGRAM TEST (FIXED)")
+        print(f"🔬 ChatGPT PPM - PREFIX Projection Method (FIXED)")
         print(f"{'='*60}")
         print(f"Seed: '{seed}'")
         print(f"✅ User-Agent ротация включена")
         print(f"✅ Задержки 1-2 сек между запросами\n")
         
-        first_word = seed.split()[0]
-        print(f"Первое слово: '{first_word}'\n")
-        
+        # ЭТАП 1: Базовый SUFFIX
         print(f"{'='*60}")
-        print(f"ТЕСТ: Топ-20 биграмм")
+        print(f"ЭТАП 1: Базовый SUFFIX парсинг")
         print(f"{'='*60}\n")
         
-        top_bigrams = {
-            "се": "сервис, сервисный",
-            "ср": "срочный",
-            "гд": "где",
-            "ма": "мастер, мастерская",
-            "не": "недорогой",
-            "де": "дешевый",
-            "пр": "профессиональный",
-            "ка": "как, качественный",
-            "сл": "сложный",
-            "от": "отличный",
-            "ск": "сколько",
-            "со": "современный",
-            "це": "центр, цена",
-            "ча": "частный",
-            "ко": "коммерческий",
-            "ме": "мелкий",
-            "бе": "бесплатный",
-            "ре": "ремонт",
-            "на": "надежный",
-            "ку": "купить"
-        }
+        alphabet = "абвгдежзийклмнопрстуфхцчшщъыьэюя"
+        suffix_results = []
         
-        discovered_words = set()
-        total_queries = 0
-        
-        for bigram, expected in top_bigrams.items():
-            query = f"{bigram} {first_word}"
+        for letter in alphabet:
+            query = f"{seed} {letter}"
             results = await self.fetch_suggestions(query, country, language)
-            total_queries += 1
-            
-            print(f"'{query}' (ожидаем: {expected})")
-            print(f"  Результатов: {len(results)}")
-            
-            if len(results) > 0:
-                found_expansions = []
-                
-                for result in results:
-                    if result.lower().startswith(bigram.lower()):
-                        after_bigram = result[len(bigram):].strip()
-                        
-                        if first_word.lower() in after_bigram.lower():
-                            word_pos = after_bigram.lower().find(first_word.lower())
-                            if word_pos > 0:
-                                expanded_word = after_bigram[:word_pos].strip()
-                                if expanded_word:
-                                    found_expansions.append(expanded_word)
-                                    discovered_words.add(expanded_word)
-                
-                if len(found_expansions) > 0:
-                    print(f"  ✅ НАЙДЕНЫ РАСШИРЕНИЯ:")
-                    for word in set(found_expansions):
-                        print(f"     🎯 '{word}'")
-                else:
-                    print(f"  ❌ Расширения НЕ найдены")
-                    for r in results[:2]:
-                        print(f"     • {r}")
-            else:
-                print(f"  ❌ Нет результатов")
-            
-            print()
-            # ВАЖНО: Задержка между запросами!
+            suffix_results.extend(results)
             await asyncio.sleep(random.uniform(1.0, 2.0))
         
-        print(f"{'='*60}")
-        print(f"✅ ТЕСТ завершён")
-        print(f"{'='*60}")
-        print(f"Запросов: {total_queries}")
-        print(f"Найдено расширений: {len(discovered_words)}\n")
+        print(f"Базовый SUFFIX: 29 запросов")
+        print(f"Получено результатов: {len(suffix_results)}\n")
         
-        if len(discovered_words) > 0:
-            print(f"🎉 БИГРАММЫ РАБОТАЮТ!")
-            for word in sorted(discovered_words):
-                print(f"  • {word}")
+        # ЭТАП 2: Отбор топ-30 SUFFIX
+        print(f"{'='*60}")
+        print(f"ЭТАП 2: Отбор топ-30 SUFFIX")
+        print(f"{'='*60}\n")
+        
+        top_suffix = suffix_results[:30] if len(suffix_results) >= 30 else suffix_results
+        
+        print(f"Отобрано: {len(top_suffix)}")
+        for s in top_suffix[:5]:
+            print(f"  • {s}")
+        print()
+        
+        # ЭТАП 3: Вторичное расширение
+        print(f"{'='*60}")
+        print(f"ЭТАП 3: Вторичное расширение (ключевой этап!)")
+        print(f"{'='*60}\n")
+        
+        expansion_letters = ["а", "б", "в", "г", "с", "м", "н", "к"]
+        all_expansions = []
+        expansion_count = 0
+        
+        for suffix_key in top_suffix:
+            for letter in expansion_letters:
+                query = f"{suffix_key} {letter}"
+                results = await self.fetch_suggestions(query, country, language)
+                all_expansions.extend(results)
+                expansion_count += 1
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        print(f"Вторичное расширение: {expansion_count} запросов")
+        print(f"Получено расширений: {len(all_expansions)}\n")
+        
+        # ЭТАП 4: Частотный анализ n-грамм
+        print(f"{'='*60}")
+        print(f"ЭТАП 4: Частотный анализ n-грамм")
+        print(f"{'='*60}\n")
+        
+        bigrams = Counter()
+        trigrams = Counter()
+        
+        for result in all_expansions:
+            words = result.lower().split()
             
-            print(f"\n{'='*60}")
-            print(f"ПРОВЕРКА PREFIX")
+            # Биграммы
+            for i in range(len(words) - 1):
+                bigram = f"{words[i]} {words[i+1]}"
+                if words[i] not in seed_words and words[i+1] not in seed_words:
+                    bigrams[bigram] += 1
+            
+            # Триграммы
+            for i in range(len(words) - 2):
+                trigram = f"{words[i]} {words[i+1]} {words[i+2]}"
+                if words[i] not in seed_words:
+                    trigrams[trigram] += 1
+        
+        frequent_bigrams = {k: v for k, v in bigrams.items() if v >= 3}
+        frequent_trigrams = {k: v for k, v in trigrams.items() if v >= 2}
+        
+        print(f"Частотных биграмм (≥3): {len(frequent_bigrams)}")
+        print(f"Топ-10:")
+        for bg, freq in sorted(frequent_bigrams.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  • '{bg}' ({freq} раз)")
+        
+        print(f"\nЧастотных триграмм (≥2): {len(frequent_trigrams)}")
+        print(f"Топ-10:")
+        for tg, freq in sorted(frequent_trigrams.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  • '{tg}' ({freq} раз)")
+        print()
+        
+        # ЭТАП 5: Математическая проекция
+        print(f"{'='*60}")
+        print(f"ЭТАП 5: Математическая проекция PREFIX")
+        print(f"{'='*60}\n")
+        
+        prefix_candidates = set()
+        projection_count = 0
+        
+        # Проверяем биграммы
+        for ngram in list(frequent_bigrams.keys())[:50]:
+            test_query = f"{ngram} {seed}"
+            results = await self.fetch_suggestions(test_query, country, language)
+            projection_count += 1
+            
+            if results:
+                prefix_candidates.add(ngram)
+                print(f"✅ '{ngram}' → PREFIX подтверждён ({len(results)} ключей)")
+            
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        # Проверяем триграммы
+        for ngram in list(frequent_trigrams.keys())[:20]:
+            test_query = f"{ngram} {seed}"
+            results = await self.fetch_suggestions(test_query, country, language)
+            projection_count += 1
+            
+            if results:
+                prefix_candidates.add(ngram)
+                print(f"✅ '{ngram}' → PREFIX подтверждён ({len(results)} ключей)")
+            
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+        
+        print(f"\nПроекция: {projection_count} запросов")
+        print(f"PREFIX кандидатов: {len(prefix_candidates)}\n")
+        
+        # ЭТАП 6: Сбор финальных ключей
+        if len(prefix_candidates) > 0:
+            print(f"{'='*60}")
+            print(f"ЭТАП 6: Сбор финальных PREFIX ключей")
             print(f"{'='*60}\n")
             
-            for word in sorted(discovered_words):
-                full_query = f"{word} {seed}"
-                results = await self.fetch_suggestions(full_query, country, language)
-                total_queries += 1
+            for candidate in prefix_candidates:
+                query = f"{candidate} {seed}"
+                results = await self.fetch_suggestions(query, country, language)
                 
-                if len(results) > 0:
+                if results:
                     all_keywords.update(results)
-                    print(f"✅ '{full_query}' → {len(results)} ключей")
-                else:
-                    print(f"❌ '{full_query}' → нет")
+                    print(f"'{candidate}' → {len(results)} ключей")
                 
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-        else:
-            print(f"❌ БИГРАММЫ НЕ РАБОТАЮТ")
+        
+        # СТАТИСТИКА
+        total_queries = 29 + expansion_count + projection_count
         
         print(f"\n{'='*60}")
-        print(f"ИТОГО ключей: {len(all_keywords)}")
+        print(f"📊 ИТОГОВАЯ СТАТИСТИКА PPM")
+        print(f"{'='*60}")
+        print(f"SUFFIX: 29 запросов")
+        print(f"Вторичное расширение: {expansion_count} запросов")
+        print(f"Проекция: {projection_count} запросов")
+        print(f"──────────────────────────────────")
+        print(f"ВСЕГО: {total_queries} запросов")
+        print(f"")
+        print(f"PREFIX кандидатов: {len(prefix_candidates)}")
+        print(f"Финальных ключей: {len(all_keywords)}")
+        print(f"")
+        
+        if len(all_keywords) > 0:
+            print(f"🎉 PPM РАБОТАЕТ!")
+            print(f"Статистическая реконструкция нашла PREFIX!")
+        else:
+            print(f"❌ PPM не дал результатов")
+        
         print(f"{'='*60}\n")
         
         return list(all_keywords)
 
 
-@app.get("/api/test-parser/gemini-bigram")
-async def test_gemini_bigram(
+@app.get("/api/test-parser/chatgpt-ppm")
+async def test_chatgpt_ppm(
     seed: str = Query("ремонт пылесосов"),
     country: str = Query("UA"),
     language: str = Query("ru")
 ):
     parser = AutocompleteParser()
     start = time.time()
-    keywords = await parser.gemini_bigram_test(seed, country, language)
+    keywords = await parser.chatgpt_ppm_test(seed, country, language)
     return {
         "seed": seed,
-        "method": "Gemini Bigram (Fixed)",
+        "method": "ChatGPT PPM (Fixed)",
         "keywords": keywords,
         "count": len(keywords),
         "time": round(time.time() - start, 2)
@@ -191,8 +248,8 @@ async def test_gemini_bigram(
 @app.get("/")
 async def root():
     return {
-        "api": "Gemini Bigram Test (Fixed)",
-        "url": "/api/test-parser/gemini-bigram?seed=ремонт пылесосов&country=UA&language=ru"
+        "api": "ChatGPT PPM Test (Fixed)",
+        "url": "/api/test-parser/chatgpt-ppm?seed=ремонт пылесосов&country=UA&language=ru"
     }
 
 
