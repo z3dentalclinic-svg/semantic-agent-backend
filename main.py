@@ -1,14 +1,16 @@
 """
-Semantic Agent Backend
-FastAPI server with Google Ads API integration
-Credentials from environment variables
+CSG (Context-Shift Graph) TEST
+Тестирование метода от ChatGPT для поиска PREFIX запросов
 
-ФИНАЛЬНАЯ ВЕРСИЯ:
-- SUFFIX парсинг (a-z + а-я + 0-9) = 65 модификаторов
-- INFIX парсинг (только кириллица а-я) = 29 модификаторов
-- MORPH парсинг (все формы слов через pymorphy2)
-- /api/test-parser/single - тестирование одиночных запросов
-- /api/test-parser/full - полный парсинг
+ЦЕЛЬ: Найти "сервисный центр ремонт пылесосов"
+
+МЕТОД CSG:
+1. Используем якорь (город): "киев"
+2. Делаем Context Shift: "киев ремонт пылесосов"
+3. Вторичное расширение: "киев ремонт пылесосов с/се/сер/серв..."
+4. Ожидаем: "киев сервисный центр ремонт пылесосов"
+5. Извлекаем: "сервисный центр"
+6. Проверяем: "сервисный центр ремонт пылесосов"
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -344,38 +346,187 @@ class AutocompleteParser:
         print(f"📍 PREFIX mode: {'ENABLED' if len(cyrillic_modifiers) > 0 else 'DISABLED'}")
         
         # ========================================
-        # WILDCARD SUFFIX COMBO TEST - КОРОТКИЕ И ДЛИННЫЕ ЗАПРОСЫ!
+        # CSG (CONTEXT-SHIFT GRAPH) TEST - ОТ CHATGPT
         # ========================================
         print(f"\n{'='*60}")
-        print(f"🔤 [ТЕСТ] WILDCARD SUFFIX - КОРОТКИЕ И ДЛИННЫЕ ЗАПРОСЫ!")
+        print(f"🔬 [ТЕСТ] CSG - CONTEXT-SHIFT GRAPH (от ChatGPT)")
         print(f"{'='*60}")
         print(f"Исходный seed: '{seed}'")
         print(f"")
-        print(f"Сравниваем:")
-        print(f"  Старый метод: 'ремонт пылесосов а/б/в...' (29 запросов)")
-        print(f"  Новый метод:  'ремонт пылесосов */__/___' (6 запросов)")
+        print(f"ЦЕЛЬ: Найти 'сервисный центр ремонт пылесосов'")
         print(f"")
-        print(f"Цель 1: Короткие - 'ремонт пылесосов киев'")
-        print(f"Цель 2: Длинные - 'ремонт пылесосов самсунг левый берег'")
+        print(f"МЕТОД CSG:")
+        print(f"1. Якорь: 'киев' (город)")
+        print(f"2. Context Shift: 'киев ремонт пылесосов'")
+        print(f"3. Вторичное расширение: 'киев ремонт пылесосов с/се/сер...'")
+        print(f"4. Ожидаем вставку: 'киев [сервисный центр] ремонт пылесосов'")
+        print(f"5. Извлекаем PREFIX: 'сервисный центр'")
         print(f"")
         
-        # Wildcard символы: от 1 до 5 подчёркиваний + звёздочка
-        wildcard_symbols = [
-            ("*", "звёздочка (любое количество слов)"),
-            ("_", "1 подчёркивание (1 слово)"),
-            ("__", "2 подчёркивания (2 слова)"),
-            ("___", "3 подчёркивания (3 слова)"),
-            ("____", "4 подчёркивания (4 слова)"),
-            ("_____", "5 подчёркиваний (5 слов)"),
-        ]
+        # ========================================
+        # ЭТАП 0: Тестовые якоря
+        # ========================================
+        test_anchors = ["киев", "москва", "астана"]
         
-        wildcard_total_results = 0
-        wildcard_all_keywords = set()
+        print(f"Тестовые якоря: {', '.join(test_anchors)}\n")
         
-        for i, (symbol, description) in enumerate(wildcard_symbols):
-            # Ставим wildcard символ ПОСЛЕ seed (SUFFIX!)
-            wildcard_query = f"{seed} {symbol}"
-            wildcard_suggestions = await self.fetch_suggestions(wildcard_query, country, language)
+        # ========================================
+        # ЭТАП 1: Context Shift с якорями
+        # ========================================
+        print(f"{'='*60}")
+        print(f"ЭТАП 1: Context Shift (якорь + seed)")
+        print(f"{'='*60}\n")
+        
+        context_shift_results = {}
+        
+        for anchor in test_anchors:
+            context_query = f"{anchor} {seed}"
+            context_suggestions = await self.fetch_suggestions(context_query, country, language)
+            context_shift_results[anchor] = context_suggestions
+            
+            print(f"'{context_query}' → {len(context_suggestions)} результатов")
+            if len(context_suggestions) > 0:
+                for s in context_suggestions[:3]:
+                    print(f"  • {s}")
+            
+            delay = random.uniform(0.5, 1.5)
+            await asyncio.sleep(delay)
+        
+        print(f"\n✅ Context Shift завершён\n")
+        
+        # ========================================
+        # ЭТАП 2: Вторичное расширение (КРИТИЧЕСКИЙ ТЕСТ!)
+        # ========================================
+        print(f"{'='*60}")
+        print(f"ЭТАП 2: Вторичное расширение (между якорем и seed)")
+        print(f"{'='*60}")
+        print(f"Проверяем: может ли Google вставить слова МЕЖДУ якорем и seed?\n")
+        
+        # Целевые буквы для поиска "сервис"
+        target_letters = {
+            "с": "ищем 'сервис', 'сервисный', 'срочный'",
+            "се": "ищем 'сервис', 'сервисный'", 
+            "сер": "ищем 'сервис', 'сервисный'",
+            "серв": "ищем 'сервис', 'сервисный'",
+            "г": "ищем 'где', 'гарантийный'",
+            "н": "ищем 'недорогой'",
+            "ц": "ищем 'центр'",
+            "м": "ищем 'мастер', 'мастерская'",
+        }
+        
+        csg_discovered_words = set()
+        csg_total_queries = 0
+        
+        for anchor in test_anchors:
+            print(f"\n--- Якорь: '{anchor}' ---")
+            
+            for letter, description in target_letters.items():
+                # CSG вторичное расширение
+                csg_query = f"{anchor} {seed} {letter}"
+                csg_suggestions = await self.fetch_suggestions(csg_query, country, language)
+                csg_total_queries += 1
+                
+                # Анализируем результаты: есть ли вставка МЕЖДУ якорем и seed?
+                inserted_words = []
+                
+                for suggestion in csg_suggestions:
+                    # Удаляем якорь из начала
+                    if suggestion.lower().startswith(anchor.lower()):
+                        after_anchor = suggestion[len(anchor):].strip()
+                        
+                        # Проверяем есть ли seed в остатке
+                        if seed.lower() in after_anchor.lower():
+                            # Извлекаем что ПЕРЕД seed
+                            seed_position = after_anchor.lower().find(seed.lower())
+                            if seed_position > 0:
+                                # Есть слова между якорем и seed!
+                                before_seed = after_anchor[:seed_position].strip()
+                                if before_seed:
+                                    inserted_words.append(before_seed)
+                                    csg_discovered_words.add(before_seed)
+                
+                # Показываем результаты
+                status = "✅ ВСТАВКА!" if len(inserted_words) > 0 else "❌ нет вставки"
+                print(f"  '{csg_query}' ({description})")
+                print(f"    Результатов: {len(csg_suggestions)} | {status}")
+                
+                if len(inserted_words) > 0:
+                    print(f"    НАЙДЕНЫ ВСТАВКИ:")
+                    for word in set(inserted_words):
+                        print(f"      🎯 '{word}'")
+                        # Показываем полный пример
+                        for s in csg_suggestions:
+                            if word in s:
+                                print(f"         Пример: {s}")
+                                break
+                
+                delay = random.uniform(0.5, 1.5)
+                await asyncio.sleep(delay)
+        
+        print(f"\n{'='*60}")
+        print(f"✅ ЭТАП 2 завершён")
+        print(f"{'='*60}")
+        print(f"Запросов сделано: {csg_total_queries}")
+        print(f"Обнаружено уникальных PREFIX слов: {len(csg_discovered_words)}")
+        
+        if len(csg_discovered_words) > 0:
+            print(f"\n🎉 CSG РАБОТАЕТ! Найдены PREFIX слова:")
+            for word in sorted(csg_discovered_words):
+                print(f"  • {word}")
+            
+            # ========================================
+            # ЭТАП 3: Проверка извлечённых PREFIX
+            # ========================================
+            print(f"\n{'='*60}")
+            print(f"ЭТАП 3: Проверка извлечённых PREFIX")
+            print(f"{'='*60}\n")
+            
+            csg_prefix_keywords = set()
+            
+            for word in sorted(csg_discovered_words):
+                prefix_query = f"{word} {seed}"
+                prefix_suggestions = await self.fetch_suggestions(prefix_query, country, language)
+                csg_total_queries += 1
+                
+                if len(prefix_suggestions) > 0:
+                    csg_prefix_keywords.update(prefix_suggestions)
+                    all_keywords.update(prefix_suggestions)
+                    
+                    print(f"✅ '{prefix_query}' → {len(prefix_suggestions)} PREFIX найдено!")
+                    for s in prefix_suggestions[:3]:
+                        print(f"    • {s}")
+                else:
+                    print(f"❌ '{prefix_query}' → нет результатов")
+                
+                delay = random.uniform(0.5, 1.5)
+                await asyncio.sleep(delay)
+            
+            print(f"\n{'='*60}")
+            print(f"📊 ИТОГОВАЯ СТАТИСТИКА CSG")
+            print(f"{'='*60}")
+            print(f"Всего запросов: {csg_total_queries}")
+            print(f"Обнаружено PREFIX слов: {len(csg_discovered_words)}")
+            print(f"Найдено PREFIX ключей: {len(csg_prefix_keywords)}")
+            print(f"")
+            
+            if "сервисный центр" in csg_discovered_words or "сервис" in csg_discovered_words:
+                print(f"🎯 ЦЕЛЬ ДОСТИГНУТА! Нашли 'сервис' или 'сервисный центр'!")
+            else:
+                print(f"❌ Цель НЕ достигнута: 'сервисный центр' не найден")
+            
+        else:
+            print(f"\n❌ CSG НЕ РАБОТАЕТ!")
+            print(f"Google НЕ делает вставки между якорем и seed")
+            print(f"Метод от ChatGPT не применим к Autocomplete API")
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 CSG ТЕСТ ЗАВЕРШЕН")
+        print(f"{'='*60}")
+        print(f"Всего уникальных ключевых слов: {len(all_keywords)}")
+        
+        latin_results = 0
+        cyrillic_results = 0
+        
             
             # Добавляем к общим результатам
             all_keywords.update(wildcard_suggestions)
@@ -448,45 +599,22 @@ class AutocompleteParser:
         cyrillic_results = 0
         
         # ========================================
-        # ADAPTIVE PREFIX - ДВУХЭТАПНЫЙ ПОДХОД!
+        # ADAPTIVE PREFIX - ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА
         # ========================================
-        print(f"\n{'='*60}")
-        print(f"🔤 [ТЕСТ] ADAPTIVE PREFIX - ДВУХЭТАПНЫЙ ПОДХОД!")
-        print(f"{'='*60}")
-        print(f"Исходный seed: '{seed}'")
-        print(f"")
-        print(f"ЭТАП 1: Парсим SUFFIX 'ремонт пылесосов а/б/в...'")
-        print(f"        → Извлекаем последние слова из результатов")
-        print(f"ЭТАП 2: Проверяем обратные запросы '[слово] ремонт пылесосов'")
-        print(f"        → Находим реальные PREFIX запросы!")
-        print(f"")
+        print(f"\n⚠️ ADAPTIVE PREFIX ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА")
         
         # ========================================
-        # ЭТАП 1: SUFFIX парсинг для извлечения потенциальных слов
+        # INFIX - ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА
         # ========================================
-        print(f"{'='*60}")
-        print(f"ЭТАП 1: SUFFIX парсинг (извлечение кандидатов)")
-        print(f"{'='*60}")
+        print(f"\n⚠️ INFIX ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА")
+        infix_results = 0
         
-        potential_prefix_words = set()
-        stage1_keywords = set()
-        stage1_count = 0
+        # ========================================
+        # PREFIX - ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА
+        # ========================================
+        print(f"\n⚠️ PREFIX ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА")
+        prefix_results = 0
         
-        for i, modifier in enumerate(cyrillic_modifiers):
-            query = f"{seed} {modifier}"
-            suggestions = await self.fetch_suggestions(query, country, language)
-            stage1_keywords.update(suggestions)
-            stage1_count += len(suggestions)
-            
-            # Извлекаем ПОСЛЕДНЕЕ слово из каждого результата
-            for suggestion in suggestions:
-                words = suggestion.split()
-                if len(words) > len(seed.split()):
-                    # Берём слово после seed
-                    last_word = words[-1]
-                    # Фильтруем: только слова длиннее 2 символов
-                    if len(last_word) > 2 and last_word.replace('-', '').isalpha():
-                        potential_prefix_words.add(last_word.lower())
             
             delay = random.uniform(0.5, 2.0)
             if i < 3 or len(suggestions) > 0:
@@ -624,52 +752,15 @@ class AutocompleteParser:
         # ========================================
         # 4. PREFIX - ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА
         # ========================================
-        print(f"\n⚠️ PREFIX (односимвольный) ОТКЛЮЧЕН ДЛЯ ТЕСТА WILDCARD")
+        print(f"\n⚠️ PREFIX (односимвольный) ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА")
         prefix_results = 0
         
         # ========================================
-        # 5. WILDCARD PREFIX TEST - ТЕСТ ПОДСТАНОВОЧНЫХ ЗНАКОВ!
+        # WILDCARD PREFIX - ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА
         # ========================================
-        wildcard_symbols = [
-            ("*", "звёздочка"),
-            ("_", "одно подчёркивание"),
-            ("__", "два подчёркивания"),
-            ("___", "три подчёркивания"),
-            ("____", "четыре подчёркивания"),
-            ("_____", "пять подчёркиваний"),
-        ]
-        
-        print(f"\n{'='*60}")
-        print(f"🔤 [ТЕСТ] WILDCARD PREFIX - ПОДСТАНОВОЧНЫЕ ЗНАКИ!")
-        print(f"{'='*60}")
-        print(f"Исходный seed: '{seed}'")
-        print(f"Цель: найти 'астана ремонт пылесосов', 'сервис ремонт пылесосов'")
-        print(f"Тестируем: * _ __ ___ ____ _____")
-        print(f"Символов для теста: {len(wildcard_symbols)}\n")
-        
+        print(f"\n⚠️ WILDCARD PREFIX ОТКЛЮЧЕН ДЛЯ CSG ТЕСТА")
         wildcard_total_results = 0
-        wildcard_total_keywords = set()
         
-        for i, (symbol, description) in enumerate(wildcard_symbols):
-            # Ставим wildcard символ ПЕРЕД seed
-            wildcard_query = f"{symbol} {seed}"
-            wildcard_suggestions = await self.fetch_suggestions(wildcard_query, country, language)
-            
-            # Проверяем есть ли РЕАЛЬНОЕ расширение (не просто symbol + seed)
-            real_expansions = []
-            for suggestion in wildcard_suggestions:
-                # Если результат НЕ начинается с нашего символа, значит расширился!
-                if not suggestion.startswith(symbol):
-                    real_expansions.append(suggestion)
-            
-            all_keywords.update(real_expansions)
-            wildcard_total_keywords.update(real_expansions)
-            wildcard_total_results += len(real_expansions)
-            
-            delay = random.uniform(0.5, 2.0)
-            
-            # Показываем все результаты для wildcard тестов
-            status = "✅ РАСШИРЕНИЕ!" if len(real_expansions) > 0 else "❌ нет расширения"
             print(f"[{i+1}/{len(wildcard_symbols)}] '{wildcard_query}' ({description})")
             print(f"    Всего: {len(wildcard_suggestions)} | Расширений: {len(real_expansions)} | {status}")
             
