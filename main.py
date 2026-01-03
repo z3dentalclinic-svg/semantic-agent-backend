@@ -1,6 +1,8 @@
 """
-CSG (Context-Shift Graph) TEST - метод от ChatGPT
-ЦЕЛЬ: Найти "сервисный центр ремонт пылесосов"
+PREPOSITIONAL BRIDGE TEST - метод от Gemini
+КРИТИЧЕСКИЙ ТЕСТ: Работает ли триграммное расширение?
+
+Проверяем: "с ремонт" → "срочный ремонт", "сервисный ремонт"?
 """
 
 from fastapi import FastAPI, Query
@@ -12,7 +14,7 @@ import asyncio
 import time
 import random
 
-app = FastAPI(title="CSG Test", version="1.0")
+app = FastAPI(title="Gemini Trigram Test", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,133 +42,147 @@ class AutocompleteParser:
             print(f"Error: {e}")
             return []
     
-    async def csg_test(self, seed: str, country: str, language: str) -> List[str]:
+    async def gemini_trigram_test(self, seed: str, country: str, language: str) -> List[str]:
         all_keywords = set()
         
         print(f"\n{'='*60}")
-        print(f"🔬 CSG - CONTEXT-SHIFT GRAPH")
+        print(f"🔬 PREPOSITIONAL BRIDGE - метод от Gemini")
         print(f"{'='*60}")
-        print(f"Seed: '{seed}' | ЦЕЛЬ: 'сервисный центр ремонт пылесосов'\n")
+        print(f"Seed: '{seed}'")
+        print(f"КРИТИЧЕСКИЙ ТЕСТ: Работает ли триграммное расширение?\n")
         
-        test_anchors = ["киев", "москва", "астана"]
-        print(f"Якоря: {', '.join(test_anchors)}\n")
+        # Берём только ПЕРВОЕ слово из seed
+        first_word = seed.split()[0]
+        print(f"Первое слово: '{first_word}'")
+        print(f"Тестируем: '[буква] {first_word}'\n")
         
-        # ЭТАП 1: Context Shift
+        # ========================================
+        # КРИТИЧЕСКИЙ ТЕСТ: Триграммы
+        # ========================================
         print(f"{'='*60}")
-        print(f"ЭТАП 1: Context Shift")
+        print(f"ТЕСТ: Триграммное расширение")
         print(f"{'='*60}\n")
         
-        for anchor in test_anchors:
-            query = f"{anchor} {seed}"
-            results = await self.fetch_suggestions(query, country, language)
-            print(f"'{query}' → {len(results)} результатов")
-            for s in results[:3]:
-                print(f"  • {s}")
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-        
-        print(f"\n✅ Этап 1 завершён\n")
-        
-        # ЭТАП 2: Вторичное расширение
-        print(f"{'='*60}")
-        print(f"ЭТАП 2: Вторичное расширение")
-        print(f"{'='*60}")
-        print(f"Проверка: Google вставляет слова МЕЖДУ якорем и seed?\n")
-        
-        target_letters = {
-            "с": "'сервис', 'сервисный', 'срочный'",
-            "се": "'сервис', 'сервисный'",
-            "сер": "'сервис', 'сервисный'",
-            "серв": "'сервисный'",
-            "г": "'где', 'гарантийный'",
-            "н": "'недорогой'",
-            "ц": "'центр'",
-            "м": "'мастер'",
+        # Тестовые буквы для поиска целевых PREFIX
+        test_letters = {
+            "с": "ожидаем: 'срочный', 'сервисный', 'сервис'",
+            "г": "ожидаем: 'где', 'гарантийный'",
+            "а": "ожидаем: 'авито'",
+            "м": "ожидаем: 'мастер', 'мастерская'",
+            "н": "ожидаем: 'недорогой'",
+            "ц": "ожидаем: 'центр'",
+            "ч": "ожидаем: 'частный'",
+            "к": "ожидаем: 'качественный', 'как'",
         }
         
-        discovered = set()
-        total_queries = 3
+        discovered_prefixes = set()
+        total_queries = 0
         
-        for anchor in test_anchors:
-            print(f"\n--- Якорь: '{anchor}' ---")
+        for letter, expectation in test_letters.items():
+            # Триграммный запрос: буква + первое_слово
+            trigram_query = f"{letter} {first_word}"
+            results = await self.fetch_suggestions(trigram_query, country, language)
+            total_queries += 1
             
-            for letter, desc in target_letters.items():
-                query = f"{anchor} {seed} {letter}"
-                results = await self.fetch_suggestions(query, country, language)
-                total_queries += 1
-                
-                inserted = []
-                for s in results:
-                    if s.lower().startswith(anchor.lower()):
-                        after = s[len(anchor):].strip()
-                        if seed.lower() in after.lower():
-                            pos = after.lower().find(seed.lower())
-                            if pos > 0:
-                                before = after[:pos].strip()
-                                if before:
-                                    inserted.append(before)
-                                    discovered.add(before)
-                
-                status = "✅ ВСТАВКА!" if inserted else "❌ нет"
-                print(f"  '{query}' ({desc})")
-                print(f"    {len(results)} результатов | {status}")
-                
-                if inserted:
-                    print(f"    ВСТАВКИ:")
-                    for w in set(inserted):
-                        print(f"      🎯 '{w}'")
-                        for s in results:
-                            if w in s:
-                                print(f"         {s}")
-                                break
-                
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+            print(f"'{trigram_query}' ({expectation})")
+            print(f"  Результатов: {len(results)}")
+            
+            if len(results) == 0:
+                print(f"  ❌ Нет результатов\n")
+                continue
+            
+            # Анализируем результаты
+            found_prefix_words = []
+            
+            for result in results:
+                # Проверяем: начинается ли с нашей буквы?
+                if result.lower().startswith(letter.lower()):
+                    # Убираем букву и смотрим что осталось
+                    after_letter = result[1:].strip()
+                    
+                    # Проверяем: есть ли наше первое слово?
+                    if first_word.lower() in after_letter.lower():
+                        # Извлекаем что ПЕРЕД первым словом
+                        word_position = after_letter.lower().find(first_word.lower())
+                        if word_position > 0:
+                            # Есть слово между буквой и first_word!
+                            prefix_word = after_letter[:word_position].strip()
+                            if prefix_word:
+                                found_prefix_words.append(prefix_word)
+                                discovered_prefixes.add(prefix_word)
+            
+            # Показываем что нашли
+            if len(found_prefix_words) > 0:
+                print(f"  ✅ НАЙДЕНЫ PREFIX слова:")
+                for word in set(found_prefix_words):
+                    print(f"     🎯 '{word}'")
+                    # Показываем пример
+                    for r in results:
+                        if word in r:
+                            print(f"        Пример: {r}")
+                            break
+            else:
+                print(f"  ❌ PREFIX слова НЕ найдены")
+                print(f"  Примеры результатов:")
+                for r in results[:3]:
+                    print(f"     • {r}")
+            
+            print()
+            await asyncio.sleep(random.uniform(0.5, 1.5))
         
-        print(f"\n{'='*60}")
-        print(f"✅ Этап 2 завершён")
         print(f"{'='*60}")
-        print(f"Запросов: {total_queries} | PREFIX слов: {len(discovered)}")
+        print(f"✅ ТЕСТ ЗАВЕРШЁН")
+        print(f"{'='*60}")
+        print(f"Запросов: {total_queries}")
+        print(f"Найдено PREFIX слов: {len(discovered_prefixes)}")
         
-        if discovered:
-            print(f"\n🎉 CSG РАБОТАЕТ! Найдены:")
-            for w in sorted(discovered):
-                print(f"  • {w}")
+        if len(discovered_prefixes) > 0:
+            print(f"\n🎉 МЕТОД GEMINI РАБОТАЕТ!")
+            print(f"Триграммное расширение находит PREFIX слова:\n")
+            for word in sorted(discovered_prefixes):
+                print(f"  • {word}")
             
-            # ЭТАП 3: Проверка PREFIX
+            # ========================================
+            # ЭТАП 2: Верификация полного seed
+            # ========================================
             print(f"\n{'='*60}")
-            print(f"ЭТАП 3: Проверка PREFIX")
+            print(f"ЭТАП 2: Верификация с полным seed")
             print(f"{'='*60}\n")
             
-            prefix_kw = set()
-            for w in sorted(discovered):
-                query = f"{w} {seed}"
-                results = await self.fetch_suggestions(query, country, language)
+            verified_keywords = set()
+            
+            for prefix_word in sorted(discovered_prefixes):
+                # Проверяем полный запрос: prefix_word + полный seed
+                full_query = f"{prefix_word} {seed}"
+                results = await self.fetch_suggestions(full_query, country, language)
                 total_queries += 1
                 
-                if results:
-                    prefix_kw.update(results)
+                if len(results) > 0:
+                    verified_keywords.update(results)
                     all_keywords.update(results)
-                    print(f"✅ '{query}' → {len(results)} PREFIX")
-                    for s in results[:3]:
-                        print(f"    • {s}")
+                    print(f"✅ '{full_query}' → {len(results)} ключей")
+                    for r in results[:3]:
+                        print(f"    • {r}")
                 else:
-                    print(f"❌ '{query}' → нет")
+                    print(f"❌ '{full_query}' → нет результатов")
                 
                 await asyncio.sleep(random.uniform(0.5, 1.5))
             
             print(f"\n{'='*60}")
-            print(f"📊 СТАТИСТИКА")
+            print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
             print(f"{'='*60}")
-            print(f"Запросов: {total_queries}")
-            print(f"PREFIX слов: {len(discovered)}")
-            print(f"PREFIX ключей: {len(prefix_kw)}")
+            print(f"Всего запросов: {total_queries}")
+            print(f"PREFIX слов найдено: {len(discovered_prefixes)}")
+            print(f"Верифицированных ключей: {len(verified_keywords)}")
             
-            if "сервисный центр" in discovered or "сервис" in discovered:
+            if "сервис" in discovered_prefixes or "срочный" in discovered_prefixes:
                 print(f"\n🎯 ЦЕЛЬ ДОСТИГНУТА!")
-            else:
-                print(f"\n❌ Цель НЕ достигнута")
+                print(f"Нашли целевые PREFIX: 'сервис' / 'срочный'")
+            
         else:
-            print(f"\n❌ CSG НЕ РАБОТАЕТ!")
-            print(f"Google НЕ вставляет слова между якорем и seed")
+            print(f"\n❌ МЕТОД GEMINI НЕ РАБОТАЕТ!")
+            print(f"Триграммное расширение НЕ находит PREFIX слова")
+            print(f"Google возвращает только морфологию или другие варианты")
         
         print(f"\n{'='*60}")
         print(f"ИТОГО ключей: {len(all_keywords)}")
@@ -175,18 +191,18 @@ class AutocompleteParser:
         return list(all_keywords)
 
 
-@app.get("/api/test-parser/csg")
-async def test(
+@app.get("/api/test-parser/gemini")
+async def test_gemini(
     seed: str = Query("ремонт пылесосов"),
     country: str = Query("UA"),
     language: str = Query("ru")
 ):
     parser = AutocompleteParser()
     start = time.time()
-    keywords = await parser.csg_test(seed, country, language)
+    keywords = await parser.gemini_trigram_test(seed, country, language)
     return {
         "seed": seed,
-        "method": "CSG",
+        "method": "PREPOSITIONAL BRIDGE (Gemini)",
         "keywords": keywords,
         "count": len(keywords),
         "time": round(time.time() - start, 2)
@@ -195,7 +211,10 @@ async def test(
 
 @app.get("/")
 async def root():
-    return {"api": "CSG Test", "url": "/api/test-parser/csg?seed=ремонт пылесосов&country=UA&language=ru"}
+    return {
+        "api": "Gemini Trigram Test",
+        "url": "/api/test-parser/gemini?seed=ремонт пылесосов&country=UA&language=ru"
+    }
 
 
 if __name__ == "__main__":
