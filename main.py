@@ -6,6 +6,7 @@ Version: 3.0 Final
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from typing import List, Dict, Optional
 from collections import Counter
 from pydantic import BaseModel
@@ -1028,6 +1029,342 @@ async def get_delay_test_results():
     return delay_test_state["last_results"]
 
 
+@app.get("/test-delays", response_class=HTMLResponse)
+async def delay_test_page():
+    """HTML страница для тестирования задержек"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delay Optimizer Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+        h1 { color: #2d3748; font-size: 32px; margin-bottom: 10px; }
+        .subtitle { color: #718096; font-size: 16px; }
+        .card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .card h2 { color: #2d3748; font-size: 20px; margin-bottom: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label {
+            display: block;
+            color: #4a5568;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        input:focus { outline: none; border-color: #667eea; }
+        .button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+        }
+        .button:hover { transform: translateY(-2px); }
+        .button:disabled { background: #cbd5e0; cursor: not-allowed; }
+        .button-secondary {
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
+        }
+        .status-box {
+            padding: 20px;
+            background: #f7fafc;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #e2e8f0;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+        }
+        .results-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        .results-table th {
+            background: #f7fafc;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+        }
+        .results-table td {
+            padding: 12px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge-success { background: #c6f6d5; color: #22543d; }
+        .badge-warning { background: #feebc8; color: #744210; }
+        .badge-danger { background: #fed7d7; color: #742a2a; }
+        .recommendation-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 20px;
+        }
+        .hidden { display: none; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .stat-card {
+            background: #f7fafc;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #667eea;
+        }
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .alert-success { background: #c6f6d5; color: #22543d; }
+        .alert-error { background: #fed7d7; color: #742a2a; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚡ Delay Optimizer Test</h1>
+            <p class="subtitle">Тестирование оптимальных задержек</p>
+        </div>
+
+        <div id="alert" class="alert hidden"></div>
+
+        <div class="card">
+            <h2>🔧 Настройки</h2>
+            <div class="form-group">
+                <label>Запросов на сценарий</label>
+                <input type="number" id="numRequests" value="50">
+            </div>
+            <div class="form-group">
+                <label>Seed запрос</label>
+                <input type="text" id="seedKeyword" value="ремонт пылесосов">
+            </div>
+            <button class="button" onclick="startTest()">▶️ Запустить тест</button>
+        </div>
+
+        <div class="card">
+            <h2>📊 Статус</h2>
+            <div class="status-box">
+                <div class="status-item">
+                    <span>Статус:</span>
+                    <span id="statusRunning">Не запущен</span>
+                </div>
+                <div class="status-item">
+                    <span>Сценарий:</span>
+                    <span id="statusScenario">0 / 0</span>
+                </div>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressBar" style="width: 0%">0%</div>
+            </div>
+            <button class="button button-secondary" onclick="checkStatus()" style="margin-top: 15px;">🔄 Обновить</button>
+        </div>
+
+        <div class="card" id="resultsCard" style="display: none;">
+            <h2>📋 Результаты</h2>
+            <div class="grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="totalScenarios">0</div>
+                    <div>Сценариев</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="totalRequests">0</div>
+                    <div>Запросов</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="totalTime">0s</div>
+                    <div>Время</div>
+                </div>
+            </div>
+
+            <table class="results-table">
+                <thead>
+                    <tr>
+                        <th>Задержка</th>
+                        <th>Успех</th>
+                        <th>Время</th>
+                        <th>Оценка</th>
+                    </tr>
+                </thead>
+                <tbody id="resultsTableBody"></tbody>
+            </table>
+
+            <div id="recommendationBox" class="recommendation-box hidden">
+                <h3>🏆 Рекомендация</h3>
+                <p id="recommendationText" style="font-size: 24px; font-weight: 700;"></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let interval = null;
+
+        function showAlert(msg, type) {
+            const alert = document.getElementById('alert');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = msg;
+            alert.classList.remove('hidden');
+            setTimeout(() => alert.classList.add('hidden'), 5000);
+        }
+
+        async function startTest() {
+            const config = {
+                num_requests_per_scenario: parseInt(document.getElementById('numRequests').value),
+                pause_between_scenarios: 30,
+                seed: document.getElementById('seedKeyword').value,
+                country: 'UA',
+                language: 'ru'
+            };
+
+            try {
+                const res = await fetch('/api/test-delays', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(config)
+                });
+                const data = await res.json();
+                
+                if (res.ok) {
+                    showAlert(`✅ ${data.message}`, 'success');
+                    interval = setInterval(checkStatus, 5000);
+                    checkStatus();
+                } else {
+                    showAlert(`❌ ${data.detail}`, 'error');
+                }
+            } catch (e) {
+                showAlert(`❌ Ошибка: ${e.message}`, 'error');
+            }
+        }
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/test-delays/status');
+                const data = await res.json();
+
+                document.getElementById('statusRunning').textContent = data.is_running ? '🟢 Работает' : '⚪ Завершён';
+                document.getElementById('statusScenario').textContent = `${data.current_scenario} / ${data.total_scenarios}`;
+                
+                const bar = document.getElementById('progressBar');
+                bar.style.width = `${data.progress}%`;
+                bar.textContent = `${data.progress}%`;
+
+                if (!data.is_running && data.progress === 100) {
+                    clearInterval(interval);
+                    await getResults();
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function getResults() {
+            try {
+                const res = await fetch('/api/test-delays/results');
+                const data = await res.json();
+
+                document.getElementById('resultsCard').style.display = 'block';
+                document.getElementById('totalScenarios').textContent = data.test_summary.total_scenarios;
+                document.getElementById('totalRequests').textContent = data.test_summary.total_requests;
+                document.getElementById('totalTime').textContent = `${data.test_summary.total_time}s`;
+
+                const tbody = document.getElementById('resultsTableBody');
+                tbody.innerHTML = '';
+
+                data.scenarios.forEach(s => {
+                    const row = tbody.insertRow();
+                    row.insertCell(0).textContent = `${s.delay_range[0]}-${s.delay_range[1]}s`;
+                    row.insertCell(1).textContent = `${s.success_rate}%`;
+                    row.insertCell(2).textContent = `${s.total_time}s`;
+                    
+                    let badge = s.success_rate >= 98 ? 'success' : s.success_rate >= 90 ? 'warning' : 'danger';
+                    row.insertCell(3).innerHTML = `<span class="badge badge-${badge}">${s.success_rate >= 98 ? '✅' : s.success_rate >= 90 ? '⚠️' : '❌'}</span>`;
+                });
+
+                if (data.recommendation) {
+                    document.getElementById('recommendationBox').classList.remove('hidden');
+                    document.getElementById('recommendationText').textContent = 
+                        `${data.recommendation.optimal_delay_range[0]}-${data.recommendation.optimal_delay_range[1]} сек (${data.recommendation.success_rate}%)`;
+                }
+
+                showAlert('✅ Результаты загружены', 'success');
+            } catch (e) {
+                showAlert(`❌ ${e.message}`, 'error');
+            }
+        }
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content)
+
+
 # ============================================
 # ГЛАВНАЯ СТРАНИЦА (ОБНОВЛЁННАЯ)
 # ============================================
@@ -1046,12 +1383,248 @@ async def root():
                 "all_methods": "POST /api/parse/all"
             },
             "delay_optimizer": {
+                "test_page": "GET /test-delays (HTML интерфейс)",
                 "start_test": "POST /api/test-delays",
                 "check_status": "GET /api/test-delays/status",
                 "get_results": "GET /api/test-delays/results"
             }
         }
     }
+
+
+@app.get("/test-delays", response_class=HTMLResponse)
+async def delay_test_page():
+    """HTML страница для тестирования задержек"""
+    html_content = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delay Optimizer - Тестирование задержек</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { background: white; border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #667eea; font-size: 32px; margin-bottom: 10px; }
+        .subtitle { color: #666; font-size: 16px; }
+        .card { background: white; border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .card h2 { color: #333; font-size: 24px; margin-bottom: 20px; }
+        .input-group { margin-bottom: 20px; }
+        label { display: block; color: #555; font-weight: 500; margin-bottom: 8px; font-size: 14px; }
+        input, select { width: 100%; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; transition: border-color 0.3s; }
+        input:focus, select:focus { outline: none; border-color: #667eea; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        button { width: 100%; padding: 14px 24px; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s; display: flex; align-items: center; justify-content: center; gap: 10px; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5568d3; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(102,126,234,0.4); }
+        .btn-secondary { background: #48bb78; color: white; }
+        .btn-secondary:hover { background: #38a169; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .status-card { background: #f7fafc; border-left: 4px solid #667eea; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .status-item { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #e0e0e0; }
+        .status-item:last-child { border-bottom: none; }
+        .status-label { color: #666; font-weight: 500; }
+        .status-value { color: #333; font-weight: 600; }
+        .progress-bar { width: 100%; height: 30px; background: #e0e0e0; border-radius: 15px; overflow: hidden; margin: 10px 0; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-weight: 600; font-size: 14px; }
+        .results-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        .results-table th { background: #667eea; color: white; padding: 12px; text-align: left; font-weight: 600; }
+        .results-table td { padding: 12px; border-bottom: 1px solid #e0e0e0; }
+        .results-table tr:hover { background: #f7fafc; }
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+        .badge-success { background: #c6f6d5; color: #22543d; }
+        .badge-warning { background: #feebc8; color: #7c2d12; }
+        .badge-danger { background: #fed7d7; color: #742a2a; }
+        .recommendation { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; margin-top: 20px; }
+        .recommendation h3 { font-size: 20px; margin-bottom: 10px; }
+        .hidden { display: none; }
+        .spinner { border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .alert { padding: 16px; border-radius: 8px; margin-bottom: 20px; }
+        .alert-info { background: #bee3f8; color: #2c5282; border-left: 4px solid #4299e1; }
+        .alert-success { background: #c6f6d5; color: #22543d; border-left: 4px solid #48bb78; }
+        .alert-error { background: #fed7d7; color: #742a2a; border-left: 4px solid #f56565; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧪 Delay Optimizer</h1>
+            <p class="subtitle">Поиск оптимальной задержки между запросами к Google Autocomplete</p>
+        </div>
+
+        <div class="card">
+            <h2>⚙️ Настройки теста</h2>
+            <div class="grid">
+                <div class="input-group">
+                    <label for="seed">Тестовый запрос</label>
+                    <input type="text" id="seed" value="ремонт пылесосов">
+                </div>
+                <div class="input-group">
+                    <label for="country">Страна</label>
+                    <select id="country">
+                        <option value="UA" selected>Украина (UA)</option>
+                        <option value="RU">Россия (RU)</option>
+                        <option value="US">США (US)</option>
+                        <option value="DE">Германия (DE)</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <label for="language">Язык</label>
+                    <select id="language">
+                        <option value="ru" selected>Русский (ru)</option>
+                        <option value="uk">Украинский (uk)</option>
+                        <option value="en">Английский (en)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="grid">
+                <div class="input-group">
+                    <label for="requests">Запросов на сценарий</label>
+                    <input type="number" id="requests" value="50" min="10" max="100">
+                </div>
+                <div class="input-group">
+                    <label for="pause">Пауза между сценариями (сек)</label>
+                    <input type="number" id="pause" value="30" min="5" max="60">
+                </div>
+            </div>
+            <button id="startBtn" class="btn-primary" onclick="startTest()">
+                <span>▶️</span><span>Запустить тест</span>
+            </button>
+        </div>
+
+        <div class="card hidden" id="statusCard">
+            <h2>📊 Статус выполнения</h2>
+            <div class="status-card">
+                <div class="status-item">
+                    <span class="status-label">Статус:</span>
+                    <span class="status-value" id="statusText">Ожидание...</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Сценарий:</span>
+                    <span class="status-value" id="scenarioText">0/0</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Прогресс:</span>
+                    <span class="status-value" id="progressText">0%</span>
+                </div>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressBar" style="width:0%">0%</div>
+            </div>
+            <button class="btn-secondary" onclick="checkStatus()">
+                <span>🔄</span><span>Обновить статус</span>
+            </button>
+        </div>
+
+        <div class="card hidden" id="resultsCard">
+            <h2>📋 Результаты тестирования</h2>
+            <div id="resultsContent"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let statusInterval = null;
+
+        async function startTest() {
+            const startBtn = document.getElementById('startBtn');
+            startBtn.disabled = true;
+            startBtn.innerHTML = '<div class="spinner"></div><span>Запуск...</span>';
+
+            try {
+                const response = await fetch(`${API_BASE}/api/test-delays`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        seed: document.getElementById('seed').value,
+                        country: document.getElementById('country').value,
+                        language: document.getElementById('language').value,
+                        num_requests_per_scenario: parseInt(document.getElementById('requests').value),
+                        pause_between_scenarios: parseInt(document.getElementById('pause').value)
+                    })
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    showAlert('success', `✅ ${data.message}. Примерное время: ${data.estimated_time_minutes} минут`);
+                    document.getElementById('statusCard').classList.remove('hidden');
+                    document.getElementById('resultsCard').classList.add('hidden');
+                    statusInterval = setInterval(checkStatus, 3000);
+                    checkStatus();
+                } else {
+                    showAlert('error', `❌ Ошибка: ${data.detail}`);
+                    startBtn.disabled = false;
+                    startBtn.innerHTML = '<span>▶️</span><span>Запустить тест</span>';
+                }
+            } catch (error) {
+                showAlert('error', `❌ ${error.message}`);
+                startBtn.disabled = false;
+                startBtn.innerHTML = '<span>▶️</span><span>Запустить тест</span>';
+            }
+        }
+
+        async function checkStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/api/test-delays/status`);
+                const data = await response.json();
+                document.getElementById('statusText').textContent = data.is_running ? '🔄 Выполняется...' : '✅ Завершено';
+                document.getElementById('scenarioText').textContent = `${data.current_scenario}/${data.total_scenarios}`;
+                document.getElementById('progressText').textContent = `${data.progress}%`;
+                const progressBar = document.getElementById('progressBar');
+                progressBar.style.width = `${data.progress}%`;
+                progressBar.textContent = `${data.progress}%`;
+                if (!data.is_running && data.progress === 100) {
+                    clearInterval(statusInterval);
+                    getResults();
+                    document.getElementById('startBtn').disabled = false;
+                    document.getElementById('startBtn').innerHTML = '<span>▶️</span><span>Запустить тест</span>';
+                }
+            } catch (error) { console.error(error); }
+        }
+
+        async function getResults() {
+            try {
+                const response = await fetch(`${API_BASE}/api/test-delays/results`);
+                const data = await response.json();
+                if (response.ok) {
+                    displayResults(data);
+                    document.getElementById('resultsCard').classList.remove('hidden');
+                    showAlert('success', '✅ Тест завершён!');
+                }
+            } catch (error) { showAlert('error', `❌ ${error.message}`); }
+        }
+
+        function displayResults(data) {
+            let html = `<div class="alert alert-info"><strong>📊 Сводка:</strong> ${data.test_summary.total_scenarios} сценариев, ${data.test_summary.total_requests} запросов, ${data.test_summary.total_time} сек</div>
+            <table class="results-table"><thead><tr><th>Задержка</th><th>Успех</th><th>Время</th><th>Результаты</th><th>Оценка</th></tr></thead><tbody>`;
+            data.scenarios.forEach(s => {
+                const badge = s.success_rate >= 98 ? '<span class="badge badge-success">✅ Отлично</span>' : 
+                             s.success_rate >= 90 ? '<span class="badge badge-warning">⚠️ Хорошо</span>' : 
+                             '<span class="badge badge-danger">❌ Плохо</span>';
+                html += `<tr><td><strong>${s.delay_range.join('-')} сек</strong></td><td>${s.success_rate}%</td><td>${s.total_time} сек</td><td>${s.avg_results_per_request}</td><td>${badge}</td></tr>`;
+            });
+            html += `</tbody></table>`;
+            if (data.recommendation) {
+                html += `<div class="recommendation"><h3>🏆 Рекомендация</h3><p><strong>Оптимальная задержка:</strong> ${data.recommendation.optimal_delay_range.join('-')} сек</p><p><strong>Успех:</strong> ${data.recommendation.success_rate}% | <strong>Время:</strong> ${data.recommendation.total_time} сек</p><p>${data.recommendation.message}</p></div>`;
+            }
+            document.getElementById('resultsContent').innerHTML = html;
+        }
+
+        function showAlert(type, message) {
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            document.querySelector('.container').insertBefore(alert, document.querySelector('.container').firstChild);
+            setTimeout(() => alert.remove(), 5000);
+        }
+    </script>
+</body>
+</html>"""
+    return html_content
+
+
+from fastapi.responses import HTMLResponse
 
 
 if __name__ == "__main__":
