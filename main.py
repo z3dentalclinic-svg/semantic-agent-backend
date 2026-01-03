@@ -1,8 +1,6 @@
 """
-PREPOSITIONAL BRIDGE TEST - метод от Gemini
-КРИТИЧЕСКИЙ ТЕСТ: Работает ли триграммное расширение?
-
-Проверяем: "с ремонт" → "срочный ремонт", "сервисный ремонт"?
+GEMINI BIGRAM TEST - Двухбуквенные префиксы
+Тестирование: работает ли "се ремонт" → "сервисный ремонт"?
 """
 
 from fastapi import FastAPI, Query
@@ -14,7 +12,7 @@ import asyncio
 import time
 import random
 
-app = FastAPI(title="Gemini Trigram Test", version="1.0")
+app = FastAPI(title="Gemini Bigram Test", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,49 +40,60 @@ class AutocompleteParser:
             print(f"Error: {e}")
             return []
     
-    async def gemini_trigram_test(self, seed: str, country: str, language: str) -> List[str]:
+    async def gemini_bigram_test(self, seed: str, country: str, language: str) -> List[str]:
         all_keywords = set()
         
         print(f"\n{'='*60}")
-        print(f"🔬 PREPOSITIONAL BRIDGE - метод от Gemini")
+        print(f"🔬 GEMINI BIGRAM TEST")
         print(f"{'='*60}")
         print(f"Seed: '{seed}'")
-        print(f"КРИТИЧЕСКИЙ ТЕСТ: Работает ли триграммное расширение?\n")
+        print(f"Гипотеза: 'се ремонт' → 'сервисный ремонт'\n")
         
         # Берём только ПЕРВОЕ слово из seed
         first_word = seed.split()[0]
-        print(f"Первое слово: '{first_word}'")
-        print(f"Тестируем: '[буква] {first_word}'\n")
+        print(f"Первое слово: '{first_word}'\n")
         
         # ========================================
-        # КРИТИЧЕСКИЙ ТЕСТ: Триграммы
+        # ЭТАП 1: Тест топ-20 биграмм
         # ========================================
         print(f"{'='*60}")
-        print(f"ТЕСТ: Триграммное расширение")
+        print(f"ЭТАП 1: Топ-20 биграмм (быстрый тест)")
         print(f"{'='*60}\n")
         
-        # Тестовые буквы для поиска целевых PREFIX
-        test_letters = {
-            "с": "ожидаем: 'срочный', 'сервисный', 'сервис'",
-            "г": "ожидаем: 'где', 'гарантийный'",
-            "а": "ожидаем: 'авито'",
-            "м": "ожидаем: 'мастер', 'мастерская'",
-            "н": "ожидаем: 'недорогой'",
-            "ц": "ожидаем: 'центр'",
-            "ч": "ожидаем: 'частный'",
-            "к": "ожидаем: 'качественный', 'как'",
+        # Топ частотные биграммы для русского языка
+        top_bigrams = {
+            "се": "сервис, сервисный",
+            "ср": "срочный",
+            "гд": "где",
+            "ма": "мастер, мастерская",
+            "не": "недорогой",
+            "де": "дешевый",
+            "пр": "профессиональный",
+            "ка": "как, качественный",
+            "сл": "сложный",
+            "от": "отличный",
+            "ск": "сколько",
+            "со": "современный",
+            "це": "центр, цена",
+            "ча": "частный",
+            "ко": "коммерческий",
+            "ме": "мелкий",
+            "бе": "бесплатный",
+            "ре": "ремонт",
+            "на": "надежный",
+            "ку": "купить"
         }
         
-        discovered_prefixes = set()
+        discovered_words = set()
         total_queries = 0
         
-        for letter, expectation in test_letters.items():
-            # Триграммный запрос: буква + первое_слово
-            trigram_query = f"{letter} {first_word}"
-            results = await self.fetch_suggestions(trigram_query, country, language)
+        for bigram, expected in top_bigrams.items():
+            # Биграммный запрос
+            query = f"{bigram} {first_word}"
+            results = await self.fetch_suggestions(query, country, language)
             total_queries += 1
             
-            print(f"'{trigram_query}' ({expectation})")
+            print(f"'{query}' (ожидаем: {expected})")
             print(f"  Результатов: {len(results)}")
             
             if len(results) == 0:
@@ -92,68 +101,65 @@ class AutocompleteParser:
                 continue
             
             # Анализируем результаты
-            found_prefix_words = []
+            found_expansions = []
             
             for result in results:
-                # Проверяем: начинается ли с нашей буквы?
-                if result.lower().startswith(letter.lower()):
-                    # Убираем букву и смотрим что осталось
-                    after_letter = result[1:].strip()
+                # Проверяем начинается ли с биграммы
+                if result.lower().startswith(bigram.lower()):
+                    # Убираем биграмму
+                    after_bigram = result[len(bigram):].strip()
                     
-                    # Проверяем: есть ли наше первое слово?
-                    if first_word.lower() in after_letter.lower():
-                        # Извлекаем что ПЕРЕД первым словом
-                        word_position = after_letter.lower().find(first_word.lower())
-                        if word_position > 0:
-                            # Есть слово между буквой и first_word!
-                            prefix_word = after_letter[:word_position].strip()
-                            if prefix_word:
-                                found_prefix_words.append(prefix_word)
-                                discovered_prefixes.add(prefix_word)
+                    # Проверяем есть ли наше первое слово
+                    if first_word.lower() in after_bigram.lower():
+                        # Извлекаем что между биграммой и first_word
+                        word_pos = after_bigram.lower().find(first_word.lower())
+                        if word_pos > 0:
+                            expanded_word = after_bigram[:word_pos].strip()
+                            if expanded_word:
+                                found_expansions.append(expanded_word)
+                                discovered_words.add(expanded_word)
             
-            # Показываем что нашли
-            if len(found_prefix_words) > 0:
-                print(f"  ✅ НАЙДЕНЫ PREFIX слова:")
-                for word in set(found_prefix_words):
+            # Показываем результаты
+            if len(found_expansions) > 0:
+                print(f"  ✅ НАЙДЕНЫ РАСШИРЕНИЯ:")
+                for word in set(found_expansions):
                     print(f"     🎯 '{word}'")
-                    # Показываем пример
                     for r in results:
                         if word in r:
                             print(f"        Пример: {r}")
                             break
             else:
-                print(f"  ❌ PREFIX слова НЕ найдены")
+                print(f"  ❌ Расширения НЕ найдены")
                 print(f"  Примеры результатов:")
                 for r in results[:3]:
                     print(f"     • {r}")
             
             print()
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+            await asyncio.sleep(random.uniform(0.3, 0.8))
         
         print(f"{'='*60}")
-        print(f"✅ ТЕСТ ЗАВЕРШЁН")
+        print(f"✅ ЭТАП 1 завершён")
         print(f"{'='*60}")
         print(f"Запросов: {total_queries}")
-        print(f"Найдено PREFIX слов: {len(discovered_prefixes)}")
+        print(f"Найдено расширений: {len(discovered_words)}")
         
-        if len(discovered_prefixes) > 0:
-            print(f"\n🎉 МЕТОД GEMINI РАБОТАЕТ!")
-            print(f"Триграммное расширение находит PREFIX слова:\n")
-            for word in sorted(discovered_prefixes):
+        if len(discovered_words) > 0:
+            print(f"\n🎉 БИГРАММЫ РАБОТАЮТ!")
+            print(f"Найдены слова:\n")
+            for word in sorted(discovered_words):
                 print(f"  • {word}")
             
             # ========================================
-            # ЭТАП 2: Верификация полного seed
+            # ЭТАП 2: Верификация с полным seed
             # ========================================
             print(f"\n{'='*60}")
-            print(f"ЭТАП 2: Верификация с полным seed")
+            print(f"ЭТАП 2: Верификация PREFIX")
             print(f"{'='*60}\n")
             
             verified_keywords = set()
             
-            for prefix_word in sorted(discovered_prefixes):
-                # Проверяем полный запрос: prefix_word + полный seed
-                full_query = f"{prefix_word} {seed}"
+            for word in sorted(discovered_words):
+                full_query = f"{word} {seed}"
                 results = await self.fetch_suggestions(full_query, country, language)
                 total_queries += 1
                 
@@ -164,25 +170,24 @@ class AutocompleteParser:
                     for r in results[:3]:
                         print(f"    • {r}")
                 else:
-                    print(f"❌ '{full_query}' → нет результатов")
+                    print(f"❌ '{full_query}' → нет")
                 
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await asyncio.sleep(random.uniform(0.3, 0.8))
             
             print(f"\n{'='*60}")
             print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
             print(f"{'='*60}")
-            print(f"Всего запросов: {total_queries}")
-            print(f"PREFIX слов найдено: {len(discovered_prefixes)}")
-            print(f"Верифицированных ключей: {len(verified_keywords)}")
+            print(f"Запросов: {total_queries}")
+            print(f"Найдено слов: {len(discovered_words)}")
+            print(f"Верифицированных PREFIX: {len(verified_keywords)}")
             
-            if "сервис" in discovered_prefixes or "срочный" in discovered_prefixes:
-                print(f"\n🎯 ЦЕЛЬ ДОСТИГНУТА!")
-                print(f"Нашли целевые PREFIX: 'сервис' / 'срочный'")
+            if "сервис" in discovered_words or "срочный" in discovered_words:
+                print(f"\n🎯 ЦЕЛЬ ДОСТИГНУТА! Нашли 'сервис' или 'срочный'!")
             
         else:
-            print(f"\n❌ МЕТОД GEMINI НЕ РАБОТАЕТ!")
-            print(f"Триграммное расширение НЕ находит PREFIX слова")
-            print(f"Google возвращает только морфологию или другие варианты")
+            print(f"\n❌ БИГРАММЫ НЕ РАБОТАЮТ!")
+            print(f"Google НЕ расширяет двухбуквенные префиксы")
+            print(f"Метод от Gemini не применим")
         
         print(f"\n{'='*60}")
         print(f"ИТОГО ключей: {len(all_keywords)}")
@@ -191,18 +196,18 @@ class AutocompleteParser:
         return list(all_keywords)
 
 
-@app.get("/api/test-parser/gemini")
-async def test_gemini(
+@app.get("/api/test-parser/gemini-bigram")
+async def test_gemini_bigram(
     seed: str = Query("ремонт пылесосов"),
     country: str = Query("UA"),
     language: str = Query("ru")
 ):
     parser = AutocompleteParser()
     start = time.time()
-    keywords = await parser.gemini_trigram_test(seed, country, language)
+    keywords = await parser.gemini_bigram_test(seed, country, language)
     return {
         "seed": seed,
-        "method": "PREPOSITIONAL BRIDGE (Gemini)",
+        "method": "Gemini Bigram",
         "keywords": keywords,
         "count": len(keywords),
         "time": round(time.time() - start, 2)
@@ -212,8 +217,8 @@ async def test_gemini(
 @app.get("/")
 async def root():
     return {
-        "api": "Gemini Trigram Test",
-        "url": "/api/test-parser/gemini?seed=ремонт пылесосов&country=UA&language=ru"
+        "api": "Gemini Bigram Test",
+        "url": "/api/test-parser/gemini-bigram?seed=ремонт пылесосов&country=UA&language=ru"
     }
 
 
