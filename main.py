@@ -1,29 +1,29 @@
 """
-MORPHOLOGICAL ADAPTIVE TEST - ИСПРАВЛЕННАЯ ВЕРСИЯ
-С User-Agent ротацией и задержками
+DELAY OPTIMIZATION TESTER
+Поиск минимальной безопасной задержки между запросами к Google Autocomplete
+
+Цель: Найти минимальный диапазон задержек при котором Google НЕ блокирует запросы
+
+Метод:
+1. Тестируем разные диапазоны задержек
+2. Делаем 50 запросов с каждым диапазоном
+3. Считаем % успешных запросов
+4. Фиксируем время выполнения
+5. Находим оптимальный баланс (скорость vs блокировки)
 """
 
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-from collections import Counter
-import os
 import httpx
 import asyncio
-import time
 import random
+import time
+import json
+from datetime import datetime
+from typing import List, Tuple, Dict
 
-app = FastAPI(title="Morphological ADAPTIVE Test Fixed", version="1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# User-Agent ротация
+# ============================================
+# USER AGENTS
+# ============================================
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -32,229 +32,400 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ]
 
-class AutocompleteParser:
+
+# ============================================
+# DELAY TESTER CLASS
+# ============================================
+class DelayTester:
     def __init__(self):
         self.base_url = "https://suggestqueries.google.com/complete/search"
+        
+        # Модификаторы для тестирования
+        self.modifiers = list("абвгдежзийклмнопрстуфхцчшщэюя")
     
-    async def fetch_suggestions(self, query: str, country: str, language: str) -> List[str]:
-        params = {"client": "chrome", "q": query, "gl": country, "hl": language}
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
+    async def fetch_suggestions(
+        self, 
+        query: str, 
+        country: str = "UA", 
+        language: str = "ru"
+    ) -> Tuple[bool, int, float]:
+        """
+        Один запрос к Google Autocomplete
+        
+        Returns:
+            (success, results_count, response_time)
+        """
+        params = {
+            "client": "chrome",
+            "q": query,
+            "gl": country,
+            "hl": language
+        }
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS)
+        }
+        
+        start = time.time()
         
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(self.base_url, params=params, headers=headers)
+                elapsed = time.time() - start
+                
                 if response.status_code == 200:
                     data = response.json()
+                    
                     if isinstance(data, list) and len(data) > 1:
-                        return [s for s in data[1] if isinstance(s, str)]
-                return []
+                        results_count = len([s for s in data[1] if isinstance(s, str)])
+                        return (True, results_count, elapsed)
+                    else:
+                        return (True, 0, elapsed)
+                
+                # Не 200 = возможно блокировка
+                return (False, 0, elapsed)
+                
         except Exception as e:
-            print(f"Error: {e}")
-            return []
+            elapsed = time.time() - start
+            return (False, 0, elapsed)
     
-    async def morphological_adaptive_test(self, seed: str, country: str, language: str) -> List[str]:
-        all_keywords = set()
-        seed_words = set(seed.lower().split())
+    async def test_delay_range(
+        self,
+        min_delay: float,
+        max_delay: float,
+        num_requests: int = 50,
+        seed: str = "ремонт пылесосов",
+        country: str = "UA",
+        language: str = "ru",
+        verbose: bool = False
+    ) -> Dict:
+        """
+        Тестируем один диапазон задержек
         
-        print(f"\n{'='*60}")
-        print(f"🔬 MORPHOLOGICAL ADAPTIVE (FIXED)")
-        print(f"{'='*60}")
+        Args:
+            min_delay: минимальная задержка (сек)
+            max_delay: максимальная задержка (сек)
+            num_requests: количество запросов для теста
+            seed: базовый запрос
+            country: код страны
+            language: код языка
+            verbose: выводить детали каждого запроса
+            
+        Returns:
+            dict с результатами теста
+        """
+        print(f"\n{'='*70}")
+        print(f"🧪 ТЕСТ: Задержка {min_delay}-{max_delay} сек")
+        print(f"{'='*70}")
+        print(f"Количество запросов: {num_requests}")
         print(f"Seed: '{seed}'")
-        print(f"✅ User-Agent ротация включена")
-        print(f"✅ Задержки 1-2 сек между запросами\n")
-        
-        # ЭТАП 1: Генерация морфологических форм
-        print(f"{'='*60}")
-        print(f"ЭТАП 1: Генерация морфологических форм")
-        print(f"{'='*60}\n")
-        
-        # Для "ремонт пылесосов" создаём формы вручную
-        forms = [
-            seed,                           # "ремонт пылесосов"
-            "ремонта пылесосов",           # родительный
-            "по ремонту пылесосов"         # предлог + дательный
-        ]
-        
-        print(f"Форм: {len(forms)}")
-        for i, form in enumerate(forms, 1):
-            print(f"  {i}. '{form}'")
         print()
         
-        # ЭТАП 2: SUFFIX парсинг для каждой формы
-        print(f"{'='*60}")
-        print(f"ЭТАП 2: SUFFIX парсинг")
-        print(f"{'='*60}\n")
+        successes = 0
+        failures = 0
+        total_results = 0
+        response_times = []
         
-        alphabet = "абвгдежзийклмнопрстуфхцчшщъыьэюя"
-        all_suffix_results = []
-        suffix_count = 0
+        start_time = time.time()
         
-        for form_idx, form in enumerate(forms, 1):
-            print(f"--- Форма {form_idx}: '{form}' ---")
-            form_results = []
+        # Делаем запросы
+        for i in range(num_requests):
+            # Используем разные модификаторы
+            modifier = self.modifiers[i % len(self.modifiers)]
+            query = f"{seed} {modifier}"
             
-            for letter in alphabet:
-                query = f"{form} {letter}"
-                results = await self.fetch_suggestions(query, country, language)
-                form_results.extend(results)
-                all_suffix_results.extend(results)
-                suffix_count += 1
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+            # Запрос
+            success, results, resp_time = await self.fetch_suggestions(query, country, language)
             
-            print(f"Результатов: {len(form_results)}")
-            if form_results:
-                for r in form_results[:3]:
-                    print(f"  • {r}")
-            print()
-        
-        print(f"SUFFIX запросов: {suffix_count}")
-        print(f"Всего результатов: {len(all_suffix_results)}\n")
-        
-        # ЭТАП 3: Извлечение слов-кандидатов
-        print(f"{'='*60}")
-        print(f"ЭТАП 3: Извлечение слов-кандидатов")
-        print(f"{'='*60}\n")
-        
-        word_counter = Counter()
-        
-        for result in all_suffix_results:
-            words = result.lower().split()
-            for word in words:
-                if word not in seed_words and len(word) > 2:
-                    word_counter[word] += 1
-        
-        # Частотная фильтрация
-        all_candidates = {w for w, count in word_counter.items() if count >= 2}
-        
-        print(f"Уникальных слов: {len(word_counter)}")
-        print(f"После фильтрации (≥2): {len(all_candidates)}")
-        print(f"\nТоп-20:")
-        for word, count in word_counter.most_common(20):
-            print(f"  • '{word}' ({count})")
-        print()
-        
-        # ЭТАП 4: Анализ новых слов
-        print(f"{'='*60}")
-        print(f"ЭТАП 4: Анализ НОВЫХ слов от морфологии")
-        print(f"{'='*60}\n")
-        
-        base_form_words = set()
-        morpho_form_words = set()
-        
-        # Слова от базовой формы (первая треть результатов)
-        base_count = len(all_suffix_results) // 3
-        for result in all_suffix_results[:base_count]:
-            words = result.lower().split()
-            for word in words:
-                if word not in seed_words and len(word) > 2:
-                    base_form_words.add(word)
-        
-        # Слова от морфологических форм
-        for result in all_suffix_results[base_count:]:
-            words = result.lower().split()
-            for word in words:
-                if word not in seed_words and len(word) > 2:
-                    morpho_form_words.add(word)
-        
-        new_from_morphology = morpho_form_words - base_form_words
-        
-        print(f"От базовой формы: {len(base_form_words)}")
-        print(f"От морфо форм: {len(morpho_form_words)}")
-        print(f"НОВЫХ от морфологии: {len(new_from_morphology)}")
-        
-        if new_from_morphology:
-            print(f"\nНовые слова:")
-            for word in sorted(list(new_from_morphology)[:20]):
-                print(f"  • {word}")
-        print()
-        
-        # ЭТАП 5: PREFIX проверка
-        print(f"{'='*60}")
-        print(f"ЭТАП 5: PREFIX проверка")
-        print(f"{'='*60}\n")
-        
-        prefix_count = 0
-        verified_count = 0
-        
-        for candidate in sorted(all_candidates):
-            query = f"{candidate} {seed}"
-            results = await self.fetch_suggestions(query, country, language)
-            prefix_count += 1
+            # Статистика
+            if success:
+                successes += 1
+                total_results += results
+            else:
+                failures += 1
             
-            if results:
-                all_keywords.update(results)
-                verified_count += 1
-                if verified_count <= 10:
-                    print(f"✅ '{query}' → {len(results)}")
+            response_times.append(resp_time)
             
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+            # Лог
+            if verbose:
+                status = "✅" if success else "❌"
+                print(f"[{i+1}/{num_requests}] {status} '{query}' → {results} results ({resp_time:.3f}s)")
+            elif (i + 1) % 10 == 0:
+                # Показываем прогресс каждые 10 запросов
+                print(f"[{i+1}/{num_requests}] Успешно: {successes}, Неудачно: {failures}")
+            
+            # Задержка (кроме последнего запроса)
+            if i < num_requests - 1:
+                delay = random.uniform(min_delay, max_delay)
+                await asyncio.sleep(delay)
         
-        print(f"\nПроверено: {prefix_count}")
-        print(f"Валидных PREFIX: {verified_count}")
-        print()
+        # Общее время
+        total_time = time.time() - start_time
         
-        # СТАТИСТИКА
-        total_queries = suffix_count + prefix_count
+        # Средние значения
+        success_rate = (successes / num_requests) * 100
+        avg_response_time = sum(response_times) / len(response_times)
+        avg_results_per_request = total_results / num_requests if num_requests > 0 else 0
         
-        print(f"{'='*60}")
-        print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
-        print(f"{'='*60}")
-        print(f"SUFFIX: {suffix_count} запросов")
-        print(f"  - Базовая форма: 29")
-        print(f"  - Морфо формы: {suffix_count - 29}")
-        print(f"PREFIX проверка: {prefix_count} запросов")
-        print(f"──────────────────────────────────")
-        print(f"ВСЕГО: {total_queries} запросов")
-        print(f"")
-        print(f"Кандидатов: {len(all_candidates)}")
-        print(f"Валидных PREFIX: {verified_count}")
-        print(f"Финальных ключей: {len(all_keywords)}")
-        print(f"")
+        # Результаты
+        result = {
+            "delay_range": (min_delay, max_delay),
+            "num_requests": num_requests,
+            "successes": successes,
+            "failures": failures,
+            "success_rate": round(success_rate, 2),
+            "total_results": total_results,
+            "avg_results_per_request": round(avg_results_per_request, 2),
+            "total_time": round(total_time, 2),
+            "avg_response_time": round(avg_response_time, 3),
+            "avg_delay": round((min_delay + max_delay) / 2, 2)
+        }
         
-        if len(all_candidates) > 0:
-            print(f"ЭФФЕКТИВНОСТЬ:")
-            print(f"  Кандидатов на запрос: {len(all_candidates)/suffix_count:.2f}")
-            print(f"  Валидация: {verified_count}/{len(all_candidates)} = {verified_count/len(all_candidates)*100:.1f}%")
-            print(f"  Ключей на запрос: {len(all_keywords)/total_queries:.2f}")
-        print(f"")
+        # Вывод результатов
+        print(f"\n{'='*70}")
+        print(f"📊 РЕЗУЛЬТАТЫ")
+        print(f"{'='*70}")
+        print(f"Успешно:              {successes}/{num_requests} ({success_rate:.1f}%)")
+        print(f"Неудачно:             {failures}/{num_requests} ({100-success_rate:.1f}%)")
+        print(f"Всего результатов:    {total_results}")
+        print(f"Среднее на запрос:    {avg_results_per_request:.1f} results")
+        print(f"Общее время:          {total_time:.2f} сек")
+        print(f"Среднее время ответа: {avg_response_time:.3f} сек")
+        print(f"Средняя задержка:     {(min_delay + max_delay)/2:.2f} сек")
         
-        if len(new_from_morphology) > 0:
-            print(f"✅ МОРФОЛОГИЯ ДАЛА РЕЗУЛЬТАТ!")
-            print(f"Новых слов: {len(new_from_morphology)} (+{len(new_from_morphology)/len(base_form_words)*100:.1f}%)")
+        # Оценка
+        if success_rate >= 98:
+            print(f"✅ ОТЛИЧНО: {success_rate:.1f}% успешных запросов")
+        elif success_rate >= 90:
+            print(f"⚠️  ХОРОШО: {success_rate:.1f}% успешных запросов (есть блокировки)")
+        elif success_rate >= 70:
+            print(f"⚠️  УДОВЛЕТВОРИТЕЛЬНО: {success_rate:.1f}% успешных запросов (много блокировок)")
         else:
-            print(f"⚠️ Морфология не дала новых слов")
+            print(f"❌ ПЛОХО: {success_rate:.1f}% успешных запросов (слишком много блокировок)")
         
-        print(f"{'='*60}\n")
+        print(f"{'='*70}\n")
         
-        return list(all_keywords)
+        return result
+    
+    async def test_all_scenarios(
+        self,
+        scenarios: List[Tuple[float, float]],
+        num_requests_per_scenario: int = 50,
+        pause_between_scenarios: float = 30.0,
+        seed: str = "ремонт пылесосов",
+        country: str = "UA",
+        language: str = "ru"
+    ) -> List[Dict]:
+        """
+        Тестируем все сценарии задержек
+        
+        Args:
+            scenarios: список кортежей (min_delay, max_delay)
+            num_requests_per_scenario: количество запросов на сценарий
+            pause_between_scenarios: пауза между сценариями (чтобы "остыть")
+            
+        Returns:
+            список результатов для каждого сценария
+        """
+        results = []
+        
+        print(f"\n{'#'*70}")
+        print(f"🚀 ЗАПУСК ПОЛНОГО ТЕСТИРОВАНИЯ ЗАДЕРЖЕК")
+        print(f"{'#'*70}")
+        print(f"Сценариев: {len(scenarios)}")
+        print(f"Запросов на сценарий: {num_requests_per_scenario}")
+        print(f"Пауза между сценариями: {pause_between_scenarios} сек")
+        print(f"Seed: '{seed}'")
+        print(f"{'#'*70}\n")
+        
+        for i, (min_delay, max_delay) in enumerate(scenarios):
+            print(f"\n{'▼'*70}")
+            print(f"СЦЕНАРИЙ {i+1}/{len(scenarios)}")
+            print(f"{'▼'*70}")
+            
+            # Тестируем сценарий
+            result = await self.test_delay_range(
+                min_delay=min_delay,
+                max_delay=max_delay,
+                num_requests=num_requests_per_scenario,
+                seed=seed,
+                country=country,
+                language=language,
+                verbose=False
+            )
+            
+            results.append(result)
+            
+            # Пауза между сценариями (кроме последнего)
+            if i < len(scenarios) - 1:
+                print(f"\n⏸️  Пауза {pause_between_scenarios} сек перед следующим сценарием...")
+                await asyncio.sleep(pause_between_scenarios)
+        
+        # Итоговая таблица
+        self.print_comparison_table(results)
+        
+        # Сохраняем результаты в JSON файл
+        self.save_results_to_file(results)
+        
+        return results
+    
+    def save_results_to_file(self, results: List[Dict]):
+        """Сохранение результатов в JSON файл"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"delay_test_results_{timestamp}.json"
+        
+        # Формируем данные для сохранения
+        output = {
+            "test_timestamp": datetime.now().isoformat(),
+            "test_summary": {
+                "total_scenarios": len(results),
+                "total_requests": sum(r['num_requests'] for r in results),
+                "total_time": sum(r['total_time'] for r in results)
+            },
+            "scenarios": results,
+            "recommendation": self.get_recommendation(results)
+        }
+        
+        # Сохраняем в файл
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+        
+        print(f"\n💾 Результаты сохранены в файл: {filename}")
+    
+    def get_recommendation(self, results: List[Dict]) -> Dict:
+        """Получить рекомендацию на основе результатов"""
+        # Находим самый быстрый сценарий с success_rate >= 95%
+        safe_results = [r for r in results if r['success_rate'] >= 95]
+        
+        if safe_results:
+            fastest = min(safe_results, key=lambda x: x['total_time'])
+            return {
+                "optimal_delay_range": fastest['delay_range'],
+                "success_rate": fastest['success_rate'],
+                "total_time": fastest['total_time'],
+                "avg_results_per_request": fastest['avg_results_per_request'],
+                "status": "found"
+            }
+        else:
+            # Если нет безопасных - берём лучший по success_rate
+            best = max(results, key=lambda x: x['success_rate'])
+            return {
+                "optimal_delay_range": best['delay_range'],
+                "success_rate": best['success_rate'],
+                "total_time": best['total_time'],
+                "avg_results_per_request": best['avg_results_per_request'],
+                "status": "no_safe_option_found"
+            }
+        
+        return results
+    
+    def print_comparison_table(self, results: List[Dict]):
+        """Вывод сравнительной таблицы всех сценариев"""
+        print(f"\n{'#'*70}")
+        print(f"📊 СРАВНИТЕЛЬНАЯ ТАБЛИЦА ВСЕХ СЦЕНАРИЕВ")
+        print(f"{'#'*70}\n")
+        
+        print(f"{'Задержка':<15} {'Успех%':<10} {'Время':<10} {'Результаты':<12} {'Оценка':<15}")
+        print(f"{'-'*70}")
+        
+        for r in results:
+            delay_str = f"{r['delay_range'][0]}-{r['delay_range'][1]}s"
+            success_str = f"{r['success_rate']}%"
+            time_str = f"{r['total_time']}s"
+            results_str = f"{r['avg_results_per_request']:.1f}/req"
+            
+            # Оценка
+            if r['success_rate'] >= 98:
+                rating = "✅ Отлично"
+            elif r['success_rate'] >= 90:
+                rating = "⚠️  Хорошо"
+            elif r['success_rate'] >= 70:
+                rating = "⚠️  Удовл."
+            else:
+                rating = "❌ Плохо"
+            
+            print(f"{delay_str:<15} {success_str:<10} {time_str:<10} {results_str:<12} {rating:<15}")
+        
+        print(f"\n{'#'*70}")
+        
+        # Рекомендация
+        best = max(results, key=lambda x: x['success_rate'])
+        fastest = min([r for r in results if r['success_rate'] >= 95], 
+                     key=lambda x: x['total_time'], 
+                     default=None)
+        
+        print(f"\n🏆 РЕКОМЕНДАЦИИ:")
+        print(f"{'='*70}")
+        
+        if fastest:
+            print(f"✅ ОПТИМАЛЬНЫЙ ДИАПАЗОН: {fastest['delay_range'][0]}-{fastest['delay_range'][1]} сек")
+            print(f"   - Успех: {fastest['success_rate']}%")
+            print(f"   - Время: {fastest['total_time']} сек")
+            print(f"   - Результаты: {fastest['avg_results_per_request']:.1f}/запрос")
+        else:
+            print(f"⚠️  НЕТ БЕЗОПАСНОГО БЫСТРОГО ДИАПАЗОНА")
+            print(f"   Лучший результат: {best['delay_range'][0]}-{best['delay_range'][1]} сек ({best['success_rate']}%)")
+        
+        print(f"{'='*70}\n")
 
 
-@app.get("/api/test-parser/morphology")
-async def test_morphology(
-    seed: str = Query("ремонт пылесосов"),
-    country: str = Query("UA"),
-    language: str = Query("ru")
-):
-    parser = AutocompleteParser()
-    start = time.time()
-    keywords = await parser.morphological_adaptive_test(seed, country, language)
-    return {
-        "seed": seed,
-        "method": "Morphological ADAPTIVE (Fixed)",
-        "keywords": keywords,
-        "count": len(keywords),
-        "time": round(time.time() - start, 2)
-    }
+# ============================================
+# ОСНОВНАЯ ФУНКЦИЯ
+# ============================================
+async def main():
+    """Запуск тестирования"""
+    
+    tester = DelayTester()
+    
+    # Сценарии для тестирования (от консервативного к агрессивному)
+    # Цель: найти МИНИМАЛЬНУЮ безопасную задержку, постепенно уменьшая
+    scenarios = [
+        (0.5, 2.0),   # Текущий (очень консервативный) - НАЧИНАЕМ С ЭТОГО
+        (0.5, 1.5),   # Консервативный
+        (0.4, 1.0),   # Умеренный
+        (0.3, 0.7),   # Умеренно агрессивный
+        (0.2, 0.5),   # Агрессивный
+        (0.1, 0.3),   # Очень агрессивный - ЗАКАНЧИВАЕМ ЭТИМ
+    ]
+    
+    # Параметры теста
+    num_requests = 50  # Запросов на сценарий
+    pause = 30.0       # Пауза между сценариями (секунды)
+    
+    print(f"""
+╔══════════════════════════════════════════════════════════════════╗
+║                  DELAY OPTIMIZATION TESTER                       ║
+║          Поиск минимальной безопасной задержки                   ║
+╚══════════════════════════════════════════════════════════════════╝
 
+📋 Параметры теста:
+   - Сценариев: {len(scenarios)}
+   - Запросов на сценарий: {num_requests}
+   - Пауза между сценариями: {pause} сек
+   - Общее примерное время: {len(scenarios) * 2 + (len(scenarios)-1) * pause / 60:.0f} минут
 
-@app.get("/")
-async def root():
-    return {
-        "api": "Morphological ADAPTIVE Test (Fixed)",
-        "url": "/api/test-parser/morphology?seed=ремонт пылесосов&country=UA&language=ru"
-    }
+⚙️  Тестируемые диапазоны задержек:
+""")
+    
+    for i, (min_d, max_d) in enumerate(scenarios, 1):
+        avg = (min_d + max_d) / 2
+        print(f"   {i}. {min_d}-{max_d} сек (среднее: {avg:.2f} сек)")
+    
+    print(f"\n{'='*70}")
+    input("Нажмите Enter для начала тестирования...")
+    
+    # Запускаем тестирование
+    results = await tester.test_all_scenarios(
+        scenarios=scenarios,
+        num_requests_per_scenario=num_requests,
+        pause_between_scenarios=pause,
+        seed="ремонт пылесосов",
+        country="UA",
+        language="ru"
+    )
+    
+    print(f"\n✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО!")
+    print(f"Результаты сохранены в переменной 'results'")
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    asyncio.run(main())
