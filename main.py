@@ -1,6 +1,6 @@
 """
-ChatGPT PPM TEST - ИСПРАВЛЕННАЯ ВЕРСИЯ
-PREFIX Projection Method с User-Agent и задержками
+MORPHOLOGICAL ADAPTIVE TEST - ИСПРАВЛЕННАЯ ВЕРСИЯ
+С User-Agent ротацией и задержками
 """
 
 from fastapi import FastAPI, Query
@@ -13,7 +13,7 @@ import asyncio
 import time
 import random
 
-app = FastAPI(title="ChatGPT PPM Test Fixed", version="1.0")
+app = FastAPI(title="Morphological ADAPTIVE Test Fixed", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,193 +52,195 @@ class AutocompleteParser:
             print(f"Error: {e}")
             return []
     
-    async def chatgpt_ppm_test(self, seed: str, country: str, language: str) -> List[str]:
+    async def morphological_adaptive_test(self, seed: str, country: str, language: str) -> List[str]:
         all_keywords = set()
         seed_words = set(seed.lower().split())
         
         print(f"\n{'='*60}")
-        print(f"🔬 ChatGPT PPM - PREFIX Projection Method (FIXED)")
+        print(f"🔬 MORPHOLOGICAL ADAPTIVE (FIXED)")
         print(f"{'='*60}")
         print(f"Seed: '{seed}'")
         print(f"✅ User-Agent ротация включена")
         print(f"✅ Задержки 1-2 сек между запросами\n")
         
-        # ЭТАП 1: Базовый SUFFIX
+        # ЭТАП 1: Генерация морфологических форм
         print(f"{'='*60}")
-        print(f"ЭТАП 1: Базовый SUFFIX парсинг")
+        print(f"ЭТАП 1: Генерация морфологических форм")
+        print(f"{'='*60}\n")
+        
+        # Для "ремонт пылесосов" создаём формы вручную
+        forms = [
+            seed,                           # "ремонт пылесосов"
+            "ремонта пылесосов",           # родительный
+            "по ремонту пылесосов"         # предлог + дательный
+        ]
+        
+        print(f"Форм: {len(forms)}")
+        for i, form in enumerate(forms, 1):
+            print(f"  {i}. '{form}'")
+        print()
+        
+        # ЭТАП 2: SUFFIX парсинг для каждой формы
+        print(f"{'='*60}")
+        print(f"ЭТАП 2: SUFFIX парсинг")
         print(f"{'='*60}\n")
         
         alphabet = "абвгдежзийклмнопрстуфхцчшщъыьэюя"
-        suffix_results = []
+        all_suffix_results = []
+        suffix_count = 0
         
-        for letter in alphabet:
-            query = f"{seed} {letter}"
-            results = await self.fetch_suggestions(query, country, language)
-            suffix_results.extend(results)
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-        
-        print(f"Базовый SUFFIX: 29 запросов")
-        print(f"Получено результатов: {len(suffix_results)}\n")
-        
-        # ЭТАП 2: Отбор топ-30 SUFFIX
-        print(f"{'='*60}")
-        print(f"ЭТАП 2: Отбор топ-30 SUFFIX")
-        print(f"{'='*60}\n")
-        
-        top_suffix = suffix_results[:30] if len(suffix_results) >= 30 else suffix_results
-        
-        print(f"Отобрано: {len(top_suffix)}")
-        for s in top_suffix[:5]:
-            print(f"  • {s}")
-        print()
-        
-        # ЭТАП 3: Вторичное расширение
-        print(f"{'='*60}")
-        print(f"ЭТАП 3: Вторичное расширение (ключевой этап!)")
-        print(f"{'='*60}\n")
-        
-        expansion_letters = ["а", "б", "в", "г", "с", "м", "н", "к"]
-        all_expansions = []
-        expansion_count = 0
-        
-        for suffix_key in top_suffix:
-            for letter in expansion_letters:
-                query = f"{suffix_key} {letter}"
+        for form_idx, form in enumerate(forms, 1):
+            print(f"--- Форма {form_idx}: '{form}' ---")
+            form_results = []
+            
+            for letter in alphabet:
+                query = f"{form} {letter}"
                 results = await self.fetch_suggestions(query, country, language)
-                all_expansions.extend(results)
-                expansion_count += 1
+                form_results.extend(results)
+                all_suffix_results.extend(results)
+                suffix_count += 1
                 await asyncio.sleep(random.uniform(1.0, 2.0))
+            
+            print(f"Результатов: {len(form_results)}")
+            if form_results:
+                for r in form_results[:3]:
+                    print(f"  • {r}")
+            print()
         
-        print(f"Вторичное расширение: {expansion_count} запросов")
-        print(f"Получено расширений: {len(all_expansions)}\n")
+        print(f"SUFFIX запросов: {suffix_count}")
+        print(f"Всего результатов: {len(all_suffix_results)}\n")
         
-        # ЭТАП 4: Частотный анализ n-грамм
+        # ЭТАП 3: Извлечение слов-кандидатов
         print(f"{'='*60}")
-        print(f"ЭТАП 4: Частотный анализ n-грамм")
+        print(f"ЭТАП 3: Извлечение слов-кандидатов")
         print(f"{'='*60}\n")
         
-        bigrams = Counter()
-        trigrams = Counter()
+        word_counter = Counter()
         
-        for result in all_expansions:
+        for result in all_suffix_results:
             words = result.lower().split()
-            
-            # Биграммы
-            for i in range(len(words) - 1):
-                bigram = f"{words[i]} {words[i+1]}"
-                if words[i] not in seed_words and words[i+1] not in seed_words:
-                    bigrams[bigram] += 1
-            
-            # Триграммы
-            for i in range(len(words) - 2):
-                trigram = f"{words[i]} {words[i+1]} {words[i+2]}"
-                if words[i] not in seed_words:
-                    trigrams[trigram] += 1
+            for word in words:
+                if word not in seed_words and len(word) > 2:
+                    word_counter[word] += 1
         
-        frequent_bigrams = {k: v for k, v in bigrams.items() if v >= 3}
-        frequent_trigrams = {k: v for k, v in trigrams.items() if v >= 2}
+        # Частотная фильтрация
+        all_candidates = {w for w, count in word_counter.items() if count >= 2}
         
-        print(f"Частотных биграмм (≥3): {len(frequent_bigrams)}")
-        print(f"Топ-10:")
-        for bg, freq in sorted(frequent_bigrams.items(), key=lambda x: x[1], reverse=True)[:10]:
-            print(f"  • '{bg}' ({freq} раз)")
-        
-        print(f"\nЧастотных триграмм (≥2): {len(frequent_trigrams)}")
-        print(f"Топ-10:")
-        for tg, freq in sorted(frequent_trigrams.items(), key=lambda x: x[1], reverse=True)[:10]:
-            print(f"  • '{tg}' ({freq} раз)")
+        print(f"Уникальных слов: {len(word_counter)}")
+        print(f"После фильтрации (≥2): {len(all_candidates)}")
+        print(f"\nТоп-20:")
+        for word, count in word_counter.most_common(20):
+            print(f"  • '{word}' ({count})")
         print()
         
-        # ЭТАП 5: Математическая проекция
+        # ЭТАП 4: Анализ новых слов
         print(f"{'='*60}")
-        print(f"ЭТАП 5: Математическая проекция PREFIX")
+        print(f"ЭТАП 4: Анализ НОВЫХ слов от морфологии")
         print(f"{'='*60}\n")
         
-        prefix_candidates = set()
-        projection_count = 0
+        base_form_words = set()
+        morpho_form_words = set()
         
-        # Проверяем биграммы
-        for ngram in list(frequent_bigrams.keys())[:50]:
-            test_query = f"{ngram} {seed}"
-            results = await self.fetch_suggestions(test_query, country, language)
-            projection_count += 1
+        # Слова от базовой формы (первая треть результатов)
+        base_count = len(all_suffix_results) // 3
+        for result in all_suffix_results[:base_count]:
+            words = result.lower().split()
+            for word in words:
+                if word not in seed_words and len(word) > 2:
+                    base_form_words.add(word)
+        
+        # Слова от морфологических форм
+        for result in all_suffix_results[base_count:]:
+            words = result.lower().split()
+            for word in words:
+                if word not in seed_words and len(word) > 2:
+                    morpho_form_words.add(word)
+        
+        new_from_morphology = morpho_form_words - base_form_words
+        
+        print(f"От базовой формы: {len(base_form_words)}")
+        print(f"От морфо форм: {len(morpho_form_words)}")
+        print(f"НОВЫХ от морфологии: {len(new_from_morphology)}")
+        
+        if new_from_morphology:
+            print(f"\nНовые слова:")
+            for word in sorted(list(new_from_morphology)[:20]):
+                print(f"  • {word}")
+        print()
+        
+        # ЭТАП 5: PREFIX проверка
+        print(f"{'='*60}")
+        print(f"ЭТАП 5: PREFIX проверка")
+        print(f"{'='*60}\n")
+        
+        prefix_count = 0
+        verified_count = 0
+        
+        for candidate in sorted(all_candidates):
+            query = f"{candidate} {seed}"
+            results = await self.fetch_suggestions(query, country, language)
+            prefix_count += 1
             
             if results:
-                prefix_candidates.add(ngram)
-                print(f"✅ '{ngram}' → PREFIX подтверждён ({len(results)} ключей)")
+                all_keywords.update(results)
+                verified_count += 1
+                if verified_count <= 10:
+                    print(f"✅ '{query}' → {len(results)}")
             
             await asyncio.sleep(random.uniform(1.0, 2.0))
         
-        # Проверяем триграммы
-        for ngram in list(frequent_trigrams.keys())[:20]:
-            test_query = f"{ngram} {seed}"
-            results = await self.fetch_suggestions(test_query, country, language)
-            projection_count += 1
-            
-            if results:
-                prefix_candidates.add(ngram)
-                print(f"✅ '{ngram}' → PREFIX подтверждён ({len(results)} ключей)")
-            
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-        
-        print(f"\nПроекция: {projection_count} запросов")
-        print(f"PREFIX кандидатов: {len(prefix_candidates)}\n")
-        
-        # ЭТАП 6: Сбор финальных ключей
-        if len(prefix_candidates) > 0:
-            print(f"{'='*60}")
-            print(f"ЭТАП 6: Сбор финальных PREFIX ключей")
-            print(f"{'='*60}\n")
-            
-            for candidate in prefix_candidates:
-                query = f"{candidate} {seed}"
-                results = await self.fetch_suggestions(query, country, language)
-                
-                if results:
-                    all_keywords.update(results)
-                    print(f"'{candidate}' → {len(results)} ключей")
-                
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+        print(f"\nПроверено: {prefix_count}")
+        print(f"Валидных PREFIX: {verified_count}")
+        print()
         
         # СТАТИСТИКА
-        total_queries = 29 + expansion_count + projection_count
+        total_queries = suffix_count + prefix_count
         
-        print(f"\n{'='*60}")
-        print(f"📊 ИТОГОВАЯ СТАТИСТИКА PPM")
         print(f"{'='*60}")
-        print(f"SUFFIX: 29 запросов")
-        print(f"Вторичное расширение: {expansion_count} запросов")
-        print(f"Проекция: {projection_count} запросов")
+        print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
+        print(f"{'='*60}")
+        print(f"SUFFIX: {suffix_count} запросов")
+        print(f"  - Базовая форма: 29")
+        print(f"  - Морфо формы: {suffix_count - 29}")
+        print(f"PREFIX проверка: {prefix_count} запросов")
         print(f"──────────────────────────────────")
         print(f"ВСЕГО: {total_queries} запросов")
         print(f"")
-        print(f"PREFIX кандидатов: {len(prefix_candidates)}")
+        print(f"Кандидатов: {len(all_candidates)}")
+        print(f"Валидных PREFIX: {verified_count}")
         print(f"Финальных ключей: {len(all_keywords)}")
         print(f"")
         
-        if len(all_keywords) > 0:
-            print(f"🎉 PPM РАБОТАЕТ!")
-            print(f"Статистическая реконструкция нашла PREFIX!")
+        if len(all_candidates) > 0:
+            print(f"ЭФФЕКТИВНОСТЬ:")
+            print(f"  Кандидатов на запрос: {len(all_candidates)/suffix_count:.2f}")
+            print(f"  Валидация: {verified_count}/{len(all_candidates)} = {verified_count/len(all_candidates)*100:.1f}%")
+            print(f"  Ключей на запрос: {len(all_keywords)/total_queries:.2f}")
+        print(f"")
+        
+        if len(new_from_morphology) > 0:
+            print(f"✅ МОРФОЛОГИЯ ДАЛА РЕЗУЛЬТАТ!")
+            print(f"Новых слов: {len(new_from_morphology)} (+{len(new_from_morphology)/len(base_form_words)*100:.1f}%)")
         else:
-            print(f"❌ PPM не дал результатов")
+            print(f"⚠️ Морфология не дала новых слов")
         
         print(f"{'='*60}\n")
         
         return list(all_keywords)
 
 
-@app.get("/api/test-parser/chatgpt-ppm")
-async def test_chatgpt_ppm(
+@app.get("/api/test-parser/morphology")
+async def test_morphology(
     seed: str = Query("ремонт пылесосов"),
     country: str = Query("UA"),
     language: str = Query("ru")
 ):
     parser = AutocompleteParser()
     start = time.time()
-    keywords = await parser.chatgpt_ppm_test(seed, country, language)
+    keywords = await parser.morphological_adaptive_test(seed, country, language)
     return {
         "seed": seed,
-        "method": "ChatGPT PPM (Fixed)",
+        "method": "Morphological ADAPTIVE (Fixed)",
         "keywords": keywords,
         "count": len(keywords),
         "time": round(time.time() - start, 2)
@@ -248,8 +250,8 @@ async def test_chatgpt_ppm(
 @app.get("/")
 async def root():
     return {
-        "api": "ChatGPT PPM Test (Fixed)",
-        "url": "/api/test-parser/chatgpt-ppm?seed=ремонт пылесосов&country=UA&language=ru"
+        "api": "Morphological ADAPTIVE Test (Fixed)",
+        "url": "/api/test-parser/morphology?seed=ремонт пылесосов&country=UA&language=ru"
     }
 
 
