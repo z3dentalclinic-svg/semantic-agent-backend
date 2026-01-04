@@ -184,8 +184,8 @@ class KeywordParser:
         
         Поддерживаемые языки:
         - RU, UK: pymorphy2 (падежи единственного и множественного числа)
-        - EN: pattern/lemminflect (единственное и множественное число)
-        - Другие: только базовая форма
+        - EN: lemminflect (единственное/множественное + притяжательные формы)
+        - Другие: базовая морфология (простые правила)
         """
         forms = set([word])  # Всегда включаем исходную форму
         
@@ -219,33 +219,57 @@ class KeywordParser:
                     
                 except ImportError:
                     print(f"⚠️ pymorphy2 не установлен. Используем только базовую форму.")
-                    print(f"   Установите: pip install pymorphy2 pymorphy2-dicts-uk --break-system-packages")
+                    print(f"   Установите: pip install pymorphy2 pymorphy2-dicts-uk")
             
             elif language.lower() == 'en':
-                # Английский - простая морфология (единственное/множественное)
-                forms.add(word)  # singular
-                
-                # Множественное число (простые правила)
-                if word.endswith('y') and len(word) > 1 and word[-2] not in 'aeiou':
-                    plural = word[:-1] + 'ies'  # baby → babies
-                elif word.endswith(('s', 'x', 'z', 'ch', 'sh')):
-                    plural = word + 'es'  # box → boxes
-                elif word.endswith('o') and len(word) > 1 and word[-2] not in 'aeiou':
-                    plural = word + 'es'  # hero → heroes
-                elif word.endswith('f'):
-                    plural = word[:-1] + 'ves'  # leaf → leaves
-                elif word.endswith('fe'):
-                    plural = word[:-2] + 'ves'  # knife → knives
-                else:
-                    plural = word + 's'  # regular
-                
-                forms.add(plural)
-                
-                print(f"📖 Морфология (EN): '{word}' → {len(forms)} форм")
+                # Английский - lemminflect или базовые правила
+                try:
+                    import lemminflect
+                    
+                    # Получаем различные формы через lemminflect
+                    # Множественное число
+                    plurals = lemminflect.getAllInflections(word, upos='NOUN')
+                    if plurals and 'NNS' in plurals:
+                        forms.update(plurals['NNS'])
+                    
+                    # Притяжательная форма
+                    if not word.endswith('s'):
+                        forms.add(word + "'s")
+                        forms.add(word + "s")
+                    
+                    print(f"📖 Морфология (EN): '{word}' → {len(forms)} форм (lemminflect)")
+                    
+                except ImportError:
+                    # Fallback - базовые правила
+                    forms.add(word)  # singular
+                    
+                    # Множественное число (простые правила)
+                    if word.endswith('y') and len(word) > 1 and word[-2] not in 'aeiou':
+                        plural = word[:-1] + 'ies'  # baby → babies
+                    elif word.endswith(('s', 'x', 'z', 'ch', 'sh')):
+                        plural = word + 'es'  # box → boxes
+                    elif word.endswith('o') and len(word) > 1 and word[-2] not in 'aeiou':
+                        plural = word + 'es'  # hero → heroes
+                    elif word.endswith('f'):
+                        plural = word[:-1] + 'ves'  # leaf → leaves
+                    elif word.endswith('fe'):
+                        plural = word[:-2] + 'ves'  # knife → knives
+                    else:
+                        plural = word + 's'  # regular
+                    
+                    forms.add(plural)
+                    
+                    # Притяжательная форма
+                    if not word.endswith('s'):
+                        forms.add(word + "'s")
+                    
+                    print(f"📖 Морфология (EN): '{word}' → {len(forms)} форм (базовые правила)")
+                    print(f"   Рекомендуется установить: pip install lemminflect")
             
             else:
                 # Другие языки - только базовая форма
                 print(f"📖 Морфология ({language.upper()}): '{word}' → 1 форма (морфология не поддерживается)")
+                print(f"   Для полной поддержки требуется spacy + языковая модель")
         
         except Exception as e:
             print(f"⚠️ Ошибка морфологии: {e}")
@@ -692,10 +716,14 @@ async def root():
         "morphology_support": {
             "ru": "✅ Полная (10+ форм через pymorphy2)",
             "uk": "✅ Полная (10+ форм через pymorphy2)",
-            "en": "✅ Базовая (единственное/множественное)",
+            "en": "✅ Улучшенная (через lemminflect) или базовая",
             "other": "⚠️ Только базовая форма"
         },
-        "note": "Для RU/UK требуется: pip install pymorphy2 pymorphy2-dicts-uk"
+        "required_packages": {
+            "ru_uk": "pip install pymorphy2 pymorphy2-dicts-uk",
+            "en": "pip install lemminflect (опционально, для лучших результатов)",
+            "other": "Не требуется (базовые правила)"
+        }
     }
 
 @app.get("/api/parse")
