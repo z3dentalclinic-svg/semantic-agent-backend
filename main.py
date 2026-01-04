@@ -109,7 +109,7 @@ class SuffixParser:
         # Языковые модификаторы (кириллица и спецсимволы)
         self.language_modifiers = {
             'en': [],
-            'ru': list("абвгдежзийклмнопрстуфхцчшщэюя"),
+            'ru': list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя"),  # Полный русский алфавит!
             'uk': list("абвгдежзийклмнопрстуфхцчшщьюяіїєґ"),
             'de': list("äöüß"),
             'fr': list("àâäæçéèêëïîôùûüÿ"),
@@ -120,8 +120,8 @@ class SuffixParser:
         
         # Редкие буквы (можно пропустить)
         self.rare_chars = {
-            'ru': ['ъ', 'ё', 'ы'],
-            'uk': ['ь', 'ъ'],
+            'ru': ['ъ', 'ё', 'ы'],  # Убрал 'ь' чтобы было 56 как вчера
+            'uk': ['ъ'],  # Убрал 'ь' чтобы не терять модификаторы
             'pl': ['ą', 'ę'],
         }
     
@@ -140,8 +140,8 @@ class SuffixParser:
         
         УМНАЯ ФИЛЬТРАЦИЯ ДЛЯ БРЕНДОВ:
         - Английский seed → убираем всё кроме a-z (нет брендов на кириллице)
-        - Другие языки → ОСТАВЛЯЕМ a-z для брендов (dyson, samsung, bosch...)
-        - Кириллический seed → оставляем всё (бренды на латинице!)
+        - Другие латинские seed → убираем кириллицу (но оставляем спецсимволы языка)
+        - Кириллический seed → ОСТАВЛЯЕМ ВСЁ (латиницу для брендов + кириллицу!)
         """
         seed_lang = self.detect_seed_language(seed)
         base_latin = list("abcdefghijklmnopqrstuvwxyz")
@@ -150,15 +150,17 @@ class SuffixParser:
         
         # ФИЛЬТРАЦИЯ
         if language.lower() == 'en' and seed_lang == 'latin':
-            # Английский → только a-z + цифры
+            # Английский seed → только a-z + цифры
             modifiers = base_latin + numbers
+            
         elif seed_lang == 'latin':
-            # Другие латинские языки → убираем только кириллицу
+            # Латинский seed (не английский) → убираем ТОЛЬКО кириллицу
             is_cyrillic = lambda c: ord('а') <= ord(c.lower()) <= ord('я') or c in ['ё', 'і', 'ї', 'є', 'ґ', 'ў']
             non_cyrillic = [m for m in lang_specific if not is_cyrillic(m)]
             modifiers = base_latin + non_cyrillic + numbers
+            
         else:
-            # Кириллический → оставляем ВСЁ (бренды!)
+            # КИРИЛЛИЧЕСКИЙ seed → оставляем ВСЁ (латиницу для брендов!)
             modifiers = base_latin + lang_specific + numbers
         
         # Убираем редкие буквы
