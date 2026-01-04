@@ -295,6 +295,8 @@ class SuffixParser:
             "seed": seed,
             "country": country,
             "language": language,
+            "modifiers_count": len(modifiers),  # ДОБАВИЛИ!
+            "modifiers_sample": modifiers[:10],  # ДОБАВИЛИ!
             "queries": total_queries,
             "successful_queries": successful_queries,
             "count": len(all_keywords),
