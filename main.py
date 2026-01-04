@@ -519,6 +519,139 @@ async def root():
     }
 
 
+@app.get("/api/test-morphology-batching")
+async def test_morphology_batching():
+    """
+    ЭКСПЕРИМЕНТАЛЬНЫЙ ТЕСТ МОРФОЛОГИЧЕСКОГО БАТЧИНГА
+    Проверяем можно ли объединить морфологические формы в один запрос
+    """
+    results = {}
+    base_url = "https://suggestqueries.google.com/complete/search"
+    headers = {"User-Agent": USER_AGENTS[0]}
+    
+    # КОНТРОЛЬ 1: Обычный запрос
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт пылесосов а", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results["control_normal"] = {
+                    "query": "ремонт пылесосов а",
+                    "suggestions_count": len(data[1]) if len(data) > 1 else 0,
+                    "suggestions": data[1][:5] if len(data) > 1 else []
+                }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["control_normal"] = {"error": str(e)}
+    
+    # ТЕСТ 1: С разделителем | между морфологиями
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт пылесоса|пылесосы|пылесосов а", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results["pipe_morphology"] = {
+                    "query": "ремонт пылесоса|пылесосы|пылесосов а",
+                    "suggestions_count": len(data[1]) if len(data) > 1 else 0,
+                    "suggestions": data[1][:5] if len(data) > 1 else [],
+                    "works": len(data[1]) > 0 if len(data) > 1 else False
+                }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["pipe_morphology"] = {"error": str(e)}
+    
+    # ТЕСТ 2: Со скобками и |
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт (пылесоса|пылесосы|пылесосов) а", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results["brackets_pipe"] = {
+                    "query": "ремонт (пылесоса|пылесосы|пылесосов) а",
+                    "suggestions_count": len(data[1]) if len(data) > 1 else 0,
+                    "suggestions": data[1][:5] if len(data) > 1 else [],
+                    "works": len(data[1]) > 0 if len(data) > 1 else False
+                }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["brackets_pipe"] = {"error": str(e)}
+    
+    # ТЕСТ 3: С оператором OR
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт (пылесоса OR пылесосы OR пылесосов) а", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results["or_operator"] = {
+                    "query": "ремонт (пылесоса OR пылесосы OR пылесосов) а",
+                    "suggestions_count": len(data[1]) if len(data) > 1 else 0,
+                    "suggestions": data[1][:5] if len(data) > 1 else [],
+                    "works": len(data[1]) > 0 if len(data) > 1 else False
+                }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["or_operator"] = {"error": str(e)}
+    
+    # ТЕСТ 4: Просто несколько слов подряд
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт пылесоса пылесосы пылесосов а", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results["multiple_words"] = {
+                    "query": "ремонт пылесоса пылесосы пылесосов а",
+                    "suggestions_count": len(data[1]) if len(data) > 1 else 0,
+                    "suggestions": data[1][:5] if len(data) > 1 else [],
+                    "works": len(data[1]) > 0 if len(data) > 1 else False
+                }
+    except Exception as e:
+        results["multiple_words"] = {"error": str(e)}
+    
+    # АНАЛИЗ
+    morphology_batching_works = False
+    working_method = None
+    
+    for method, data in results.items():
+        if method != "control_normal" and data.get("works"):
+            # Проверяем что результаты РЕЛЕВАНТНЫЕ (не просто "есть")
+            control_suggestions = results.get("control_normal", {}).get("suggestions", [])
+            test_suggestions = data.get("suggestions", [])
+            
+            # Если есть пересечения с контрольными результатами - метод работает!
+            overlap = set(control_suggestions) & set(test_suggestions)
+            if len(overlap) > 0:
+                morphology_batching_works = True
+                working_method = method
+                break
+    
+    return {
+        "morphology_batching_supported": morphology_batching_works,
+        "working_method": working_method,
+        "all_tests": results,
+        "conclusion": "МОРФОЛОГИЧЕСКИЙ БАТЧИНГ РАБОТАЕТ!" if morphology_batching_works else "Морфологический батчинг НЕ поддерживается - Google ищет буквальную фразу с | или OR"
+    }
+
+
 @app.get("/api/test-batching")
 async def test_batching():
     """
