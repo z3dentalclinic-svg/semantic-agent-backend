@@ -507,6 +507,100 @@ async def root():
     }
 
 
+@app.get("/api/test-batching")
+async def test_batching():
+    """
+    ЭКСПЕРИМЕНТАЛЬНЫЙ ТЕСТ БАТЧИНГА
+    Проверяем все возможные способы батчинга Google Autocomplete API
+    """
+    results = {}
+    base_url = "https://suggestqueries.google.com/complete/search"
+    headers = {"User-Agent": USER_AGENTS[0]}
+    
+    # КОНТРОЛЬ: Обычный запрос
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт а", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            results["control"] = {
+                "method": "Обычный запрос (контроль)",
+                "status": response.status_code,
+                "works": response.status_code == 200,
+                "response_sample": response.text[:200] if response.status_code == 200 else response.text
+            }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["control"] = {"method": "Обычный запрос", "error": str(e), "works": False}
+    
+    # МЕТОД 1: Массив в параметре q
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": ["ремонт а", "ремонт б"], "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            results["array"] = {
+                "method": "Массив в q",
+                "status": response.status_code,
+                "works": response.status_code == 200,
+                "response_sample": response.text[:200]
+            }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["array"] = {"method": "Массив в q", "error": str(e), "works": False}
+    
+    # МЕТОД 2: Разделитель |
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт а|ремонт б|ремонт в", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            results["pipe"] = {
+                "method": "Разделитель |",
+                "status": response.status_code,
+                "works": response.status_code == 200,
+                "response_sample": response.text[:200]
+            }
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        results["pipe"] = {"method": "Разделитель |", "error": str(e), "works": False}
+    
+    # МЕТОД 3: POST запрос
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                base_url,
+                json={"queries": ["ремонт а", "ремонт б"], "client": "chrome", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            results["post"] = {
+                "method": "POST запрос",
+                "status": response.status_code,
+                "works": response.status_code == 200,
+                "response_sample": response.text[:200]
+            }
+    except Exception as e:
+        results["post"] = {"method": "POST запрос", "error": str(e), "works": False}
+    
+    # Проверяем есть ли работающие методы батчинга
+    batching_works = any(
+        result.get("works") and result.get("method") != "Обычный запрос (контроль)" 
+        for result in results.values()
+    )
+    
+    return {
+        "batching_supported": batching_works,
+        "tested_methods": results,
+        "conclusion": "БАТЧИНГ ПОДДЕРЖИВАЕТСЯ!" if batching_works else "Батчинг НЕ поддерживается - только 1 запрос за раз"
+    }
+
+
 @app.get("/api/parse")
 async def parse_suffix(
     seed: str = Query("ремонт пылесосов", description="Базовый запрос"),
