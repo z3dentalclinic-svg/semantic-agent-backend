@@ -1,8 +1,8 @@
 """
-GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH SMART FILTERING
-SUFFIX парсинг с умной фильтрацией модификаторов (с учётом брендов)
-Version: 3.4 Smart Filtering (Brand-Aware)
-Задержка: 0.2-0.5 сек + параллелизм (3-5 потоков) + умная фильтрация
+GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH ADAPTIVE DELAY
+SUFFIX парсинг с адаптивной задержкой и умной фильтрацией
+Version: 3.5 Adaptive Delay
+Задержка: 0.1-1.0 сек (адаптивная) + параллелизм (3-5 потоков) + умная фильтрация
 """
 
 from fastapi import FastAPI, Query
@@ -14,9 +14,9 @@ import time
 import random
 
 app = FastAPI(
-    title="Google Autocomplete Parser - SUFFIX with Smart Filtering", 
-    version="3.4",
-    description="SUFFIX парсинг с умной фильтрацией (сохраняем латиницу для брендов)"
+    title="Google Autocomplete Parser - SUFFIX with Adaptive Delay", 
+    version="3.5",
+    description="SUFFIX парсинг с адаптивной задержкой (автоматически находит оптимум)"
 )
 
 app.add_middleware(
@@ -40,11 +40,107 @@ USER_AGENTS = [
 
 
 # ============================================
+# ADAPTIVE DELAY CLASS
+# ============================================
+class AdaptiveDelay:
+    """
+    Умное управление задержками с автоматической адаптацией
+    
+    Логика:
+    - Начинаем с initial_delay (0.2 сек)
+    - При успехе → уменьшаем на 5% (× 0.95)
+    - При 429 → увеличиваем в 2 раза (× 2.0)
+    - Границы: min_delay (0.1) до max_delay (1.0)
+    - Автоматически находит оптимальную скорость!
+    """
+    
+    def __init__(self, initial_delay=0.2, min_delay=0.1, max_delay=1.0):
+        self.current_delay = initial_delay
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.initial_delay = initial_delay
+        
+        # Статистика
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.rate_limit_hits = 0
+        self.delay_history = []
+        
+        # Параметры адаптации
+        self.decrease_factor = 0.95  # При успехе уменьшаем на 5%
+        self.increase_factor = 2.0   # При 429 увеличиваем в 2 раза
+    
+    async def wait(self):
+        """Ждём текущую задержку и записываем в историю"""
+        await asyncio.sleep(self.current_delay)
+        self.delay_history.append(self.current_delay)
+    
+    def record_success(self):
+        """Записать успешный запрос → УМЕНЬШАЕМ задержку"""
+        self.total_requests += 1
+        self.successful_requests += 1
+        
+        # Постепенно уменьшаем задержку (работаем быстрее)
+        old_delay = self.current_delay
+        self.current_delay = max(
+            self.min_delay,
+            self.current_delay * self.decrease_factor
+        )
+        
+        # Логируем только существенные изменения
+        if old_delay - self.current_delay > 0.05:
+            print(f"🟢 Ускоряемся: {old_delay:.3f} → {self.current_delay:.3f} сек")
+    
+    def record_rate_limit(self):
+        """Записать rate limit (429) → УВЕЛИЧИВАЕМ задержку"""
+        self.total_requests += 1
+        self.rate_limit_hits += 1
+        
+        # Резко увеличиваем задержку (защита)
+        old_delay = self.current_delay
+        self.current_delay = min(
+            self.max_delay,
+            self.current_delay * self.increase_factor
+        )
+        
+        print(f"🔴 Rate limit! Замедляемся: {old_delay:.3f} → {self.current_delay:.3f} сек")
+    
+    def record_error(self):
+        """Записать другую ошибку"""
+        self.total_requests += 1
+    
+    def get_stats(self):
+        """Получить статистику адаптивной задержки"""
+        avg_delay = sum(self.delay_history) / len(self.delay_history) if self.delay_history else 0
+        min_delay_used = min(self.delay_history) if self.delay_history else 0
+        max_delay_used = max(self.delay_history) if self.delay_history else 0
+        
+        return {
+            "initial_delay": self.initial_delay,
+            "final_delay": self.current_delay,
+            "avg_delay": round(avg_delay, 3),
+            "min_delay_used": round(min_delay_used, 3),
+            "max_delay_used": round(max_delay_used, 3),
+            "total_requests": self.total_requests,
+            "successful_requests": self.successful_requests,
+            "rate_limit_hits": self.rate_limit_hits,
+            "success_rate": round(self.successful_requests / self.total_requests * 100, 1) if self.total_requests > 0 else 0
+        }
+
+
+# ============================================
 # SMART SUFFIX PARSER (BRAND-AWARE)
 # ============================================
 class SmartSuffixParser:
     def __init__(self):
         self.base_url = "https://suggestqueries.google.com/complete/search"
+        
+        # Adaptive Delay (начинаем с 0.2 сек, можем до 0.1 сек)
+        self.adaptive_delay = AdaptiveDelay(
+            initial_delay=0.2,
+            min_delay=0.1,
+            max_delay=1.0
+        )
         
         # Базовые модификаторы (латиница + цифры)
         self.base_modifiers = list("abcdefghijklmnopqrstuvwxyz0123456789")
@@ -168,8 +264,13 @@ class SmartSuffixParser:
         
         return modifiers
     
-    async def fetch_suggestions(self, query: str, country: str, language: str) -> List[str]:
-        """Запрос к Google Autocomplete API"""
+    async def fetch_suggestions(self, query: str, country: str, language: str) -> tuple:
+        """
+        Запрос к Google Autocomplete API с адаптивной задержкой
+        
+        Returns:
+            (suggestions, success, is_rate_limit)
+        """
         params = {
             "client": "chrome",
             "q": query,
@@ -180,22 +281,45 @@ class SmartSuffixParser:
             "User-Agent": random.choice(USER_AGENTS)
         }
         
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(self.base_url, params=params, headers=headers)
-                
-                if response.status_code == 200:
-                    data = response.json()
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(self.base_url, params=params, headers=headers)
                     
-                    if isinstance(data, list) and len(data) > 1:
-                        suggestions = [s for s in data[1] if isinstance(s, str)]
-                        return suggestions
-                
-                return []
-                
-        except Exception as e:
-            print(f"❌ Error fetching '{query}': {e}")
-            return []
+                    if response.status_code == 200:
+                        data = response.json()
+                        
+                        if isinstance(data, list) and len(data) > 1:
+                            suggestions = [s for s in data[1] if isinstance(s, str)]
+                            return (suggestions, True, False)
+                        
+                        return ([], True, False)
+                    
+                    elif response.status_code == 429:  # Too Many Requests
+                        # Rate limit! Возвращаем специальный флаг
+                        if attempt < max_retries - 1:
+                            # Ждём с exponential backoff
+                            wait_time = (2 ** attempt)  # 1, 2, 4 секунды
+                            print(f"⚠️ Rate limit (попытка {attempt+1}/{max_retries}). Ждём {wait_time} сек...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            # Последняя попытка - возвращаем rate limit флаг
+                            return ([], False, True)
+                    
+                    return ([], True, False)
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    print(f"❌ Error fetching '{query}': {e}")
+                    return ([], False, False)
+        
+        return ([], False, False)
     
     async def fetch_with_delay(
         self, 
@@ -204,18 +328,31 @@ class SmartSuffixParser:
         country: str, 
         language: str
     ) -> tuple:
-        """Запрос с задержкой"""
+        """Запрос с АДАПТИВНОЙ задержкой"""
         try:
-            # Задержка 0.2-0.5 сек
-            await asyncio.sleep(random.uniform(0.2, 0.5))
+            # АДАПТИВНАЯ задержка
+            await self.adaptive_delay.wait()
             
             # Реальный запрос
             query = f"{seed} {modifier}"
-            results = await self.fetch_suggestions(query, country, language)
+            results, success, is_rate_limit = await self.fetch_suggestions(query, country, language)
             
-            return (modifier, results, True)
+            # Обновляем адаптивную задержку
+            if is_rate_limit:
+                # Rate limit → увеличиваем задержку
+                self.adaptive_delay.record_rate_limit()
+                return (modifier, [], False)
+            elif success:
+                # Успех → уменьшаем задержку
+                self.adaptive_delay.record_success()
+                return (modifier, results, True)
+            else:
+                # Другая ошибка
+                self.adaptive_delay.record_error()
+                return (modifier, [], False)
             
         except Exception as e:
+            self.adaptive_delay.record_error()
             print(f"❌ Error with '{modifier}': {e}")
             return (modifier, [], False)
     
@@ -238,7 +375,7 @@ class SmartSuffixParser:
         print(f"Country: {country.upper()}")
         print(f"Language: {language.upper()}")
         print(f"Use numbers: {use_numbers}")
-        print(f"Delay: 0.2-0.5 сек")
+        print(f"Delay: 0.1-1.0 сек (адаптивная)")
         print(f"Parallel: {parallel_limit} потоков\n")
         
         # Получаем умно отфильтрованные модификаторы
@@ -297,6 +434,9 @@ class SmartSuffixParser:
         # Время выполнения
         elapsed_time = time.time() - start_time
         
+        # Статистика адаптивной задержки
+        delay_stats = self.adaptive_delay.get_stats()
+        
         # Итоговая статистика
         print(f"\n{'='*60}")
         print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
@@ -309,15 +449,22 @@ class SmartSuffixParser:
         print(f"Время выполнения: {elapsed_time:.2f} сек")
         print(f"Средняя скорость: {elapsed_time/total_queries:.2f} сек/запрос")
         print(f"Параллельных потоков: {parallel_limit}")
+        print(f"\n🧠 ADAPTIVE DELAY:")
+        print(f"  Начальная задержка: {delay_stats['initial_delay']:.3f} сек")
+        print(f"  Финальная задержка: {delay_stats['final_delay']:.3f} сек")
+        print(f"  Средняя задержка: {delay_stats['avg_delay']:.3f} сек")
+        print(f"  Диапазон: {delay_stats['min_delay_used']:.3f} - {delay_stats['max_delay_used']:.3f} сек")
+        print(f"  Rate limit hits: {delay_stats['rate_limit_hits']}")
+        print(f"  Success rate: {delay_stats['success_rate']}%")
         print(f"{'='*60}\n")
         
         return {
-            "method": "SUFFIX with Smart Filtering (Brand-Aware)",
+            "method": "SUFFIX with Smart Filtering (Brand-Aware) + Adaptive Delay",
             "seed": seed,
             "country": country,
             "language": language,
             "use_numbers": use_numbers,
-            "delay_range": "0.2-0.5 sec",
+            "adaptive_delay": delay_stats,
             "parallel_limit": parallel_limit,
             "queries": total_queries,
             "successful_queries": successful_queries,
@@ -337,11 +484,14 @@ class SmartSuffixParser:
 @app.get("/")
 async def root():
     return {
-        "api": "Google Autocomplete Parser - SUFFIX with Smart Filtering",
-        "version": "3.4",
+        "api": "Google Autocomplete Parser - SUFFIX with Adaptive Delay",
+        "version": "3.5",
         "method": "SUFFIX: seed + [a-z, а-я, 0-9]",
-        "optimization": "Smart Filtering (Brand-Aware) + Parallel (3-5) + Delay 0.2-0.5 sec",
+        "optimization": "Adaptive Delay + Smart Filtering + Parallel (3-5)",
         "features": {
+            "adaptive_delay": True,
+            "auto_throttling": True,
+            "exponential_backoff": True,
             "smart_filtering": True,
             "brand_aware": True,
             "language_detection": True,
@@ -366,9 +516,15 @@ async def parse_suffix(
     parallel: int = Query(3, description="Количество параллельных потоков (1-5)", ge=1, le=5)
 ):
     """
-    SUFFIX ПАРСИНГ С УМНОЙ ФИЛЬТРАЦИЕЙ (BRAND-AWARE)
+    SUFFIX ПАРСИНГ С АДАПТИВНОЙ ЗАДЕРЖКОЙ
     
     Паттерн: seed + modifier
+    
+    Адаптивная задержка:
+    - Начало: 0.2 сек
+    - При успехах → уменьшается до 0.1 сек (ускоряемся!)
+    - При 429 → увеличивается до 1.0 сек (защита!)
+    - Автоматически находит оптимум!
     
     Умная фильтрация:
     - Английский seed → убираем всё кроме a-z
@@ -376,13 +532,14 @@ async def parse_suffix(
     - Убираем редкие буквы (ъ, ё, ы)
     
     Оптимизация:
+    - Адаптивная задержка (0.1-1.0 сек)
     - Параллелизм (3-5 потоков)
-    - Задержка: 0.2-0.5 сек
     - Умная фильтрация модификаторов
+    - Exponential backoff при rate limits
     
     Ожидаемое ускорение:
-    - Для английского: 4-5× (убираем ~40 модификаторов)
-    - Для русского: 3× (параллелизм + задержки, БЕЗ потери брендов)
+    - Для английского: 5-6×
+    - Для русского: 3.5-4×
     """
     parser = SmartSuffixParser()
     
