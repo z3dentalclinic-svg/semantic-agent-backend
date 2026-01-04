@@ -1,8 +1,8 @@
 """
-GOOGLE AUTOCOMPLETE PARSER - SUFFIX ONLY WITH ADAPTIVE PARALLEL
-Только SUFFIX парсинг с умным параллелизмом
-Version: 3.2 Adaptive Parallel
-Задержка: 0.3-0.7 сек + адаптивная параллелизация (3-10 потоков)
+GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH SIMPLE PARALLEL
+SUFFIX парсинг с простым параллелизмом (БЕЗ адаптации)
+Version: 3.2 Simple Parallel
+Задержка: 0.3-0.7 сек + фиксированный параллелизм (3 потока)
 """
 
 from fastapi import FastAPI, Query
@@ -14,9 +14,9 @@ import time
 import random
 
 app = FastAPI(
-    title="Google Autocomplete Parser - SUFFIX with Adaptive Parallel", 
+    title="Google Autocomplete Parser - SUFFIX with Simple Parallel", 
     version="3.2",
-    description="SUFFIX парсинг с адаптивным параллелизмом: автоматически находит безопасный предел"
+    description="SUFFIX парсинг с простым параллелизмом (3 потока)"
 )
 
 app.add_middleware(
@@ -40,108 +40,9 @@ USER_AGENTS = [
 
 
 # ============================================
-# ADAPTIVE SEMAPHORE CLASS
+# SIMPLE SUFFIX PARSER WITH PARALLEL
 # ============================================
-class AdaptiveSemaphore:
-    """
-    Умный семафор который автоматически регулирует количество параллельных запросов
-    
-    Логика:
-    - Начинаем с initial_limit (3 параллельных)
-    - При успехах → постепенно увеличиваем до max_limit (10)
-    - При ошибках → быстро снижаем до min_limit (1)
-    - Автоматически находит оптимальный баланс скорость/безопасность
-    """
-    
-    def __init__(self, initial_limit=3, min_limit=1, max_limit=10):
-        self.current_limit = initial_limit
-        self.min_limit = min_limit
-        self.max_limit = max_limit
-        self._semaphore = asyncio.Semaphore(initial_limit)
-        self._lock = asyncio.Lock()
-        
-        # Счётчики для адаптации
-        self.success_streak = 0  # Подряд успешных запросов
-        self.error_count = 0     # Ошибки в текущем окне
-        self.total_requests = 0
-        
-        # Параметры адаптации
-        self.increase_threshold = 15  # После 15 успехов увеличиваем
-        self.decrease_threshold = 3   # После 3 ошибок снижаем
-    
-    async def acquire(self):
-        """Захватить семафор"""
-        await self._semaphore.acquire()
-    
-    def release(self):
-        """Освободить семафор"""
-        self._semaphore.release()
-    
-    async def record_success(self):
-        """Записать успешный запрос"""
-        async with self._lock:
-            self.success_streak += 1
-            self.error_count = 0  # Сбрасываем ошибки
-            self.total_requests += 1
-            
-            # Увеличиваем параллелизм если много успехов подряд
-            if self.success_streak >= self.increase_threshold and self.current_limit < self.max_limit:
-                await self._increase_limit()
-                self.success_streak = 0
-    
-    async def record_error(self):
-        """Записать ошибку"""
-        async with self._lock:
-            self.error_count += 1
-            self.success_streak = 0  # Сбрасываем успехи
-            self.total_requests += 1
-            
-            # Снижаем параллелизм если много ошибок
-            if self.error_count >= self.decrease_threshold and self.current_limit > self.min_limit:
-                await self._decrease_limit()
-                self.error_count = 0
-    
-    async def _increase_limit(self):
-        """Увеличить лимит параллельных запросов"""
-        old_limit = self.current_limit
-        self.current_limit = min(self.current_limit + 1, self.max_limit)
-        
-        # Пересоздаём семафор с новым лимитом
-        # Ждём освобождения всех текущих слотов
-        for _ in range(old_limit):
-            await self._semaphore.acquire()
-        
-        self._semaphore = asyncio.Semaphore(self.current_limit)
-        
-        print(f"✅ Увеличиваем параллелизм: {old_limit} → {self.current_limit}")
-    
-    async def _decrease_limit(self):
-        """Снизить лимит параллельных запросов"""
-        old_limit = self.current_limit
-        self.current_limit = max(self.current_limit - 1, self.min_limit)
-        
-        # Пересоздаём семафор с новым лимитом
-        for _ in range(old_limit):
-            await self._semaphore.acquire()
-        
-        self._semaphore = asyncio.Semaphore(self.current_limit)
-        
-        print(f"⚠️ Снижаем параллелизм: {old_limit} → {self.current_limit}")
-    
-    def get_stats(self):
-        """Получить статистику"""
-        return {
-            "current_limit": self.current_limit,
-            "total_requests": self.total_requests,
-            "success_streak": self.success_streak,
-            "error_count": self.error_count
-        }
-
-
-# ============================================
-# SUFFIX PARSER CLASS WITH ADAPTIVE PARALLEL
-# ============================================
-class AdaptiveSuffixParser:
+class SimpleSuffixParser:
     def __init__(self):
         self.base_url = "https://suggestqueries.google.com/complete/search"
         
@@ -159,13 +60,6 @@ class AdaptiveSuffixParser:
             'pl': list("ąćęłńóśźż"),
             'it': list("àèéìíîòóùú"),
         }
-        
-        # Adaptive Semaphore (начинаем с 3, можем до 10)
-        self.adaptive_sem = AdaptiveSemaphore(
-            initial_limit=3,
-            min_limit=1,
-            max_limit=10
-        )
     
     def get_modifiers(self, language: str, use_numbers: bool = True) -> List[str]:
         """Получить все модификаторы для языка"""
@@ -182,9 +76,7 @@ class AdaptiveSuffixParser:
         return modifiers
     
     async def fetch_suggestions(self, query: str, country: str, language: str) -> List[str]:
-        """
-        Запрос к Google Autocomplete API с retry логикой
-        """
+        """Запрос к Google Autocomplete API"""
         params = {
             "client": "chrome",
             "q": query,
@@ -195,55 +87,31 @@ class AdaptiveSuffixParser:
             "User-Agent": random.choice(USER_AGENTS)
         }
         
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(self.base_url, params=params, headers=headers)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(self.base_url, params=params, headers=headers)
+                
+                if response.status_code == 200:
+                    data = response.json()
                     
-                    if response.status_code == 200:
-                        data = response.json()
-                        
-                        if isinstance(data, list) and len(data) > 1:
-                            suggestions = [s for s in data[1] if isinstance(s, str)]
-                            return suggestions
-                    
-                    elif response.status_code == 429:  # Too Many Requests
-                        if attempt < max_retries - 1:
-                            wait_time = (2 ** attempt)  # 1, 2, 4 секунды
-                            print(f"⚠️ Rate limit! Ждём {wait_time} сек...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                    
-                    return []
-                    
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)
-                    continue
-                else:
-                    print(f"❌ Error fetching '{query}': {e}")
-                    return []
-        
-        return []
+                    if isinstance(data, list) and len(data) > 1:
+                        suggestions = [s for s in data[1] if isinstance(s, str)]
+                        return suggestions
+                
+                return []
+                
+        except Exception as e:
+            print(f"❌ Error fetching '{query}': {e}")
+            return []
     
-    async def fetch_with_semaphore(
+    async def fetch_with_delay(
         self, 
         modifier: str, 
         seed: str, 
         country: str, 
         language: str
     ) -> tuple:
-        """
-        Запрос с использованием Adaptive Semaphore
-        
-        Returns:
-            (modifier, results, success)
-        """
-        # Захватываем слот семафора
-        await self.adaptive_sem.acquire()
-        
+        """Запрос с задержкой"""
         try:
             # Задержка 0.3-0.7 сек
             await asyncio.sleep(random.uniform(0.3, 0.7))
@@ -252,43 +120,35 @@ class AdaptiveSuffixParser:
             query = f"{seed} {modifier}"
             results = await self.fetch_suggestions(query, country, language)
             
-            # Записываем успех
-            await self.adaptive_sem.record_success()
-            
             return (modifier, results, True)
             
         except Exception as e:
-            # Записываем ошибку
-            await self.adaptive_sem.record_error()
             print(f"❌ Error with '{modifier}': {e}")
             return (modifier, [], False)
-            
-        finally:
-            # Освобождаем слот
-            self.adaptive_sem.release()
     
     async def parse_suffix(
         self,
         seed: str,
         country: str,
         language: str,
-        use_numbers: bool = True
+        use_numbers: bool = True,
+        parallel_limit: int = 3
     ) -> Dict:
         """
-        SUFFIX ПАРСИНГ С ADAPTIVE PARALLEL
+        SUFFIX ПАРСИНГ С ПРОСТЫМ ПАРАЛЛЕЛИЗМОМ
         """
         start_time = time.time()
         all_keywords = set()
         
         print(f"\n{'='*60}")
-        print(f"SUFFIX PARSER - ADAPTIVE PARALLEL")
+        print(f"SUFFIX PARSER - SIMPLE PARALLEL")
         print(f"{'='*60}")
         print(f"Seed: '{seed}'")
         print(f"Country: {country.upper()}")
         print(f"Language: {language.upper()}")
         print(f"Use numbers: {use_numbers}")
         print(f"Delay: 0.3-0.7 сек")
-        print(f"Parallel: адаптивно от 1 до 10 потоков\n")
+        print(f"Parallel: {parallel_limit} потоков\n")
         
         # Получаем модификаторы
         modifiers = self.get_modifiers(language, use_numbers)
@@ -306,17 +166,28 @@ class AdaptiveSuffixParser:
         successful_queries = 0
         failed_queries = 0
         
-        # ПАРАЛЛЕЛЬНЫЙ ПАРСИНГ с Adaptive Semaphore
-        tasks = [
-            self.fetch_with_semaphore(modifier, seed, country, language)
-            for modifier in modifiers
-        ]
+        # ПАРАЛЛЕЛЬНЫЙ ПАРСИНГ с Semaphore
+        semaphore = asyncio.Semaphore(parallel_limit)
+        
+        async def fetch_limited(modifier):
+            async with semaphore:
+                return await self.fetch_with_delay(modifier, seed, country, language)
+        
+        # Создаём задачи
+        tasks = [fetch_limited(modifier) for modifier in modifiers]
         
         # Запускаем все задачи параллельно
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Обрабатываем результаты
-        for i, (modifier, suggestions, success) in enumerate(results):
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"[{i+1}/{len(modifiers)}] ❌ EXCEPTION: {result}")
+                failed_queries += 1
+                total_queries += 1
+                continue
+            
+            modifier, suggestions, success = result
             query = f"{seed} {modifier}"
             total_queries += 1
             
@@ -335,9 +206,6 @@ class AdaptiveSuffixParser:
         # Время выполнения
         elapsed_time = time.time() - start_time
         
-        # Статистика семафора
-        sem_stats = self.adaptive_sem.get_stats()
-        
         # Итоговая статистика
         print(f"\n{'='*60}")
         print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
@@ -349,25 +217,17 @@ class AdaptiveSuffixParser:
         print(f"Уникальных ключей: {len(all_keywords)}")
         print(f"Время выполнения: {elapsed_time:.2f} сек")
         print(f"Средняя скорость: {elapsed_time/total_queries:.2f} сек/запрос")
-        print(f"\n🧠 ADAPTIVE SEMAPHORE:")
-        print(f"  Финальный лимит: {sem_stats['current_limit']} параллельных потоков")
-        print(f"  Успехов подряд: {sem_stats['success_streak']}")
-        print(f"  Ошибок в окне: {sem_stats['error_count']}")
+        print(f"Параллельных потоков: {parallel_limit}")
         print(f"{'='*60}\n")
         
         return {
-            "method": "SUFFIX with Adaptive Parallel",
+            "method": "SUFFIX with Simple Parallel",
             "seed": seed,
             "country": country,
             "language": language,
             "use_numbers": use_numbers,
             "delay_range": "0.3-0.7 sec",
-            "parallel": {
-                "type": "adaptive",
-                "final_limit": sem_stats['current_limit'],
-                "min_limit": 1,
-                "max_limit": 10
-            },
+            "parallel_limit": parallel_limit,
             "queries": total_queries,
             "successful_queries": successful_queries,
             "failed_queries": failed_queries,
@@ -386,14 +246,13 @@ class AdaptiveSuffixParser:
 @app.get("/")
 async def root():
     return {
-        "api": "Google Autocomplete Parser - SUFFIX with Adaptive Parallel",
+        "api": "Google Autocomplete Parser - SUFFIX with Simple Parallel",
         "version": "3.2",
         "method": "SUFFIX: seed + [a-z, а-я, 0-9]",
-        "optimization": "Adaptive Parallel (1-10 потоков) + Delay 0.3-0.7 sec",
+        "optimization": "Simple Parallel (3 потока) + Delay 0.3-0.7 sec",
         "features": {
-            "adaptive_semaphore": True,
-            "auto_throttling": True,
-            "retry_logic": True,
+            "simple_parallel": True,
+            "fixed_semaphore": 3,
             "morphology": False,
             "infix": False
         },
@@ -409,28 +268,28 @@ async def parse_suffix(
     seed: str = Query("ремонт пылесосов", description="Базовый запрос"),
     country: str = Query("UA", description="Код страны (UA, US, RU, DE...)"),
     language: str = Query("ru", description="Код языка (ru, en, uk, de...)"),
-    use_numbers: bool = Query(False, description="Включить цифры 0-9")
+    use_numbers: bool = Query(False, description="Включить цифры 0-9"),
+    parallel: int = Query(3, description="Количество параллельных потоков (1-5)", ge=1, le=5)
 ):
     """
-    SUFFIX ПАРСИНГ С ADAPTIVE PARALLEL
+    SUFFIX ПАРСИНГ С ПРОСТЫМ ПАРАЛЛЕЛИЗМОМ
     
     Паттерн: seed + modifier
     Оптимизация: 
-    - Адаптивный параллелизм (1-10 потоков)
-    - Автоматическое снижение при ошибках
-    - Автоматическое увеличение при успехах
+    - Фиксированный параллелизм (по умолчанию 3 потока)
     - Задержка: 0.3-0.7 сек
-    - Retry логика при rate limits
+    - Без сложной адаптации
     
-    Ожидаемое ускорение: 3-8× по сравнению с последовательным
+    Ожидаемое ускорение: 3× при parallel=3
     """
-    parser = AdaptiveSuffixParser()
+    parser = SimpleSuffixParser()
     
     result = await parser.parse_suffix(
         seed=seed,
         country=country,
         language=language,
-        use_numbers=use_numbers
+        use_numbers=use_numbers,
+        parallel_limit=parallel
     )
     
     return result
