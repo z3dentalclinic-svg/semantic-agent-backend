@@ -1,8 +1,8 @@
 """
-GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH SIMPLE PARALLEL
-SUFFIX парсинг с простым параллелизмом (БЕЗ адаптации)
-Version: 3.3 Faster Delays
-Задержка: 0.2-0.5 сек + фиксированный параллелизм (3 потока)
+GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH SMART FILTERING
+SUFFIX парсинг с умной фильтрацией модификаторов (с учётом брендов)
+Version: 3.4 Smart Filtering (Brand-Aware)
+Задержка: 0.2-0.5 сек + параллелизм (3-5 потоков) + умная фильтрация
 """
 
 from fastapi import FastAPI, Query
@@ -14,9 +14,9 @@ import time
 import random
 
 app = FastAPI(
-    title="Google Autocomplete Parser - SUFFIX with Simple Parallel", 
-    version="3.3",
-    description="SUFFIX парсинг с простым параллелизмом (3 потока)"
+    title="Google Autocomplete Parser - SUFFIX with Smart Filtering", 
+    version="3.4",
+    description="SUFFIX парсинг с умной фильтрацией (сохраняем латиницу для брендов)"
 )
 
 app.add_middleware(
@@ -40,16 +40,16 @@ USER_AGENTS = [
 
 
 # ============================================
-# SIMPLE SUFFIX PARSER WITH PARALLEL
+# SMART SUFFIX PARSER (BRAND-AWARE)
 # ============================================
-class SimpleSuffixParser:
+class SmartSuffixParser:
     def __init__(self):
         self.base_url = "https://suggestqueries.google.com/complete/search"
         
         # Базовые модификаторы (латиница + цифры)
         self.base_modifiers = list("abcdefghijklmnopqrstuvwxyz0123456789")
         
-        # Языковые модификаторы (кириллица и др.)
+        # Языковые модификаторы (кириллица и спецсимволы)
         self.language_modifiers = {
             'en': [],
             'ru': list("абвгдежзийклмнопрстуфхцчшщэюя"),
@@ -60,18 +60,111 @@ class SimpleSuffixParser:
             'pl': list("ąćęłńóśźż"),
             'it': list("àèéìíîòóùú"),
         }
+        
+        # Редкие буквы которые можно пропустить
+        self.rare_chars = {
+            'ru': ['ъ', 'ё', 'ы'],  # Редко начинаются слова
+            'uk': ['ь', 'ъ'],
+            'pl': ['ą', 'ę'],
+        }
     
-    def get_modifiers(self, language: str, use_numbers: bool = True) -> List[str]:
-        """Получить все модификаторы для языка"""
-        modifiers = self.base_modifiers.copy()
+    def detect_seed_language(self, seed: str) -> str:
+        """
+        Определить язык seed запроса
         
-        # Добавляем языковые модификаторы
-        lang_mods = self.language_modifiers.get(language.lower(), [])
-        modifiers.extend(lang_mods)
+        Returns:
+            'latin' - если латиница или цифры
+            'cyrillic' - если кириллица
+            'mixed' - если смесь
+        """
+        has_latin = False
+        has_cyrillic = False
         
-        # Убираем цифры если нужно
-        if not use_numbers:
-            modifiers = [m for m in modifiers if not m.isdigit()]
+        for char in seed.lower():
+            if char.isalpha():
+                if ord(char) >= ord('a') and ord(char) <= ord('z'):
+                    has_latin = True
+                elif ord(char) >= ord('а') and ord(char) <= ord('я'):
+                    has_cyrillic = True
+        
+        if has_cyrillic and has_latin:
+            return 'mixed'
+        elif has_cyrillic:
+            return 'cyrillic'
+        else:
+            return 'latin'  # По умолчанию латиница (включая только цифры)
+    
+    def get_modifiers(self, language: str, use_numbers: bool = True, seed: str = "") -> List[str]:
+        """
+        УМНАЯ ФИЛЬТРАЦИЯ С УЧЁТОМ БРЕНДОВ (для всех языков!)
+        
+        КЛЮЧЕВАЯ ЛОГИКА:
+        1. АНГЛИЙСКИЙ seed → убираем ВСЁ кроме a-z (кириллицу, äöü, àâ...)
+        2. ЛЮБОЙ ДРУГОЙ язык → ОСТАВЛЯЕМ латиницу для БРЕНДОВ (dyson, samsung, bosch...)
+        3. Убираем редкие буквы (ъ, ё, ы)
+        
+        Примеры:
+        - "vacuum repair" (EN) → [a-z, 0-9] (убрали 40+ символов)
+        - "ремонт пылесосов" (RU) → [a-z, а-я, 0-9] (оставили a-z для брендов!)
+        - "reparatur" (DE) → [a-z, äöüß, 0-9] (оставили a-z для брендов!)
+        - "réparation" (FR) → [a-z, àâ..., 0-9] (оставили a-z для брендов!)
+        
+        Бренды почти всегда латиница: dyson, samsung, lg, bosch, apple, philips...
+        """
+        seed_lang = self.detect_seed_language(seed)
+        
+        # Базовая латиница a-z
+        base_latin = list("abcdefghijklmnopqrstuvwxyz")
+        
+        # Цифры
+        numbers = list("0123456789") if use_numbers else []
+        
+        # Языковые модификаторы (кириллица + спецсимволы)
+        lang_specific = self.language_modifiers.get(language.lower(), [])
+        
+        # УМНАЯ ФИЛЬТРАЦИЯ С УЧЁТОМ БРЕНДОВ:
+        
+        if language.lower() == 'en' and seed_lang == 'latin':
+            # ===== ТОЛЬКО ДЛЯ АНГЛИЙСКОГО =====
+            # Английский seed → убираем ВСЁ кроме a-z
+            # "vacuum repair" → [a-z, 0-9], БЕЗ кириллицы, БЕЗ äöü, БЕЗ àâ
+            modifiers = base_latin + numbers
+            removed = len(lang_specific)
+            print(f"🇬🇧 Английский seed → {len(modifiers)} модификаторов (убрали {removed} не-английских)")
+        
+        elif seed_lang == 'latin':
+            # ===== ДРУГИЕ ЛАТИНСКИЕ ЯЗЫКИ =====
+            # Латинский seed НЕ английский → убираем ТОЛЬКО кириллицу
+            # "reparatur" (DE) → [a-z, äöüß, 0-9], БЕЗ кириллицы
+            # ОСТАВЛЯЕМ a-z для брендов: bosch, siemens, miele
+            
+            # Фильтруем: убираем ТОЛЬКО кириллицу
+            is_cyrillic = lambda c: (ord('а') <= ord(c) <= ord('я')) or c in ['ё', 'і', 'ї', 'є', 'ґ', 'ў']
+            non_cyrillic = [m for m in lang_specific if not is_cyrillic(m)]
+            
+            modifiers = base_latin + non_cyrillic + numbers
+            removed = len(lang_specific) - len(non_cyrillic)
+            if removed > 0:
+                print(f"🌍 {language.upper()} латинский seed → {len(modifiers)} модификаторов (убрали {removed} кириллических)")
+            else:
+                print(f"🌍 {language.upper()} латинский seed → {len(modifiers)} модификаторов")
+        
+        else:
+            # ===== КИРИЛЛИЧЕСКИЕ ЯЗЫКИ =====
+            # Кириллический seed → ОСТАВЛЯЕМ латиницу для БРЕНДОВ!
+            # "ремонт пылесосов" → [a-z, а-я, 0-9]
+            # НЕ убираем a-z потому что: "ремонт dyson", "ремонт samsung", "ремонт lg"
+            modifiers = base_latin + lang_specific + numbers
+            print(f"🇷🇺 {language.upper()} кириллический seed → {len(modifiers)} модификаторов (оставили латиницу для брендов!)")
+        
+        # Убираем редкие буквы для конкретного языка
+        rare = self.rare_chars.get(language.lower(), [])
+        if rare:
+            before = len(modifiers)
+            modifiers = [m for m in modifiers if m not in rare]
+            removed = before - len(modifiers)
+            if removed > 0:
+                print(f"🗑️ Убрали {removed} редких букв: {rare}")
         
         return modifiers
     
@@ -134,14 +227,12 @@ class SimpleSuffixParser:
         use_numbers: bool = True,
         parallel_limit: int = 3
     ) -> Dict:
-        """
-        SUFFIX ПАРСИНГ С ПРОСТЫМ ПАРАЛЛЕЛИЗМОМ
-        """
+        """SUFFIX ПАРСИНГ С УМНОЙ ФИЛЬТРАЦИЕЙ"""
         start_time = time.time()
         all_keywords = set()
         
         print(f"\n{'='*60}")
-        print(f"SUFFIX PARSER - SIMPLE PARALLEL")
+        print(f"SUFFIX PARSER - SMART FILTERING (BRAND-AWARE)")
         print(f"{'='*60}")
         print(f"Seed: '{seed}'")
         print(f"Country: {country.upper()}")
@@ -150,10 +241,10 @@ class SimpleSuffixParser:
         print(f"Delay: 0.2-0.5 сек")
         print(f"Parallel: {parallel_limit} потоков\n")
         
-        # Получаем модификаторы
-        modifiers = self.get_modifiers(language, use_numbers)
+        # Получаем умно отфильтрованные модификаторы
+        modifiers = self.get_modifiers(language, use_numbers, seed)
         
-        print(f"📊 Модификаторы: {len(modifiers)}")
+        print(f"\n📊 Модификаторы: {len(modifiers)}")
         print(f"  Pattern: '{seed} [modifier]'")
         print(f"  Примеры: {modifiers[:10]}...\n")
         print(f"{'='*60}")
@@ -221,7 +312,7 @@ class SimpleSuffixParser:
         print(f"{'='*60}\n")
         
         return {
-            "method": "SUFFIX with Simple Parallel",
+            "method": "SUFFIX with Smart Filtering (Brand-Aware)",
             "seed": seed,
             "country": country,
             "language": language,
@@ -246,13 +337,16 @@ class SimpleSuffixParser:
 @app.get("/")
 async def root():
     return {
-        "api": "Google Autocomplete Parser - SUFFIX with Simple Parallel",
-        "version": "3.3",
+        "api": "Google Autocomplete Parser - SUFFIX with Smart Filtering",
+        "version": "3.4",
         "method": "SUFFIX: seed + [a-z, а-я, 0-9]",
-        "optimization": "Simple Parallel (3 потока) + Delay 0.2-0.5 sec",
+        "optimization": "Smart Filtering (Brand-Aware) + Parallel (3-5) + Delay 0.2-0.5 sec",
         "features": {
+            "smart_filtering": True,
+            "brand_aware": True,
+            "language_detection": True,
+            "rare_chars_removal": True,
             "simple_parallel": True,
-            "fixed_semaphore": 3,
             "morphology": False,
             "infix": False
         },
@@ -272,17 +366,25 @@ async def parse_suffix(
     parallel: int = Query(3, description="Количество параллельных потоков (1-5)", ge=1, le=5)
 ):
     """
-    SUFFIX ПАРСИНГ С ПРОСТЫМ ПАРАЛЛЕЛИЗМОМ
+    SUFFIX ПАРСИНГ С УМНОЙ ФИЛЬТРАЦИЕЙ (BRAND-AWARE)
     
     Паттерн: seed + modifier
-    Оптимизация: 
-    - Фиксированный параллелизм (по умолчанию 3 потока)
-    - Задержка: 0.2-0.5 сек
-    - Без сложной адаптации
     
-    Ожидаемое ускорение: 3× при parallel=3
+    Умная фильтрация:
+    - Английский seed → убираем всё кроме a-z
+    - Другие языки → ОСТАВЛЯЕМ латиницу для БРЕНДОВ (dyson, samsung, bosch...)
+    - Убираем редкие буквы (ъ, ё, ы)
+    
+    Оптимизация:
+    - Параллелизм (3-5 потоков)
+    - Задержка: 0.2-0.5 сек
+    - Умная фильтрация модификаторов
+    
+    Ожидаемое ускорение:
+    - Для английского: 4-5× (убираем ~40 модификаторов)
+    - Для русского: 3× (параллелизм + задержки, БЕЗ потери брендов)
     """
-    parser = SimpleSuffixParser()
+    parser = SmartSuffixParser()
     
     result = await parser.parse_suffix(
         seed=seed,
