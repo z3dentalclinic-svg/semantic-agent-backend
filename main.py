@@ -553,7 +553,7 @@ async def test_batching():
     except Exception as e:
         results["array"] = {"method": "Массив в q", "error": str(e), "works": False}
     
-    # МЕТОД 2: Разделитель |
+    # МЕТОД 2: Разделитель | (ДЕТАЛЬНЫЙ ТЕСТ)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
@@ -561,11 +561,20 @@ async def test_batching():
                 params={"client": "chrome", "q": "ремонт а|ремонт б|ремонт в", "gl": "UA", "hl": "ru"},
                 headers=headers
             )
+            
+            full_data = None
+            if response.status_code == 200:
+                try:
+                    full_data = response.json()
+                except:
+                    pass
+            
             results["pipe"] = {
                 "method": "Разделитель |",
                 "status": response.status_code,
                 "works": response.status_code == 200,
-                "response_sample": response.text[:200]
+                "full_response": full_data,  # ПОЛНЫЙ ОТВЕТ!
+                "response_text": response.text
             }
             await asyncio.sleep(0.5)
     except Exception as e:
@@ -587,6 +596,65 @@ async def test_batching():
             }
     except Exception as e:
         results["post"] = {"method": "POST запрос", "error": str(e), "works": False}
+    
+    # СРАВНИТЕЛЬНЫЙ ТЕСТ: 3 отдельных vs 1 батч
+    comparison = {}
+    
+    # 3 отдельных запроса
+    try:
+        start_separate = time.time()
+        separate_results = []
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for query in ["ремонт а", "ремонт б", "ремонт в"]:
+                await asyncio.sleep(0.3)
+                resp = await client.get(
+                    base_url,
+                    params={"client": "chrome", "q": query, "gl": "UA", "hl": "ru"},
+                    headers=headers
+                )
+                if resp.status_code == 200:
+                    separate_results.append(resp.json())
+        
+        time_separate = time.time() - start_separate
+        comparison["separate"] = {
+            "method": "3 отдельных запроса",
+            "time": round(time_separate, 2),
+            "results_count": len(separate_results)
+        }
+    except Exception as e:
+        comparison["separate"] = {"error": str(e)}
+    
+    # 1 батч запрос
+    try:
+        start_batch = time.time()
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await asyncio.sleep(0.3)
+            resp = await client.get(
+                base_url,
+                params={"client": "chrome", "q": "ремонт а|ремонт б|ремонт в", "gl": "UA", "hl": "ru"},
+                headers=headers
+            )
+            batch_result = resp.json() if resp.status_code == 200 else None
+        
+        time_batch = time.time() - start_batch
+        comparison["batch"] = {
+            "method": "1 батч запрос (|)",
+            "time": round(time_batch, 2),
+            "works": resp.status_code == 200
+        }
+    except Exception as e:
+        comparison["batch"] = {"error": str(e)}
+    
+    # Вычисляем ускорение
+    if comparison.get("separate") and comparison.get("batch"):
+        speedup = comparison["separate"].get("time", 0) / comparison["batch"].get("time", 1)
+        comparison["speedup"] = f"{speedup:.1f}× быстрее"
+    
+    results["comparison"] = comparison
+    
+    # МЕТОД 4 (старый POST оставляем как есть)
     
     # Проверяем есть ли работающие методы батчинга
     batching_works = any(
