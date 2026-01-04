@@ -519,6 +519,109 @@ async def root():
     }
 
 
+@app.get("/api/test-websocket")
+async def test_websocket():
+    """
+    ЭКСПЕРИМЕНТАЛЬНЫЙ ТЕСТ WebSocket
+    Проверяем поддерживает ли Google Autocomplete API WebSocket соединения
+    """
+    results = {}
+    
+    # Возможные WebSocket endpoints
+    ws_endpoints = [
+        "wss://suggestqueries.google.com/ws",
+        "wss://suggestqueries.google.com/websocket",
+        "wss://suggestqueries.google.com/complete/ws",
+        "wss://suggestqueries.google.com/complete/websocket",
+        "ws://suggestqueries.google.com/ws",  # Без SSL
+    ]
+    
+    # ТЕСТ 1: Проверяем может ли HTTP endpoint апгрейдиться до WebSocket
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Пытаемся сделать WebSocket handshake через HTTP
+            response = await client.get(
+                "https://suggestqueries.google.com/complete/search",
+                headers={
+                    "Upgrade": "websocket",
+                    "Connection": "Upgrade",
+                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                    "Sec-WebSocket-Version": "13"
+                }
+            )
+            results["http_upgrade"] = {
+                "method": "HTTP Upgrade to WebSocket",
+                "status": response.status_code,
+                "headers": dict(response.headers),
+                "supports_ws": response.status_code == 101,  # 101 = Switching Protocols
+                "note": "101 = WebSocket OK, другое = не поддерживает"
+            }
+    except Exception as e:
+        results["http_upgrade"] = {
+            "method": "HTTP Upgrade to WebSocket",
+            "error": str(e),
+            "supports_ws": False
+        }
+    
+    # ТЕСТ 2: Пробуем прямые WebSocket endpoints
+    # Примечание: httpx не поддерживает WebSocket напрямую
+    # Нужна библиотека websockets, но мы можем проверить доступность
+    for endpoint in ws_endpoints:
+        try:
+            # Попытка подключения через httpx (увидим ошибку если WS не поддерживается)
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                try:
+                    response = await client.get(endpoint)
+                    results[endpoint] = {
+                        "endpoint": endpoint,
+                        "status": response.status_code,
+                        "accessible": True,
+                        "note": "Endpoint доступен, но возможно не WebSocket"
+                    }
+                except httpx.UnsupportedProtocol:
+                    results[endpoint] = {
+                        "endpoint": endpoint,
+                        "error": "UnsupportedProtocol - возможно WebSocket endpoint!",
+                        "might_be_ws": True,
+                        "note": "httpx не может подключиться = может быть WS"
+                    }
+        except Exception as e:
+            results[endpoint] = {
+                "endpoint": endpoint,
+                "error": str(e),
+                "accessible": False
+            }
+        
+        await asyncio.sleep(0.3)
+    
+    # АНАЛИЗ
+    websocket_supported = False
+    working_endpoint = None
+    
+    # Проверяем HTTP upgrade
+    if results.get("http_upgrade", {}).get("supports_ws"):
+        websocket_supported = True
+        working_endpoint = "https://suggestqueries.google.com/complete/search"
+    
+    # Проверяем прямые WS endpoints
+    for endpoint, data in results.items():
+        if endpoint.startswith("ws") and data.get("might_be_ws"):
+            # Нужна дополнительная проверка с библиотекой websockets
+            pass
+    
+    return {
+        "websocket_supported": websocket_supported,
+        "working_endpoint": working_endpoint,
+        "all_tests": results,
+        "conclusion": (
+            f"WebSocket ПОДДЕРЖИВАЕТСЯ! Endpoint: {working_endpoint}" 
+            if websocket_supported 
+            else "WebSocket НЕ поддерживается - Google Autocomplete использует только HTTP REST API"
+        ),
+        "note": "Для полной проверки WebSocket endpoints нужна библиотека 'websockets'. httpx показывает только базовую доступность."
+    }
+
+
 @app.get("/api/test-morphology-batching")
 async def test_morphology_batching():
     """
