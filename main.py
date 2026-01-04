@@ -99,9 +99,9 @@ class AdaptiveDelay:
         }
 
 # ============================================
-# SUFFIX PARSER
+# KEYWORD PARSER (SUFFIX + INFIX)
 # ============================================
-class SuffixParser:
+class KeywordParser:
     def __init__(self):
         self.base_url = "https://suggestqueries.google.com/complete/search"
         self.adaptive_delay = AdaptiveDelay(initial_delay=0.2, min_delay=0.1, max_delay=1.0)
@@ -196,14 +196,14 @@ class SuffixParser:
         except Exception as e:
             return ([], False, False)
     
-    async def fetch_with_delay(self, modifier: str, seed: str, country: str, language: str, client: httpx.AsyncClient) -> tuple:
+    async def fetch_with_delay(self, modifier: str, seed: str, country: str, language: str, client: httpx.AsyncClient, custom_query: str = None) -> tuple:
         """Запрос с адаптивной задержкой и connection pooling"""
         try:
             # Адаптивная задержка
             await self.adaptive_delay.wait()
             
             # Запрос через shared client (connection pooling!)
-            query = f"{seed} {modifier}"
+            query = custom_query if custom_query else f"{seed} {modifier}"
             results, success, is_rate_limit = await self.fetch_suggestions(query, country, language, client)
             
             # Обновляем задержку
@@ -307,6 +307,117 @@ class SuffixParser:
             "avg_time_per_query": round(elapsed_time / total_queries, 2),
             "adaptive_delay": delay_stats
         }
+    
+    async def parse_infix(self, seed: str, country: str, language: str, use_numbers: bool = True, parallel_limit: int = 5) -> Dict:
+        """
+        INFIX парсинг с максимальной оптимизацией
+        Паттерн: word1 + modifier + word2
+        
+        Пример:
+        Seed: "ремонт пылесосов"
+        Разбивается на: ["ремонт", "пылесосов"]
+        Запросы: "ремонт а пылесосов", "ремонт б пылесосов", ...
+        """
+        start_time = time.time()
+        all_keywords = set()
+        
+        print(f"\n{'='*60}")
+        print(f"INFIX PARSER - OPTIMIZED v3.6")
+        print(f"{'='*60}")
+        print(f"Seed: '{seed}'")
+        print(f"Country: {country.upper()}, Language: {language.upper()}")
+        print(f"Parallel: {parallel_limit}, Adaptive Delay: 0.1-1.0 сек\n")
+        
+        # Разбиваем seed на слова
+        words = seed.strip().split()
+        
+        if len(words) < 2:
+            return {
+                "error": "INFIX требует минимум 2 слова в seed",
+                "example": "ремонт пылесосов (2 слова) ✅",
+                "your_seed": f"{seed} ({len(words)} слов) ❌"
+            }
+        
+        # Получаем модификаторы
+        modifiers = self.get_modifiers(language, use_numbers, seed)
+        print(f"📊 Модификаторы: {modifiers[:10]}... (всего {len(modifiers)})")
+        print(f"📊 Паттерн INFIX: '{words[0]}' + modifier + '{' '.join(words[1:])}'")
+        print(f"📊 Пример: '{words[0]} а {' '.join(words[1:])}'\n")
+        
+        # Счётчики
+        total_queries = 0
+        successful_queries = 0
+        failed_queries = 0
+        
+        # Сбрасываем адаптивную задержку для нового парсинга
+        self.adaptive_delay = AdaptiveDelay(initial_delay=0.2, min_delay=0.1, max_delay=1.0)
+        
+        # ПАРАЛЛЕЛЬНЫЙ ПАРСИНГ с Connection Pooling
+        semaphore = asyncio.Semaphore(parallel_limit)
+        
+        async with httpx.AsyncClient(timeout=10.0) as shared_client:
+            print(f"🏊 Connection pooling: используем общий HTTP клиент\n")
+            
+            async def fetch_limited(modifier):
+                async with semaphore:
+                    # INFIX паттерн: word1 + modifier + word2 word3...
+                    infix_seed = f"{words[0]} {modifier} {' '.join(words[1:])}"
+                    return await self.fetch_with_delay(modifier, words[0] + " _", country, language, shared_client, custom_query=infix_seed)
+            
+            # Запускаем все задачи параллельно
+            tasks = [fetch_limited(m) for m in modifiers]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Обрабатываем результаты
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                failed_queries += 1
+                total_queries += 1
+                continue
+            
+            modifier, suggestions, success = result
+            total_queries += 1
+            
+            if success:
+                all_keywords.update(suggestions)
+                successful_queries += 1
+                infix_query = f"{words[0]} {modifier} {' '.join(words[1:])}"
+                if i < 5 or len(suggestions) > 0:
+                    print(f"[{i+1}/{len(modifiers)}] '{infix_query}' → {len(suggestions)} results")
+            else:
+                failed_queries += 1
+        
+        elapsed_time = time.time() - start_time
+        delay_stats = self.adaptive_delay.get_stats()
+        
+        # Итоговая статистика
+        print(f"\n{'='*60}")
+        print(f"📊 СТАТИСТИКА")
+        print(f"{'='*60}")
+        print(f"Запросов: {total_queries} (✅ {successful_queries}, ❌ {failed_queries})")
+        print(f"Уникальных ключей: {len(all_keywords)}")
+        print(f"Время: {elapsed_time:.2f} сек ({elapsed_time/total_queries:.2f} сек/запрос)")
+        print(f"Параллелизм: {parallel_limit}")
+        print(f"🧠 Adaptive Delay: {delay_stats['final_delay']:.3f} сек (rate limits: {delay_stats['rate_limit_hits']})")
+        print(f"🏊 Connection Pooling: ВКЛЮЧЁН")
+        print(f"{'='*60}\n")
+        
+        return {
+            "method": "INFIX Optimized",
+            "seed": seed,
+            "pattern": f"'{words[0]}' + modifier + '{' '.join(words[1:])}'",
+            "country": country,
+            "language": language,
+            "modifiers_count": len(modifiers),
+            "modifiers_sample": modifiers[:10],
+            "queries": total_queries,
+            "successful_queries": successful_queries,
+            "count": len(all_keywords),
+            "keywords": sorted(list(all_keywords)),
+            "elapsed_time": round(elapsed_time, 2),
+            "avg_time_per_query": round(elapsed_time / total_queries, 2),
+            "adaptive_delay": delay_stats
+        }
 
 # ============================================
 # API ENDPOINTS
@@ -317,6 +428,10 @@ async def root():
     return {
         "api": "Google Autocomplete Parser - Optimized",
         "version": "3.6",
+        "methods": {
+            "suffix": "seed + modifier (ремонт пылесосов + а)",
+            "infix": "word1 + modifier + word2 (ремонт + а + пылесосов)"
+        },
         "optimizations": [
             "Connection Pooling (переиспользование соединений)",
             "Adaptive Delay (автоматическая оптимизация)",
@@ -325,12 +440,18 @@ async def root():
         ],
         "performance": {
             "baseline": "37.86 сек",
-            "optimized": "~2.21 сек",
-            "speedup": "17× быстрее"
+            "optimized": "~2.48 сек",
+            "speedup": "15× быстрее"
         },
         "endpoints": {
-            "parse": "/api/parse",
-            "example": "/api/parse?seed=ремонт+пылесосов&country=UA&language=ru&parallel=5"
+            "suffix": "/api/parse",
+            "infix": "/api/parse-infix",
+            "compare": "/api/compare",
+            "examples": {
+                "suffix": "/api/parse?seed=ремонт+пылесосов&country=UA&language=ru&parallel=5",
+                "infix": "/api/parse-infix?seed=ремонт+пылесосов&country=UA&language=ru&parallel=5",
+                "compare": "/api/compare?seed=ремонт+пылесосов&country=UA&language=ru&parallel=5"
+            }
         }
     }
 
@@ -357,7 +478,7 @@ async def parse_suffix(
     - Время: ~2 сек на 56 запросов
     - Ускорение: 17× от базовой версии
     """
-    parser = SuffixParser()
+    parser = KeywordParser()
     result = await parser.parse(
         seed=seed,
         country=country,
@@ -366,3 +487,133 @@ async def parse_suffix(
         parallel_limit=parallel
     )
     return result
+
+@app.get("/api/parse-infix")
+async def parse_infix(
+    seed: str = Query("ремонт пылесосов", description="Базовый запрос (минимум 2 слова)"),
+    country: str = Query("UA", description="Код страны (UA, US, RU, DE...)"),
+    language: str = Query("ru", description="Код языка (ru, en, uk, de...)"),
+    use_numbers: bool = Query(False, description="Включить цифры 0-9"),
+    parallel: int = Query(5, description="Параллельных потоков (1-10)", ge=1, le=10)
+):
+    """
+    ОПТИМИЗИРОВАННЫЙ INFIX ПАРСИНГ
+    
+    Паттерн: word1 + modifier + word2
+    
+    Пример:
+    Seed: "ремонт пылесосов" → "ремонт а пылесосов", "ремонт б пылесосов", ...
+    
+    Требования:
+    - Seed должен содержать минимум 2 слова
+    
+    Оптимизации:
+    - Connection Pooling: переиспользование HTTP соединений
+    - Adaptive Delay: автоматическая оптимизация задержек (0.1-1.0 сек)
+    - Parallel: 5 потоков одновременно
+    - Smart Filtering: сохраняем латиницу для брендов
+    
+    Производительность:
+    - Время: ~2-3 сек на 56 запросов
+    - Ускорение: 15× от базовой версии
+    """
+    parser = KeywordParser()
+    result = await parser.parse_infix(
+        seed=seed,
+        country=country,
+        language=language,
+        use_numbers=use_numbers,
+        parallel_limit=parallel
+    )
+    return result
+
+@app.get("/api/compare")
+async def compare_methods(
+    seed: str = Query("ремонт пылесосов", description="Базовый запрос"),
+    country: str = Query("UA", description="Код страны"),
+    language: str = Query("ru", description="Код языка"),
+    parallel: int = Query(5, description="Параллельных потоков", ge=1, le=10)
+):
+    """
+    СРАВНЕНИЕ SUFFIX vs INFIX
+    
+    Запускает оба метода и сравнивает результаты:
+    - Количество уникальных ключей
+    - Время выполнения
+    - Пересечения результатов
+    - Уникальные ключи каждого метода
+    """
+    parser = KeywordParser()
+    
+    print("\n🔄 СРАВНЕНИЕ МЕТОДОВ: SUFFIX vs INFIX\n")
+    
+    # SUFFIX
+    suffix_result = await parser.parse(
+        seed=seed,
+        country=country,
+        language=language,
+        use_numbers=False,
+        parallel_limit=parallel
+    )
+    
+    # Сбрасываем adaptive delay между методами
+    parser.adaptive_delay = AdaptiveDelay(initial_delay=0.2, min_delay=0.1, max_delay=1.0)
+    
+    # INFIX
+    infix_result = await parser.parse_infix(
+        seed=seed,
+        country=country,
+        language=language,
+        use_numbers=False,
+        parallel_limit=parallel
+    )
+    
+    # Сравнение
+    if "error" in infix_result:
+        return {
+            "error": "INFIX недоступен для этого seed",
+            "reason": infix_result["error"],
+            "suffix_result": suffix_result
+        }
+    
+    suffix_keywords = set(suffix_result["keywords"])
+    infix_keywords = set(infix_result["keywords"])
+    
+    intersection = suffix_keywords & infix_keywords
+    suffix_only = suffix_keywords - infix_keywords
+    infix_only = infix_keywords - suffix_keywords
+    total_unique = suffix_keywords | infix_keywords
+    
+    return {
+        "seed": seed,
+        "comparison": {
+            "suffix": {
+                "count": len(suffix_keywords),
+                "time": suffix_result["elapsed_time"],
+                "queries": suffix_result["queries"]
+            },
+            "infix": {
+                "count": len(infix_keywords),
+                "time": infix_result["elapsed_time"],
+                "queries": infix_result["queries"]
+            },
+            "overlap": {
+                "count": len(intersection),
+                "percentage": round(len(intersection) / len(total_unique) * 100, 1) if total_unique else 0
+            },
+            "unique_to_suffix": {
+                "count": len(suffix_only),
+                "sample": sorted(list(suffix_only))[:10]
+            },
+            "unique_to_infix": {
+                "count": len(infix_only),
+                "sample": sorted(list(infix_only))[:10]
+            },
+            "total_unique": len(total_unique)
+        },
+        "winner": {
+            "by_count": "INFIX" if len(infix_keywords) > len(suffix_keywords) else "SUFFIX",
+            "by_speed": "INFIX" if infix_result["elapsed_time"] < suffix_result["elapsed_time"] else "SUFFIX",
+            "recommendation": "Используйте оба метода для максимального покрытия" if len(total_unique) > max(len(suffix_keywords), len(infix_keywords)) * 1.3 else "Достаточно одного метода"
+        }
+    }
