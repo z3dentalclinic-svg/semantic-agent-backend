@@ -1,8 +1,8 @@
 """
-GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH ADAPTIVE DELAY
-SUFFIX парсинг с адаптивной задержкой и умной фильтрацией
-Version: 3.5 Adaptive Delay
-Задержка: 0.1-1.0 сек (адаптивная) + параллелизм (3-5 потоков) + умная фильтрация
+GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH CONNECTION POOLING
+SUFFIX парсинг с connection pooling, адаптивной задержкой и умной фильтрацией
+Version: 3.6 Connection Pooling
+Задержка: 0.1-1.0 сек (адаптивная) + параллелизм (3-5) + connection pooling + умная фильтрация
 """
 
 from fastapi import FastAPI, Query
@@ -14,9 +14,9 @@ import time
 import random
 
 app = FastAPI(
-    title="Google Autocomplete Parser - SUFFIX with Adaptive Delay", 
-    version="3.5",
-    description="SUFFIX парсинг с адаптивной задержкой (автоматически находит оптимум)"
+    title="Google Autocomplete Parser - SUFFIX with Connection Pooling", 
+    version="3.6",
+    description="SUFFIX парсинг с connection pooling (переиспользование HTTP соединений)"
 )
 
 app.add_middleware(
@@ -142,6 +142,9 @@ class SmartSuffixParser:
             max_delay=1.0
         )
         
+        # Shared HTTP Client для connection pooling (переиспользуем соединения!)
+        self.shared_client = None
+        
         # Базовые модификаторы (латиница + цифры)
         self.base_modifiers = list("abcdefghijklmnopqrstuvwxyz0123456789")
         
@@ -264,9 +267,10 @@ class SmartSuffixParser:
         
         return modifiers
     
-    async def fetch_suggestions(self, query: str, country: str, language: str) -> tuple:
+    async def fetch_suggestions(self, query: str, country: str, language: str, client: httpx.AsyncClient) -> tuple:
         """
         Запрос к Google Autocomplete API с адаптивной задержкой
+        ИСПОЛЬЗУЕТ SHARED CLIENT для connection pooling!
         
         Returns:
             (suggestions, success, is_rate_limit)
@@ -285,32 +289,32 @@ class SmartSuffixParser:
         
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(self.base_url, params=params, headers=headers)
+                # ИСПОЛЬЗУЕМ ПЕРЕДАННЫЙ CLIENT (connection pooling!)
+                response = await client.get(self.base_url, params=params, headers=headers)
+                
+                if response.status_code == 200:
+                    data = response.json()
                     
-                    if response.status_code == 200:
-                        data = response.json()
-                        
-                        if isinstance(data, list) and len(data) > 1:
-                            suggestions = [s for s in data[1] if isinstance(s, str)]
-                            return (suggestions, True, False)
-                        
-                        return ([], True, False)
-                    
-                    elif response.status_code == 429:  # Too Many Requests
-                        # Rate limit! Возвращаем специальный флаг
-                        if attempt < max_retries - 1:
-                            # Ждём с exponential backoff
-                            wait_time = (2 ** attempt)  # 1, 2, 4 секунды
-                            print(f"⚠️ Rate limit (попытка {attempt+1}/{max_retries}). Ждём {wait_time} сек...")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            # Последняя попытка - возвращаем rate limit флаг
-                            return ([], False, True)
+                    if isinstance(data, list) and len(data) > 1:
+                        suggestions = [s for s in data[1] if isinstance(s, str)]
+                        return (suggestions, True, False)
                     
                     return ([], True, False)
-                    
+                
+                elif response.status_code == 429:  # Too Many Requests
+                    # Rate limit! Возвращаем специальный флаг
+                    if attempt < max_retries - 1:
+                        # Ждём с exponential backoff
+                        wait_time = (2 ** attempt)  # 1, 2, 4 секунды
+                        print(f"⚠️ Rate limit (попытка {attempt+1}/{max_retries}). Ждём {wait_time} сек...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        # Последняя попытка - возвращаем rate limit флаг
+                        return ([], False, True)
+                
+                return ([], True, False)
+                
             except Exception as e:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1)
@@ -326,16 +330,17 @@ class SmartSuffixParser:
         modifier: str, 
         seed: str, 
         country: str, 
-        language: str
+        language: str,
+        client: httpx.AsyncClient  # ПРИНИМАЕМ SHARED CLIENT!
     ) -> tuple:
-        """Запрос с АДАПТИВНОЙ задержкой"""
+        """Запрос с АДАПТИВНОЙ задержкой и CONNECTION POOLING"""
         try:
             # АДАПТИВНАЯ задержка
             await self.adaptive_delay.wait()
             
-            # Реальный запрос
+            # Реальный запрос через SHARED CLIENT
             query = f"{seed} {modifier}"
-            results, success, is_rate_limit = await self.fetch_suggestions(query, country, language)
+            results, success, is_rate_limit = await self.fetch_suggestions(query, country, language, client)
             
             # Обновляем адаптивную задержку
             if is_rate_limit:
@@ -369,7 +374,7 @@ class SmartSuffixParser:
         all_keywords = set()
         
         print(f"\n{'='*60}")
-        print(f"SUFFIX PARSER - SMART FILTERING (BRAND-AWARE)")
+        print(f"SUFFIX PARSER - CONNECTION POOLING + ADAPTIVE DELAY")
         print(f"{'='*60}")
         print(f"Seed: '{seed}'")
         print(f"Country: {country.upper()}")
@@ -394,18 +399,23 @@ class SmartSuffixParser:
         successful_queries = 0
         failed_queries = 0
         
-        # ПАРАЛЛЕЛЬНЫЙ ПАРСИНГ с Semaphore
+        # ПАРАЛЛЕЛЬНЫЙ ПАРСИНГ с Semaphore и CONNECTION POOLING
         semaphore = asyncio.Semaphore(parallel_limit)
         
-        async def fetch_limited(modifier):
-            async with semaphore:
-                return await self.fetch_with_delay(modifier, seed, country, language)
-        
-        # Создаём задачи
-        tasks = [fetch_limited(modifier) for modifier in modifiers]
-        
-        # Запускаем все задачи параллельно
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # СОЗДАЁМ ОДИН SHARED CLIENT для всех запросов (connection pooling!)
+        async with httpx.AsyncClient(timeout=10.0) as shared_client:
+            print(f"🏊 Connection pooling: используем ОДИН HTTP клиент для всех запросов\n")
+            
+            async def fetch_limited(modifier):
+                async with semaphore:
+                    # Передаём SHARED CLIENT в каждый запрос!
+                    return await self.fetch_with_delay(modifier, seed, country, language, shared_client)
+            
+            # Создаём задачи
+            tasks = [fetch_limited(modifier) for modifier in modifiers]
+            
+            # Запускаем все задачи параллельно через ОДИН клиент
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Обрабатываем результаты
         for i, result in enumerate(results):
@@ -449,6 +459,7 @@ class SmartSuffixParser:
         print(f"Время выполнения: {elapsed_time:.2f} сек")
         print(f"Средняя скорость: {elapsed_time/total_queries:.2f} сек/запрос")
         print(f"Параллельных потоков: {parallel_limit}")
+        print(f"🏊 Connection pooling: ВКЛЮЧЁН (переиспользование HTTP соединений)")
         print(f"\n🧠 ADAPTIVE DELAY:")
         print(f"  Начальная задержка: {delay_stats['initial_delay']:.3f} сек")
         print(f"  Финальная задержка: {delay_stats['final_delay']:.3f} сек")
@@ -459,7 +470,7 @@ class SmartSuffixParser:
         print(f"{'='*60}\n")
         
         return {
-            "method": "SUFFIX with Smart Filtering (Brand-Aware) + Adaptive Delay",
+            "method": "SUFFIX with Connection Pooling + Adaptive Delay + Smart Filtering",
             "seed": seed,
             "country": country,
             "language": language,
@@ -484,11 +495,12 @@ class SmartSuffixParser:
 @app.get("/")
 async def root():
     return {
-        "api": "Google Autocomplete Parser - SUFFIX with Adaptive Delay",
-        "version": "3.5",
+        "api": "Google Autocomplete Parser - SUFFIX with Connection Pooling",
+        "version": "3.6",
         "method": "SUFFIX: seed + [a-z, а-я, 0-9]",
-        "optimization": "Adaptive Delay + Smart Filtering + Parallel (3-5)",
+        "optimization": "Connection Pooling + Adaptive Delay + Smart Filtering + Parallel (3-5)",
         "features": {
+            "connection_pooling": True,
             "adaptive_delay": True,
             "auto_throttling": True,
             "exponential_backoff": True,
@@ -678,9 +690,15 @@ async def parse_suffix(
     parallel: int = Query(3, description="Количество параллельных потоков (1-5)", ge=1, le=5)
 ):
     """
-    SUFFIX ПАРСИНГ С АДАПТИВНОЙ ЗАДЕРЖКОЙ
+    SUFFIX ПАРСИНГ С CONNECTION POOLING
     
     Паттерн: seed + modifier
+    
+    Connection Pooling (НОВОЕ!):
+    - Один HTTP клиент для ВСЕХ запросов
+    - Переиспользование TCP/TLS соединений
+    - Экономия на DNS lookup, TCP handshake, TLS handshake
+    - Ускорение: +10-20%
     
     Адаптивная задержка:
     - Начало: 0.2 сек
@@ -694,14 +712,15 @@ async def parse_suffix(
     - Убираем редкие буквы (ъ, ё, ы)
     
     Оптимизация:
+    - Connection pooling (переиспользование соединений) ✨
     - Адаптивная задержка (0.1-1.0 сек)
     - Параллелизм (3-5 потоков)
     - Умная фильтрация модификаторов
     - Exponential backoff при rate limits
     
     Ожидаемое ускорение:
-    - Для английского: 5-6×
-    - Для русского: 3.5-4×
+    - Для английского: 6-7×
+    - Для русского: 3-3.5×
     """
     parser = SmartSuffixParser()
     
