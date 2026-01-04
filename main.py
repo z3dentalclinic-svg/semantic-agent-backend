@@ -1,8 +1,8 @@
 """
 GOOGLE AUTOCOMPLETE PARSER - SUFFIX WITH SIMPLE PARALLEL
 SUFFIX парсинг с простым параллелизмом (БЕЗ адаптации)
-Version: 3.2 Simple Parallel
-Задержка: 0.3-0.7 сек + фиксированный параллелизм (3 потока)
+Version: 3.3 Faster Delays
+Задержка: 0.2-0.5 сек + фиксированный параллелизм (3 потока)
 """
 
 from fastapi import FastAPI, Query
@@ -15,7 +15,7 @@ import random
 
 app = FastAPI(
     title="Google Autocomplete Parser - SUFFIX with Simple Parallel", 
-    version="3.2",
+    version="3.3",
     description="SUFFIX парсинг с простым параллелизмом (3 потока)"
 )
 
@@ -113,8 +113,8 @@ class SimpleSuffixParser:
     ) -> tuple:
         """Запрос с задержкой"""
         try:
-            # Задержка 0.3-0.7 сек
-            await asyncio.sleep(random.uniform(0.3, 0.7))
+            # Задержка 0.2-0.5 сек
+            await asyncio.sleep(random.uniform(0.2, 0.5))
             
             # Реальный запрос
             query = f"{seed} {modifier}"
@@ -147,7 +147,7 @@ class SimpleSuffixParser:
         print(f"Country: {country.upper()}")
         print(f"Language: {language.upper()}")
         print(f"Use numbers: {use_numbers}")
-        print(f"Delay: 0.3-0.7 сек")
+        print(f"Delay: 0.2-0.5 сек")
         print(f"Parallel: {parallel_limit} потоков\n")
         
         # Получаем модификаторы
@@ -226,7 +226,7 @@ class SimpleSuffixParser:
             "country": country,
             "language": language,
             "use_numbers": use_numbers,
-            "delay_range": "0.3-0.7 sec",
+            "delay_range": "0.2-0.5 sec",
             "parallel_limit": parallel_limit,
             "queries": total_queries,
             "successful_queries": successful_queries,
@@ -247,9 +247,9 @@ class SimpleSuffixParser:
 async def root():
     return {
         "api": "Google Autocomplete Parser - SUFFIX with Simple Parallel",
-        "version": "3.2",
+        "version": "3.3",
         "method": "SUFFIX: seed + [a-z, а-я, 0-9]",
-        "optimization": "Simple Parallel (3 потока) + Delay 0.3-0.7 sec",
+        "optimization": "Simple Parallel (3 потока) + Delay 0.2-0.5 sec",
         "features": {
             "simple_parallel": True,
             "fixed_semaphore": 3,
@@ -277,7 +277,7 @@ async def parse_suffix(
     Паттерн: seed + modifier
     Оптимизация: 
     - Фиксированный параллелизм (по умолчанию 3 потока)
-    - Задержка: 0.3-0.7 сек
+    - Задержка: 0.2-0.5 сек
     - Без сложной адаптации
     
     Ожидаемое ускорение: 3× при parallel=3
