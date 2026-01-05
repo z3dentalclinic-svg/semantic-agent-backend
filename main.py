@@ -823,11 +823,61 @@ async def root():
 async def parse_suffix(
     seed: str = Query("ремонт пылесосов"),
     country: str = Query("UA"),
+    region: int = Query(187),
     language: str = Query("ru"),
-    parallel: int = Query(5, ge=1, le=10)
+    parallel: int = Query(5, ge=1, le=10),
+    source: str = Query("all", description="Источник: google / yandex / bing / all")
 ):
+    """SUFFIX парсинг с выбором источника"""
     parser = KeywordParser()
-    return await parser.parse(seed, country, language, False, parallel)
+    
+    # Используем упрощённую версию через compare (только SUFFIX)
+    modifiers = parser.get_modifiers(language, False, seed)
+    queries = [f"{seed} {mod}" for mod in modifiers]
+    
+    # Определяем источник
+    async def fetch_with_source(query: str, client):
+        if source == "google":
+            return await parser.fetch_suggestions(query, country, language, client)
+        elif source == "yandex":
+            return await parser.fetch_suggestions_yandex(query, language, region, client)
+        elif source == "bing":
+            return await parser.fetch_suggestions_bing(query, language, country, client)
+        elif source == "all":
+            google_task = parser.fetch_suggestions(query, country, language, client)
+            yandex_task = parser.fetch_suggestions_yandex(query, language, region, client)
+            bing_task = parser.fetch_suggestions_bing(query, language, country, client)
+            g, y, b = await asyncio.gather(google_task, yandex_task, bing_task)
+            return list(set(g + y + b))
+        return []
+    
+    start_time = time.time()
+    semaphore = asyncio.Semaphore(parallel)
+    
+    async def fetch_with_limit(q: str, client):
+        async with semaphore:
+            await asyncio.sleep(parser.adaptive_delay.get_delay())
+            return await fetch_with_source(q, client)
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        tasks = [fetch_with_limit(q, client) for q in queries]
+        results = await asyncio.gather(*tasks)
+    
+    all_keywords = set()
+    for r in results:
+        all_keywords.update(r)
+    
+    elapsed = time.time() - start_time
+    
+    return {
+        "seed": seed,
+        "method": "suffix",
+        "source": source,
+        "keywords": sorted(list(all_keywords)),
+        "count": len(all_keywords),
+        "queries": len(queries),
+        "elapsed_time": round(elapsed, 2)
+    }
 
 
 @app.get("/api/parse-infix")
@@ -870,11 +920,27 @@ async def parse_yandex_only(
 async def parse_morphology(
     seed: str = Query("ремонт пылесосов"),
     country: str = Query("UA"),
+    region: int = Query(187),
     language: str = Query("ru"),
-    parallel: int = Query(5, ge=1, le=10)
+    parallel: int = Query(5, ge=1, le=10),
+    source: str = Query("all", description="Источник: google / yandex / bing / all")
 ):
+    """MORPHOLOGY парсинг с выбором источника"""
+    # Используем compare с source, но возвращаем только morphology
     parser = KeywordParser()
-    return await parser.parse_morphology(seed, country, language, False, parallel)
+    result = await parser.compare_all(seed, country, region, language, False, parallel, True, source)
+    
+    # Извлекаем только morphology данные
+    return {
+        "seed": seed,
+        "method": "morphology",
+        "source": source,
+        "keywords": result.get("keywords", {}).get("all_unique", []),
+        "count": result["comparison"]["morphology"]["count"],
+        "queries": result["comparison"]["morphology"]["queries"],
+        "forms": result["comparison"]["morphology"]["forms"],
+        "elapsed_time": result["comparison"]["morphology"]["time"]
+    }
 
 
 @app.get("/api/compare")
@@ -885,9 +951,9 @@ async def compare_methods(
     language: str = Query("ru", description="Код языка"),
     parallel: int = Query(5, ge=1, le=10, description="Параллельных потоков"),
     include_keywords: bool = Query(True, description="Включить полные списки ключей"),
-    source: str = Query("google", description="Источник: google / yandex / bing / all")
+    source: str = Query("all", description="Источник: google / yandex / bing / all")
 ):
-    """COMPARE: сравнение всех методов с выбором источника"""
+    """COMPARE: сравнение всех методов с выбором источника (по умолчанию ALL)"""
     parser = KeywordParser()
     return await parser.compare_all(seed, country, region, language, False, parallel, include_keywords, source)
 
