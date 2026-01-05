@@ -863,6 +863,16 @@ class KeywordParser:
         """Сравнение всех трёх методов с выбором источника (google/yandex/bing/all)"""
         print(f"\n🔥 COMPARE ({source.upper()}): SUFFIX vs INFIX vs MORPHOLOGY")
         
+        # ✏️ АВТОКОРРЕКЦИЯ ПЕРЕД ПАРСИНГОМ
+        correction = await self.autocorrect_text(seed, language)
+        original_seed = seed
+        
+        if correction.get("has_errors"):
+            seed = correction["corrected"]
+            print(f"✏️ Исправлено: '{original_seed}' → '{seed}'")
+            for cor in correction.get("corrections", []):
+                print(f"   • '{cor['word']}' → '{cor['suggestion']}'")
+        
         # Определяем какой источник использовать
         async def fetch_with_source(query: str, client: httpx.AsyncClient):
             """Запрос к выбранному источнику"""
@@ -1018,6 +1028,8 @@ class KeywordParser:
         
         response = {
             "seed": seed,
+            "original_seed": original_seed if correction.get("has_errors") else seed,
+            "autocorrect": correction if correction.get("has_errors") else None,
             "source": source,
             "comparison": {
                 "suffix": {
@@ -1067,6 +1079,12 @@ async def parse_suffix(
 ):
     """SUFFIX парсинг с выбором источника"""
     parser = KeywordParser()
+    
+    # ✏️ АВТОКОРРЕКЦИЯ
+    correction = await parser.autocorrect_text(seed, language)
+    if correction.get("has_errors"):
+        seed = correction["corrected"]
+        print(f"✏️ Исправлено: '{correction['original']}' → '{seed}'")
     
     # Используем упрощённую версию через compare (только SUFFIX)
     modifiers = parser.get_modifiers(language, False, seed)
