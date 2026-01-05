@@ -6,7 +6,7 @@ pydantic==2.10.3
 httpx==0.28.1
 setuptools>=65.0.0
 dawg-python
-pymorphy2
+pymorphy2-fork
 pymorphy2-dicts-ru
 inflect
 lemminflect
