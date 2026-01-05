@@ -370,20 +370,19 @@ class KeywordParser:
         Фильтр для INFIX результатов - убираем мусорные фразы с одиночными бессмысленными буквами
         
         Проблема:
-        "медицинский а стерилизатор купить" ← "а" = мусор ❌
+        "медицинский э стерилизатор купить" ← "э" = мусор ❌
         "медицинский в стерилизатор купить" ← "в" = предлог ✅
         
-        Решение: проверяем одиночные буквы по whitelist предлогов
+        Решение: проверяем ВСЕ одиночные буквы по whitelist предлогов
         """
-        import re
         
-        # Whitelist полезных предлогов/союзов
+        # Whitelist полезных предлогов/союзов (расширенный)
         if language.lower() == 'ru':
-            valid_prepositions = {'в', 'на', 'у', 'к', 'от', 'из', 'по', 'о', 'об', 'с', 'со', 'за', 'для', 'и', 'а'}
+            valid_prepositions = {'в', 'на', 'у', 'к', 'от', 'из', 'по', 'о', 'об', 'с', 'со', 'за', 'для', 'и', 'а', 'но'}
         elif language.lower() == 'uk':
-            valid_prepositions = {'в', 'на', 'у', 'до', 'від', 'з', 'по', 'про', 'для', 'і', 'та'}
+            valid_prepositions = {'в', 'на', 'у', 'до', 'від', 'з', 'по', 'про', 'для', 'і', 'та', 'або'}
         elif language.lower() == 'en':
-            valid_prepositions = {'in', 'on', 'at', 'to', 'from', 'with', 'for', 'by', 'of', 'and', 'or', 'a'}
+            valid_prepositions = {'in', 'on', 'at', 'to', 'from', 'with', 'for', 'by', 'of', 'and', 'or', 'a', 'i'}
         else:
             valid_prepositions = set()
         
@@ -393,9 +392,9 @@ class KeywordParser:
             keyword_lower = keyword.lower()
             words = keyword_lower.split()
             
-            # Ищем одиночные буквы между словами
+            # Ищем ЛЮБЫЕ одиночные буквы (кроме первого слова)
             has_garbage = False
-            for i in range(1, len(words) - 1):  # Проверяем слова между первым и последним
+            for i in range(1, len(words)):  # ← ИСПРАВЛЕНО: проверяем ВСЕ слова после первого!
                 word = words[i]
                 if len(word) == 1:  # Одиночная буква
                     if word not in valid_prepositions:
@@ -820,16 +819,20 @@ class KeywordParser:
                 query = ' '.join(words[:i]) + f' {mod} ' + ' '.join(words[i:])
                 queries.append(query)
         
-        result = await self.parse_with_semaphore(queries, country, language, parallel_limit)
+        result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit)
+        
+        # ФИЛЬТРУЕМ результаты от мусорных одиночных букв
+        filtered_keywords = await self.filter_infix_results(result_raw['keywords'], language)
+        
         elapsed_time = time.time() - start_time
         
-        print(f"✅ {len(result['keywords'])} ключей за {elapsed_time:.2f} сек")
+        print(f"✅ {len(result_raw['keywords'])} → {len(filtered_keywords)} ключей (отфильтровано {len(result_raw['keywords']) - len(filtered_keywords)}) за {elapsed_time:.2f} сек")
         
         return {
             "seed": seed,
             "method": "infix",
-            "keywords": result["keywords"],
-            "count": len(result["keywords"]),
+            "keywords": filtered_keywords,
+            "count": len(filtered_keywords),
             "queries": len(queries),
             "elapsed_time": round(elapsed_time, 2)
         }
