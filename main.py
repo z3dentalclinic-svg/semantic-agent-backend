@@ -365,6 +365,90 @@ class KeywordParser:
                 "has_errors": False
             }
     
+    async def filter_infix_results(self, keywords: List[str], language: str) -> List[str]:
+        """
+        Фильтр для INFIX результатов - убираем мусорные фразы с одиночными бессмысленными буквами
+        
+        Проблема:
+        "медицинский а стерилизатор купить" ← "а" = мусор ❌
+        "медицинский в стерилизатор купить" ← "в" = предлог ✅
+        
+        Решение: проверяем одиночные буквы по whitelist предлогов
+        """
+        import re
+        
+        # Whitelist полезных предлогов/союзов
+        if language.lower() == 'ru':
+            valid_prepositions = {'в', 'на', 'у', 'к', 'от', 'из', 'по', 'о', 'об', 'с', 'со', 'за', 'для', 'и', 'а'}
+        elif language.lower() == 'uk':
+            valid_prepositions = {'в', 'на', 'у', 'до', 'від', 'з', 'по', 'про', 'для', 'і', 'та'}
+        elif language.lower() == 'en':
+            valid_prepositions = {'in', 'on', 'at', 'to', 'from', 'with', 'for', 'by', 'of', 'and', 'or', 'a'}
+        else:
+            valid_prepositions = set()
+        
+        filtered = []
+        
+        for keyword in keywords:
+            keyword_lower = keyword.lower()
+            words = keyword_lower.split()
+            
+            # Ищем одиночные буквы между словами
+            has_garbage = False
+            for i in range(1, len(words) - 1):  # Проверяем слова между первым и последним
+                word = words[i]
+                if len(word) == 1:  # Одиночная буква
+                    if word not in valid_prepositions:
+                        # Бессмысленная одиночная буква → МУСОР!
+                        has_garbage = True
+                        break
+            
+            if not has_garbage:
+                filtered.append(keyword)
+        
+        return filtered
+    
+    def get_infix_modifiers(self, language: str) -> List[str]:
+        """
+        Получить модификаторы специально для INFIX метода
+        
+        INFIX вставляет слова МЕЖДУ словами в seed, поэтому нужны:
+        - Предлоги (в, на, для, с, от, у, к, по, из)
+        - Союзы (и, а, или)
+        - НЕ нужны: одиночные бессмысленные буквы (б, ж, ц, щ...)
+        
+        Примеры:
+        "ремонт телефонов" + "в" = "ремонт в телефонов" → "ремонт в телефонов киев" ✅
+        "ремонт телефонов" + "ж" = "ремонт ж телефонов" → МУСОР ❌
+        """
+        
+        if language.lower() == 'ru':
+            return [
+                # Предлоги места
+                'в', 'на', 'у', 'к', 'от', 'из', 'по', 'о', 'об',
+                # Предлоги с инструментальным
+                'с', 'со', 'за', 'под', 'над', 'между',
+                # Предлоги для
+                'для',
+                # Союзы
+                'и', 'а', 'или',
+                # Другие частые слова
+                'без', 'про', 'через'
+            ]
+        elif language.lower() == 'uk':
+            return [
+                'в', 'на', 'у', 'до', 'від', 'з', 'по', 'про',
+                'для', 'і', 'та', 'або', 'без', 'через'
+            ]
+        elif language.lower() == 'en':
+            return [
+                'in', 'on', 'at', 'to', 'from', 'with', 'for',
+                'by', 'of', 'and', 'or', 'the', 'a'
+            ]
+        else:
+            # Для других языков - используем только частые предлоги
+            return ['in', 'on', 'for', 'with', 'and', 'or']
+    
     async def filter_relevant_keywords(self, keywords: List[str], seed: str) -> List[str]:
         """
         Фильтр релевантности - оставляем только ключи содержащие ВСЕ важные слова из seed
@@ -946,7 +1030,18 @@ class KeywordParser:
                 for mod in modifiers_infix:
                     query = ' '.join(words[:i]) + f' {mod} ' + ' '.join(words[i:])
                     queries_infix.append(query)
-            infix_result = await parse_with_source(queries_infix)
+            infix_result_raw = await parse_with_source(queries_infix)
+            
+            # ФИЛЬТРУЕМ результаты от мусорных одиночных букв
+            filtered_keywords = await self.filter_infix_results(infix_result_raw['keywords'], language)
+            infix_result = {
+                "keywords": filtered_keywords,
+                "success": infix_result_raw['success'],
+                "failed": infix_result_raw['failed']
+            }
+            
+            infix_time = time.time()
+            print(f"✅ INFIX: {len(infix_result_raw['keywords'])} → {len(filtered_keywords)} ключей (отфильтровано {len(infix_result_raw['keywords']) - len(filtered_keywords)})")
             infix_time = time.time()
             print(f"✅ INFIX: {len(infix_result['keywords'])} ключей")
         else:
@@ -1211,6 +1306,41 @@ async def parse_morphology(
         "queries": result["comparison"]["morphology"]["queries"],
         "forms": result["comparison"]["morphology"]["forms"],
         "elapsed_time": result["comparison"]["morphology"]["time"]
+    }
+
+
+@app.get("/api/debug/modifiers")
+async def debug_modifiers(
+    seed: str = Query("медицинский стерилизатор купить"),
+    language: str = Query("ru")
+):
+    """DEBUG: Показать какие модификаторы используются"""
+    parser = KeywordParser()
+    
+    modifiers = parser.get_modifiers(language, False, seed)
+    
+    # Разделяем на латинские и кириллические
+    latin = [m for m in modifiers if ord('a') <= ord(m.lower()) <= ord('z')]
+    cyrillic = [m for m in modifiers if ord('а') <= ord(m.lower()) <= ord('я')]
+    
+    return {
+        "seed": seed,
+        "language": language,
+        "total_modifiers": len(modifiers),
+        "breakdown": {
+            "latin": {
+                "count": len(latin),
+                "letters": "".join(latin)
+            },
+            "cyrillic": {
+                "count": len(cyrillic),
+                "letters": "".join(cyrillic),
+                "has_hard_sign": "ъ" in cyrillic,
+                "has_soft_sign": "ь" in cyrillic,
+                "has_yeru": "ы" in cyrillic
+            }
+        },
+        "all_modifiers": modifiers
     }
 
 
