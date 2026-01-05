@@ -189,6 +189,57 @@ class KeywordParser:
         except Exception:
             return []
     
+    async def fetch_suggestions_bing(self, query: str, language: str, country: str, client: httpx.AsyncClient) -> List[str]:
+        """Получить подсказки от Bing Autosuggest"""
+        url = "https://www.bing.com/AS/Suggestions"
+        
+        # Формируем market code (язык-страна)
+        # Bing НЕ поддерживает "ru-UA", поэтому fallback на uk-UA
+        if language == "ru" and country == "UA":
+            market = "uk-UA"  # Fallback
+        elif language == "uk" and country == "UA":
+            market = "uk-UA"
+        elif language == "ru" and country == "RU":
+            market = "ru-RU"
+        elif language == "en" and country == "US":
+            market = "en-US"
+        elif language == "en" and country == "GB":
+            market = "en-GB"
+        else:
+            market = f"{language}-{country}"
+        
+        params = {
+            "q": query,
+            "mkt": market,
+            "qry": query,
+            "cp": len(query),
+            "cvid": f"{random.randint(1000000, 9999999)}"
+        }
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        
+        try:
+            response = await client.get(url, params=params, headers=headers, timeout=10.0)
+            
+            if response.status_code == 429:
+                self.adaptive_delay.on_rate_limit()
+                return []
+            
+            self.adaptive_delay.on_success()
+            
+            if response.status_code == 200:
+                data = response.json()
+                # Bing возвращает: {"AS":{"Results":[{"Suggests":[{"Txt":"..."}]}]}}
+                if "AS" in data and "Results" in data["AS"]:
+                    results = data["AS"]["Results"]
+                    if results and "Suggests" in results[0]:
+                        suggests = results[0]["Suggests"]
+                        return [s["Txt"] for s in suggests if "Txt" in s]
+            
+            return []
+            
+        except Exception:
+            return []
+    
     async def fetch_suggestions_yandex(self, query: str, language: str, region_id: int, client: httpx.AsyncClient) -> List[str]:
         """Получить подсказки от Yandex Suggest"""
         url = "https://suggest.yandex.ru/suggest-ff.cgi"
@@ -563,7 +614,7 @@ class KeywordParser:
     # COMPARE METHOD
     # ============================================
     async def compare_all(self, seed: str, country: str, region_id: int, language: str, use_numbers: bool, parallel_limit: int, include_keywords: bool, source: str = "google") -> Dict:
-        """Сравнение всех трёх методов с выбором источника (google/yandex/dual)"""
+        """Сравнение всех трёх методов с выбором источника (google/yandex/bing/all)"""
         print(f"\n🔥 COMPARE ({source.upper()}): SUFFIX vs INFIX vs MORPHOLOGY")
         
         # Определяем какой источник использовать
@@ -573,11 +624,16 @@ class KeywordParser:
                 return await self.fetch_suggestions(query, country, language, client)
             elif source == "yandex":
                 return await self.fetch_suggestions_yandex(query, language, region_id, client)
-            elif source == "dual":
+            elif source == "bing":
+                return await self.fetch_suggestions_bing(query, language, country, client)
+            elif source == "all":
+                # Все три источника параллельно
                 google_task = self.fetch_suggestions(query, country, language, client)
                 yandex_task = self.fetch_suggestions_yandex(query, language, region_id, client)
-                google_results, yandex_results = await asyncio.gather(google_task, yandex_task)
-                return list(set(google_results + yandex_results))
+                bing_task = self.fetch_suggestions_bing(query, language, country, client)
+                google_results, yandex_results, bing_results = await asyncio.gather(google_task, yandex_task, bing_task)
+                # Объединяем и дедуплицируем
+                return list(set(google_results + yandex_results + bing_results))
             else:
                 return []
         
@@ -815,12 +871,12 @@ async def parse_morphology(
 @app.get("/api/compare")
 async def compare_methods(
     seed: str = Query("ремонт пылесосов", description="Ключевое слово"),
-    country: str = Query("UA", description="Код страны (для Google)"),
+    country: str = Query("UA", description="Код страны"),
     region: int = Query(187, description="Yandex Region ID (187=Украина)"),
     language: str = Query("ru", description="Код языка"),
     parallel: int = Query(5, ge=1, le=10, description="Параллельных потоков"),
     include_keywords: bool = Query(True, description="Включить полные списки ключей"),
-    source: str = Query("google", description="Источник: google / yandex / dual")
+    source: str = Query("google", description="Источник: google / yandex / bing / all")
 ):
     """COMPARE: сравнение всех методов с выбором источника"""
     parser = KeywordParser()
