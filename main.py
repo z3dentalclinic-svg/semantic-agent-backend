@@ -191,53 +191,62 @@ class KeywordParser:
     
     async def fetch_suggestions_bing(self, query: str, language: str, country: str, client: httpx.AsyncClient) -> List[str]:
         """Получить подсказки от Bing Autosuggest"""
-        url = "https://www.bing.com/AS/Suggestions"
         
-        # Формируем market code (язык-страна)
-        # Bing НЕ поддерживает "ru-UA", поэтому fallback на uk-UA
+        # Формируем market code
         if language == "ru" and country == "UA":
-            market = "uk-UA"  # Fallback
+            market = "ru-RU"  # Используем русский российский
+            setlang = "ru"
         elif language == "uk" and country == "UA":
             market = "uk-UA"
+            setlang = "uk"
         elif language == "ru" and country == "RU":
             market = "ru-RU"
+            setlang = "ru"
         elif language == "en" and country == "US":
             market = "en-US"
-        elif language == "en" and country == "GB":
-            market = "en-GB"
+            setlang = "en"
         else:
             market = f"{language}-{country}"
+            setlang = language
         
+        # Используем альтернативный endpoint
+        url = "https://api.bing.com/osjson.aspx"
         params = {
-            "q": query,
-            "mkt": market,
-            "qry": query,
-            "cp": len(query),
-            "cvid": f"{random.randint(1000000, 9999999)}"
+            "query": query,
+            "market": market,
+            "setLang": setlang
         }
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "application/json",
+            "Accept-Language": f"{language}",
+            "Referer": "https://www.bing.com/"
+        }
         
         try:
-            response = await client.get(url, params=params, headers=headers, timeout=10.0)
+            response = await client.get(url, params=params, headers=headers, timeout=10.0, follow_redirects=True)
             
             if response.status_code == 429:
                 self.adaptive_delay.on_rate_limit()
+                return []
+            
+            if response.status_code == 403:
+                print(f"⚠️ Bing 403: блокировка запроса")
                 return []
             
             self.adaptive_delay.on_success()
             
             if response.status_code == 200:
                 data = response.json()
-                # Bing возвращает: {"AS":{"Results":[{"Suggests":[{"Txt":"..."}]}]}}
-                if "AS" in data and "Results" in data["AS"]:
-                    results = data["AS"]["Results"]
-                    if results and "Suggests" in results[0]:
-                        suggests = results[0]["Suggests"]
-                        return [s["Txt"] for s in suggests if "Txt" in s]
+                # Bing osjson возвращает: [query, [suggestions]]
+                if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                    return [s for s in data[1] if isinstance(s, str)]
             
             return []
             
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Bing error: {e}")
             return []
     
     async def fetch_suggestions_yandex(self, query: str, language: str, region_id: int, client: httpx.AsyncClient) -> List[str]:
