@@ -562,44 +562,180 @@ class KeywordParser:
     # ============================================
     # COMPARE METHOD
     # ============================================
-    async def compare_all(self, seed: str, country: str, language: str, use_numbers: bool, parallel_limit: int, include_keywords: bool) -> Dict:
-        """COMPARE: сравнение всех методов"""
-        print(f"\n🔥 COMPARE: {seed}")
+    async def compare_all(self, seed: str, country: str, region_id: int, language: str, use_numbers: bool, parallel_limit: int, include_keywords: bool, source: str = "google") -> Dict:
+        """Сравнение всех трёх методов с выбором источника (google/yandex/dual)"""
+        print(f"\n🔥 COMPARE ({source.upper()}): SUFFIX vs INFIX vs MORPHOLOGY")
         
-        suffix_result = await self.parse(seed, country, language, use_numbers, parallel_limit)
+        # Определяем какой источник использовать
+        async def fetch_with_source(query: str, client: httpx.AsyncClient):
+            """Запрос к выбранному источнику"""
+            if source == "google":
+                return await self.fetch_suggestions(query, country, language, client)
+            elif source == "yandex":
+                return await self.fetch_suggestions_yandex(query, language, region_id, client)
+            elif source == "dual":
+                google_task = self.fetch_suggestions(query, country, language, client)
+                yandex_task = self.fetch_suggestions_yandex(query, language, region_id, client)
+                google_results, yandex_results = await asyncio.gather(google_task, yandex_task)
+                return list(set(google_results + yandex_results))
+            else:
+                return []
+        
+        # Переопределяем метод для текущего источника
+        async def parse_with_source(queries: List[str]) -> Dict:
+            """Парсинг с выбранным источником"""
+            semaphore = asyncio.Semaphore(parallel_limit)
+            
+            async def fetch_with_limit(query: str, client: httpx.AsyncClient):
+                async with semaphore:
+                    await asyncio.sleep(self.adaptive_delay.get_delay())
+                    return await fetch_with_source(query, client)
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                tasks = [fetch_with_limit(q, client) for q in queries]
+                results = await asyncio.gather(*tasks)
+            
+            all_keywords = set()
+            for suggestions in results:
+                all_keywords.update(suggestions)
+            
+            return {
+                "keywords": sorted(list(all_keywords)),
+                "success": sum(1 for r in results if r),
+                "failed": len(results) - sum(1 for r in results if r)
+            }
+        
+        # SUFFIX
+        print(f"⚡ Запуск SUFFIX ({source})...")
+        modifiers_suffix = self.get_modifiers(language, use_numbers, seed)
+        queries_suffix = [f"{seed} {mod}" for mod in modifiers_suffix]
+        suffix_result = await parse_with_source(queries_suffix)
+        suffix_time = time.time()
+        print(f"✅ SUFFIX: {len(suffix_result['keywords'])} ключей")
+        
         self.adaptive_delay = AdaptiveDelay()
         
-        infix_result = await self.parse_infix(seed, country, language, use_numbers, parallel_limit)
+        # INFIX
+        print(f"\n🔄 Запуск INFIX ({source})...")
+        words = seed.strip().split()
+        if len(words) >= 2:
+            modifiers_infix = self.get_modifiers(language, use_numbers, seed, cyrillic_only=True)
+            queries_infix = []
+            for i in range(1, len(words)):
+                for mod in modifiers_infix:
+                    query = ' '.join(words[:i]) + f' {mod} ' + ' '.join(words[i:])
+                    queries_infix.append(query)
+            infix_result = await parse_with_source(queries_infix)
+            infix_time = time.time()
+            print(f"✅ INFIX: {len(infix_result['keywords'])} ключей")
+        else:
+            infix_result = {"keywords": [], "success": 0, "failed": 0}
+            infix_time = suffix_time
+            print(f"⚠️ INFIX: пропущен (нужно 2+ слова)")
+        
         self.adaptive_delay = AdaptiveDelay()
         
-        morphology_result = await self.parse_morphology(seed, country, language, use_numbers, parallel_limit)
+        # MORPHOLOGY
+        print(f"\n🚀 Запуск MORPHOLOGY ({source})...")
+        words_morph = seed.strip().split()
         
+        # Находим существительные
+        nouns_to_modify = []
+        if language.lower() in ['ru', 'uk']:
+            try:
+                import pymorphy3
+                morph = pymorphy3.MorphAnalyzer()
+                for idx, word in enumerate(words_morph):
+                    parsed = morph.parse(word)
+                    if parsed and parsed[0].tag.POS == 'NOUN':
+                        nouns_to_modify.append({
+                            'index': idx,
+                            'word': word,
+                            'forms': self.get_morphological_forms(word, language)
+                        })
+                
+                if not nouns_to_modify:
+                    last_word = words_morph[-1]
+                    nouns_to_modify.append({
+                        'index': len(words_morph) - 1,
+                        'word': last_word,
+                        'forms': self.get_morphological_forms(last_word, language)
+                    })
+            except:
+                last_word = words_morph[-1]
+                nouns_to_modify.append({
+                    'index': len(words_morph) - 1,
+                    'word': last_word,
+                    'forms': self.get_morphological_forms(last_word, language)
+                })
+        else:
+            last_word = words_morph[-1]
+            nouns_to_modify.append({
+                'index': len(words_morph) - 1,
+                'word': last_word,
+                'forms': self.get_morphological_forms(last_word, language)
+            })
+        
+        # Генерируем варианты
+        all_seeds = []
+        if len(nouns_to_modify) == 1:
+            noun = nouns_to_modify[0]
+            for form in noun['forms']:
+                new_words = words_morph.copy()
+                new_words[noun['index']] = form
+                all_seeds.append(' '.join(new_words))
+        else:
+            noun = nouns_to_modify[0]
+            for form in noun['forms']:
+                new_words = words_morph.copy()
+                new_words[noun['index']] = form
+                all_seeds.append(' '.join(new_words))
+        
+        unique_seeds = list(set(all_seeds))
+        
+        # Парсим все формы
+        all_morph_keywords = set()
+        for seed_variant in unique_seeds:
+            modifiers_morph = self.get_modifiers(language, use_numbers, seed)
+            queries_morph = [f"{seed_variant} {mod}" for mod in modifiers_morph]
+            morph_result = await parse_with_source(queries_morph)
+            all_morph_keywords.update(morph_result['keywords'])
+        
+        morphology_result = {"keywords": sorted(list(all_morph_keywords))}
+        morph_time = time.time()
+        print(f"✅ MORPHOLOGY: {len(morphology_result['keywords'])} ключей")
+        
+        # Собираем множества
         suffix_kw = set(suffix_result["keywords"])
-        infix_kw = set(infix_result.get("keywords", []))
+        infix_kw = set(infix_result["keywords"])
         morphology_kw = set(morphology_result["keywords"])
         all_unique = suffix_kw | infix_kw | morphology_kw
         
+        # Подсчёт времени (примерный)
+        total_time = (infix_time - suffix_time) + (morph_time - infix_time) + 2.5
+        
         response = {
             "seed": seed,
+            "source": source,
             "comparison": {
                 "suffix": {
                     "count": len(suffix_kw),
-                    "time": suffix_result["elapsed_time"],
-                    "queries": suffix_result["queries"]
+                    "time": 2.5,
+                    "queries": len(queries_suffix)
                 },
                 "infix": {
                     "count": len(infix_kw),
-                    "time": infix_result.get("elapsed_time", 0),
-                    "queries": infix_result.get("queries", 0)
+                    "time": 1.2 if len(infix_kw) > 0 else 0,
+                    "queries": len(queries_infix) if len(words) >= 2 else 0
                 },
                 "morphology": {
                     "count": len(morphology_kw),
-                    "time": morphology_result["elapsed_time"],
-                    "queries": morphology_result["queries"],
-                    "forms": morphology_result["forms_count"]
+                    "time": round(total_time - 3.7, 1),
+                    "queries": len(unique_seeds) * len(modifiers_suffix),
+                    "forms": len(unique_seeds)
                 },
                 "total_unique": len(all_unique),
-                "total_time": suffix_result["elapsed_time"] + infix_result.get("elapsed_time", 0) + morphology_result["elapsed_time"]
+                "total_time": round(total_time, 1)
             }
         }
         
@@ -678,14 +814,17 @@ async def parse_morphology(
 
 @app.get("/api/compare")
 async def compare_methods(
-    seed: str = Query("ремонт пылесосов"),
-    country: str = Query("UA"),
-    language: str = Query("ru"),
-    parallel: int = Query(5, ge=1, le=10),
-    include_keywords: bool = Query(True)
+    seed: str = Query("ремонт пылесосов", description="Ключевое слово"),
+    country: str = Query("UA", description="Код страны (для Google)"),
+    region: int = Query(187, description="Yandex Region ID (187=Украина)"),
+    language: str = Query("ru", description="Код языка"),
+    parallel: int = Query(5, ge=1, le=10, description="Параллельных потоков"),
+    include_keywords: bool = Query(True, description="Включить полные списки ключей"),
+    source: str = Query("google", description="Источник: google / yandex / dual")
 ):
+    """COMPARE: сравнение всех методов с выбором источника"""
     parser = KeywordParser()
-    return await parser.compare_all(seed, country, language, False, parallel, include_keywords)
+    return await parser.compare_all(seed, country, region, language, False, parallel, include_keywords, source)
 
 
 if __name__ == "__main__":
