@@ -164,6 +164,243 @@ class KeywordParser:
         
         return sorted(list(forms))
     
+    async def autocorrect_text(self, text: str, language: str) -> Dict:
+        """
+        Автокоррекция текста через Yandex Speller API
+        
+        Returns:
+        {
+            "original": "медецинский стерелизатор купить",
+            "corrected": "медицинский стерилизатор купить",
+            "corrections": [
+                {"word": "медецинский", "suggestion": "медицинский"},
+                {"word": "стерелизатор", "suggestion": "стерилизатор"}
+            ],
+            "has_errors": True
+        }
+        """
+        url = "https://speller.yandex.net/services/spellservice.json/checkText"
+        
+        # Определяем язык для Yandex (ru, uk, en)
+        lang_map = {
+            'ru': 'ru',
+            'uk': 'uk',
+            'en': 'en'
+        }
+        yandex_lang = lang_map.get(language.lower(), 'ru')
+        
+        params = {
+            "text": text,
+            "lang": yandex_lang,
+            "options": 0  # 0 = игнорировать капитализацию
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, params=params)
+                
+                if response.status_code == 200:
+                    errors = response.json()
+                    
+                    if not errors:
+                        # Нет ошибок
+                        return {
+                            "original": text,
+                            "corrected": text,
+                            "corrections": [],
+                            "has_errors": False
+                        }
+                    
+                    # Исправляем ошибки
+                    corrected = text
+                    corrections = []
+                    
+                    # Сортируем по позиции (от конца к началу чтобы не сбить индексы)
+                    errors_sorted = sorted(errors, key=lambda x: x.get('pos', 0), reverse=True)
+                    
+                    for error in errors_sorted:
+                        word = error.get('word', '')
+                        suggestions = error.get('s', [])
+                        
+                        if suggestions:
+                            suggestion = suggestions[0]  # Берём первую подсказку
+                            pos = error.get('pos', 0)
+                            length = error.get('len', len(word))
+                            
+                            # Заменяем слово
+                            corrected = corrected[:pos] + suggestion + corrected[pos + length:]
+                            
+                            corrections.append({
+                                "word": word,
+                                "suggestion": suggestion
+                            })
+                    
+                    return {
+                        "original": text,
+                        "corrected": corrected,
+                        "corrections": corrections,
+                        "has_errors": True
+                    }
+                
+                # Если API не работает - возвращаем оригинал
+                return {
+                    "original": text,
+                    "corrected": text,
+                    "corrections": [],
+                    "has_errors": False,
+                    "error": "API unavailable"
+                }
+                
+        except Exception as e:
+            print(f"⚠️ Yandex Speller error: {e}")
+            # Fallback: пробуем LanguageTool для всех языков
+            return await self.autocorrect_languagetool(text, language)
+    
+    async def autocorrect_languagetool(self, text: str, language: str) -> Dict:
+        """
+        Автокоррекция через LanguageTool API (30+ языков)
+        
+        Поддержка: ru, uk, en, de, fr, es, pl, it, pt, nl, ca, sv, da, no, fi, ja, zh, ar...
+        """
+        url = "https://api.languagetool.org/v2/check"
+        
+        # Маппинг языков
+        lang_map = {
+            'ru': 'ru-RU',
+            'uk': 'uk-UA',
+            'en': 'en-US',
+            'de': 'de-DE',
+            'fr': 'fr-FR',
+            'es': 'es-ES',
+            'pl': 'pl-PL',
+            'it': 'it-IT',
+            'pt': 'pt-PT',
+            'nl': 'nl-NL'
+        }
+        
+        lt_lang = lang_map.get(language.lower(), 'en-US')
+        
+        data = {
+            "text": text,
+            "language": lt_lang
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(url, data=data)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    matches = result.get('matches', [])
+                    
+                    if not matches:
+                        return {
+                            "original": text,
+                            "corrected": text,
+                            "corrections": [],
+                            "has_errors": False
+                        }
+                    
+                    # Исправляем только spelling errors
+                    corrected = text
+                    corrections = []
+                    
+                    # Сортируем от конца к началу
+                    spelling_errors = [m for m in matches if 'misspelling' in m.get('rule', {}).get('issueType', '').lower()]
+                    spelling_errors_sorted = sorted(spelling_errors, key=lambda x: x.get('offset', 0), reverse=True)
+                    
+                    for match in spelling_errors_sorted:
+                        replacements = match.get('replacements', [])
+                        if not replacements:
+                            continue
+                        
+                        offset = match.get('offset', 0)
+                        length = match.get('length', 0)
+                        original_word = text[offset:offset+length]
+                        suggestion = replacements[0].get('value', '')
+                        
+                        # Заменяем
+                        corrected = corrected[:offset] + suggestion + corrected[offset+length:]
+                        
+                        corrections.append({
+                            "word": original_word,
+                            "suggestion": suggestion
+                        })
+                    
+                    if corrections:
+                        print(f"✏️ LanguageTool ({language}): '{text}' → '{corrected}'")
+                    
+                    return {
+                        "original": text,
+                        "corrected": corrected,
+                        "corrections": corrections,
+                        "has_errors": len(corrections) > 0,
+                        "service": "LanguageTool"
+                    }
+                
+                # API не работает - возвращаем оригинал
+                return {
+                    "original": text,
+                    "corrected": text,
+                    "corrections": [],
+                    "has_errors": False
+                }
+                
+        except Exception as e:
+            print(f"⚠️ LanguageTool error: {e}")
+            # Используем оригинальный текст
+            return {
+                "original": text,
+                "corrected": text,
+                "corrections": [],
+                "has_errors": False
+            }
+    
+    async def filter_relevant_keywords(self, keywords: List[str], seed: str) -> List[str]:
+        """
+        Фильтр релевантности - оставляем только ключи содержащие ВСЕ важные слова из seed
+        
+        Проблема:
+        seed = "медецинский стерелизатор купить"
+        Google возвращает: "купить холодильник харьков" ← потерял "стерелизатор"!
+        
+        Решение: проверяем что ключ содержит хотя бы одно главное существительное из seed
+        """
+        
+        # Извлекаем слова из seed
+        seed_words = set(seed.lower().split())
+        
+        # Стоп-слова (не проверяем их наличие)
+        stop_words = {'в', 'на', 'для', 'с', 'о', 'по', 'из', 'к', 'от', 'у', 
+                     'купить', 'купил', 'купишь', 'купят', 'куплю', 'купила', 'покупать',
+                     'заказать', 'заказал', 'заказывать',
+                     'цена', 'цены', 'ценам', 'стоимость', 
+                     'недорого', 'дешево', 'дорого', 'где', 'как', 'что'}
+        
+        # Важные слова = все слова кроме стоп-слов
+        important_words = [w for w in seed_words if w not in stop_words and len(w) > 2]
+        
+        if not important_words:
+            return keywords  # Если нет важных слов, возвращаем всё
+        
+        # Находим самое редкое/специфичное слово (обычно это существительное)
+        # Например: "стерелизатор" - редкое слово
+        # "медецинский" - частое
+        main_word = max(important_words, key=len)  # Берём самое длинное как главное
+        
+        filtered = []
+        for keyword in keywords:
+            keyword_lower = keyword.lower()
+            
+            # КРИТЕРИЙ: ключ ДОЛЖЕН содержать главное слово!
+            if main_word in keyword_lower:
+                filtered.append(keyword)
+            else:
+                # Потерял главное слово → МУСОР!
+                pass
+        
+        return filtered
+    
     async def fetch_suggestions(self, query: str, country: str, language: str, client: httpx.AsyncClient) -> List[str]:
         """Получить подсказки от Google Autocomplete"""
         url = "https://www.google.com/complete/search"
@@ -867,16 +1104,23 @@ async def parse_suffix(
     for r in results:
         all_keywords.update(r)
     
+    # ФИЛЬТРУЕМ нерелевантные ключи
+    filtered_keywords = await parser.filter_relevant_keywords(sorted(list(all_keywords)), seed)
+    
     elapsed = time.time() - start_time
     
     return {
         "seed": seed,
         "method": "suffix",
         "source": source,
-        "keywords": sorted(list(all_keywords)),
-        "count": len(all_keywords),
+        "keywords": filtered_keywords,
+        "count": len(filtered_keywords),
         "queries": len(queries),
-        "elapsed_time": round(elapsed, 2)
+        "elapsed_time": round(elapsed, 2),
+        "filtered": {
+            "total_before": len(all_keywords),
+            "removed": len(all_keywords) - len(filtered_keywords)
+        }
     }
 
 
