@@ -916,7 +916,8 @@ async def compare_methods(
     seed: str = Query("ремонт пылесосов", description="Базовый запрос"),
     country: str = Query("UA", description="Код страны"),
     language: str = Query("ru", description="Код языка"),
-    parallel: int = Query(5, description="Параллельных потоков", ge=1, le=10)
+    parallel: int = Query(5, description="Параллельных потоков", ge=1, le=10),
+    include_keywords: bool = Query(False, description="Включить полные списки ключей в ответ")
 ):
     """
     СРАВНЕНИЕ ВСЕХ ТРЁХ МЕТОДОВ: SUFFIX vs INFIX vs MORPHOLOGY
@@ -1008,7 +1009,8 @@ async def compare_methods(
     winner_count = max(counts, key=counts.get)
     winner_speed = min(times, key=times.get)
     
-    return {
+    # Базовый ответ
+    response = {
         "seed": seed,
         "comparison": {
             "suffix": {
@@ -1057,3 +1059,19 @@ async def compare_methods(
         },
         "summary": f"Найдено {len(total_unique)} уникальных ключей за {sum(times.values()):.1f} сек"
     }
+    
+    # Если нужны полные списки ключей
+    if include_keywords:
+        response["keywords"] = {
+            "suffix": sorted(list(suffix_keywords)),
+            "infix": sorted(list(infix_keywords)),
+            "morphology": sorted(list(morphology_keywords)),
+            "all_unique": sorted(list(total_unique)),
+            "only_suffix": sorted(list(suffix_only)),
+            "only_infix": sorted(list(infix_only)),
+            "only_morphology": sorted(list(morphology_only)),
+            "common_all_three": sorted(list(all_three))
+        }
+        print(f"\n📦 Включены полные списки ключей (размер ответа: ~{len(str(response))/1024:.1f} KB)")
+    
+    return response
