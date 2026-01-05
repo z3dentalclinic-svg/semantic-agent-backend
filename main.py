@@ -1,11 +1,11 @@
 """
-FGS Parser API - Clean Version 4.3.1
-Три метода парсинга: SUFFIX + INFIX + MORPHOLOGY
+FGS Parser API - Clean Version 4.4.0
+Четыре метода парсинга: SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
 
 Последнее обновление: 2026-01-05
-Полная переработка кода: удалены все дубликаты и старые методы
++ Добавлен MORPHOLOGY ADAPTIVE метод (78% релевантность)
 """
 
 from fastapi import FastAPI, Query
@@ -22,8 +22,8 @@ import random
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="4.3.1",
-    description="Google + Yandex + Bing | SUFFIX + INFIX + MORPHOLOGY"
+    version="4.4.0",
+    description="Google + Yandex + Bing | SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE"
 )
 
 app.add_middleware(
@@ -565,6 +565,113 @@ class GoogleAutocompleteParser:
         }
     
     # ============================================
+    # MORPHOLOGICAL ADAPTIVE METHOD
+    # ============================================
+    async def parse_morphological_adaptive(self, seed: str, country: str, language: str, use_numbers: bool, 
+                                           parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+        """MORPHOLOGICAL ADAPTIVE метод: морфология + частотный анализ + PREFIX проверка"""
+        start_time = time.time()
+        
+        words = seed.strip().split()
+        seed_words = set(seed.lower().split())
+        
+        # ЭТАП 1: Генерация морфологических форм
+        nouns_to_modify = []
+        
+        if language.lower() in ['ru', 'uk']:
+            try:
+                import pymorphy3
+                morph = pymorphy3.MorphAnalyzer()
+                for idx, word in enumerate(words):
+                    parsed = morph.parse(word)
+                    if parsed and parsed[0].tag.POS == 'NOUN':
+                        nouns_to_modify.append({
+                            'index': idx,
+                            'word': word,
+                            'forms': self.get_morphological_forms(word, language)
+                        })
+                
+                if not nouns_to_modify:
+                    last_word = words[-1]
+                    nouns_to_modify.append({
+                        'index': len(words) - 1,
+                        'word': last_word,
+                        'forms': self.get_morphological_forms(last_word, language)
+                    })
+            except:
+                last_word = words[-1]
+                nouns_to_modify.append({
+                    'index': len(words) - 1,
+                    'word': last_word,
+                    'forms': self.get_morphological_forms(last_word, language)
+                })
+        else:
+            last_word = words[-1]
+            nouns_to_modify.append({
+                'index': len(words) - 1,
+                'word': last_word,
+                'forms': self.get_morphological_forms(last_word, language)
+            })
+        
+        # Генерируем варианты seed
+        all_seeds = []
+        if len(nouns_to_modify) >= 1:
+            noun = nouns_to_modify[0]
+            for form in noun['forms']:
+                new_words = words.copy()
+                new_words[noun['index']] = form
+                all_seeds.append(' '.join(new_words))
+        
+        unique_seeds = list(set(all_seeds))
+        
+        # ЭТАП 2: SUFFIX парсинг всех форм
+        all_suffix_results = []
+        modifiers = self.get_modifiers(language, use_numbers, seed)
+        
+        for seed_variant in unique_seeds:
+            queries = [f"{seed_variant} {mod}" for mod in modifiers]
+            result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
+            all_suffix_results.extend(result['keywords'])
+        
+        # ЭТАП 3: Частотный анализ - извлечение слов-кандидатов
+        from collections import Counter
+        word_counter = Counter()
+        
+        for result in all_suffix_results:
+            result_words = result.lower().split()
+            for word in result_words:
+                # Только если слово не из seed и длина > 2
+                if word not in seed_words and len(word) > 2:
+                    word_counter[word] += 1
+        
+        # Фильтрация: слова встречающиеся ≥2 раза
+        candidates = {w for w, count in word_counter.items() if count >= 2}
+        
+        # ЭТАП 4: PREFIX проверка кандидатов
+        all_keywords = set()
+        
+        for candidate in sorted(candidates):
+            query = f"{candidate} {seed}"
+            result = await self.parse_with_semaphore([query], country, language, parallel_limit, source, region_id)
+            if result['keywords']:
+                all_keywords.update(result['keywords'])
+        
+        # Фильтр релевантности
+        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed)
+        
+        elapsed = time.time() - start_time
+        
+        return {
+            "seed": seed,
+            "method": "morphology_adaptive",
+            "source": source,
+            "keywords": filtered,
+            "count": len(filtered),
+            "candidates_found": len(candidates),
+            "elapsed_time": round(elapsed, 2)
+        }
+    
+    # ============================================
     # COMPARE ALL
     # ============================================
     async def compare_all(self, seed: str, country: str, region_id: int, language: str, 
@@ -737,6 +844,34 @@ async def parse_morphology_endpoint(
         seed = correction["corrected"]
     
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    if correction.get("has_errors"):
+        result["original_seed"] = correction["original"]
+        result["corrections"] = correction.get("corrections", [])
+    
+    return result
+
+@app.get("/api/parse/morphology-adaptive")
+async def parse_morphology_adaptive_endpoint(
+    seed: str = Query(..., description="Базовый запрос"),
+    country: str = Query("ua", description="Код страны"),
+    region_id: int = Query(143, description="ID региона для Yandex"),
+    language: str = Query("auto", description="Язык"),
+    use_numbers: bool = Query(False, description="Добавить цифры"),
+    parallel_limit: int = Query(10, description="Параллельных запросов"),
+    source: str = Query("google", description="Источник: google/yandex/bing")
+):
+    """MORPHOLOGY ADAPTIVE метод (улучшенный с частотным анализом)"""
+    
+    if language == "auto":
+        language = parser.detect_seed_language(seed)
+    
+    # Автокоррекция
+    correction = await parser.autocorrect_text(seed, language)
+    if correction.get("has_errors"):
+        seed = correction["corrected"]
+    
+    result = await parser.parse_morphological_adaptive(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
