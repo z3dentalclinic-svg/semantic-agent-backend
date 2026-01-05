@@ -919,9 +919,9 @@ async def compare_methods(
     parallel: int = Query(5, description="Параллельных потоков", ge=1, le=10)
 ):
     """
-    СРАВНЕНИЕ SUFFIX vs INFIX
+    СРАВНЕНИЕ ВСЕХ ТРЁХ МЕТОДОВ: SUFFIX vs INFIX vs MORPHOLOGY
     
-    Запускает оба метода и сравнивает результаты:
+    Запускает все методы и сравнивает результаты:
     - Количество уникальных ключей
     - Время выполнения
     - Пересечения результатов
@@ -929,9 +929,10 @@ async def compare_methods(
     """
     parser = KeywordParser()
     
-    print("\n🔄 СРАВНЕНИЕ МЕТОДОВ: SUFFIX vs INFIX\n")
+    print("\n🔄 СРАВНЕНИЕ МЕТОДОВ: SUFFIX vs INFIX vs MORPHOLOGY\n")
     
     # SUFFIX
+    print("⚡ Запуск SUFFIX...")
     suffix_result = await parser.parse(
         seed=seed,
         country=country,
@@ -944,6 +945,7 @@ async def compare_methods(
     parser.adaptive_delay = AdaptiveDelay(initial_delay=0.2, min_delay=0.1, max_delay=1.0)
     
     # INFIX
+    print("\n🔄 Запуск INFIX...")
     infix_result = await parser.parse_infix(
         seed=seed,
         country=country,
@@ -952,21 +954,59 @@ async def compare_methods(
         parallel_limit=parallel
     )
     
-    # Сравнение
+    # Сбрасываем adaptive delay между методами
+    parser.adaptive_delay = AdaptiveDelay(initial_delay=0.2, min_delay=0.1, max_delay=1.0)
+    
+    # MORPHOLOGY
+    print("\n🚀 Запуск MORPHOLOGY...")
+    morphology_result = await parser.parse_morphology(
+        seed=seed,
+        country=country,
+        language=language,
+        use_numbers=False,
+        parallel_limit=parallel
+    )
+    
+    # Обработка ошибки INFIX
     if "error" in infix_result:
-        return {
-            "error": "INFIX недоступен для этого seed",
-            "reason": infix_result["error"],
-            "suffix_result": suffix_result
-        }
+        print("⚠️ INFIX недоступен для этого seed")
+        infix_keywords = set()
+    else:
+        infix_keywords = set(infix_result["keywords"])
     
+    # Собираем множества ключей
     suffix_keywords = set(suffix_result["keywords"])
-    infix_keywords = set(infix_result["keywords"])
+    morphology_keywords = set(morphology_result["keywords"])
     
-    intersection = suffix_keywords & infix_keywords
-    suffix_only = suffix_keywords - infix_keywords
-    infix_only = infix_keywords - suffix_keywords
-    total_unique = suffix_keywords | infix_keywords
+    # Пересечения
+    all_three = suffix_keywords & infix_keywords & morphology_keywords
+    suffix_infix = suffix_keywords & infix_keywords
+    suffix_morphology = suffix_keywords & morphology_keywords
+    infix_morphology = infix_keywords & morphology_keywords
+    
+    # Уникальные для каждого
+    suffix_only = suffix_keywords - infix_keywords - morphology_keywords
+    infix_only = infix_keywords - suffix_keywords - morphology_keywords
+    morphology_only = morphology_keywords - suffix_keywords - infix_keywords
+    
+    # Всего уникальных
+    total_unique = suffix_keywords | infix_keywords | morphology_keywords
+    
+    # Определяем победителя
+    counts = {
+        "SUFFIX": len(suffix_keywords),
+        "INFIX": len(infix_keywords),
+        "MORPHOLOGY": len(morphology_keywords)
+    }
+    
+    times = {
+        "SUFFIX": suffix_result["elapsed_time"],
+        "INFIX": infix_result.get("elapsed_time", 0),
+        "MORPHOLOGY": morphology_result["elapsed_time"]
+    }
+    
+    winner_count = max(counts, key=counts.get)
+    winner_speed = min(times, key=times.get)
     
     return {
         "seed": seed,
@@ -978,26 +1018,42 @@ async def compare_methods(
             },
             "infix": {
                 "count": len(infix_keywords),
-                "time": infix_result["elapsed_time"],
-                "queries": infix_result["queries"]
+                "time": infix_result.get("elapsed_time", 0),
+                "queries": infix_result.get("queries", 0)
             },
-            "overlap": {
-                "count": len(intersection),
-                "percentage": round(len(intersection) / len(total_unique) * 100, 1) if total_unique else 0
+            "morphology": {
+                "count": len(morphology_keywords),
+                "time": morphology_result["elapsed_time"],
+                "queries": morphology_result["queries"],
+                "forms": morphology_result.get("forms_count", 0)
             },
-            "unique_to_suffix": {
-                "count": len(suffix_only),
-                "sample": sorted(list(suffix_only))[:10]
+            "total_unique": len(total_unique),
+            "total_time": sum(times.values()),
+            "intersections": {
+                "all_three": len(all_three),
+                "suffix_infix": len(suffix_infix),
+                "suffix_morphology": len(suffix_morphology),
+                "infix_morphology": len(infix_morphology)
             },
-            "unique_to_infix": {
-                "count": len(infix_only),
-                "sample": sorted(list(infix_only))[:10]
-            },
-            "total_unique": len(total_unique)
+            "unique_only": {
+                "suffix": {
+                    "count": len(suffix_only),
+                    "sample": sorted(list(suffix_only))[:5]
+                },
+                "infix": {
+                    "count": len(infix_only),
+                    "sample": sorted(list(infix_only))[:5]
+                },
+                "morphology": {
+                    "count": len(morphology_only),
+                    "sample": sorted(list(morphology_only))[:5]
+                }
+            }
         },
         "winner": {
-            "by_count": "INFIX" if len(infix_keywords) > len(suffix_keywords) else "SUFFIX",
-            "by_speed": "INFIX" if infix_result["elapsed_time"] < suffix_result["elapsed_time"] else "SUFFIX",
-            "recommendation": "Используйте оба метода для максимального покрытия" if len(total_unique) > max(len(suffix_keywords), len(infix_keywords)) * 1.3 else "Достаточно одного метода"
-        }
+            "by_count": winner_count,
+            "by_speed": winner_speed,
+            "recommendation": f"🏆 {winner_count} даёт максимум ключей ({counts[winner_count]}), {winner_speed} самый быстрый ({times[winner_speed]:.1f}с)"
+        },
+        "summary": f"Найдено {len(total_unique)} уникальных ключей за {sum(times.values()):.1f} сек"
     }
