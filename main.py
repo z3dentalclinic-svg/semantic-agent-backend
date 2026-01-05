@@ -1,11 +1,13 @@
 """
-FGS Parser API - Clean Version 4.5.1
-Пять методов парсинга: SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE + ADAPTIVE PREFIX
+FGS Parser API - Version 5.0.0
+Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
 
 Последнее обновление: 2026-01-05
-+ Улучшен ADAPTIVE PREFIX (извлекает ВСЕ слова, не только последнее)
++ Удалён MORPHOLOGY ADAPTIVE
++ Добавлен LIGHT SEARCH (SUFFIX + INFIX)
++ Добавлен DEEP SEARCH (все 4 метода)
 """
 
 from fastapi import FastAPI, Query
@@ -22,8 +24,8 @@ import random
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="4.5.1",
-    description="5 методов: SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE + ADAPTIVE PREFIX"
+    version="5.0.0",
+    description="6 методов: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH"
 )
 
 app.add_middleware(
@@ -575,109 +577,30 @@ class GoogleAutocompleteParser:
         }
     
     # ============================================
-    # MORPHOLOGICAL ADAPTIVE METHOD
+    # LIGHT SEARCH (SUFFIX + INFIX)
     # ============================================
-    async def parse_morphological_adaptive(self, seed: str, country: str, language: str, use_numbers: bool, 
-                                           parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
-        """MORPHOLOGICAL ADAPTIVE метод: морфология + частотный анализ + PREFIX проверка"""
+    async def parse_light_search(self, seed: str, country: str, language: str, use_numbers: bool, 
+                                 parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+        """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
         start_time = time.time()
         
-        words = seed.strip().split()
-        seed_words = set(seed.lower().split())
+        # Запускаем SUFFIX и INFIX параллельно
+        suffix_result = await self.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+        infix_result = await self.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
         
-        # ЭТАП 1: Генерация морфологических форм
-        nouns_to_modify = []
-        
-        if language.lower() in ['ru', 'uk']:
-            try:
-                import pymorphy3
-                morph = pymorphy3.MorphAnalyzer()
-                for idx, word in enumerate(words):
-                    parsed = morph.parse(word)
-                    if parsed and parsed[0].tag.POS == 'NOUN':
-                        nouns_to_modify.append({
-                            'index': idx,
-                            'word': word,
-                            'forms': self.get_morphological_forms(word, language)
-                        })
-                
-                if not nouns_to_modify:
-                    last_word = words[-1]
-                    nouns_to_modify.append({
-                        'index': len(words) - 1,
-                        'word': last_word,
-                        'forms': self.get_morphological_forms(last_word, language)
-                    })
-            except:
-                last_word = words[-1]
-                nouns_to_modify.append({
-                    'index': len(words) - 1,
-                    'word': last_word,
-                    'forms': self.get_morphological_forms(last_word, language)
-                })
-        else:
-            last_word = words[-1]
-            nouns_to_modify.append({
-                'index': len(words) - 1,
-                'word': last_word,
-                'forms': self.get_morphological_forms(last_word, language)
-            })
-        
-        # Генерируем варианты seed
-        all_seeds = []
-        if len(nouns_to_modify) >= 1:
-            noun = nouns_to_modify[0]
-            for form in noun['forms']:
-                new_words = words.copy()
-                new_words[noun['index']] = form
-                all_seeds.append(' '.join(new_words))
-        
-        unique_seeds = list(set(all_seeds))
-        
-        # ЭТАП 2: SUFFIX парсинг всех форм
-        all_suffix_results = []
-        modifiers = self.get_modifiers(language, use_numbers, seed)
-        
-        for seed_variant in unique_seeds:
-            queries = [f"{seed_variant} {mod}" for mod in modifiers]
-            result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
-            all_suffix_results.extend(result['keywords'])
-        
-        # ЭТАП 3: Частотный анализ - извлечение слов-кандидатов
-        from collections import Counter
-        word_counter = Counter()
-        
-        for result in all_suffix_results:
-            result_words = result.lower().split()
-            for word in result_words:
-                # Только если слово не из seed и длина > 2
-                if word not in seed_words and len(word) > 2:
-                    word_counter[word] += 1
-        
-        # Фильтрация: слова встречающиеся ≥2 раза
-        candidates = {w for w, count in word_counter.items() if count >= 2}
-        
-        # ЭТАП 4: PREFIX проверка кандидатов
-        all_keywords = set()
-        
-        for candidate in sorted(candidates):
-            query = f"{candidate} {seed}"
-            result = await self.parse_with_semaphore([query], country, language, parallel_limit, source, region_id)
-            if result['keywords']:
-                all_keywords.update(result['keywords'])
-        
-        # Фильтр релевантности
-        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed)
+        # Объединяем результаты
+        all_keywords = set(suffix_result["keywords"]) | set(infix_result.get("keywords", []))
         
         elapsed = time.time() - start_time
         
         return {
             "seed": seed,
-            "method": "morphology_adaptive",
+            "method": "light_search",
             "source": source,
-            "keywords": filtered,
-            "count": len(filtered),
-            "candidates_found": len(candidates),
+            "keywords": sorted(list(all_keywords)),
+            "count": len(all_keywords),
+            "suffix_count": len(suffix_result["keywords"]),
+            "infix_count": len(infix_result.get("keywords", [])),
             "elapsed_time": round(elapsed, 2)
         }
     
@@ -740,12 +663,12 @@ class GoogleAutocompleteParser:
         }
     
     # ============================================
-    # COMPARE ALL
+    # DEEP SEARCH (ВСЕ МЕТОДЫ)
     # ============================================
-    async def compare_all(self, seed: str, country: str, region_id: int, language: str, 
-                         use_numbers: bool, parallel_limit: int, include_keywords: bool, 
-                         source: str = "google") -> Dict:
-        """Сравнение всех трёх методов с автокоррекцией"""
+    async def parse_deep_search(self, seed: str, country: str, region_id: int, language: str, 
+                                use_numbers: bool, parallel_limit: int, include_keywords: bool, 
+                                source: str = "google") -> Dict:
+        """DEEP SEARCH: глубокий поиск (все 4 метода)"""
         
         # Автокоррекция seed
         correction = await self.autocorrect_text(seed, language)
@@ -756,23 +679,19 @@ class GoogleAutocompleteParser:
         
         start_time = time.time()
         
-        # Запускаем все три метода
+        # Запускаем все 4 метода
         suffix_result = await self.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
         infix_result = await self.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
         morph_result = await self.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
+        prefix_result = await self.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
         
         # Собираем результаты
         suffix_kw = set(suffix_result["keywords"])
         infix_kw = set(infix_result.get("keywords", []))
         morph_kw = set(morph_result["keywords"])
+        prefix_kw = set(prefix_result["keywords"])
         
-        all_unique = suffix_kw | infix_kw | morph_kw
-        
-        # Пересечения
-        suffix_only = suffix_kw - infix_kw - morph_kw
-        infix_only = infix_kw - suffix_kw - morph_kw
-        morph_only = morph_kw - suffix_kw - infix_kw
-        all_three = suffix_kw & infix_kw & morph_kw
+        all_unique = suffix_kw | infix_kw | morph_kw | prefix_kw
         
         elapsed = time.time() - start_time
         
@@ -785,13 +704,8 @@ class GoogleAutocompleteParser:
             "methods": {
                 "suffix": {"count": len(suffix_kw)},
                 "infix": {"count": len(infix_kw)},
-                "morphology": {"count": len(morph_kw)}
-            },
-            "unique_to_method": {
-                "suffix_only": len(suffix_only),
-                "infix_only": len(infix_only),
-                "morph_only": len(morph_only),
-                "all_three": len(all_three)
+                "morphology": {"count": len(morph_kw)},
+                "adaptive_prefix": {"count": len(prefix_kw)}
             },
             "elapsed_time": round(elapsed, 2)
         }
@@ -801,7 +715,8 @@ class GoogleAutocompleteParser:
                 "all": sorted(list(all_unique)),
                 "suffix": sorted(list(suffix_kw)),
                 "infix": sorted(list(infix_kw)),
-                "morphology": sorted(list(morph_kw))
+                "morphology": sorted(list(morph_kw)),
+                "adaptive_prefix": sorted(list(prefix_kw))
             }
         
         return response
@@ -817,6 +732,53 @@ async def root():
     """Главная страница"""
     return FileResponse('static/index.html')
 
+@app.get("/api/light-search")
+async def light_search_endpoint(
+    seed: str = Query(..., description="Базовый запрос"),
+    country: str = Query("ua", description="Код страны"),
+    region_id: int = Query(143, description="ID региона для Yandex"),
+    language: str = Query("auto", description="Язык"),
+    use_numbers: bool = Query(False, description="Добавить цифры"),
+    parallel_limit: int = Query(10, description="Параллельных запросов"),
+    source: str = Query("google", description="Источник: google/yandex/bing")
+):
+    """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
+    
+    if language == "auto":
+        language = parser.detect_seed_language(seed)
+    
+    # Автокоррекция
+    correction = await parser.autocorrect_text(seed, language)
+    if correction.get("has_errors"):
+        seed = correction["corrected"]
+    
+    result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    if correction.get("has_errors"):
+        result["original_seed"] = correction["original"]
+        result["corrections"] = correction.get("corrections", [])
+    
+    return result
+
+@app.get("/api/deep-search")
+async def deep_search_endpoint(
+    seed: str = Query(..., description="Базовый запрос"),
+    country: str = Query("ua", description="Код страны (ua/us/de...)"),
+    region_id: int = Query(143, description="ID региона для Yandex (143=Киев)"),
+    language: str = Query("auto", description="Язык (auto/ru/uk/en)"),
+    use_numbers: bool = Query(False, description="Добавить цифры 0-9"),
+    parallel_limit: int = Query(10, description="Параллельных запросов"),
+    include_keywords: bool = Query(True, description="Включить список ключей"),
+    source: str = Query("google", description="Источник: google/yandex/bing")
+):
+    """DEEP SEARCH: глубокий поиск (все 4 метода)"""
+    
+    if language == "auto":
+        language = parser.detect_seed_language(seed)
+    
+    return await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords, source)
+
+# Оставляю старый endpoint для совместимости
 @app.get("/api/compare")
 async def compare_methods(
     seed: str = Query(..., description="Базовый запрос"),
@@ -828,12 +790,12 @@ async def compare_methods(
     include_keywords: bool = Query(True, description="Включить список ключей"),
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
-    """Сравнение всех методов (ОСНОВНОЙ ENDPOINT)"""
+    """[DEPRECATED] Используйте /api/deep-search"""
     
     if language == "auto":
         language = parser.detect_seed_language(seed)
     
-    return await parser.compare_all(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords, source)
+    return await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords, source)
 
 @app.get("/api/parse/suffix")
 async def parse_suffix_endpoint(
@@ -912,34 +874,6 @@ async def parse_morphology_endpoint(
         seed = correction["corrected"]
     
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
-    
-    if correction.get("has_errors"):
-        result["original_seed"] = correction["original"]
-        result["corrections"] = correction.get("corrections", [])
-    
-    return result
-
-@app.get("/api/parse/morphology-adaptive")
-async def parse_morphology_adaptive_endpoint(
-    seed: str = Query(..., description="Базовый запрос"),
-    country: str = Query("ua", description="Код страны"),
-    region_id: int = Query(143, description="ID региона для Yandex"),
-    language: str = Query("auto", description="Язык"),
-    use_numbers: bool = Query(False, description="Добавить цифры"),
-    parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
-):
-    """MORPHOLOGY ADAPTIVE метод (улучшенный с частотным анализом)"""
-    
-    if language == "auto":
-        language = parser.detect_seed_language(seed)
-    
-    # Автокоррекция
-    correction = await parser.autocorrect_text(seed, language)
-    if correction.get("has_errors"):
-        seed = correction["corrected"]
-    
-    result = await parser.parse_morphological_adaptive(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
