@@ -1,13 +1,12 @@
 """
-FGS Parser API - Version 5.0.0
+FGS Parser API - Version 5.1.0
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
 
 Последнее обновление: 2026-01-05
-+ Удалён MORPHOLOGY ADAPTIVE
-+ Добавлен LIGHT SEARCH (SUFFIX + INFIX)
-+ Добавлен DEEP SEARCH (все 4 метода)
++ Добавлен Adaptive Delay для Yandex и Bing (on_success + on_rate_limit)
++ Улучшена фильтрация модификаторов (умный анализ seed)
 """
 
 from fastapi import FastAPI, Query
@@ -24,8 +23,8 @@ import random
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.0.0",
-    description="6 методов: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH"
+    version="5.1.0",
+    description="6 методов | 3 источника | Adaptive Delay для всех | Умная фильтрация"
 )
 
 app.add_middleware(
@@ -85,8 +84,13 @@ class GoogleAutocompleteParser:
         return 'en'
     
     def get_modifiers(self, language: str, use_numbers: bool, seed: str, cyrillic_only: bool = False) -> List[str]:
-        """Получить модификаторы для языка"""
+        """Получить модификаторы для языка с умной фильтрацией"""
         modifiers = []
+        
+        # Умная фильтрация: анализ seed для определения алфавита
+        seed_lower = seed.lower()
+        has_cyrillic = any('\u0400' <= c <= '\u04FF' for c in seed_lower)
+        has_latin = any('a' <= c <= 'z' for c in seed_lower)
         
         # Кириллица (БЕЗ ъ, ь, ы)
         if language.lower() == 'ru':
@@ -94,9 +98,18 @@ class GoogleAutocompleteParser:
         elif language.lower() == 'uk':
             modifiers.extend(list("абвгдежзийклмнопрстуфхцчшщюяіїєґ"))
         
-        # Латиница
+        # Латиница - умная фильтрация
         if not cyrillic_only:
-            modifiers.extend(list("abcdefghijklmnopqrstuvwxyz"))
+            # Если seed полностью на кириллице И не задан английский язык - пропускаем латиницу
+            if has_cyrillic and not has_latin and language.lower() not in ['en', 'de', 'fr', 'es', 'pl']:
+                # Не добавляем латиницу для чисто кириллических seed
+                pass
+            else:
+                # Добавляем латиницу если:
+                # - В seed есть латиница
+                # - Язык = английский/европейский
+                # - Seed без алфавита (только пробелы/цифры)
+                modifiers.extend(list("abcdefghijklmnopqrstuvwxyz"))
         
         # Цифры
         if use_numbers:
@@ -337,6 +350,14 @@ class GoogleAutocompleteParser:
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
             
+            # Обработка rate limit
+            if response.status_code == 429:
+                self.adaptive_delay.on_rate_limit()
+                return []
+            
+            # Успешный запрос
+            self.adaptive_delay.on_success()
+            
             if response.status_code == 200:
                 data = response.json()
                 results = data.get('results', [])
@@ -361,6 +382,14 @@ class GoogleAutocompleteParser:
         
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
+            
+            # Обработка rate limit
+            if response.status_code == 429:
+                self.adaptive_delay.on_rate_limit()
+                return []
+            
+            # Успешный запрос
+            self.adaptive_delay.on_success()
             
             if response.status_code == 200:
                 data = response.json()
