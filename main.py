@@ -1017,9 +1017,18 @@ class KeywordParser:
         print(f"⚡ Запуск SUFFIX ({source})...")
         modifiers_suffix = self.get_modifiers(language, use_numbers, seed)
         queries_suffix = [f"{seed} {mod}" for mod in modifiers_suffix]
-        suffix_result = await parse_with_source(queries_suffix)
+        suffix_result_raw = await parse_with_source(queries_suffix)
+        
+        # ФИЛЬТРУЕМ нерелевантные ключи
+        filtered_suffix = await self.filter_relevant_keywords(suffix_result_raw['keywords'], seed)
+        suffix_result = {
+            "keywords": filtered_suffix,
+            "success": suffix_result_raw['success'],
+            "failed": suffix_result_raw['failed']
+        }
+        
         suffix_time = time.time()
-        print(f"✅ SUFFIX: {len(suffix_result['keywords'])} ключей")
+        print(f"✅ SUFFIX: {len(suffix_result_raw['keywords'])} → {len(filtered_suffix)} ключей (отфильтровано {len(suffix_result_raw['keywords']) - len(filtered_suffix)})")
         
         self.adaptive_delay = AdaptiveDelay()
         
@@ -1035,18 +1044,20 @@ class KeywordParser:
                     queries_infix.append(query)
             infix_result_raw = await parse_with_source(queries_infix)
             
-            # ФИЛЬТРУЕМ результаты от мусорных одиночных букв
-            filtered_keywords = await self.filter_infix_results(infix_result_raw['keywords'], language)
+            # ФИЛЬТР 1: Убираем мусорные одиночные буквы
+            filtered_infix_1 = await self.filter_infix_results(infix_result_raw['keywords'], language)
+            
+            # ФИЛЬТР 2: Убираем нерелевантные ключи (потерявшие главное слово)
+            filtered_infix_2 = await self.filter_relevant_keywords(filtered_infix_1, seed)
+            
             infix_result = {
-                "keywords": filtered_keywords,
+                "keywords": filtered_infix_2,
                 "success": infix_result_raw['success'],
                 "failed": infix_result_raw['failed']
             }
             
             infix_time = time.time()
-            print(f"✅ INFIX: {len(infix_result_raw['keywords'])} → {len(filtered_keywords)} ключей (отфильтровано {len(infix_result_raw['keywords']) - len(filtered_keywords)})")
-            infix_time = time.time()
-            print(f"✅ INFIX: {len(infix_result['keywords'])} ключей")
+            print(f"✅ INFIX: {len(infix_result_raw['keywords'])} → {len(filtered_infix_1)} → {len(filtered_infix_2)} ключей (отфильтровано {len(infix_result_raw['keywords']) - len(filtered_infix_2)})")
         else:
             infix_result = {"keywords": [], "success": 0, "failed": 0}
             infix_time = suffix_time
@@ -1120,9 +1131,12 @@ class KeywordParser:
             morph_result = await parse_with_source(queries_morph)
             all_morph_keywords.update(morph_result['keywords'])
         
-        morphology_result = {"keywords": sorted(list(all_morph_keywords))}
+        # ФИЛЬТРУЕМ нерелевантные ключи
+        filtered_morph = await self.filter_relevant_keywords(sorted(list(all_morph_keywords)), seed)
+        
+        morphology_result = {"keywords": filtered_morph}
         morph_time = time.time()
-        print(f"✅ MORPHOLOGY: {len(morphology_result['keywords'])} ключей")
+        print(f"✅ MORPHOLOGY: {len(all_morph_keywords)} → {len(filtered_morph)} ключей (отфильтровано {len(all_morph_keywords) - len(filtered_morph)})")
         
         # Собираем множества
         suffix_kw = set(suffix_result["keywords"])
