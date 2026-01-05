@@ -1,8 +1,11 @@
 """
-FGS Parser API - Clean Version 4.3
+FGS Parser API - Clean Version 4.3.1
 Три метода парсинга: SUFFIX + INFIX + MORPHOLOGY
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
+
+Последнее обновление: 2026-01-05
+Полная переработка кода: удалены все дубликаты и старые методы
 """
 
 from fastapi import FastAPI, Query
@@ -19,7 +22,7 @@ import random
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="4.3",
+    version="4.3.1",
     description="Google + Yandex + Bing | SUFFIX + INFIX + MORPHOLOGY"
 )
 
