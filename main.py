@@ -137,9 +137,13 @@ class KeywordParser:
                 
                 if parsed:
                     for form in parsed[0].lexeme:
-                        forms.add(form.word)
+                        # Фильтруем причастия и деепричастия
+                        # Они создают странные комбинации типа "купившего rgb"
+                        pos = form.tag.POS
+                        if pos not in ['PRTS', 'PRTF', 'GRND']:  # participle short, participle full, gerund
+                            forms.add(form.word)
                 
-                print(f"📖 Морфология: '{word}' → {len(forms)} форм")
+                print(f"📖 Морфология: '{word}' → {len(forms)} форм (без причастий)")
             except ImportError:
                 print(f"⚠️ pymorphy3 не установлен")
             except Exception as e:
@@ -275,35 +279,102 @@ class KeywordParser:
     # MORPHOLOGY METHOD
     # ============================================
     async def parse_morphology(self, seed: str, country: str, language: str, use_numbers: bool, parallel_limit: int) -> Dict:
-        """MORPHOLOGY метод"""
+        """MORPHOLOGY метод - модифицирует ВСЕ существительные в запросе"""
         start_time = time.time()
         print(f"\n🚀 MORPHOLOGY: {seed}")
         
         words = seed.strip().split()
-        last_word = words[-1]
-        prefix = ' '.join(words[:-1]) + ' ' if len(words) > 1 else ''
         
-        word_forms = self.get_morphological_forms(last_word, language)
-        unique_forms = list(set(word_forms))
+        # Находим все существительные в запросе
+        nouns_to_modify = []
         
-        print(f"📚 Форм: {len(unique_forms)}")
+        if language.lower() in ['ru', 'uk']:
+            try:
+                import pymorphy3
+                morph = pymorphy3.MorphAnalyzer()
+                
+                for idx, word in enumerate(words):
+                    parsed = morph.parse(word)
+                    if parsed:
+                        # Проверяем является ли слово существительным
+                        pos = parsed[0].tag.POS
+                        if pos == 'NOUN':
+                            nouns_to_modify.append({
+                                'index': idx,
+                                'word': word,
+                                'forms': self.get_morphological_forms(word, language)
+                            })
+                            print(f"📌 Существительное #{idx}: '{word}' → {len(self.get_morphological_forms(word, language))} форм")
+                
+                if not nouns_to_modify:
+                    print(f"⚠️ Существительные не найдены, модифицируем последнее слово")
+                    last_word = words[-1]
+                    nouns_to_modify.append({
+                        'index': len(words) - 1,
+                        'word': last_word,
+                        'forms': self.get_morphological_forms(last_word, language)
+                    })
+                
+            except ImportError:
+                print(f"⚠️ pymorphy3 не установлен, модифицируем последнее слово")
+                last_word = words[-1]
+                nouns_to_modify.append({
+                    'index': len(words) - 1,
+                    'word': last_word,
+                    'forms': [last_word]
+                })
+        else:
+            # Для не-русских языков модифицируем последнее слово
+            last_word = words[-1]
+            nouns_to_modify.append({
+                'index': len(words) - 1,
+                'word': last_word,
+                'forms': self.get_morphological_forms(last_word, language)
+            })
         
-        async def parse_single_form(form: str) -> Dict:
-            form_seed = prefix + form
+        print(f"📚 Будем модифицировать: {len(nouns_to_modify)} слов(а)")
+        
+        # Генерируем все комбинации форм
+        all_seeds = []
+        
+        if len(nouns_to_modify) == 1:
+            # Одно существительное - просто меняем формы
+            noun = nouns_to_modify[0]
+            for form in noun['forms']:
+                new_words = words.copy()
+                new_words[noun['index']] = form
+                all_seeds.append(' '.join(new_words))
+        
+        else:
+            # Несколько существительных - модифицируем ПЕРВОЕ (обычно это главное слово)
+            # Например: "ремонт телефонов" → модифицируем "ремонт"
+            noun = nouns_to_modify[0]
+            print(f"🎯 Модифицируем первое существительное: '{noun['word']}'")
+            
+            for form in noun['forms']:
+                new_words = words.copy()
+                new_words[noun['index']] = form
+                all_seeds.append(' '.join(new_words))
+        
+        unique_seeds = list(set(all_seeds))
+        print(f"📋 Уникальных вариантов seed: {len(unique_seeds)}")
+        
+        # Парсим каждый вариант
+        async def parse_single_seed(seed_variant: str) -> Dict:
             modifiers = self.get_modifiers(language, use_numbers, seed)
-            queries = [f"{form_seed} {mod}" for mod in modifiers]
+            queries = [f"{seed_variant} {mod}" for mod in modifiers]
             result = await self.parse_with_semaphore(queries, country, language, parallel_limit)
             return {"keywords": result["keywords"], "queries": len(queries)}
         
-        tasks = [parse_single_form(form) for form in unique_forms]
-        forms_results = await asyncio.gather(*tasks)
+        tasks = [parse_single_seed(s) for s in unique_seeds]
+        seed_results = await asyncio.gather(*tasks)
         
         all_keywords = set()
         total_queries = 0
         
-        for form_result in forms_results:
-            all_keywords.update(form_result["keywords"])
-            total_queries += form_result["queries"]
+        for seed_result in seed_results:
+            all_keywords.update(seed_result["keywords"])
+            total_queries += seed_result["queries"]
         
         elapsed_time = time.time() - start_time
         print(f"✅ {len(all_keywords)} ключей за {elapsed_time:.2f} сек")
@@ -313,7 +384,8 @@ class KeywordParser:
             "method": "morphology",
             "keywords": sorted(list(all_keywords)),
             "count": len(all_keywords),
-            "forms_count": len(unique_forms),
+            "forms_count": len(unique_seeds),
+            "nouns_modified": len(nouns_to_modify),
             "queries": total_queries,
             "elapsed_time": round(elapsed_time, 2)
         }
