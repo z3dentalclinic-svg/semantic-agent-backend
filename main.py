@@ -1,11 +1,11 @@
 """
-FGS Parser API - Clean Version 4.4.0
-Четыре метода парсинга: SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE
+FGS Parser API - Clean Version 4.5.1
+Пять методов парсинга: SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE + ADAPTIVE PREFIX
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
 
 Последнее обновление: 2026-01-05
-+ Добавлен MORPHOLOGY ADAPTIVE метод (78% релевантность)
++ Улучшен ADAPTIVE PREFIX (извлекает ВСЕ слова, не только последнее)
 """
 
 from fastapi import FastAPI, Query
@@ -22,8 +22,8 @@ import random
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="4.4.0",
-    description="Google + Yandex + Bing | SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE"
+    version="4.5.1",
+    description="5 методов: SUFFIX + INFIX + MORPHOLOGY + MORPHOLOGY ADAPTIVE + ADAPTIVE PREFIX"
 )
 
 app.add_middleware(
@@ -255,7 +255,7 @@ class GoogleAutocompleteParser:
         return filtered
     
     async def filter_relevant_keywords(self, keywords: List[str], seed: str) -> List[str]:
-        """Простой фильтр релевантности: главное слово обязательно"""
+        """Улучшенный фильтр релевантности: проверяет ВСЕ важные слова из seed"""
         
         seed_words = set(seed.lower().split())
         
@@ -269,13 +269,23 @@ class GoogleAutocompleteParser:
         if not important_words:
             return keywords
         
-        # Главное слово = самое длинное
-        main_word = max(important_words, key=len)
-        
-        # Фильтруем: ключ должен содержать главное слово
+        # НОВАЯ ЛОГИКА: проверяем сколько важных слов присутствует в ключе
         filtered = []
+        
         for keyword in keywords:
-            if main_word in keyword.lower():
+            keyword_lower = keyword.lower()
+            
+            # Считаем сколько важных слов из seed есть в ключе
+            matches = sum(1 for word in important_words if word in keyword_lower)
+            
+            # Если seed короткий (1-2 слова) - требуем хотя бы 1 совпадение
+            # Если seed длинный (3+ слова) - требуем хотя бы 2 совпадения
+            if len(important_words) <= 2:
+                required_matches = 1
+            else:
+                required_matches = min(2, len(important_words))  # Минимум 2, но не больше чем есть
+            
+            if matches >= required_matches:
                 filtered.append(keyword)
         
         return filtered
@@ -672,6 +682,64 @@ class GoogleAutocompleteParser:
         }
     
     # ============================================
+    # ADAPTIVE PREFIX METHOD
+    # ============================================
+    async def parse_adaptive_prefix(self, seed: str, country: str, language: str, use_numbers: bool, 
+                                    parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+        """ADAPTIVE PREFIX метод: извлечение слов из SUFFIX + PREFIX проверка"""
+        start_time = time.time()
+        
+        seed_words = set(seed.lower().split())
+        
+        # ЭТАП 1: SUFFIX парсинг для извлечения кандидатов
+        # Используем только кириллицу (PREFIX работает только с кириллицей)
+        modifiers = self.get_modifiers(language, use_numbers, seed, cyrillic_only=True)
+        queries = [f"{seed} {mod}" for mod in modifiers]
+        
+        result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
+        
+        # ЭТАП 2: Извлечение ВСЕХ новых слов из результатов
+        from collections import Counter
+        word_counter = Counter()
+        
+        for result in result_raw['keywords']:
+            result_words = result.lower().split()
+            for word in result_words:
+                # Только если слово не из seed и длина > 2
+                if word not in seed_words and len(word) > 2:
+                    word_counter[word] += 1
+        
+        # Фильтрация: слова встречающиеся ≥2 раза
+        candidates = {w for w, count in word_counter.items() if count >= 2}
+        
+        # ЭТАП 3: PREFIX проверка - проверяем "{слово} {seed}"
+        all_keywords = set()
+        verified_prefixes = []
+        
+        for candidate in sorted(candidates):
+            query = f"{candidate} {seed}"
+            result = await self.parse_with_semaphore([query], country, language, parallel_limit, source, region_id)
+            if result['keywords']:
+                all_keywords.update(result['keywords'])
+                verified_prefixes.append(candidate)
+        
+        # Фильтр релевантности
+        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed)
+        
+        elapsed = time.time() - start_time
+        
+        return {
+            "seed": seed,
+            "method": "adaptive_prefix",
+            "source": source,
+            "keywords": filtered,
+            "count": len(filtered),
+            "candidates_found": len(candidates),
+            "verified_prefixes": verified_prefixes,
+            "elapsed_time": round(elapsed, 2)
+        }
+    
+    # ============================================
     # COMPARE ALL
     # ============================================
     async def compare_all(self, seed: str, country: str, region_id: int, language: str, 
@@ -872,6 +940,34 @@ async def parse_morphology_adaptive_endpoint(
         seed = correction["corrected"]
     
     result = await parser.parse_morphological_adaptive(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    if correction.get("has_errors"):
+        result["original_seed"] = correction["original"]
+        result["corrections"] = correction.get("corrections", [])
+    
+    return result
+
+@app.get("/api/parse/adaptive-prefix")
+async def parse_adaptive_prefix_endpoint(
+    seed: str = Query(..., description="Базовый запрос"),
+    country: str = Query("ua", description="Код страны"),
+    region_id: int = Query(143, description="ID региона для Yandex"),
+    language: str = Query("auto", description="Язык"),
+    use_numbers: bool = Query(False, description="Добавить цифры"),
+    parallel_limit: int = Query(10, description="Параллельных запросов"),
+    source: str = Query("google", description="Источник: google/yandex/bing")
+):
+    """ADAPTIVE PREFIX метод (находит PREFIX запросы типа 'киев ремонт пылесосов')"""
+    
+    if language == "auto":
+        language = parser.detect_seed_language(seed)
+    
+    # Автокоррекция
+    correction = await parser.autocorrect_text(seed, language)
+    if correction.get("has_errors"):
+        seed = correction["corrected"]
+    
+    result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
