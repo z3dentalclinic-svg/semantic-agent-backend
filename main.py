@@ -1,5 +1,5 @@
 """
-FGS Parser API - Version 5.2.0
+FGS Parser API - Version 5.2.1
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -7,7 +7,8 @@ FGS Parser API - Version 5.2.0
 Последнее обновление: 2026-01-07
 + Гибридная нормализация (Pymorphy3 + Snowball + Fuzzy Matching)
 + Поддержка 8 языков: RU, UK, EN, DE, FR, ES, IT, PL
-+ Улучшенная фильтрация результатов (subset matching)
++ Двухфакторная фильтрация (subset matching + проверка оригинальных форм)
++ Защита от грамматически неправильных форм слов
 """
 
 from fastapi import FastAPI, Query
@@ -40,8 +41,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.0",
-    description="6 методов | 3 источника | Hybrid Normalization (Pymorphy3 + Snowball) | Умная фильтрация"
+    version="5.2.1",
+    description="6 методов | 3 источника | Двухфакторная фильтрация (Gemini + Claude) | 8 языков"
 )
 
 app.add_middleware(
@@ -470,39 +471,64 @@ class GoogleAutocompleteParser:
         
         return filtered
     
-    async def filter_relevant_keywords(self, keywords: List[str], seed: str) -> List[str]:
-        """Улучшенный фильтр релевантности: проверяет ВСЕ важные слова из seed"""
+    async def filter_relevant_keywords(self, keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
+        """
+        SUBSET MATCHING v5.2.1: Двухфакторная проверка (рекомендация Gemini)
         
-        seed_words = set(seed.lower().split())
+        Сито 1 (Леммы): Проверяет смысл - про пылесосы или про утюги
+        Сито 2 (Оригиналы): Проверяет синтаксис - правильная ли форма слова
         
-        # Стоп-слова (игнорируем)
-        stop_words = {'в', 'на', 'для', 'с', 'о', 'по', 'из', 'к', 'от', 'у',
-                     'купить', 'заказать', 'цена', 'недорого', 'где', 'как', 'что'}
+        Архитектура:
+        - Использует гибридную нормализацию (_normalize)
+        - Требует ВСЕ леммы seed в keyword (subset matching)
+        - Требует минимум 70% оригинальных слов seed в keyword
+        """
         
-        # Важные слова seed
-        important_words = [w for w in seed_words if w not in stop_words and len(w) > 2]
+        # 1. Нормализуем seed (леммы для смысловой проверки)
+        seed_lemmas = self._normalize(seed, language)
         
-        if not important_words:
+        if not seed_lemmas:
             return keywords
         
-        # НОВАЯ ЛОГИКА: проверяем сколько важных слов присутствует в ключе
+        # 2. Оригинальные слова seed (для синтаксической проверки)
+        seed_words_original = [w.lower() for w in re.findall(r'\w+', seed) if len(w) > 2]
+        
+        # Получаем стоп-слова для языка
+        stop_words = self.stop_words.get(language, self.stop_words['ru'])
+        
+        # Фильтруем стоп-слова из оригинальных слов
+        seed_important_words = [w for w in seed_words_original if w not in stop_words]
+        
+        if not seed_important_words:
+            # Если все слова - стоп-слова, полагаемся только на леммы
+            seed_important_words = seed_words_original
+        
         filtered = []
         
         for keyword in keywords:
-            keyword_lower = keyword.lower()
+            kw_lower = keyword.lower()
             
-            # Считаем сколько важных слов из seed есть в ключе
-            matches = sum(1 for word in important_words if word in keyword_lower)
+            # ПРОВЕРКА 1: Леммы (Subset Matching - смысл)
+            kw_lemmas = self._normalize(keyword, language)
+            if not seed_lemmas.issubset(kw_lemmas):
+                continue  # Не про то - отсеиваем
             
-            # Если seed короткий (1-2 слова) - требуем хотя бы 1 совпадение
-            # Если seed длинный (3+ слова) - требуем хотя бы 2 совпадения
-            if len(important_words) <= 2:
-                required_matches = 1
-            else:
-                required_matches = min(2, len(important_words))  # Минимум 2, но не больше чем есть
+            # ПРОВЕРКА 2: Оригинальные формы (защита от "ремонтах" - синтаксис)
+            # Проверяем вхождение слов из seed в слова keyword
+            kw_words = kw_lower.split()
+            matches = 0
             
-            if matches >= required_matches:
-                filtered.append(keyword)
+            for seed_word in seed_important_words:
+                # Проверяем, есть ли слово из seed в составе слов keyword
+                # Пример: "пылесосов" найдётся в "пылесосов" или "пылесоса"
+                if any(seed_word in kw_word for kw_word in kw_words):
+                    matches += 1
+            
+            # Требуем минимум 70% совпадений важных слов
+            if len(seed_important_words) > 0:
+                match_ratio = matches / len(seed_important_words)
+                if match_ratio >= 0.7:
+                    filtered.append(keyword)
         
         return filtered
     
@@ -668,8 +694,8 @@ class GoogleAutocompleteParser:
         
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
         
-        # Фильтр релевантности
-        filtered = await self.filter_relevant_keywords(result_raw['keywords'], seed)
+        # Фильтр релевантности (v5.2.0: subset matching)
+        filtered = await self.filter_relevant_keywords(result_raw['keywords'], seed, language)
         
         elapsed = time.time() - start_time
         
@@ -709,8 +735,8 @@ class GoogleAutocompleteParser:
         # Фильтр 1: одиночные буквы
         filtered_1 = await self.filter_infix_results(result_raw['keywords'], language)
         
-        # Фильтр 2: релевантность
-        filtered_2 = await self.filter_relevant_keywords(filtered_1, seed)
+        # Фильтр 2: релевантность (v5.2.0: subset matching)
+        filtered_2 = await self.filter_relevant_keywords(filtered_1, seed, language)
         
         elapsed = time.time() - start_time
         
@@ -793,7 +819,7 @@ class GoogleAutocompleteParser:
             all_keywords.update(result['keywords'])
         
         # Фильтр релевантности
-        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed)
+        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
         
         elapsed = time.time() - start_time
         
@@ -877,7 +903,7 @@ class GoogleAutocompleteParser:
                 verified_prefixes.append(candidate)
         
         # Фильтр релевантности
-        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed)
+        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
         
         elapsed = time.time() - start_time
         
