@@ -1,12 +1,13 @@
 """
-FGS Parser API - Version 5.1.0
+FGS Parser API - Version 5.2.0
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
 
-Последнее обновление: 2026-01-05
-+ Добавлен Adaptive Delay для Yandex и Bing (on_success + on_rate_limit)
-+ Улучшена фильтрация модификаторов (умный анализ seed)
+Последнее обновление: 2026-01-07
++ Гибридная нормализация (Pymorphy3 + Snowball + Fuzzy Matching)
++ Поддержка 8 языков: RU, UK, EN, DE, FR, ES, IT, PL
++ Улучшенная фильтрация результатов (subset matching)
 """
 
 from fastapi import FastAPI, Query
@@ -21,7 +22,15 @@ import re
 from difflib import SequenceMatcher
 
 # NLTK для стемминга (v5.2.0)
+import nltk
 from nltk.stem import SnowballStemmer
+
+# Скачивание необходимых данных NLTK (для Render.com)
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+except Exception as e:
+    print(f"Warning: Could not download NLTK data: {e}")
 
 # Pymorphy3 для лемматизации RU/UK (v5.2.0)
 import pymorphy3
@@ -31,8 +40,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.1.0",
-    description="6 методов | 3 источника | Adaptive Delay для всех | Умная фильтрация"
+    version="5.2.0",
+    description="6 методов | 3 источника | Hybrid Normalization (Pymorphy3 + Snowball) | Умная фильтрация"
 )
 
 app.add_middleware(
