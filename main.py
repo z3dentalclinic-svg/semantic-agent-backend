@@ -1,5 +1,5 @@
 """
-FGS Parser API - Version 5.2.2
+FGS Parser API - Version 5.2.3
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -8,7 +8,8 @@ FGS Parser API - Version 5.2.2
 + Гибридная нормализация (Pymorphy3 + Snowball + Fuzzy Matching)
 + Поддержка 8 языков: RU, UK, EN, DE, FR, ES, IT, PL
 + Трёхфакторная фильтрация (леммы + оригиналы + порядок слов)
-+ 100% требование совпадения важных слов + проверка порядка
++ Морфологический фильтр по тегам - отсекает "грамматический шум" (Gemini)
++ Защита от форм datv/ablt/loct во множественном числе
 """
 
 from fastapi import FastAPI, Query
@@ -41,8 +42,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.2",
-    description="6 методов | 3 источника | Трёхфакторная фильтрация (100% + порядок) | 8 языков"
+    version="5.2.3",
+    description="6 методов | 3 источника | Морфологический фильтр (Gemini) | Diamond Quality"
 )
 
 app.add_middleware(
@@ -340,6 +341,73 @@ class GoogleAutocompleteParser:
             meaningful = [w for w in words if w not in stop_words and len(w) > 1]
             return set(meaningful)
     
+    def is_grammatically_valid(self, seed_word: str, kw_word: str, language: str = 'ru') -> bool:
+        """
+        Морфологический фильтр по тегам (v5.2.3 - рекомендация Gemini)
+        
+        Проверяет грамматическую совместимость слов из seed и keyword.
+        Отсекает "грамматический шум" - формы которые лингвистически правильные,
+        но в поисковых запросах не встречаются.
+        
+        Args:
+            seed_word: Слово из seed (обычно в Именительном падеже)
+            kw_word: Слово из keyword (может быть в любой форме)
+            language: Язык (для ru/uk используется Pymorphy3)
+            
+        Returns:
+            bool: True если форма допустимая, False если это "грамматический шум"
+            
+        Примеры:
+            >>> is_grammatically_valid('ремонт', 'ремонта', 'ru')
+            True  # Родительный падеж - OK
+            
+            >>> is_grammatically_valid('ремонт', 'ремонтам', 'ru')
+            False  # Дательный мн.ч - грамматический мусор!
+            
+            >>> is_grammatically_valid('ремонт', 'ремонтами', 'ru')
+            False  # Творительный мн.ч - грамматический мусор!
+        """
+        # Для языков без морфологии возвращаем True
+        if language not in ['ru', 'uk']:
+            return True
+        
+        try:
+            # Выбираем морфоанализатор
+            morph = self.morph_ru if language == 'ru' else self.morph_uk
+            
+            # Парсим обе формы
+            parsed_seed = morph.parse(seed_word)
+            parsed_kw = morph.parse(kw_word)
+            
+            if not parsed_seed or not parsed_kw:
+                return True  # Если не распарсилось - пропускаем
+            
+            seed_form = parsed_seed[0]
+            kw_form = parsed_kw[0]
+            
+            # Проверка 1: Это одно и то же слово?
+            if seed_form.normal_form != kw_form.normal_form:
+                return True  # Разные слова - не наша проблема
+            
+            # Проверка 2: Запрещённые грамматические формы
+            # Список ЗАПРЕЩЁННЫХ тегов для поисковых запросов:
+            # - datv (дательный): "ремонтам"
+            # - ablt (творительный): "ремонтами"  
+            # - loct (предложный): "ремонтах"
+            # ВО МНОЖЕСТВЕННОМ ЧИСЛЕ (plur)
+            
+            invalid_tags = {'datv', 'ablt', 'loct'}
+            
+            # Если слово во множественном числе И в одном из запрещённых падежей
+            if 'plur' in kw_form.tag and any(tag in kw_form.tag for tag in invalid_tags):
+                return False  # Отсеиваем грамматический мусор!
+            
+            return True  # Форма допустимая
+            
+        except Exception as e:
+            # В случае ошибки - пропускаем (безопаснее пропустить чем отсеять хорошее)
+            return True
+    
     # ============================================
     # AUTOCORRECTION
     # ============================================
@@ -473,10 +541,10 @@ class GoogleAutocompleteParser:
     
     async def filter_relevant_keywords(self, keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
         """
-        SUBSET MATCHING v5.2.2: Трёхфакторная проверка (улучшено по результатам теста)
+        SUBSET MATCHING v5.2.3: Трёхфакторная проверка (улучшено по результатам теста)
         
         Сито 1 (Леммы): Проверяет смысл - про пылесосы или про утюги
-        Сито 2 (Оригиналы): Проверяет синтаксис - правильная ли форма слова
+        Сито 2 (Оригиналы + Морфология): Проверяет синтаксис - правильная ли форма слова
         Сито 3 (Порядок): Проверяет что seed - это подстрока или слова в правильном порядке
         
         Архитектура:
@@ -520,12 +588,30 @@ class GoogleAutocompleteParser:
             # Проверяем вхождение слов из seed в слова keyword
             kw_words = kw_lower.split()
             matches = 0
+            grammatically_valid = True
             
             for seed_word in seed_important_words:
-                # Проверяем, есть ли слово из seed в составе слов keyword
-                # Пример: "пылесосов" найдётся в "пылесосов" или "пылесоса"
-                if any(seed_word in kw_word for kw_word in kw_words):
+                found_match = False
+                
+                for kw_word in kw_words:
+                    # Проверяем вхождение
+                    if seed_word in kw_word:
+                        # ПРОВЕРКА 2.5: Грамматическая валидность (v5.2.3 - Gemini)
+                        # Проверяем что это не "грамматический мусор"
+                        if self.is_grammatically_valid(seed_word, kw_word, language):
+                            found_match = True
+                            break
+                        else:
+                            # Форма грамматически неправильная (например "ремонтам")
+                            grammatically_valid = False
+                            break
+                
+                if found_match:
                     matches += 1
+            
+            # Если нашли грамматически неправильную форму - отсеиваем
+            if not grammatically_valid:
+                continue
             
             # Требуем 100% совпадений важных слов (строже!)
             if len(seed_important_words) > 0:
