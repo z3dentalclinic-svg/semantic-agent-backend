@@ -1,5 +1,5 @@
 """
-FGS Parser API - Version 5.2.3
+FGS Parser API - Version 5.2.4
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -9,7 +9,8 @@ FGS Parser API - Version 5.2.3
 + Поддержка 8 языков: RU, UK, EN, DE, FR, ES, IT, PL
 + Трёхфакторная фильтрация (леммы + оригиналы + порядок слов)
 + Морфологический фильтр по тегам - отсекает "грамматический шум" (Gemini)
-+ Защита от форм datv/ablt/loct во множественном числе
++ EntityLogicManager - конфликты городов/брендов (Natasha NER)
++ Полная реализация УРОВНЯ 2 (Subset Matching)
 """
 
 from fastapi import FastAPI, Query
@@ -27,6 +28,14 @@ from difflib import SequenceMatcher
 import nltk
 from nltk.stem import SnowballStemmer
 
+# Natasha для NER (v5.2.4)
+try:
+    from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
+    NATASHA_AVAILABLE = True
+except ImportError:
+    NATASHA_AVAILABLE = False
+    print("⚠️ Natasha не установлена. EntityLogicManager будет работать только с жёстким кешем.")
+
 # Скачивание необходимых данных NLTK (для Render.com)
 try:
     nltk.download('punkt', quiet=True)
@@ -42,8 +51,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.3",
-    description="6 методов | 3 источника | Морфологический фильтр (Gemini) | Diamond Quality"
+    version="5.2.4",
+    description="6 методов | 3 источника | EntityLogicManager (NER) | Level 2 Complete"
 )
 
 app.add_middleware(
@@ -85,11 +94,172 @@ class AdaptiveDelay:
 
 
 # ============================================
+# ENTITY CONFLICT DETECTION (v5.2.4)
+# ============================================
+class EntityLogicManager:
+    """
+    Определение конфликтов entities (города, бренды)
+    
+    Гибридный подход:
+    1. Жёсткий кеш популярных entities (O(1) - мгновенно)
+    2. Natasha NER для неизвестных (только RU, если установлена)
+    3. Кеширование результатов для ускорения
+    
+    Примеры:
+        >>> manager = EntityLogicManager()
+        >>> manager.check_conflict("ремонт днепр", "ремонт киев", "ru")
+        True  # Конфликт городов!
+        
+        >>> manager.check_conflict("ремонт днепр", "ремонт днепр недорого", "ru")
+        False  # Нет конфликта
+    """
+    
+    def __init__(self):
+        # Кеш для ускорения (seed проверяется много раз)
+        self.cache = {}
+        
+        # Жёсткий кеш популярных entities (O(1) проверка)
+        self.hard_cache = {
+            'LOC': {
+                # Украина
+                "киев", "днепр", "днепропетровск", "харьков", "одесса", "львов", 
+                "запорожье", "донецк", "кривой рог", "николаев", "луганск", 
+                "винница", "херсон", "полтава", "чернигов", "черкассы",
+                "житомир", "сумы", "хмельницкий", "ровно", "ивано-франковск",
+                "тернополь", "луцк", "ужгород", "черновцы",
+                # Россия
+                "москва", "спб", "питер", "санкт-петербург", "екатеринбург", 
+                "новосибирск", "казань", "краснодар", "воронеж", "самара", 
+                "ростов", "уфа", "челябинск", "нижний новгород", "омск",
+                "красноярск", "пермь", "волгоград", "саратов", "тюмень",
+                # Беларусь
+                "минск", "гомель", "могилев", "витебск", "гродно", "брест",
+                # Другие
+                "астана", "алматы", "ташкент", "тбилиси", "ереван", "баку",
+                "кишинев", "рига", "таллин", "вильнюс", "прага", "варшава",
+                # Крым
+                "симферополь", "севастополь", "ялта", "евпатория", "керчь", "феодосия",
+                # Кипр
+                "лимассол", "никосия", "ларнака", "пафос"
+            },
+            'ORG': {
+                # Бренды техники
+                "apple", "samsung", "xiaomi", "lg", "sony", "bosch",
+                "philips", "panasonic", "nokia", "huawei", "lenovo",
+                "dell", "hp", "asus", "acer", "msi", "intel", "amd",
+                # Бытовая техника
+                "dyson", "karcher", "thomas", "electrolux", "siemens",
+                "ariston", "indesit", "candy", "zanussi", "beko",
+                "gorenje", "whirlpool", "hotpoint", "miele", "aeg"
+            }
+        }
+        
+        # Инициализация Natasha (только если установлена)
+        self.natasha_available = NATASHA_AVAILABLE
+        if self.natasha_available:
+            try:
+                self.segmenter = Segmenter()
+                self.morph_vocab = MorphVocab()
+                self.emb = NewsEmbedding()
+                self.ner_tagger = NewsNERTagger(self.emb)
+            except Exception as e:
+                print(f"⚠️ Ошибка инициализации Natasha: {e}")
+                self.natasha_available = False
+    
+    def get_entities(self, text: str, lang: str = 'ru') -> Dict[str, set]:
+        """
+        Извлечь entities из текста
+        
+        Args:
+            text: Текст для анализа
+            lang: Язык текста (ru, uk, en)
+            
+        Returns:
+            {'LOC': set(), 'ORG': set()}
+        """
+        # Проверка кеша
+        cache_key = f"{text}_{lang}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        text_lower = text.lower()
+        entities = {'LOC': set(), 'ORG': set()}
+        
+        # ШАГ 1: Быстрая проверка по жёсткому кешу
+        words = set(re.findall(r'\w+', text_lower))
+        for category, items in self.hard_cache.items():
+            intersection = words.intersection(items)
+            if intersection:
+                entities[category].update(intersection)
+        
+        # ШАГ 2: Если ничего не нашли и язык = RU и Natasha доступна → NER
+        if not any(entities.values()) and lang == 'ru' and self.natasha_available:
+            try:
+                doc = Doc(text)
+                doc.segment(self.segmenter)
+                doc.tag_ner(self.ner_tagger)
+                
+                for span in doc.spans:
+                    if span.type == 'LOC':
+                        entities['LOC'].add(span.text.lower())
+                    elif span.type == 'ORG':
+                        entities['ORG'].add(span.text.lower())
+            except Exception as e:
+                pass  # NER может упасть на некорректном тексте
+        
+        # Сохраняем в кеш
+        self.cache[cache_key] = entities
+        return entities
+    
+    def check_conflict(self, seed: str, keyword: str, lang: str = 'ru') -> bool:
+        """
+        Проверить конфликт entities
+        
+        Возвращает True если:
+        - В seed есть город А, а в keyword появился город Б
+        - В seed есть бренд А, а в keyword появился бренд Б
+        
+        Args:
+            seed: Исходный запрос
+            keyword: Ключевое слово для проверки
+            lang: Язык
+            
+        Returns:
+            True если конфликт, False если всё ОК
+            
+        Примеры:
+            >>> check_conflict("ремонт днепр", "ремонт киев", "ru")
+            True  # Конфликт: днепр != киев
+            
+            >>> check_conflict("ремонт днепр", "ремонт днепр недорого", "ru")
+            False  # Нет конфликта: тот же город
+        """
+        seed_entities = self.get_entities(seed, lang)
+        kw_entities = self.get_entities(keyword, lang)
+        
+        # Проверяем каждый тип entities (LOC, ORG)
+        for entity_type in ['LOC', 'ORG']:
+            seed_set = seed_entities[entity_type]
+            kw_set = kw_entities[entity_type]
+            
+            # Если в seed есть entity, а в keyword появился ДРУГОЙ
+            if seed_set and (kw_set - seed_set):
+                return True  # КОНФЛИКТ!
+        
+        return False  # Нет конфликта
+
+
+# ============================================
 # PARSER CLASS
 # ============================================
 class GoogleAutocompleteParser:
     def __init__(self):
         self.adaptive_delay = AdaptiveDelay()
+        
+        # ============================================
+        # ENTITY CONFLICT DETECTION (v5.2.4)
+        # ============================================
+        self.entity_manager = EntityLogicManager()
         
         # ============================================
         # НОРМАЛИЗАЦИЯ ДЛЯ ФИЛЬТРАЦИИ (v5.2.0)
@@ -658,7 +828,26 @@ class GoogleAutocompleteParser:
             if order_correct:
                 filtered.append(keyword)
         
-        return filtered
+        # ============================================
+        # ЭТАП 2: ENTITY CONFLICTS (v5.2.4)
+        # Проверяем конфликты городов/брендов
+        # ============================================
+        filtered_final = []
+        
+        for keyword in filtered:
+            # Запускаем в отдельном потоке т.к. Natasha синхронная
+            # (asyncio.to_thread не блокирует event loop)
+            is_conflict = await asyncio.to_thread(
+                self.entity_manager.check_conflict,
+                seed,
+                keyword,
+                language
+            )
+            
+            if not is_conflict:
+                filtered_final.append(keyword)
+        
+        return filtered_final
     
     # ============================================
     # FETCH SUGGESTIONS (3 источника)
