@@ -17,6 +17,14 @@ import httpx
 import asyncio
 import time
 import random
+import re
+from difflib import SequenceMatcher
+
+# NLTK для стемминга (v5.2.0)
+from nltk.stem import SnowballStemmer
+
+# Pymorphy3 для лемматизации RU/UK (v5.2.0)
+import pymorphy3
 
 # ============================================
 # FASTAPI APP
@@ -71,6 +79,50 @@ class AdaptiveDelay:
 class GoogleAutocompleteParser:
     def __init__(self):
         self.adaptive_delay = AdaptiveDelay()
+        
+        # ============================================
+        # НОРМАЛИЗАЦИЯ ДЛЯ ФИЛЬТРАЦИИ (v5.2.0)
+        # Гибридный подход: Pymorphy3 (RU/UK) + Snowball (остальные)
+        # ============================================
+        
+        # Pymorphy3 для точной лемматизации RU/UK
+        self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
+        self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+        
+        # Snowball для быстрого стемминга других языков
+        self.stemmers = {
+            'en': SnowballStemmer("english"),
+            'de': SnowballStemmer("german"),
+            'fr': SnowballStemmer("french"),
+            'es': SnowballStemmer("spanish"),
+            'it': SnowballStemmer("italian"),
+        }
+        
+        # Стоп-слова (предлоги, союзы - игнорируются при фильтрации)
+        self.stop_words = {
+            'ru': {'и', 'в', 'во', 'не', 'на', 'с', 'от', 'для', 'по', 'о', 'об', 'к', 'у', 'за', 
+                   'из', 'со', 'до', 'при', 'без', 'над', 'под', 'а', 'но', 'да', 'или', 'чтобы', 
+                   'что', 'как', 'где', 'когда', 'куда', 'откуда', 'почему'},
+            'uk': {'і', 'в', 'на', 'з', 'від', 'для', 'по', 'о', 'до', 'при', 'без', 'над', 'під', 
+                   'а', 'але', 'та', 'або', 'що', 'як', 'де', 'коли', 'куди', 'звідки', 'чому'},
+            'en': {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 
+                   'up', 'about', 'into', 'through', 'during', 'and', 'or', 'but', 'if', 'when', 
+                   'where', 'how', 'why', 'what'},
+            'de': {'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einen', 'einem', 
+                   'und', 'oder', 'aber', 'in', 'auf', 'von', 'zu', 'mit', 'für', 'bei', 'nach',
+                   'wie', 'wo', 'wann', 'warum', 'was', 'wer'},
+            'fr': {'le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'et', 'ou', 'mais', 'dans',
+                   'sur', 'avec', 'pour', 'par', 'à', 'en', 'au', 'aux', 'ce', 'qui', 'que',
+                   'comment', 'où', 'quand', 'pourquoi', 'quoi'},
+            'es': {'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'y', 'o',
+                   'pero', 'en', 'con', 'por', 'para', 'a', 'al', 'como', 'que', 'quien',
+                   'donde', 'cuando', 'porque', 'qué'},
+            'it': {'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'uno', 'una', 'di', 'da', 'e', 'o',
+                   'ma', 'in', 'su', 'con', 'per', 'a', 'come', 'che', 'chi', 'dove', 'quando',
+                   'perché', 'cosa'},
+            'pl': {'i', 'w', 'na', 'z', 'do', 'dla', 'po', 'o', 'przy', 'bez', 'nad', 'pod',
+                   'a', 'ale', 'lub', 'czy', 'że', 'jak', 'gdzie', 'kiedy', 'dlaczego', 'co'}
+        }
     
     # ============================================
     # LANGUAGE & MODIFIERS
@@ -137,6 +189,146 @@ class GoogleAutocompleteParser:
                 pass
         
         return sorted(list(forms))
+    
+    def _normalize_with_pymorphy(self, text: str, language: str) -> set:
+        """
+        Лемматизация через Pymorphy3 для RU/UK
+        
+        Args:
+            text: Текст для анализа
+            language: 'ru' или 'uk'
+            
+        Returns:
+            set: Множество лемм (начальных форм слов)
+        """
+        # Выбираем анализатор
+        morph = self.morph_ru if language == 'ru' else self.morph_uk
+        
+        # Получаем стоп-слова
+        stop_words = self.stop_words.get(language, self.stop_words['ru'])
+        
+        # Извлекаем слова
+        words = re.findall(r'\w+', text.lower())
+        
+        # Фильтруем стоп-слова
+        meaningful = [w for w in words if w not in stop_words and len(w) > 1]
+        
+        # Лемматизация через Pymorphy3
+        lemmas = set()
+        for word in meaningful:
+            try:
+                parsed = morph.parse(word)
+                if parsed:
+                    lemmas.add(parsed[0].normal_form)
+            except:
+                # Если не удалось распарсить - добавляем как есть
+                lemmas.add(word)
+        
+        return lemmas
+    
+    def _normalize_with_snowball(self, text: str, language: str) -> set:
+        """
+        Стемминг через Snowball для EN/DE/FR/ES/IT
+        
+        Args:
+            text: Текст для анализа
+            language: Язык (en, de, fr, es, it)
+            
+        Returns:
+            set: Множество стеммов (корней слов)
+        """
+        # Получаем стеммер
+        stemmer = self.stemmers.get(language, self.stemmers['en'])
+        
+        # Получаем стоп-слова
+        stop_words = self.stop_words.get(language, self.stop_words['en'])
+        
+        # Извлекаем слова
+        words = re.findall(r'\w+', text.lower())
+        
+        # Фильтруем стоп-слова
+        meaningful = [w for w in words if w not in stop_words and len(w) > 1]
+        
+        # Стемминг
+        stems = {stemmer.stem(w) for w in meaningful}
+        
+        return stems
+    
+    def _are_words_similar(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
+        """
+        Fuzzy Matching для сравнения похожих слов (RU ↔ UK)
+        
+        Применяется только для слов длиннее 5 символов
+        
+        Args:
+            word1: Первое слово
+            word2: Второе слово
+            threshold: Порог схожести (0.85-0.9)
+            
+        Returns:
+            bool: True если слова похожи
+            
+        Примеры:
+            >>> _are_words_similar('пилосос', 'пылесос', 0.85)
+            True  # Украинский ↔ Русский
+            
+            >>> _are_words_similar('ремонт', 'демонт', 0.85)
+            False  # Разные слова
+        """
+        # Fuzzy только для длинных слов (избегаем ложных срабатываний)
+        if len(word1) <= 4 or len(word2) <= 4:
+            return False
+        
+        # Вычисляем схожесть через SequenceMatcher
+        similarity = SequenceMatcher(None, word1, word2).ratio()
+        
+        return similarity >= threshold
+    
+    def _normalize(self, text: str, language: str = 'ru') -> set:
+        """
+        Гибридная нормализация текста (v5.2.0)
+        
+        Стратегия:
+        - RU/UK: Pymorphy3 (точная лемматизация)
+        - EN/DE/FR/ES/IT: Snowball (быстрый стемминг)
+        - PL: Snowball с русским движком (fallback)
+        
+        Логика от Gemini AI - гибридный подход
+        
+        Args:
+            text: Текст для анализа
+            language: Язык текста (ru, uk, en, de, fr, es, it, pl)
+            
+        Returns:
+            set: Множество нормализованных форм слов
+            
+        Примеры:
+            >>> _normalize("ремонт пылесосов в днепре", "ru")
+            {'ремонт', 'пылесос', 'днепр'}
+            
+            >>> _normalize("пилососів дніпро", "uk")
+            {'пилосос', 'дніпро'}
+            
+            >>> _normalize("repair vacuum cleaner", "en")
+            {'repair', 'vacuum', 'cleaner'}
+        """
+        
+        # СТРАТЕГИЯ 1: Pymorphy3 для RU/UK (лемматизация)
+        if language in ['ru', 'uk']:
+            return self._normalize_with_pymorphy(text, language)
+        
+        # СТРАТЕГИЯ 2: Snowball для остальных (стемминг)
+        elif language in ['en', 'de', 'fr', 'es', 'it']:
+            return self._normalize_with_snowball(text, language)
+        
+        # СТРАТЕГИЯ 3: Fallback для PL и неизвестных
+        else:
+            # Для польского используем простую нормализацию
+            # (Pymorphy3 не поддерживает, Snowball тоже)
+            words = re.findall(r'\w+', text.lower())
+            stop_words = self.stop_words.get('en', set())  # fallback на английские
+            meaningful = [w for w in words if w not in stop_words and len(w) > 1]
+            return set(meaningful)
     
     # ============================================
     # AUTOCORRECTION
