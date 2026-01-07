@@ -1,5 +1,5 @@
 """
-FGS Parser API - Version 5.2.1
+FGS Parser API - Version 5.2.2
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -7,8 +7,8 @@ FGS Parser API - Version 5.2.1
 Последнее обновление: 2026-01-07
 + Гибридная нормализация (Pymorphy3 + Snowball + Fuzzy Matching)
 + Поддержка 8 языков: RU, UK, EN, DE, FR, ES, IT, PL
-+ Двухфакторная фильтрация (subset matching + проверка оригинальных форм)
-+ Защита от грамматически неправильных форм слов
++ Трёхфакторная фильтрация (леммы + оригиналы + порядок слов)
++ 100% требование совпадения важных слов + проверка порядка
 """
 
 from fastapi import FastAPI, Query
@@ -41,8 +41,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.1",
-    description="6 методов | 3 источника | Двухфакторная фильтрация (Gemini + Claude) | 8 языков"
+    version="5.2.2",
+    description="6 методов | 3 источника | Трёхфакторная фильтрация (100% + порядок) | 8 языков"
 )
 
 app.add_middleware(
@@ -473,15 +473,17 @@ class GoogleAutocompleteParser:
     
     async def filter_relevant_keywords(self, keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
         """
-        SUBSET MATCHING v5.2.1: Двухфакторная проверка (рекомендация Gemini)
+        SUBSET MATCHING v5.2.2: Трёхфакторная проверка (улучшено по результатам теста)
         
         Сито 1 (Леммы): Проверяет смысл - про пылесосы или про утюги
         Сито 2 (Оригиналы): Проверяет синтаксис - правильная ли форма слова
+        Сито 3 (Порядок): Проверяет что seed - это подстрока или слова в правильном порядке
         
         Архитектура:
         - Использует гибридную нормализацию (_normalize)
         - Требует ВСЕ леммы seed в keyword (subset matching)
-        - Требует минимум 70% оригинальных слов seed в keyword
+        - Требует 100% оригинальных слов seed в keyword (строже чем 70%)
+        - Требует что seed присутствует как подстрока ИЛИ слова идут в правильном порядке
         """
         
         # 1. Нормализуем seed (леммы для смысловой проверки)
@@ -491,6 +493,7 @@ class GoogleAutocompleteParser:
             return keywords
         
         # 2. Оригинальные слова seed (для синтаксической проверки)
+        seed_lower = seed.lower()
         seed_words_original = [w.lower() for w in re.findall(r'\w+', seed) if len(w) > 2]
         
         # Получаем стоп-слова для языка
@@ -524,11 +527,50 @@ class GoogleAutocompleteParser:
                 if any(seed_word in kw_word for kw_word in kw_words):
                     matches += 1
             
-            # Требуем минимум 70% совпадений важных слов
+            # Требуем 100% совпадений важных слов (строже!)
             if len(seed_important_words) > 0:
                 match_ratio = matches / len(seed_important_words)
-                if match_ratio >= 0.7:
-                    filtered.append(keyword)
+                if match_ratio < 1.0:  # Если НЕ 100% - отсеиваем
+                    continue
+            
+            # ПРОВЕРКА 3: Порядок слов + позиция seed
+            # Проверяем что первое слово seed находится в начале keyword (или близко к началу)
+            # И все слова идут в правильном порядке
+            
+            first_seed_word = seed_important_words[0]
+            first_word_position = -1
+            
+            # Находим позицию первого важного слова seed в keyword
+            for i, kw_word in enumerate(kw_words):
+                if first_seed_word in kw_word:
+                    first_word_position = i
+                    break
+            
+            # Если первое слово seed находится слишком далеко от начала - отсеиваем
+            # Допускаем максимум 1 слово перед первым важным словом seed
+            if first_word_position > 1:
+                continue  # "дому ремонт пылесосов" → позиция 1, но это уже мусор
+            
+            # Проверяем что все важные слова seed встречаются в keyword в правильном порядке
+            last_index = -1
+            order_correct = True
+            
+            for seed_word in seed_important_words:
+                # Ищем это слово в keyword после предыдущего найденного
+                found_at = -1
+                for i, kw_word in enumerate(kw_words):
+                    if i > last_index and seed_word in kw_word:
+                        found_at = i
+                        break
+                
+                if found_at == -1:
+                    order_correct = False
+                    break
+                
+                last_index = found_at
+            
+            if order_correct:
+                filtered.append(keyword)
         
         return filtered
     
