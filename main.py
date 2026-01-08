@@ -693,7 +693,7 @@ class GoogleAutocompleteParser:
             >>> is_query_allowed("ремонт пылесосов москва цена", "ремонт пылесосов москва", "ua")
             True  # Разрешено: "москва" в seed (пользователь САМ указал)
         """
-        blacklist = GEO_BLACKLIST.get(country, [])
+        blacklist = GEO_BLACKLIST.get(country.lower(), [])  # .lower() для надёжности!
         
         if not blacklist:
             return True  # Нет blacklist для этой страны
@@ -711,7 +711,7 @@ class GoogleAutocompleteParser:
         query_lower = query.lower()
         for city in blacklist:
             if city in query_lower:
-                print(f"🚫 [PRE-FILTER] Блокировка: '{query}' (чужой город: {city}, страна: {country})")
+                print(f"🚫 [PRE-FILTER] Блокировка: '{query}' (чужой город: {city}, страна: {country})", flush=True)
                 return False
         
         return True
