@@ -1,5 +1,5 @@
 """
-FGS Parser API - Version 5.2.4
+FGS Parser API - Version 5.2.5
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -9,7 +9,7 @@ FGS Parser API - Version 5.2.4
 + Поддержка 8 языков: RU, UK, EN, DE, FR, ES, IT, PL
 + Трёхфакторная фильтрация (леммы + оригиналы + порядок слов)
 + Морфологический фильтр по тегам - отсекает "грамматический шум" (Gemini)
-+ EntityLogicManager - конфликты городов/брендов (Natasha NER)
++ EntityLogicManager с нормализацией - находит "киеве" → "киев"
 + Полная реализация УРОВНЯ 2 (Subset Matching)
 """
 
@@ -51,8 +51,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.4",
-    description="6 методов | 3 источника | EntityLogicManager (NER) | Level 2 Complete"
+    version="5.2.5",
+    description="6 методов | 3 источника | Entity normalization | Level 2 Complete"
 )
 
 app.add_middleware(
@@ -118,6 +118,17 @@ class EntityLogicManager:
         # Кеш для ускорения (seed проверяется много раз)
         self.cache = {}
         
+        # Pymorphy3 для нормализации слов (v5.2.5)
+        # Используем для приведения "киеве" → "киев"
+        try:
+            import pymorphy3
+            self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
+            self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+            self.morph_available = True
+        except Exception as e:
+            print(f"⚠️ Pymorphy3 не доступен для EntityLogicManager: {e}")
+            self.morph_available = False
+        
         # Жёсткий кеш популярных entities (O(1) проверка)
         self.hard_cache = {
             'LOC': {
@@ -168,7 +179,7 @@ class EntityLogicManager:
     
     def get_entities(self, text: str, lang: str = 'ru') -> Dict[str, set]:
         """
-        Извлечь entities из текста
+        Извлечь entities из текста (v5.2.5 с нормализацией)
         
         Args:
             text: Текст для анализа
@@ -176,6 +187,10 @@ class EntityLogicManager:
             
         Returns:
             {'LOC': set(), 'ORG': set()}
+            
+        Улучшения v5.2.5:
+            - Нормализация слов через Pymorphy3 перед проверкой кеша
+            - Теперь "киеве" → "киев", "днепром" → "днепр"
         """
         # Проверка кеша
         cache_key = f"{text}_{lang}"
@@ -185,14 +200,34 @@ class EntityLogicManager:
         text_lower = text.lower()
         entities = {'LOC': set(), 'ORG': set()}
         
-        # ШАГ 1: Быстрая проверка по жёсткому кешу
-        words = set(re.findall(r'\w+', text_lower))
+        # ШАГ 1: Нормализация слов через Pymorphy3 (v5.2.5)
+        words_original = set(re.findall(r'\w+', text_lower))
+        
+        if self.morph_available and lang in ['ru', 'uk']:
+            # Используем Pymorphy3 для нормализации
+            morph = self.morph_ru if lang == 'ru' else self.morph_uk
+            words_normalized = set()
+            
+            for word in words_original:
+                try:
+                    parsed = morph.parse(word)
+                    if parsed:
+                        # Добавляем нормальную форму (именительный падеж)
+                        words_normalized.add(parsed[0].normal_form)
+                except:
+                    # Если не распарсилось - добавляем как есть
+                    words_normalized.add(word)
+        else:
+            # Для других языков или если Pymorphy3 недоступен
+            words_normalized = words_original
+        
+        # ШАГ 2: Быстрая проверка по жёсткому кешу (используем нормализованные слова)
         for category, items in self.hard_cache.items():
-            intersection = words.intersection(items)
+            intersection = words_normalized.intersection(items)
             if intersection:
                 entities[category].update(intersection)
         
-        # ШАГ 2: Если ничего не нашли и язык = RU и Natasha доступна → NER
+        # ШАГ 3: Если ничего не нашли и язык = RU и Natasha доступна → NER
         if not any(entities.values()) and lang == 'ru' and self.natasha_available:
             try:
                 doc = Doc(text)
