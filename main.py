@@ -1,4 +1,5 @@
 """
+# DEPLOYED: 2026-01-08 v5.2.6 FINAL (with .lower() and flush=True fixes)
 FGS Parser API - Version 5.2.6
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
