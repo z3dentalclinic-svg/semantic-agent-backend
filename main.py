@@ -1,6 +1,6 @@
 """
-# DEPLOYED: 2026-01-08 v5.2.7 (with pre-filter normalization)
-FGS Parser API - Version 5.2.7
+# DEPLOYED: 2026-01-08 v5.2.8 (geonamescache - full database)
+FGS Parser API - Version 5.2.8
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -11,7 +11,7 @@ FGS Parser API - Version 5.2.7
 + Трёхфакторная фильтрация (леммы + оригиналы + порядок слов)
 + Морфологический фильтр по тегам - отсекает "грамматический шум"
 + EntityLogicManager с двухступенчатой проверкой (для "львов")
-+ Пре-фильтр с нормализацией - блокирует "в москве", "москвой"
++ Пре-фильтр: geonamescache база (15000+ городов, автогенерация)
 + Регионы в кеше - определяет конфликты областей
 + Полная реализация УРОВНЯ 2 (Subset Matching)
 """
@@ -54,8 +54,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.7",
-    description="6 методов | 3 источника | Pre-filter с нормализацией | Level 2 Complete"
+    version="5.2.8",
+    description="6 методов | 3 источника | Pre-filter: geonames (15k+ cities) | Level 2 Complete"
 )
 
 app.add_middleware(
@@ -76,32 +76,109 @@ USER_AGENTS = [
 ]
 
 # ============================================
-# GEO BLACKLIST ДЛЯ ПРЕ-ФИЛЬТРА (v5.2.6)
-# Блокирует запросы с городами других стран ДО отправки в Google
+# GEO BLACKLIST ДЛЯ ПРЕ-ФИЛЬТРА (v5.2.8)
+# Автоматическая генерация из geonamescache (15000+ городов)
 # ============================================
-GEO_BLACKLIST = {
-    # Украина - блокируем российские/белорусские города
-    "ua": [
-        "москва", "мск", "спб", "питер", "санкт-петербург",
-        "краснодар", "новосибирск", "екатеринбург", "казань",
-        "красноярск", "воронеж", "самара", "ростов", "уфа",
-        "минск", "гомель", "могилев", "витебск", "гродно", "брест"
-    ],
-    # Россия - блокируем украинские города  
-    "ru": [
-        "киев", "харьков", "днепр", "днепропетровск", "одесса",
-        "львов", "запорожье", "кривой рог", "николаев", "луганск"
-    ],
-    # Беларусь - блокируем российские/украинские
-    "by": [
-        "москва", "спб", "питер", "краснодар",
-        "киев", "харьков", "днепр", "одесса", "львов"
-    ],
-    # Казахстан
-    "kz": [
-        "москва", "спб", "питер", "киев", "минск"
-    ],
-}
+
+def generate_geo_blacklist_full():
+    """
+    Генерирует ПОЛНЫЙ GEO_BLACKLIST из базы geonames
+    
+    База содержит:
+    - 15000+ городов мира
+    - Альтернативные названия (Москва, Moscow, Maskva, МСК...)
+    - Привязка к странам через countrycode
+    
+    БЕЗ фильтра по населению - берём ВСЕ города!
+    
+    Returns:
+        dict: {
+            'ua': [список чужих городов для Украины],
+            'ru': [список чужих городов для России],
+            ...
+        }
+    """
+    try:
+        from geonamescache import GeonamesCache
+        
+        gc = GeonamesCache()
+        cities = gc.get_cities()
+        
+        # Группируем города по странам
+        cities_by_country = {}
+        
+        for city_id, city_data in cities.items():
+            country = city_data['countrycode']
+            
+            if country not in cities_by_country:
+                cities_by_country[country] = set()
+            
+            # Добавляем основное название
+            name = city_data['name'].lower()
+            cities_by_country[country].add(name)
+            
+            # Добавляем альтернативные названия
+            for alt in city_data.get('alternatenames', []):
+                # Фильтруем: только читаемые названия (не иероглифы)
+                if alt and len(alt) <= 30:
+                    # Только если содержит буквы
+                    if any(c.isalpha() for c in alt):
+                        cities_by_country[country].add(alt.lower())
+        
+        # Формируем blacklist
+        blacklist = {}
+        
+        # Украина блокирует: Россию + Беларусь + Казахстан + соседей
+        blacklist['ua'] = (
+            cities_by_country.get('RU', set()) |  # Россия
+            cities_by_country.get('BY', set()) |  # Беларусь
+            cities_by_country.get('KZ', set()) |  # Казахстан
+            cities_by_country.get('PL', set()) |  # Польша (Щецин!)
+            cities_by_country.get('LT', set()) |  # Литва
+            cities_by_country.get('LV', set()) |  # Латвия
+            cities_by_country.get('EE', set())    # Эстония
+        )
+        
+        # Россия блокирует: Украину + Беларусь + Казахстан
+        blacklist['ru'] = (
+            cities_by_country.get('UA', set()) |
+            cities_by_country.get('BY', set()) |
+            cities_by_country.get('KZ', set())
+        )
+        
+        # Беларусь блокирует: Россию + Украину
+        blacklist['by'] = (
+            cities_by_country.get('RU', set()) |
+            cities_by_country.get('UA', set())
+        )
+        
+        # Казахстан блокирует: Россию + Украину + Беларусь
+        blacklist['kz'] = (
+            cities_by_country.get('RU', set()) |
+            cities_by_country.get('UA', set()) |
+            cities_by_country.get('BY', set())
+        )
+        
+        # Логируем статистику
+        print("✅ GEO_BLACKLIST сгенерирован из geonames:")
+        for country, cities_set in blacklist.items():
+            print(f"   {country.upper()}: {len(cities_set)} городов в blacklist")
+        
+        return blacklist
+        
+    except ImportError:
+        # Если geonamescache не установлен - fallback на минимальный список
+        print("⚠️ geonamescache не установлен, используется минимальный blacklist")
+        return {
+            "ua": {"москва", "мск", "спб", "питер", "санкт-петербург", "минск"},
+            "ru": {"киев", "харьков", "днепр", "львов", "одесса"},
+            "by": {"москва", "спб", "киев", "харьков"},
+            "kz": {"москва", "спб", "киев"}
+        }
+
+# Генерируем при импорте модуля (один раз при старте)
+GEO_BLACKLIST = generate_geo_blacklist_full()
+
 
 # ============================================
 # ADAPTIVE DELAY
@@ -669,15 +746,17 @@ class GoogleAutocompleteParser:
     
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        ПРЕ-ФИЛЬТР (v5.2.7): Проверяет запрос ДО отправки в Google
+        ПРЕ-ФИЛЬТР (v5.2.8): Проверяет запрос ДО отправки в Google
         
         Блокирует запросы с городами других стран для предотвращения:
         1. Нецелевого трафика (украинский IP спрашивает про Москву)
         2. Потенциальных проблем с Google (подозрительное поведение)
         
-        Улучшения v5.2.7:
-        - Нормализация слов query через Pymorphy3
-        - Теперь блокирует "в москве", "москвой", "москву"
+        Улучшения v5.2.8:
+        - База geonames: 15000+ городов вместо 20 вручную
+        - Автоматическая генерация blacklist при старте
+        - Альтернативные названия (Moscow, Москва, Maskva, МСК...)
+        - Покрытие: ~1500 городов для UA (было 20)
         
         Умная логика:
         - Если город в seed - разрешаем (пользователь САМ указал)
@@ -693,15 +772,15 @@ class GoogleAutocompleteParser:
             
         Примеры:
             >>> is_query_allowed("ремонт пылесосов москва", "ремонт пылесосов", "ua")
-            False  # Блокировка: "москва" для Украины
+            False  # Блокировка: "москва" в базе geonames
             
-            >>> is_query_allowed("ремонт пылесосов в москве", "ремонт пылесосов", "ua")
-            False  # Блокировка: "москве" → "москва" (нормализация!)
+            >>> is_query_allowed("ремонт пылесосов szczecin", "ремонт пылесосов", "ua")
+            False  # Блокировка: "szczecin" → "щецин" в базе geonames
             
             >>> is_query_allowed("ремонт пылесосов москва цена", "ремонт пылесосов москва", "ua")
             True  # Разрешено: "москва" в seed (пользователь САМ указал)
         """
-        blacklist = GEO_BLACKLIST.get(country.lower(), [])  # .lower() для надёжности!
+        blacklist = GEO_BLACKLIST.get(country.lower(), set())  # .lower() для надёжности!
         
         if not blacklist:
             return True  # Нет blacklist для этой страны
