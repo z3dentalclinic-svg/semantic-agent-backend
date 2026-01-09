@@ -1,6 +1,6 @@
 """
-# DEPLOYED: 2026-01-09 v5.2.9 (whole word check + rare cities)
-FGS Parser API - Version 5.2.9
+# DEPLOYED: 2026-01-09 v5.2.10 (filtered alternative names)
+FGS Parser API - Version 5.2.10
 Методы парсинга: SUFFIX | INFIX | MORPHOLOGY | ADAPTIVE PREFIX | LIGHT SEARCH | DEEP SEARCH
 Три источника: Google + Yandex + Bing
 Автокоррекция: Yandex Speller + LanguageTool
@@ -11,8 +11,9 @@ FGS Parser API - Version 5.2.9
 + Трёхфакторная фильтрация (леммы + оригиналы + порядок слов)
 + Морфологический фильтр по тегам - отсекает "грамматический шум"
 + EntityLogicManager с двухступенчатой проверкой (для "львов")
-+ Пре-фильтр: geonames (15k+ городов) + ручной список редких городов
-+ Проверка ЦЕЛЫХ слов (фикс "филипс"/"фили", "щелкино"/"елк")
++ Пре-фильтр: geonames (фильтрованные альты) + ручной список
++ Фильтры альтернатив: без пробелов, 3-30 букв, латиница/кириллица
++ Проверка ЦЕЛЫХ слов (фикс "филипс"/"фили")
 + Регионы в кеше - определяет конфликты областей
 + Полная реализация УРОВНЯ 2 (Subset Matching)
 """
@@ -55,8 +56,8 @@ import pymorphy3
 # ============================================
 app = FastAPI(
     title="FGS Parser API",
-    version="5.2.9",
-    description="6 методов | 3 источника | Pre-filter: whole words + rare cities | Level 2 Complete"
+    version="5.2.10",
+    description="6 методов | 3 источника | Pre-filter: filtered alts (no spaces/junk) | Level 2"
 )
 
 app.add_middleware(
@@ -149,12 +150,32 @@ def generate_geo_blacklist_full():
             name = city_data['name'].lower()
             cities_by_country[country].add(name)
             
-            # Добавляем альтернативные названия
+            # Добавляем альтернативные названия (С ФИЛЬТРАМИ!)
             for alt in city_data.get('alternatenames', []):
-                # Фильтруем: только читаемые названия (не иероглифы)
-                if alt and len(alt) <= 30:
-                    # Только если содержит буквы
-                    if any(c.isalpha() for c in alt):
+                # Фильтр 1: Пропускаем если есть пробелы (мусорные транслитерации)
+                if ' ' in alt:
+                    continue
+                
+                # Фильтр 2: Только разумная длина (3-30 символов)
+                if not (3 <= len(alt) <= 30):
+                    continue
+                
+                # Фильтр 3: Только если содержит буквы
+                if not any(c.isalpha() for c in alt):
+                    continue
+                
+                # Фильтр 4: Только латиница и кириллица (не иероглифы, арабское и т.д.)
+                alt_clean = alt.replace('-', '').replace("'", "")  # Убираем дефисы/апострофы для проверки
+                if alt_clean.isalpha():  # Только буквы
+                    # Проверяем что это латиница или кириллица
+                    is_latin_cyrillic = all(
+                        ('\u0000' <= c <= '\u007F') or  # ASCII (латиница)
+                        ('\u0400' <= c <= '\u04FF') or  # Кириллица
+                        c in ['-', "'"]                  # Дефис и апостроф OK
+                        for c in alt
+                    )
+                    
+                    if is_latin_cyrillic:
                         cities_by_country[country].add(alt.lower())
         
         # Формируем blacklist из geonames
