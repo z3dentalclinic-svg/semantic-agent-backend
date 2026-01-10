@@ -1,12 +1,14 @@
 
 """
-FGS Parser API - Version 5.3.1 PRODUCTION
+FGS Parser API - Version 5.3.2 PRODUCTION (DIAGNOSTIC)
 Deployed: 2026-01-10
-Fixed: 
-- Корректная обработка английских брендов и русских городов в is_query_allowed
+Changes:
+- Added logging to is_query_allowed for Pre-filter diagnostics
+- Logs every ALLOWED and BLOCKED query with reason
+- Format: ✅ ALLOWED or 🚫 BLOCKED: query | Reason: ...
+Previous fixes (v5.3.1):
+- Корректная обработка английских брендов и русских городов
 - Убраны лишние пробелы в parse_adaptive_prefix
-- Удалены отладочные принты
-All functionality preserved
 """
 
 
@@ -20,7 +22,15 @@ import asyncio
 import time
 import random
 import re
+import logging
 from difflib import SequenceMatcher
+
+# Настройка логирования для диагностики Pre-filter
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # NLTK для стемминга (v5.2.0)
 import nltk
@@ -45,8 +55,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.3.1",
-    description="6 методов | 3 источника | Pre-filter: fixed brands/cities logic | Level 2"
+    version="5.3.2-diagnostic",
+    description="6 методов | 3 источника | Pre-filter with detailed logging | Level 2"
 )
 
 app.add_middleware(
@@ -561,6 +571,7 @@ class GoogleAutocompleteParser:
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
         Пре-фильтр v5.3.1: корректная обработка английских брендов и русских городов
+        + Логирование для диагностики
         """
         import re
         
@@ -568,6 +579,7 @@ class GoogleAutocompleteParser:
         
         # 1. Если в запросе есть бренд из Whitelist - ПРОВЕРКА ОКОНЧЕНА (разрешаем)
         if any(white in q_lower for white in WHITELIST_TOKENS):
+            logger.info(f"✅ ALLOWED (whitelist): {query}")
             return True
         
         # 2. Разбиваем на слова и проверяем каждое
@@ -580,6 +592,7 @@ class GoogleAutocompleteParser:
             
             # Проверка оригинала
             if word in blacklist:
+                logger.warning(f"🚫 BLOCKED: {query} | Reason: word '{word}' in blacklist")
                 return False
             
             # Проверка леммы (только для кириллицы)
@@ -588,10 +601,12 @@ class GoogleAutocompleteParser:
                     try:
                         lemma = self.morph_ru.parse(word)[0].normal_form
                         if lemma in blacklist and lemma not in WHITELIST_TOKENS:
+                            logger.warning(f"🚫 BLOCKED: {query} | Reason: lemma '{lemma}' (from '{word}') in blacklist")
                             return False
                     except:
                         pass
         
+        logger.info(f"✅ ALLOWED: {query}")
         return True
 
     async def autocorrect_text(self, text: str, language: str) -> Dict:
