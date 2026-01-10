@@ -1,42 +1,34 @@
 
 """
-FGS Parser API - Version 5.4.7 PRODUCTION
+FGS Parser API - Version 5.4.8 PRODUCTION
 Deployed: 2026-01-10
 
-STRICT FILTERING MODE (Gemini Strict):
-- parse_adaptive_prefix переписан с строгой фильтрацией
-- КАЖДЫЙ результат прогоняется через is_query_allowed
-- Мусор (Крым, РФ) НЕ попадает в keywords, только в anchors
-- Чистые ключи дополнительно очищаются через strip_geo_to_anchor
+ФИНАЛЬНАЯ КАЛИБРОВКА ФИЛЬТРА:
 
-Логика обработки результатов:
-1. Получаем результат от Google
-2. Проверяем через is_query_allowed (Hard-Blacklist + Natasha + ALL_CITIES_GLOBAL)
-3. Если МУСОР → создаём якорь → добавляем в internal_anchors
-4. Если ЧИСТО → очищаем через strip_geo_to_anchor → добавляем в keywords
+1. REGEX FIXES:
+   - Все регулярки теперь: r'[а-яёa-z0-9-]+' (дефис внутри!)
+   - Ловит составные города: Йошкар-Ола, Набережные-Челны, Усть-Каменогорск
 
-Пример:
-Google вернул: ["ремонт пылесосов москва", "ремонт пылесосов киев", "ремонт пылесосов philips"]
+2. ЛОГИКА "ВХОЖДЕНИЯ ФРАЗЫ" в is_query_allowed:
+   - УРОВЕНЬ 1: Hard-Blacklist (Крым + ОРДЛО)
+   - УРОВЕНЬ 2: Проверка ВСЕЙ базы ALL_CITIES_GLOBAL как подстроки
+   - УРОВЕНЬ 3: Natasha NER + белый список UA городов
+   
+   Пример:
+   "ремонт йошкар-ола" → проверяем "йошкар-ола" in query → блокируем (RU город)
 
-Обработка:
-- "ремонт пылесосов москва":
-  is_query_allowed → FALSE (москва=RU)
-  strip_geo_to_anchor → "philips" (если есть)
-  → internal_anchors
+3. БЕЛЫЙ СПИСОК УКРАИНЫ в Natasha:
+   Если Natasha нашла локацию, проверяем:
+   - Есть в белом списке UA? → OK
+   - Нет в белом списке? → Проверяем ALL_CITIES_GLOBAL
+   - Не в базе и не в белом списке? → BLOCK
 
-- "ремонт пылесосов киев":
-  is_query_allowed → TRUE (киев=UA)
-  strip_geo_to_anchor → "ремонт пылесосов киев"
-  → keywords
+4. ALL_CITIES_GLOBAL:
+   - Все ключи в нижнем регистре ✅
+   - Проверка через вхождение подстроки (не побуквенно!)
 
-- "ремонт пылесосов philips":
-  is_query_allowed → TRUE
-  strip_geo_to_anchor → "philips"
-  → keywords
-
-Previous (v5.4.6):
-- Правильный Hard-Blacklist (только Крым + ОРДЛО)
-- Natasha NER работает со всеми странами
+Previous (v5.4.7):
+- Strict filtering mode в parse_adaptive_prefix
 """
 
 
@@ -83,8 +75,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.4.7",
-    description="6 методов | 3 sources | Strict filtering mode | Every result through is_query_allowed | Level 2"
+    version="5.4.8",
+    description="6 методов | 3 sources | Phrase matching + UA whitelist | Hyphenated cities support | Level 2"
 )
 
 app.add_middleware(
@@ -774,72 +766,75 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        Пре-фильтр v5.4.6: Интеграция Natasha NER + Hard-Blacklist
+        Пре-фильтр v5.4.8: Логика "Вхождения Фразы"
         
         Трёхуровневая защита:
-        1. Hard-Blacklist (ТОЛЬКО оккупированные территории: Крым + ОРДЛО)
-        2. Natasha NER (распознавание LOC entities)
-        3. Динамическая проверка через ALL_CITIES_GLOBAL (РФ, BY, KZ, UZ и др.)
-        
-        Важно: РФ/BY/KZ/UZ города фильтруются ДИНАМИЧЕСКИ, не через Hard-Blacklist!
+        1. Hard-Blacklist (оккупированные территории: Крым + ОРДЛО)
+        2. Проверка ВСЕЙ базы ALL_CITIES_GLOBAL (вхождение города как подстроки)
+        3. Natasha NER (для районов/поселков которых нет в базе)
         """
-        import re
-        
         q_lower = query.lower().strip()
         
-        # УРОВЕНЬ 1: Hard-Blacklist (ТОЛЬКО Крым + ОРДЛО)
+        # УРОВЕНЬ 1: Hard-Blacklist (мгновенная проверка)
         if any(forbidden in q_lower for forbidden in self.forbidden_geo):
-            logger.warning(f"🚫 HARD-BLACKLIST BLOCKED: {query} | Occupied territory detected")
+            logger.warning(f"🚫 HARD-BLACKLIST BLOCKED: {query} | Occupied territory")
             return False
         
-        # УРОВЕНЬ 2: Natasha NER (распознавание локаций)
+        # УРОВЕНЬ 2: Проверка ВСЕЙ базы городов (вхождение фразы)
+        # Решает проблему составных городов: Йошкар-Ола, Набережные Челны
+        for city_name, city_country in ALL_CITIES_GLOBAL.items():
+            city_lower = city_name.lower()
+            
+            # Защита от коротких совпадений (например "ор" в слове "мотор")
+            if len(city_lower) < 4:
+                continue
+            
+            # Проверяем вхождение города как ПОДСТРОКИ
+            if city_lower in q_lower:
+                # Если это ЧУЖОЙ город - блокируем
+                if city_country.lower() != country.lower():
+                    logger.warning(f"🚫 CITY MATCH: '{city_lower}' ({city_country}) found in '{query}'")
+                    return False
+        
+        # УРОВЕНЬ 3: Natasha NER (для районов/поселков которых нет в базе)
         if self.natasha_ready and NATASHA_AVAILABLE:
             try:
                 doc = Doc(query)
                 doc.segment(self.segmenter)
                 doc.tag_ner(self.ner_tagger)
                 
+                # Белый список основных городов Украины
+                ua_whitelist = {
+                    'киев', 'київ', 'харьков', 'харків', 'одесса', 'одеса', 
+                    'днепр', 'дніпро', 'днепропетровск', 'львов', 'львів',
+                    'винница', 'вінниця', 'запорожье', 'запоріжжя', 'кривой рог',
+                    'кривий ріг', 'николаев', 'миколаїв', 'мариуполь', 'маріуполь',
+                    'луганск', 'херсон', 'полтава', 'чернигов', 'черкассы',
+                    'сумы', 'житомир', 'хмельницкий', 'ровно', 'черновцы',
+                    'тернополь', 'ивано-франковск', 'луцк', 'ужгород'
+                }
+                
                 for span in doc.spans:
                     if span.type == 'LOC':
                         span.normalize(self.morph_vocab)
-                        loc_name = span.normal.lower()
+                        norm_loc = span.normal.lower()
                         
-                        # Проверяем через ALL_CITIES_GLOBAL
-                        if loc_name in ALL_CITIES_GLOBAL:
-                            city_country = ALL_CITIES_GLOBAL[loc_name]
-                            
-                            # Если локация НЕ из целевой страны - блокируем
-                            if city_country != country.lower():
-                                logger.warning(f"📍 NATASHA NER BLOCKED: '{loc_name}' (city of {city_country}) in '{query}'")
+                        # Если локация НЕ из белого списка Украины
+                        if not any(ua_city in norm_loc for ua_city in ua_whitelist):
+                            # Дополнительно проверяем через ALL_CITIES_GLOBAL
+                            if norm_loc in ALL_CITIES_GLOBAL:
+                                if ALL_CITIES_GLOBAL[norm_loc].lower() != country.lower():
+                                    logger.warning(f"📍 NATASHA NER BLOCKED: '{norm_loc}' (not UA) in '{query}'")
+                                    return False
+                            else:
+                                # Локация не в базе и не в белом списке - подозрительно
+                                logger.warning(f"📍 NATASHA NER BLOCKED: '{norm_loc}' (unknown location) in '{query}'")
                                 return False
-                        else:
-                            # Natasha нашла локацию, но её НЕТ в нашей базе
-                            # Считаем подозрительной и блокируем (может быть район/область/мусор)
-                            logger.warning(f"📍 NATASHA NER BLOCKED: '{loc_name}' (unknown location) in '{query}'")
-                            return False
-                            
+                                
             except Exception as e:
-                # Если Natasha упала - продолжаем без неё
                 logger.debug(f"Natasha NER error: {e}")
         
-        # УРОВЕНЬ 3: Динамическая проверка через ALL_CITIES_GLOBAL (как раньше)
-        # 1. Whitelist брендов - разрешаем сразу
-        if any(white in q_lower for white in WHITELIST_TOKENS):
-            logger.info(f"✅ ALLOWED (whitelist): {query}")
-            return True
-        
-        # 2. Разбиваем на слова
-        words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
-        
-        for word in words:
-            if len(word) < 3:  # Пропускаем короткие (предлоги)
-                continue
-            
-            # Динамическая проверка через is_city_allowed
-            if not self.is_city_allowed(word, country):
-                logger.warning(f"🚫 BLOCKED (v5.4.5): {query} | City '{word}' not allowed for {country.upper()}")
-                return False
-        
+        # Если прошли все проверки - разрешаем
         logger.info(f"✅ ALLOWED: {query}")
         return True
     
@@ -866,8 +861,8 @@ class GoogleAutocompleteParser:
             should_remove = False
             kw_lower = keyword.lower()
             
-            # Разбиваем на слова
-            words = re.findall(r'[а-яёa-z0-9]+', kw_lower)
+            # Разбиваем на слова (с дефисом для составных городов!)
+            words = re.findall(r'[а-яёa-z0-9-]+', kw_lower)
             
             for word in words:
                 if len(word) < 3:
