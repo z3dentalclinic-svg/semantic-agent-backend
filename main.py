@@ -1,34 +1,38 @@
 
 """
-FGS Parser API - Version 5.4.8 PRODUCTION
+FGS Parser API - Version 5.5.1 PRODUCTION
 Deployed: 2026-01-10
 
-ФИНАЛЬНАЯ КАЛИБРОВКА ФИЛЬТРА:
+КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ - УЗКОЕ МЕСТО НАЙДЕНО:
 
-1. REGEX FIXES:
-   - Все регулярки теперь: r'[а-яёa-z0-9-]+' (дефис внутри!)
-   - Ловит составные города: Йошкар-Ола, Набережные-Челны, Усть-Каменогорск
+ПРОБЛЕМА:
+- Ялта, Крым, Евпатория, Керчь, Симферополь попадали в выдачу
+- Причина: parse_suffix, parse_infix, parse_morphology использовали СТАРЫЙ post_filter_cities
+- post_filter_cities НЕ проверял forbidden_geo (Крым, ОРДЛО)
+- post_filter_cities НЕ делал лемматизацию ("ялте" не блокировался)
 
-2. ЛОГИКА "ВХОЖДЕНИЯ ФРАЗЫ" в is_query_allowed:
-   - УРОВЕНЬ 1: Hard-Blacklist (Крым + ОРДЛО)
-   - УРОВЕНЬ 2: Проверка ВСЕЙ базы ALL_CITIES_GLOBAL как подстроки
-   - УРОВЕНЬ 3: Natasha NER + белый список UA городов
-   
-   Пример:
-   "ремонт йошкар-ола" → проверяем "йошкар-ола" in query → блокируем (RU город)
+РЕШЕНИЕ:
+Заменил post_filter_cities на is_query_allowed во ВСЕХ методах:
+✅ parse_suffix - теперь использует is_query_allowed
+✅ parse_infix - теперь использует is_query_allowed
+✅ parse_morphology - теперь использует is_query_allowed
+✅ parse_adaptive_prefix - уже использовал is_query_allowed
 
-3. БЕЛЫЙ СПИСОК УКРАИНЫ в Natasha:
-   Если Natasha нашла локацию, проверяем:
-   - Есть в белом списке UA? → OK
-   - Нет в белом списке? → Проверяем ALL_CITIES_GLOBAL
-   - Не в базе и не в белом списке? → BLOCK
+ТЕПЕРЬ ВСЕ МЕТОДЫ:
+1. Проверяют каждый результат через is_query_allowed
+2. Блокируют forbidden_geo (Крым + ОРДЛО)
+3. Используют лемматизацию ("ялте" → "ялта" → BLOCK)
+4. Используют substring search ("набережные челны")
 
-4. ALL_CITIES_GLOBAL:
-   - Все ключи в нижнем регистре ✅
-   - Проверка через вхождение подстроки (не побуквенно!)
+БЛОКИРУЕТСЯ ВО ВСЕХ МЕТОДАХ:
+- ялта, в ялте, из ялты
+- симферополь, в симферополе
+- евпатория, из евпатории
+- керчь, к керчи
+- набережные челны, в набережных челнах
 
-Previous (v5.4.7):
-- Strict filtering mode в parse_adaptive_prefix
+Previous (v5.5.0):
+- Лемматизация в фильтре (но только в parse_adaptive_prefix)
 """
 
 
@@ -75,8 +79,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.4.8",
-    description="6 методов | 3 sources | Phrase matching + UA whitelist | Hyphenated cities support | Level 2"
+    version="5.5.1",
+    description="6 методов | 3 sources | is_query_allowed in ALL methods | Blocks Crimea everywhere | Level 2"
 )
 
 app.add_middleware(
@@ -157,7 +161,7 @@ def generate_geo_blacklist_full():
             country = city_data['countrycode'].lower()  # 'RU', 'UA', 'BY' → 'ru', 'ua', 'by'
 
             # Основное название
-            name = city_data['name'].lower()
+            name = city_data['name'].lower().strip()
             all_cities_global[name] = country
 
             # Альтернативные названия
@@ -181,7 +185,7 @@ def generate_geo_blacklist_full():
                     )
 
                     if is_latin_cyrillic:
-                        alt_lower = alt.lower()
+                        alt_lower = alt.lower().strip()
                         # Если город уже есть, не перезаписываем (оставляем первое вхождение)
                         if alt_lower not in all_cities_global:
                             all_cities_global[alt_lower] = country
@@ -407,19 +411,42 @@ class GoogleAutocompleteParser:
         else:
             self.natasha_ready = False
         
-        # HARD-BLACKLIST только для оккупированных территорий (v5.4.6)
-        # Остальные страны фильтруются динамически через ALL_CITIES_GLOBAL + Natasha
+        # HARD-BLACKLIST только для оккупированных территорий (v5.4.9)
+        # Эти города блокируются ПОЛИТИЧЕСКИ, даже если в базах помечены как UA
         self.forbidden_geo = {
-            # Оккупированный Крым (формально в базах может быть UA, но должен блокироваться)
-            'крым', 'crimea', 'симферополь', 'sevastopol', 'севастополь', 'ялта', 'yalta',
-            'алушта', 'alushta', 'евпатория', 'yevpatoria', 'керчь', 'kerch',
-            'феодосия', 'feodosia', 'судак', 'sudak', 'бахчисарай', 'bakhchisaray',
+            # Оккупированный Крым
+            'крым', 'crimea', 'крим', 'крым', 
+            'симферополь', 'sevastopol', 'сімферополь', 'simferopol',
+            'севастополь', 'sebastopol',
+            'ялта', 'yalta', 'ялта',
+            'алушта', 'alushta', 'алушта',
+            'евпатория', 'yevpatoria', 'євпаторія', 'evpatoria',
+            'керчь', 'kerch', 'керч',
+            'феодосия', 'feodosia', 'феодосія', 'theodosia',
+            'судак', 'sudak', 'судак',
+            'бахчисарай', 'bakhchisaray', 'бахчисарай',
+            'джанкой', 'dzhankoy', 'джанкой',
+            'красноперекопск', 'krasnoperekopsk',
+            'армянск', 'armyansk', 'армянськ',
+            'саки', 'saki', 'саки',
+            'белогорск', 'belogorsk', 'білогорськ',
+            'старый крым', 'staryi krym', 'старий крим',
             
             # Оккупированные территории Донбасса (ОРДЛО)
-            'донецк', 'donetsk', 'луганск', 'luhansk', 'мариуполь', 'mariupol',
-            'бердянск', 'berdiansk', 'мелитополь', 'melitopol', 'горловка', 'horlivka',
-            'макеевка', 'makiivka', 'енакиево', 'yenakiieve', 'алчевск', 'alchevsk',
-            'краматорск', 'kramatorsk', 'славянск', 'sloviansk', 'торез', 'torez'
+            'донецк', 'donetsk', 'донецьк',
+            'луганск', 'luhansk', 'луганськ', 'lugansk',
+            'мариуполь', 'mariupol', 'маріуполь',
+            'бердянск', 'berdiansk', 'бердянськ',
+            'мелитополь', 'melitopol', 'мелітополь',
+            'горловка', 'horlivka', 'горлівка',
+            'макеевка', 'makiivka', 'макіївка',
+            'енакиево', 'yenakiieve', 'єнакієве',
+            'алчевск', 'alchevsk', 'алчевськ',
+            'краматорск', 'kramatorsk', 'краматорськ',
+            'славянск', 'sloviansk', 'слов\'янськ',
+            'торез', 'torez', 'торез',
+            'шахтерск', 'shakhtarsk', 'шахтарськ',
+            'снежное', 'snizhne', 'сніжне'
         }
 
         self.stemmers = {
@@ -766,75 +793,106 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        Пре-фильтр v5.4.8: Логика "Вхождения Фразы"
+        Пре-фильтр v5.5.0: ЛЕММАТИЗАЦИЯ + SUBSTRING SEARCH
         
-        Трёхуровневая защита:
-        1. Hard-Blacklist (оккупированные территории: Крым + ОРДЛО)
-        2. Проверка ВСЕЙ базы ALL_CITIES_GLOBAL (вхождение города как подстроки)
-        3. Natasha NER (для районов/поселков которых нет в базе)
+        Проблема: "в ялте" пропускалось (ялте != ялта)
+        Решение: Лемматизируем слова перед проверкой
         """
+        import re
+        
         q_lower = query.lower().strip()
+        target_country = country.lower()
         
-        # УРОВЕНЬ 1: Hard-Blacklist (мгновенная проверка)
-        if any(forbidden in q_lower for forbidden in self.forbidden_geo):
-            logger.warning(f"🚫 HARD-BLACKLIST BLOCKED: {query} | Occupied territory")
-            return False
+        # А) ЛЕММАТИЗАЦИЯ ЗАПРОСА
+        # Разбиваем на слова и получаем леммы
+        words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
+        lemmas = set()
         
-        # УРОВЕНЬ 2: Проверка ВСЕЙ базы городов (вхождение фразы)
-        # Решает проблему составных городов: Йошкар-Ола, Набережные Челны
+        for word in words:
+            if len(word) < 3:
+                lemmas.add(word)
+                continue
+            
+            # Лемматизация для кириллицы
+            try:
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    lemma = self.morph_ru.parse(word)[0].normal_form
+                    lemmas.add(lemma)
+                else:
+                    lemmas.add(word)  # Латиница как есть
+            except:
+                lemmas.add(word)
+        
+        # Б) Hard-Blacklist с ЛЕММАТИЗАЦИЕЙ
+        for forbidden in self.forbidden_geo:
+            # Проверяем как подстроку (для фраз типа "старый крым")
+            if forbidden in q_lower:
+                logger.warning(f"🚫 HARD-BLACKLIST: '{query}' contains '{forbidden}'")
+                return False
+            
+            # Проверяем леммы (для склонений: "ялте" → "ялта")
+            if forbidden in lemmas:
+                logger.warning(f"🚫 HARD-BLACKLIST (lemma): '{query}' → lemma '{forbidden}'")
+                return False
+        
+        # В) Substring scan по ALL_CITIES_GLOBAL
         for city_name, city_country in ALL_CITIES_GLOBAL.items():
             city_lower = city_name.lower()
             
-            # Защита от коротких совпадений (например "ор" в слове "мотор")
             if len(city_lower) < 4:
                 continue
             
-            # Проверяем вхождение города как ПОДСТРОКИ
+            # 1. Проверяем прямое вхождение (для городов в именительном падеже)
             if city_lower in q_lower:
-                # Если это ЧУЖОЙ город - блокируем
-                if city_country.lower() != country.lower():
-                    logger.warning(f"🚫 CITY MATCH: '{city_lower}' ({city_country}) found in '{query}'")
+                if city_country != target_country:
+                    logger.warning(f"🚫 SUBSTRING BLOCK: Found '{city_lower}' ({city_country}) in '{query}'")
                     return False
-        
-        # УРОВЕНЬ 3: Natasha NER (для районов/поселков которых нет в базе)
-        if self.natasha_ready and NATASHA_AVAILABLE:
-            try:
-                doc = Doc(query)
-                doc.segment(self.segmenter)
-                doc.tag_ner(self.ner_tagger)
+            
+            # 2. Проверяем через леммы (для склонений)
+            # Например: "набережных челнах" → леммы ["набережный", "челны"]
+            city_words = city_lower.split()
+            
+            # Если город многословный (например "набережные челны")
+            if len(city_words) > 1:
+                # Лемматизируем слова города
+                city_lemmas = []
+                for city_word in city_words:
+                    try:
+                        if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in city_word):
+                            city_lemma = self.morph_ru.parse(city_word)[0].normal_form
+                            city_lemmas.append(city_lemma)
+                        else:
+                            city_lemmas.append(city_word)
+                    except:
+                        city_lemmas.append(city_word)
                 
-                # Белый список основных городов Украины
-                ua_whitelist = {
-                    'киев', 'київ', 'харьков', 'харків', 'одесса', 'одеса', 
-                    'днепр', 'дніпро', 'днепропетровск', 'львов', 'львів',
-                    'винница', 'вінниця', 'запорожье', 'запоріжжя', 'кривой рог',
-                    'кривий ріг', 'николаев', 'миколаїв', 'мариуполь', 'маріуполь',
-                    'луганск', 'херсон', 'полтава', 'чернигов', 'черкассы',
-                    'сумы', 'житомир', 'хмельницкий', 'ровно', 'черновцы',
-                    'тернополь', 'ивано-франковск', 'луцк', 'ужгород'
-                }
-                
-                for span in doc.spans:
-                    if span.type == 'LOC':
-                        span.normalize(self.morph_vocab)
-                        norm_loc = span.normal.lower()
-                        
-                        # Если локация НЕ из белого списка Украины
-                        if not any(ua_city in norm_loc for ua_city in ua_whitelist):
-                            # Дополнительно проверяем через ALL_CITIES_GLOBAL
-                            if norm_loc in ALL_CITIES_GLOBAL:
-                                if ALL_CITIES_GLOBAL[norm_loc].lower() != country.lower():
-                                    logger.warning(f"📍 NATASHA NER BLOCKED: '{norm_loc}' (not UA) in '{query}'")
-                                    return False
-                            else:
-                                # Локация не в базе и не в белом списке - подозрительно
-                                logger.warning(f"📍 NATASHA NER BLOCKED: '{norm_loc}' (unknown location) in '{query}'")
-                                return False
-                                
-            except Exception as e:
-                logger.debug(f"Natasha NER error: {e}")
+                # Если все леммы города есть в леммах запроса
+                if all(city_lemma in lemmas for city_lemma in city_lemmas):
+                    if city_country != target_country:
+                        logger.warning(f"🚫 LEMMA BLOCK: Found '{city_name}' ({city_country}) via lemmas in '{query}'")
+                        return False
+            else:
+                # Одно-словный город - просто проверяем лемму
+                try:
+                    if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in city_lower):
+                        city_lemma = self.morph_ru.parse(city_lower)[0].normal_form
+                    else:
+                        city_lemma = city_lower
+                    
+                    if city_lemma in lemmas:
+                        if city_country != target_country:
+                            logger.warning(f"🚫 LEMMA BLOCK: Found '{city_name}' ({city_country}) via lemma '{city_lemma}' in '{query}'")
+                            return False
+                except:
+                    pass
         
-        # Если прошли все проверки - разрешаем
+        # Г) Блокировка областей/стран
+        stopwords = ['область', 'край', 'израиль', 'россия', 'казахстан', 'узбекистан', 'беларусь']
+        if any(stop in q_lower for stop in stopwords):
+            if target_country == 'ua' and 'украина' not in q_lower:
+                logger.warning(f"🚫 REGION/COUNTRY BLOCK: '{query}' contains {[s for s in stopwords if s in q_lower]}")
+                return False
+        
         logger.info(f"✅ ALLOWED: {query}")
         return True
     
@@ -1254,26 +1312,32 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        # POST-FILTER: Чистка от нецелевых городов
-        cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
+        # СТРОГАЯ ФИЛЬТРАЦИЯ v5.5.0: Проверка каждого результата через is_query_allowed
+        keywords = set()
+        internal_anchors = set()
         
-        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
-        anchors_created = set()
-        for keyword in cleaned_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, seed, country)
-            if anchor and len(anchor) > 3 and anchor != keyword.lower():
-                anchors_created.add(anchor)
+        for kw in result_raw['keywords']:
+            # 1. Прогоняем через главный щит
+            if not self.is_query_allowed(kw, seed, country):
+                # Если это мусор - создаём якорь
+                anchor = self.strip_geo_to_anchor(kw, seed, country)
+                if anchor and anchor != seed.lower() and len(anchor) > 5:
+                    internal_anchors.add(anchor)
+                continue  # НЕ добавляем в keywords
+            
+            # 2. Если прошёл проверку - очищаем
+            clean_kw = self.strip_geo_to_anchor(kw, seed, country)
+            if clean_kw and len(clean_kw) > 3:
+                keywords.add(clean_kw)
         
-        # Объединяем для фильтрации
-        all_with_anchors = cleaned_keywords | anchors_created
-        
-        # Фильтр релевантности (v5.2.0: subset matching)
+        # Финальная фильтрация релевантности
+        all_with_anchors = keywords | internal_anchors
         filtered = await self.filter_relevant_keywords(list(all_with_anchors), seed, language)
         
         # Разделяем обратно
         filtered_set = set(filtered)
-        final_keywords = sorted(list(cleaned_keywords & filtered_set))
-        final_anchors = sorted(list(anchors_created & filtered_set))
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
 
         elapsed = time.time() - start_time
 
@@ -1309,19 +1373,26 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        # POST-FILTER: Чистка от нецелевых городов
-        cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
+        # СТРОГАЯ ФИЛЬТРАЦИЯ v5.5.0: Проверка каждого результата через is_query_allowed
+        keywords = set()
+        internal_anchors = set()
         
-        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
-        anchors_created = set()
-        for keyword in cleaned_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, seed, country)
-            if anchor and len(anchor) > 3 and anchor != keyword.lower():
-                anchors_created.add(anchor)
+        for kw in result_raw['keywords']:
+            # 1. Прогоняем через главный щит
+            if not self.is_query_allowed(kw, seed, country):
+                # Если это мусор - создаём якорь
+                anchor = self.strip_geo_to_anchor(kw, seed, country)
+                if anchor and anchor != seed.lower() and len(anchor) > 5:
+                    internal_anchors.add(anchor)
+                continue  # НЕ добавляем в keywords
+            
+            # 2. Если прошёл проверку - очищаем
+            clean_kw = self.strip_geo_to_anchor(kw, seed, country)
+            if clean_kw and len(clean_kw) > 3:
+                keywords.add(clean_kw)
         
-        # Объединяем для фильтрации
-        all_with_anchors = cleaned_keywords | anchors_created
-        
+        # Финальная фильтрация
+        all_with_anchors = keywords | internal_anchors
         filtered_1 = await self.filter_infix_results(list(all_with_anchors), language)
 
         # Фильтр 2: релевантность (v5.2.0: subset matching)
@@ -1329,8 +1400,8 @@ class GoogleAutocompleteParser:
         
         # Разделяем обратно
         filtered_set = set(filtered_2)
-        final_keywords = sorted(list(cleaned_keywords & filtered_set))
-        final_anchors = sorted(list(anchors_created & filtered_set))
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
 
         elapsed = time.time() - start_time
 
@@ -1408,25 +1479,32 @@ class GoogleAutocompleteParser:
             result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
             all_keywords.update(result['keywords'])
 
-        # POST-FILTER: Чистка от нецелевых городов
-        all_keywords = self.post_filter_cities(all_keywords, country)
+        # СТРОГАЯ ФИЛЬТРАЦИЯ v5.5.0: Проверка каждого результата через is_query_allowed
+        keywords = set()
+        internal_anchors = set()
         
-        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
-        anchors_created = set()
-        for keyword in all_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, seed, country)
-            if anchor and len(anchor) > 3 and anchor != keyword.lower():
-                anchors_created.add(anchor)
+        for kw in all_keywords:
+            # 1. Прогоняем через главный щит
+            if not self.is_query_allowed(kw, seed, country):
+                # Если это мусор - создаём якорь
+                anchor = self.strip_geo_to_anchor(kw, seed, country)
+                if anchor and anchor != seed.lower() and len(anchor) > 5:
+                    internal_anchors.add(anchor)
+                continue  # НЕ добавляем в keywords
+            
+            # 2. Если прошёл проверку - очищаем
+            clean_kw = self.strip_geo_to_anchor(kw, seed, country)
+            if clean_kw and len(clean_kw) > 3:
+                keywords.add(clean_kw)
         
-        # Объединяем для фильтрации
-        all_with_anchors = all_keywords | anchors_created
-        
+        # Финальная фильтрация
+        all_with_anchors = keywords | internal_anchors
         filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
         
         # Разделяем обратно
         filtered_set = set(filtered)
-        final_keywords = sorted(list(all_keywords & filtered_set))
-        final_anchors = sorted(list(anchors_created & filtered_set))
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
 
         elapsed = time.time() - start_time
 
