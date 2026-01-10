@@ -1,6 +1,6 @@
 """
 FGS Parser API - Version 5.5.5 PRODUCTION
-Deployed: 2026-01-10
+Deployed: 2026-01-10 (Force Deploy - Fixed Anchor Logic)
 
 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ - ОПТИМИЗАЦИЯ is_query_allowed:
 
