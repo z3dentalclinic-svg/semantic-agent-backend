@@ -1,22 +1,24 @@
 
 """
-FGS Parser API - Version 5.4.0 PRODUCTION
+FGS Parser API - Version 5.4.2 PRODUCTION
 Deployed: 2026-01-10
 
-ДИНАМИЧЕСКАЯ ГЕО-ФИЛЬТРАЦИЯ:
-- ALL_CITIES_GLOBAL: Словарь {город: код_страны} из geonames
-- is_city_allowed(): Динамическая проверка принадлежности города
-- Убраны ВСЕ ручные списки (GEO_BLACKLIST, UA_CITIES)
-- Масштабируемость: работает для ЛЮБОЙ страны автоматически
-- PRE-FILTER: Блокирует чужие города через is_city_allowed()
-- POST-FILTER: Чистит результаты через is_city_allowed()
+РАЗДЕЛЬНЫЙ ВЫВОД ЯКОРЕЙ:
+- Все методы теперь возвращают: keywords + anchors отдельно
+- Frontend показывает якоря отдельной секцией
+- Export в CSV с пометкой типа (Ключ/Якорь)
 
-Architecture:
-- Запрос → PRE-FILTER → Google → POST-FILTER → Результат
-- Проверка: город в базе? → Да → Проверяем страну → Блокируем если чужая
+API Response format:
+{
+  "keywords": [...],     // Оригинальные ключи
+  "anchors": [...],      // Созданные якоря
+  "count": 10,           // Количество ключей
+  "anchors_count": 5     // Количество якорей
+}
 
-Previous (v5.3.3):
-- Статичные списки UA_CITIES, GEO_BLACKLIST
+Previous (v5.4.1):
+- Супер-очиститель strip_geo_to_anchor()
+- Якоря смешивались с ключами
 """
 
 
@@ -63,8 +65,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.4.0",
-    description="6 методов | 3 источника | Dynamic Geo-Filter: ANY country support | Level 2"
+    version="5.4.2",
+    description="6 методов | 3 источника | Separate anchors output + Frontend support | Level 2"
 )
 
 app.add_middleware(
@@ -455,6 +457,72 @@ class GoogleAutocompleteParser:
             return True  # Город нашей страны — разрешаем
         
         return False  # Город чужой страны — блокируем
+    
+    def strip_geo_to_anchor(self, text: str, target_country: str) -> str:
+        """
+        v5.4.0: Супер-очиститель гео-мусора
+        
+        Удаляет из фразы ВСЕ города кроме целевой страны.
+        Создаёт "якорь" - чистую фразу без гео-привязок.
+        
+        Args:
+            text: Исходная фраза (например, "ремонт пылесосов москва")
+            target_country: Целевая страна ('ua', 'ru', 'by', 'kz')
+        
+        Returns:
+            Очищенная фраза (например, "ремонт пылесосов")
+        
+        Примеры:
+            >>> strip_geo_to_anchor("ремонт пылесосов москва", "ua")
+            "ремонт пылесосов"
+            
+            >>> strip_geo_to_anchor("ремонт пылесосов киев", "ua")
+            "ремонт пылесосов киев"  # Киев - наш город, оставляем
+            
+            >>> strip_geo_to_anchor("ремонт в йошкар-ола", "ua")
+            "ремонт в"  # Йошкар-Ола удалён целиком (с дефисом)
+        """
+        import re
+        
+        # Очищаем от спецсимволов и делим на слова (включая дефис!)
+        words = re.findall(r'[а-яёa-z0-9-]+', text.lower())
+        clean_words = []
+        
+        for w in words:
+            if len(w) < 3:
+                clean_words.append(w)
+                continue
+            
+            try:
+                parsed = self.morph_ru.parse(w)[0]
+                lemma = parsed.normal_form
+            except:
+                lemma = w
+            
+            # Если слово или лемма есть в ГЛОБАЛЬНОЙ базе городов
+            is_city = lemma in ALL_CITIES_GLOBAL or w in ALL_CITIES_GLOBAL
+            
+            # Проверяем, наш ли это город (например, UA)
+            is_our_city = False
+            if is_city:
+                city_info = ALL_CITIES_GLOBAL.get(lemma) or ALL_CITIES_GLOBAL.get(w)
+                if city_info == target_country.lower():
+                    is_our_city = True
+            
+            # Если это ЧУЖОЙ город — просто пропускаем слово (удаляем)
+            if is_city and not is_our_city:
+                logger.info(f"🧼 STRIPPED: '{w}' from '{text}' (city of {ALL_CITIES_GLOBAL.get(lemma) or ALL_CITIES_GLOBAL.get(w)})")
+                continue
+            
+            clean_words.append(w)
+        
+        cleaned = " ".join(clean_words).strip()
+        
+        # Логируем только если что-то изменилось
+        if cleaned != text.lower():
+            logger.warning(f"🧼 ANCHOR CREATED: '{text}' → '{cleaned}'")
+        
+        return cleaned
 
     def detect_seed_language(self, seed: str) -> str:
         """Автоопределение языка seed"""
@@ -1062,8 +1130,23 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка от нецелевых городов
         cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
         
+        # SUPER-CLEANER v5.4.1: Создаём якоря
+        anchors_created = set()
+        for keyword in cleaned_keywords:
+            anchor = self.strip_geo_to_anchor(keyword, country)
+            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+                anchors_created.add(anchor)
+        
+        # Объединяем для фильтрации
+        all_with_anchors = cleaned_keywords | anchors_created
+        
         # Фильтр релевантности (v5.2.0: subset matching)
-        filtered = await self.filter_relevant_keywords(list(cleaned_keywords), seed, language)
+        filtered = await self.filter_relevant_keywords(list(all_with_anchors), seed, language)
+        
+        # Разделяем обратно
+        filtered_set = set(filtered)
+        final_keywords = sorted(list(cleaned_keywords & filtered_set))
+        final_anchors = sorted(list(anchors_created & filtered_set))
 
         elapsed = time.time() - start_time
 
@@ -1071,8 +1154,10 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "suffix",
             "source": source,
-            "keywords": filtered,
-            "count": len(filtered),
+            "keywords": final_keywords,
+            "anchors": final_anchors,
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2)
         }
@@ -1100,10 +1185,25 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка от нецелевых городов
         cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
         
-        filtered_1 = await self.filter_infix_results(list(cleaned_keywords), language)
+        # SUPER-CLEANER v5.4.1: Создаём якоря
+        anchors_created = set()
+        for keyword in cleaned_keywords:
+            anchor = self.strip_geo_to_anchor(keyword, country)
+            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+                anchors_created.add(anchor)
+        
+        # Объединяем для фильтрации
+        all_with_anchors = cleaned_keywords | anchors_created
+        
+        filtered_1 = await self.filter_infix_results(list(all_with_anchors), language)
 
         # Фильтр 2: релевантность (v5.2.0: subset matching)
         filtered_2 = await self.filter_relevant_keywords(filtered_1, seed, language)
+        
+        # Разделяем обратно
+        filtered_set = set(filtered_2)
+        final_keywords = sorted(list(cleaned_keywords & filtered_set))
+        final_anchors = sorted(list(anchors_created & filtered_set))
 
         elapsed = time.time() - start_time
 
@@ -1111,8 +1211,10 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "infix",
             "source": source,
-            "keywords": filtered_2,
-            "count": len(filtered_2),
+            "keywords": final_keywords,
+            "anchors": final_anchors,
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2)
         }
@@ -1182,7 +1284,22 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка от нецелевых городов
         all_keywords = self.post_filter_cities(all_keywords, country)
         
-        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
+        # SUPER-CLEANER v5.4.1: Создаём якоря
+        anchors_created = set()
+        for keyword in all_keywords:
+            anchor = self.strip_geo_to_anchor(keyword, country)
+            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+                anchors_created.add(anchor)
+        
+        # Объединяем для фильтрации
+        all_with_anchors = all_keywords | anchors_created
+        
+        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        
+        # Разделяем обратно
+        filtered_set = set(filtered)
+        final_keywords = sorted(list(all_keywords & filtered_set))
+        final_anchors = sorted(list(anchors_created & filtered_set))
 
         elapsed = time.time() - start_time
 
@@ -1190,8 +1307,10 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "morphology",
             "source": source,
-            "keywords": filtered,
-            "count": len(filtered),
+            "keywords": final_keywords,
+            "anchors": final_anchors,
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "elapsed_time": round(elapsed, 2)
         }
 
@@ -1268,9 +1387,24 @@ class GoogleAutocompleteParser:
                 verified_prefixes.append(candidate)
 
         # POST-FILTER: Чистка результатов от нецелевых городов
-        all_keywords = self.post_filter_cities(all_keywords, country)
+        cleaned_keywords = self.post_filter_cities(all_keywords, country)
         
-        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
+        # SUPER-CLEANER v5.4.1: Создаём якоря
+        anchors_created = set()
+        for keyword in cleaned_keywords:
+            anchor = self.strip_geo_to_anchor(keyword, country)
+            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+                anchors_created.add(anchor)
+        
+        # Объединяем для фильтрации
+        all_with_anchors = cleaned_keywords | anchors_created
+        
+        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        
+        # Разделяем обратно
+        filtered_set = set(filtered)
+        final_keywords = sorted(list(cleaned_keywords & filtered_set))
+        final_anchors = sorted(list(anchors_created & filtered_set))
 
         elapsed = time.time() - start_time
 
@@ -1278,8 +1412,10 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "adaptive_prefix",
             "source": source,
-            "keywords": filtered,
-            "count": len(filtered),
+            "keywords": final_keywords,
+            "anchors": final_anchors,
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "candidates_found": len(candidates),
             "verified_prefixes": verified_prefixes,
             "elapsed_time": round(elapsed, 2)
@@ -1307,8 +1443,15 @@ class GoogleAutocompleteParser:
         infix_kw = set(infix_result.get("keywords", []))
         morph_kw = set(morph_result["keywords"])
         prefix_kw = set(prefix_result["keywords"])
+        
+        # Собираем якоря
+        suffix_anchors = set(suffix_result.get("anchors", []))
+        infix_anchors = set(infix_result.get("anchors", []))
+        morph_anchors = set(morph_result.get("anchors", []))
+        prefix_anchors = set(prefix_result.get("anchors", []))
 
         all_unique = suffix_kw | infix_kw | morph_kw | prefix_kw
+        all_anchors = suffix_anchors | infix_anchors | morph_anchors | prefix_anchors
 
         elapsed = time.time() - start_time
 
@@ -1318,11 +1461,12 @@ class GoogleAutocompleteParser:
             "corrections": correction.get("corrections", []) if correction.get("has_errors") else [],
             "source": source,
             "total_unique_keywords": len(all_unique),
+            "total_anchors": len(all_anchors),
             "methods": {
-                "suffix": {"count": len(suffix_kw)},
-                "infix": {"count": len(infix_kw)},
-                "morphology": {"count": len(morph_kw)},
-                "adaptive_prefix": {"count": len(prefix_kw)}
+                "suffix": {"count": len(suffix_kw), "anchors_count": len(suffix_anchors)},
+                "infix": {"count": len(infix_kw), "anchors_count": len(infix_anchors)},
+                "morphology": {"count": len(morph_kw), "anchors_count": len(morph_anchors)},
+                "adaptive_prefix": {"count": len(prefix_kw), "anchors_count": len(prefix_anchors)}
             },
             "elapsed_time": round(elapsed, 2)
         }
@@ -1334,6 +1478,13 @@ class GoogleAutocompleteParser:
                 "infix": sorted(list(infix_kw)),
                 "morphology": sorted(list(morph_kw)),
                 "adaptive_prefix": sorted(list(prefix_kw))
+            }
+            response["anchors"] = {
+                "all": sorted(list(all_anchors)),
+                "suffix": sorted(list(suffix_anchors)),
+                "infix": sorted(list(infix_anchors)),
+                "morphology": sorted(list(morph_anchors)),
+                "adaptive_prefix": sorted(list(prefix_anchors))
             }
 
         return response
