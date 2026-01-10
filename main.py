@@ -1,30 +1,42 @@
 
 """
-FGS Parser API - Version 5.4.6 PRODUCTION
+FGS Parser API - Version 5.4.7 PRODUCTION
 Deployed: 2026-01-10
 
-ПРАВИЛЬНАЯ ЛОГИКА HARD-BLACKLIST:
-- Hard-Blacklist ТОЛЬКО для оккупированных территорий Украины:
-  • Крым: Симферополь, Севастополь, Ялта, Евпатория, Керчь...
-  • ОРДЛО: Донецк, Луганск, Мариуполь, Горловка, Макеевка...
+STRICT FILTERING MODE (Gemini Strict):
+- parse_adaptive_prefix переписан с строгой фильтрацией
+- КАЖДЫЙ результат прогоняется через is_query_allowed
+- Мусор (Крым, РФ) НЕ попадает в keywords, только в anchors
+- Чистые ключи дополнительно очищаются через strip_geo_to_anchor
 
-- РФ/BY/KZ/UZ города фильтруются ДИНАМИЧЕСКИ через:
-  • ALL_CITIES_GLOBAL (база всех городов мира)
-  • Natasha NER (распознавание LOC entities)
+Логика обработки результатов:
+1. Получаем результат от Google
+2. Проверяем через is_query_allowed (Hard-Blacklist + Natasha + ALL_CITIES_GLOBAL)
+3. Если МУСОР → создаём якорь → добавляем в internal_anchors
+4. Если ЧИСТО → очищаем через strip_geo_to_anchor → добавляем в keywords
 
-Трёхуровневая защита:
-1. Hard-Blacklist → Крым + ОРДЛО
-2. Natasha NER → Распознавание локаций с нормализацией
-3. ALL_CITIES_GLOBAL → Динамическая проверка остальных стран
+Пример:
+Google вернул: ["ремонт пылесосов москва", "ремонт пылесосов киев", "ремонт пылесосов philips"]
 
-Примеры:
-- "ремонт севастополь" → 🚫 Hard-Blacklist (Крым)
-- "ремонт москва" → 🚫 ALL_CITIES_GLOBAL (RU город для UA)
-- "ремонт в евпатории" → 🚫 Hard-Blacklist + Natasha (Крым, склонение)
-- "ремонт шабаны" → 🚫 Natasha NER (неизвестная локация)
+Обработка:
+- "ремонт пылесосов москва":
+  is_query_allowed → FALSE (москва=RU)
+  strip_geo_to_anchor → "philips" (если есть)
+  → internal_anchors
 
-Previous (v5.4.5):
-- Natasha NER integration (но слишком большой Hard-Blacklist)
+- "ремонт пылесосов киев":
+  is_query_allowed → TRUE (киев=UA)
+  strip_geo_to_anchor → "ремонт пылесосов киев"
+  → keywords
+
+- "ремонт пылесосов philips":
+  is_query_allowed → TRUE
+  strip_geo_to_anchor → "philips"
+  → keywords
+
+Previous (v5.4.6):
+- Правильный Hard-Blacklist (только Крым + ОРДЛО)
+- Natasha NER работает со всеми странами
 """
 
 
@@ -71,8 +83,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.4.6",
-    description="6 методов | 3 sources | Natasha NER | Hard-Blacklist: Crimea+ORDLO only | Level 2"
+    version="5.4.7",
+    description="6 методов | 3 sources | Strict filtering mode | Every result through is_query_allowed | Level 2"
 )
 
 app.add_middleware(
@@ -1492,39 +1504,48 @@ class GoogleAutocompleteParser:
 
         candidates = {w for w, count in word_counter.items() if count >= 2}
 
-        all_keywords = set()
+        # --- СТРОГАЯ ФИЛЬТРАЦИЯ (Gemini Strict Mode) ---
+        keywords = set()
+        internal_anchors = set()
         verified_prefixes = []
 
         for candidate in sorted(candidates):
             query = f"{candidate} {seed}"
 
+            # Прогоняем кандидат через главный щит
             if not self.is_query_allowed(query, seed, country):
                 continue
 
             result = await self.parse_with_semaphore([query], country, language, parallel_limit, source, region_id)
+            
             if result['keywords']:
-                all_keywords.update(result['keywords'])
                 verified_prefixes.append(candidate)
-
-        # POST-FILTER: Чистка результатов от нецелевых городов
-        cleaned_keywords = self.post_filter_cities(all_keywords, country)
+                
+                # Обрабатываем каждый полученный ключ
+                for kw in result['keywords']:
+                    # 1. Прогоняем через главный щит (Hard-Blacklist + Natasha NER)
+                    if not self.is_query_allowed(kw, seed, country):
+                        # Если это мусор (Крым, РФ и т.д.), НЕ добавляем в выдачу
+                        # Но пытаемся сделать из него чистый "якорь"
+                        anchor = self.strip_geo_to_anchor(kw, seed, country)
+                        if anchor and anchor != seed.lower() and len(anchor) > 5:
+                            internal_anchors.add(anchor)
+                        continue  # Пропускаем этот мусорный ключ
+                    
+                    # 2. Если ключ прошел проверку, очищаем от локальных шумов
+                    clean_kw = self.strip_geo_to_anchor(kw, seed, country)
+                    
+                    if clean_kw and len(clean_kw) > 3:
+                        keywords.add(clean_kw)
         
-        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
-        anchors_created = set()
-        for keyword in cleaned_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, seed, country)
-            if anchor and len(anchor) > 3 and anchor != keyword.lower():
-                anchors_created.add(anchor)
-        
-        # Объединяем для фильтрации
-        all_with_anchors = cleaned_keywords | anchors_created
-        
+        # Финальная фильтрация релевантности
+        all_with_anchors = keywords | internal_anchors
         filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
         
         # Разделяем обратно
         filtered_set = set(filtered)
-        final_keywords = sorted(list(cleaned_keywords & filtered_set))
-        final_anchors = sorted(list(anchors_created & filtered_set))
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
 
         elapsed = time.time() - start_time
 
