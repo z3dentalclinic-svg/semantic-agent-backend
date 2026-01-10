@@ -1,6 +1,12 @@
 
 """
+FGS Parser API - Version 5.3.0 PRODUCTION (CLEAN)
+Deployed: 2026-01-10
+Cleaned version: removed 419 lines of comments and whitespace
+All functionality preserved
 """
+
+
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +42,7 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.3.0",
+    version="5.3.0-production-clean",
     description="6 методов | 3 источника | Pre-filter: words + whitelist (Gemini) | Level 2"
 )
 
