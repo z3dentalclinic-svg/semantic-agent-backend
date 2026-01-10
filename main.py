@@ -1,24 +1,30 @@
 
 """
-FGS Parser API - Version 5.4.2 PRODUCTION
+FGS Parser API - Version 5.4.6 PRODUCTION
 Deployed: 2026-01-10
 
-РАЗДЕЛЬНЫЙ ВЫВОД ЯКОРЕЙ:
-- Все методы теперь возвращают: keywords + anchors отдельно
-- Frontend показывает якоря отдельной секцией
-- Export в CSV с пометкой типа (Ключ/Якорь)
+ПРАВИЛЬНАЯ ЛОГИКА HARD-BLACKLIST:
+- Hard-Blacklist ТОЛЬКО для оккупированных территорий Украины:
+  • Крым: Симферополь, Севастополь, Ялта, Евпатория, Керчь...
+  • ОРДЛО: Донецк, Луганск, Мариуполь, Горловка, Макеевка...
 
-API Response format:
-{
-  "keywords": [...],     // Оригинальные ключи
-  "anchors": [...],      // Созданные якоря
-  "count": 10,           // Количество ключей
-  "anchors_count": 5     // Количество якорей
-}
+- РФ/BY/KZ/UZ города фильтруются ДИНАМИЧЕСКИ через:
+  • ALL_CITIES_GLOBAL (база всех городов мира)
+  • Natasha NER (распознавание LOC entities)
 
-Previous (v5.4.1):
-- Супер-очиститель strip_geo_to_anchor()
-- Якоря смешивались с ключами
+Трёхуровневая защита:
+1. Hard-Blacklist → Крым + ОРДЛО
+2. Natasha NER → Распознавание локаций с нормализацией
+3. ALL_CITIES_GLOBAL → Динамическая проверка остальных стран
+
+Примеры:
+- "ремонт севастополь" → 🚫 Hard-Blacklist (Крым)
+- "ремонт москва" → 🚫 ALL_CITIES_GLOBAL (RU город для UA)
+- "ремонт в евпатории" → 🚫 Hard-Blacklist + Natasha (Крым, склонение)
+- "ремонт шабаны" → 🚫 Natasha NER (неизвестная локация)
+
+Previous (v5.4.5):
+- Natasha NER integration (но слишком большой Hard-Blacklist)
 """
 
 
@@ -65,8 +71,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.4.2",
-    description="6 методов | 3 источника | Separate anchors output + Frontend support | Level 2"
+    version="5.4.6",
+    description="6 методов | 3 sources | Natasha NER | Hard-Blacklist: Crimea+ORDLO only | Level 2"
 )
 
 app.add_middleware(
@@ -381,6 +387,36 @@ class GoogleAutocompleteParser:
 
         self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
         self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+        
+        # NATASHA NER INTEGRATION (v5.4.5)
+        if NATASHA_AVAILABLE:
+            try:
+                self.segmenter = Segmenter()
+                self.morph_vocab = MorphVocab()
+                self.emb = NewsEmbedding()
+                self.ner_tagger = NewsNERTagger(self.emb)
+                self.natasha_ready = True
+                print("✅ Natasha NER initialized for geo-filtering")
+            except Exception as e:
+                print(f"⚠️ Natasha initialization failed: {e}")
+                self.natasha_ready = False
+        else:
+            self.natasha_ready = False
+        
+        # HARD-BLACKLIST только для оккупированных территорий (v5.4.6)
+        # Остальные страны фильтруются динамически через ALL_CITIES_GLOBAL + Natasha
+        self.forbidden_geo = {
+            # Оккупированный Крым (формально в базах может быть UA, но должен блокироваться)
+            'крым', 'crimea', 'симферополь', 'sevastopol', 'севастополь', 'ялта', 'yalta',
+            'алушта', 'alushta', 'евпатория', 'yevpatoria', 'керчь', 'kerch',
+            'феодосия', 'feodosia', 'судак', 'sudak', 'бахчисарай', 'bakhchisaray',
+            
+            # Оккупированные территории Донбасса (ОРДЛО)
+            'донецк', 'donetsk', 'луганск', 'luhansk', 'мариуполь', 'mariupol',
+            'бердянск', 'berdiansk', 'мелитополь', 'melitopol', 'горловка', 'horlivka',
+            'макеевка', 'makiivka', 'енакиево', 'yenakiieve', 'алчевск', 'alchevsk',
+            'краматорск', 'kramatorsk', 'славянск', 'sloviansk', 'торез', 'torez'
+        }
 
         self.stemmers = {
             'en': SnowballStemmer("english"),
@@ -458,71 +494,115 @@ class GoogleAutocompleteParser:
         
         return False  # Город чужой страны — блокируем
     
-    def strip_geo_to_anchor(self, text: str, target_country: str) -> str:
+    def strip_geo_to_anchor(self, text: str, seed: str, target_country: str) -> str:
         """
-        v5.4.0: Супер-очиститель гео-мусора
+        v5.4.4: Супер-очиститель - ПРАВИЛЬНАЯ ЛОГИКА ЯКОРЕЙ
         
-        Удаляет из фразы ВСЕ города кроме целевой страны.
-        Создаёт "якорь" - чистую фразу без гео-привязок.
+        Алгоритм:
+        1. Убираем ВСЕ слова из seed (с лемматизацией, независимо от порядка)
+        2. Убираем чужие города из остатка
+        3. Якорь = то что осталось
         
         Args:
-            text: Исходная фраза (например, "ремонт пылесосов москва")
+            text: Исходная фраза (например, "ремонт пылесосов поларис москва")
+            seed: Базовый запрос (например, "ремонт пылесосов")
             target_country: Целевая страна ('ua', 'ru', 'by', 'kz')
         
         Returns:
-            Очищенная фраза (например, "ремонт пылесосов")
+            Якорь (например, "поларис")
         
         Примеры:
-            >>> strip_geo_to_anchor("ремонт пылесосов москва", "ua")
-            "ремонт пылесосов"
+            >>> strip_geo_to_anchor("ремонт пылесосов поларис москва", "ремонт пылесосов", "ua")
+            "поларис"  # Убрали seed + москва
             
-            >>> strip_geo_to_anchor("ремонт пылесосов киев", "ua")
-            "ремонт пылесосов киев"  # Киев - наш город, оставляем
+            >>> strip_geo_to_anchor("ремонт пылесосов недорого киев", "ремонт пылесосов", "ua")
+            "недорого киев"  # Убрали seed, киев оставили (UA город)
             
-            >>> strip_geo_to_anchor("ремонт в йошкар-ола", "ua")
-            "ремонт в"  # Йошкар-Ола удалён целиком (с дефисом)
+            >>> strip_geo_to_anchor("пылесосов ремонт samsung", "ремонт пылесосов", "ua")
+            "samsung"  # Убрали seed независимо от порядка
+            
+            >>> strip_geo_to_anchor("ремонт пылесоса philips", "ремонт пылесосов", "ua")
+            "philips"  # Лемматизация: пылесоса → пылесос
         """
         import re
         
-        # Очищаем от спецсимволов и делим на слова (включая дефис!)
-        words = re.findall(r'[а-яёa-z0-9-]+', text.lower())
+        # Шаг 1: Получаем леммы seed (для удаления)
+        seed_words = re.findall(r'[а-яёa-z0-9-]+', seed.lower())
+        seed_lemmas = set()
+        
+        for word in seed_words:
+            if len(word) < 2:
+                continue
+            try:
+                # Лемматизация для кириллицы
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    lemma = self.morph_ru.parse(word)[0].normal_form
+                    seed_lemmas.add(lemma)
+                else:
+                    seed_lemmas.add(word)  # Латиница как есть
+            except:
+                seed_lemmas.add(word)
+        
+        # Шаг 2: Обрабатываем текст - убираем слова seed
+        text_words = re.findall(r'[а-яёa-z0-9-]+', text.lower())
+        remaining_words = []
+        
+        for word in text_words:
+            if len(word) < 2:
+                remaining_words.append(word)
+                continue
+            
+            # Получаем лемму слова
+            try:
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    word_lemma = self.morph_ru.parse(word)[0].normal_form
+                else:
+                    word_lemma = word
+            except:
+                word_lemma = word
+            
+            # Если лемма слова есть в seed - пропускаем (удаляем)
+            if word_lemma in seed_lemmas:
+                logger.info(f"🗑️ SEED REMOVED: '{word}' (lemma: {word_lemma}) from '{text}'")
+                continue
+            
+            remaining_words.append(word)
+        
+        # Шаг 3: Убираем чужие города из оставшихся слов
         clean_words = []
         
-        for w in words:
-            if len(w) < 3:
-                clean_words.append(w)
+        for word in remaining_words:
+            if len(word) < 2:
+                clean_words.append(word)
                 continue
             
+            # Проверяем является ли слово чужим городом
             try:
-                parsed = self.morph_ru.parse(w)[0]
-                lemma = parsed.normal_form
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    lemma = self.morph_ru.parse(word)[0].normal_form
+                else:
+                    lemma = word
             except:
-                lemma = w
+                lemma = word
             
-            # Если слово или лемма есть в ГЛОБАЛЬНОЙ базе городов
-            is_city = lemma in ALL_CITIES_GLOBAL or w in ALL_CITIES_GLOBAL
+            # Если это город в глобальной базе
+            if lemma in ALL_CITIES_GLOBAL or word in ALL_CITIES_GLOBAL:
+                city_country = ALL_CITIES_GLOBAL.get(lemma) or ALL_CITIES_GLOBAL.get(word)
+                
+                # Если это ЧУЖОЙ город - пропускаем (удаляем)
+                if city_country != target_country.lower():
+                    logger.info(f"🧼 CITY REMOVED: '{word}' (city of {city_country}) from anchor")
+                    continue
             
-            # Проверяем, наш ли это город (например, UA)
-            is_our_city = False
-            if is_city:
-                city_info = ALL_CITIES_GLOBAL.get(lemma) or ALL_CITIES_GLOBAL.get(w)
-                if city_info == target_country.lower():
-                    is_our_city = True
-            
-            # Если это ЧУЖОЙ город — просто пропускаем слово (удаляем)
-            if is_city and not is_our_city:
-                logger.info(f"🧼 STRIPPED: '{w}' from '{text}' (city of {ALL_CITIES_GLOBAL.get(lemma) or ALL_CITIES_GLOBAL.get(w)})")
-                continue
-            
-            clean_words.append(w)
+            clean_words.append(word)
         
-        cleaned = " ".join(clean_words).strip()
+        anchor = " ".join(clean_words).strip()
         
-        # Логируем только если что-то изменилось
-        if cleaned != text.lower():
-            logger.warning(f"🧼 ANCHOR CREATED: '{text}' → '{cleaned}'")
+        # Логируем только если создали якорь
+        if anchor and anchor != text.lower():
+            logger.warning(f"⚓ ANCHOR CREATED: '{text}' → '{anchor}'")
         
-        return cleaned
+        return anchor
 
     def detect_seed_language(self, seed: str) -> str:
         """Автоопределение языка seed"""
@@ -682,22 +762,62 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        Пре-фильтр v5.4.0: Динамическая Гео-Фильтрация
+        Пре-фильтр v5.4.6: Интеграция Natasha NER + Hard-Blacklist
         
-        Использует is_city_allowed() для проверки каждого слова.
-        Масштабируемо работает для ЛЮБОЙ страны без ручных списков.
+        Трёхуровневая защита:
+        1. Hard-Blacklist (ТОЛЬКО оккупированные территории: Крым + ОРДЛО)
+        2. Natasha NER (распознавание LOC entities)
+        3. Динамическая проверка через ALL_CITIES_GLOBAL (РФ, BY, KZ, UZ и др.)
+        
+        Важно: РФ/BY/KZ/UZ города фильтруются ДИНАМИЧЕСКИ, не через Hard-Blacklist!
         """
         import re
         
         q_lower = query.lower().strip()
         
+        # УРОВЕНЬ 1: Hard-Blacklist (ТОЛЬКО Крым + ОРДЛО)
+        if any(forbidden in q_lower for forbidden in self.forbidden_geo):
+            logger.warning(f"🚫 HARD-BLACKLIST BLOCKED: {query} | Occupied territory detected")
+            return False
+        
+        # УРОВЕНЬ 2: Natasha NER (распознавание локаций)
+        if self.natasha_ready and NATASHA_AVAILABLE:
+            try:
+                doc = Doc(query)
+                doc.segment(self.segmenter)
+                doc.tag_ner(self.ner_tagger)
+                
+                for span in doc.spans:
+                    if span.type == 'LOC':
+                        span.normalize(self.morph_vocab)
+                        loc_name = span.normal.lower()
+                        
+                        # Проверяем через ALL_CITIES_GLOBAL
+                        if loc_name in ALL_CITIES_GLOBAL:
+                            city_country = ALL_CITIES_GLOBAL[loc_name]
+                            
+                            # Если локация НЕ из целевой страны - блокируем
+                            if city_country != country.lower():
+                                logger.warning(f"📍 NATASHA NER BLOCKED: '{loc_name}' (city of {city_country}) in '{query}'")
+                                return False
+                        else:
+                            # Natasha нашла локацию, но её НЕТ в нашей базе
+                            # Считаем подозрительной и блокируем (может быть район/область/мусор)
+                            logger.warning(f"📍 NATASHA NER BLOCKED: '{loc_name}' (unknown location) in '{query}'")
+                            return False
+                            
+            except Exception as e:
+                # Если Natasha упала - продолжаем без неё
+                logger.debug(f"Natasha NER error: {e}")
+        
+        # УРОВЕНЬ 3: Динамическая проверка через ALL_CITIES_GLOBAL (как раньше)
         # 1. Whitelist брендов - разрешаем сразу
         if any(white in q_lower for white in WHITELIST_TOKENS):
             logger.info(f"✅ ALLOWED (whitelist): {query}")
             return True
         
         # 2. Разбиваем на слова
-        words = re.findall(r'[а-яёa-z0-9]+', q_lower)
+        words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
         
         for word in words:
             if len(word) < 3:  # Пропускаем короткие (предлоги)
@@ -705,7 +825,7 @@ class GoogleAutocompleteParser:
             
             # Динамическая проверка через is_city_allowed
             if not self.is_city_allowed(word, country):
-                logger.warning(f"🚫 BLOCKED (v5.4.0): {query} | City '{word}' not allowed for {country.upper()}")
+                logger.warning(f"🚫 BLOCKED (v5.4.5): {query} | City '{word}' not allowed for {country.upper()}")
                 return False
         
         logger.info(f"✅ ALLOWED: {query}")
@@ -1130,11 +1250,11 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка от нецелевых городов
         cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
         
-        # SUPER-CLEANER v5.4.1: Создаём якоря
+        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
         anchors_created = set()
         for keyword in cleaned_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, country)
-            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+            anchor = self.strip_geo_to_anchor(keyword, seed, country)
+            if anchor and len(anchor) > 3 and anchor != keyword.lower():
                 anchors_created.add(anchor)
         
         # Объединяем для фильтрации
@@ -1185,11 +1305,11 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка от нецелевых городов
         cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
         
-        # SUPER-CLEANER v5.4.1: Создаём якоря
+        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
         anchors_created = set()
         for keyword in cleaned_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, country)
-            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+            anchor = self.strip_geo_to_anchor(keyword, seed, country)
+            if anchor and len(anchor) > 3 and anchor != keyword.lower():
                 anchors_created.add(anchor)
         
         # Объединяем для фильтрации
@@ -1284,11 +1404,11 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка от нецелевых городов
         all_keywords = self.post_filter_cities(all_keywords, country)
         
-        # SUPER-CLEANER v5.4.1: Создаём якоря
+        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
         anchors_created = set()
         for keyword in all_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, country)
-            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+            anchor = self.strip_geo_to_anchor(keyword, seed, country)
+            if anchor and len(anchor) > 3 and anchor != keyword.lower():
                 anchors_created.add(anchor)
         
         # Объединяем для фильтрации
@@ -1389,11 +1509,11 @@ class GoogleAutocompleteParser:
         # POST-FILTER: Чистка результатов от нецелевых городов
         cleaned_keywords = self.post_filter_cities(all_keywords, country)
         
-        # SUPER-CLEANER v5.4.1: Создаём якоря
+        # SUPER-CLEANER v5.4.4: Создаём якоря (убираем seed + чужие города)
         anchors_created = set()
         for keyword in cleaned_keywords:
-            anchor = self.strip_geo_to_anchor(keyword, country)
-            if anchor and len(anchor) > 5 and anchor != keyword.lower():
+            anchor = self.strip_geo_to_anchor(keyword, seed, country)
+            if anchor and len(anchor) > 3 and anchor != keyword.lower():
                 anchors_created.add(anchor)
         
         # Объединяем для фильтрации
@@ -1422,9 +1542,8 @@ class GoogleAutocompleteParser:
         }
 
     async def parse_deep_search(self, seed: str, country: str, region_id: int, language: str, 
-                                use_numbers: bool, parallel_limit: int, include_keywords: bool, 
-                                source: str = "google") -> Dict:
-        """DEEP SEARCH: глубокий поиск (все 4 метода)"""
+                                use_numbers: bool, parallel_limit: int, include_keywords: bool) -> Dict:
+        """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
         correction = await self.autocorrect_text(seed, language)
         original_seed = seed
@@ -1433,25 +1552,43 @@ class GoogleAutocompleteParser:
             seed = correction["corrected"]
 
         start_time = time.time()
-
-        suffix_result = await self.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-        infix_result = await self.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-        morph_result = await self.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
-        prefix_result = await self.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-
-        suffix_kw = set(suffix_result["keywords"])
-        infix_kw = set(infix_result.get("keywords", []))
-        morph_kw = set(morph_result["keywords"])
-        prefix_kw = set(prefix_result["keywords"])
         
-        # Собираем якоря
-        suffix_anchors = set(suffix_result.get("anchors", []))
-        infix_anchors = set(infix_result.get("anchors", []))
-        morph_anchors = set(morph_result.get("anchors", []))
-        prefix_anchors = set(prefix_result.get("anchors", []))
-
-        all_unique = suffix_kw | infix_kw | morph_kw | prefix_kw
-        all_anchors = suffix_anchors | infix_anchors | morph_anchors | prefix_anchors
+        # Парсим ИЗ ВСЕХ 3 ИСТОЧНИКОВ ОДНОВРЕМЕННО
+        sources = ["google", "yandex", "bing"]
+        all_keywords_by_source = {}
+        all_anchors_by_source = {}
+        
+        for source in sources:
+            suffix_result = await self.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+            infix_result = await self.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+            morph_result = await self.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
+            prefix_result = await self.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+            
+            # Собираем ключи по источникам
+            all_keywords_by_source[source] = {
+                "suffix": set(suffix_result["keywords"]),
+                "infix": set(infix_result.get("keywords", [])),
+                "morphology": set(morph_result["keywords"]),
+                "adaptive_prefix": set(prefix_result["keywords"])
+            }
+            
+            # Собираем якоря по источникам
+            all_anchors_by_source[source] = {
+                "suffix": set(suffix_result.get("anchors", [])),
+                "infix": set(infix_result.get("anchors", [])),
+                "morphology": set(morph_result.get("anchors", [])),
+                "adaptive_prefix": set(prefix_result.get("anchors", []))
+            }
+        
+        # Объединяем ВСЕ ключи из всех источников
+        all_unique_keywords = set()
+        all_unique_anchors = set()
+        
+        for source in sources:
+            for method_kw in all_keywords_by_source[source].values():
+                all_unique_keywords |= method_kw
+            for method_anchors in all_anchors_by_source[source].values():
+                all_unique_anchors |= method_anchors
 
         elapsed = time.time() - start_time
 
@@ -1459,32 +1596,47 @@ class GoogleAutocompleteParser:
             "seed": original_seed,
             "corrected_seed": seed if correction.get("has_errors") else None,
             "corrections": correction.get("corrections", []) if correction.get("has_errors") else [],
-            "source": source,
-            "total_unique_keywords": len(all_unique),
-            "total_anchors": len(all_anchors),
-            "methods": {
-                "suffix": {"count": len(suffix_kw), "anchors_count": len(suffix_anchors)},
-                "infix": {"count": len(infix_kw), "anchors_count": len(infix_anchors)},
-                "morphology": {"count": len(morph_kw), "anchors_count": len(morph_anchors)},
-                "adaptive_prefix": {"count": len(prefix_kw), "anchors_count": len(prefix_anchors)}
+            "sources": sources,  # Показываем что парсили из всех источников
+            "total_unique_keywords": len(all_unique_keywords),
+            "total_anchors": len(all_unique_anchors),
+            "sources_stats": {
+                source: {
+                    "keywords": sum(len(kw) for kw in all_keywords_by_source[source].values()),
+                    "anchors": sum(len(anch) for anch in all_anchors_by_source[source].values())
+                }
+                for source in sources
             },
             "elapsed_time": round(elapsed, 2)
         }
 
         if include_keywords:
             response["keywords"] = {
-                "all": sorted(list(all_unique)),
-                "suffix": sorted(list(suffix_kw)),
-                "infix": sorted(list(infix_kw)),
-                "morphology": sorted(list(morph_kw)),
-                "adaptive_prefix": sorted(list(prefix_kw))
+                "all": sorted(list(all_unique_keywords)),
+                # По источникам
+                **{
+                    source: {
+                        "all": sorted(list(set.union(*all_keywords_by_source[source].values()))),
+                        "suffix": sorted(list(all_keywords_by_source[source]["suffix"])),
+                        "infix": sorted(list(all_keywords_by_source[source]["infix"])),
+                        "morphology": sorted(list(all_keywords_by_source[source]["morphology"])),
+                        "adaptive_prefix": sorted(list(all_keywords_by_source[source]["adaptive_prefix"]))
+                    }
+                    for source in sources
+                }
             }
             response["anchors"] = {
-                "all": sorted(list(all_anchors)),
-                "suffix": sorted(list(suffix_anchors)),
-                "infix": sorted(list(infix_anchors)),
-                "morphology": sorted(list(morph_anchors)),
-                "adaptive_prefix": sorted(list(prefix_anchors))
+                "all": sorted(list(all_unique_anchors)),
+                # По источникам
+                **{
+                    source: {
+                        "all": sorted(list(set.union(*all_anchors_by_source[source].values()))),
+                        "suffix": sorted(list(all_anchors_by_source[source]["suffix"])),
+                        "infix": sorted(list(all_anchors_by_source[source]["infix"])),
+                        "morphology": sorted(list(all_anchors_by_source[source]["morphology"])),
+                        "adaptive_prefix": sorted(list(all_anchors_by_source[source]["adaptive_prefix"]))
+                    }
+                    for source in sources
+                }
             }
 
         return response
@@ -1531,15 +1683,14 @@ async def deep_search_endpoint(
     language: str = Query("auto", description="Язык (auto/ru/uk/en)"),
     use_numbers: bool = Query(False, description="Добавить цифры 0-9"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
-    include_keywords: bool = Query(True, description="Включить список ключей"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
+    include_keywords: bool = Query(True, description="Включить список ключей")
 ):
-    """DEEP SEARCH: глубокий поиск (все 4 метода)"""
+    """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    return await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords, source)
+    return await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
 
 @app.get("/api/compare")
 async def compare_methods(
