@@ -1,14 +1,17 @@
 
 """
-FGS Parser API - Version 5.3.2 PRODUCTION (DIAGNOSTIC)
+FGS Parser API - Version 5.3.3 PRODUCTION
 Deployed: 2026-01-10
-Changes:
-- Added logging to is_query_allowed for Pre-filter diagnostics
-- Logs every ALLOWED and BLOCKED query with reason
-- Format: ✅ ALLOWED or 🚫 BLOCKED: query | Reason: ...
-Previous fixes (v5.3.1):
-- Корректная обработка английских брендов и русских городов
-- Убраны лишние пробелы в parse_adaptive_prefix
+MAJOR CHANGES:
+- NEW LOGIC: Block ALL cities except UA cities (whitelist approach)
+- ALL_CITIES_GLOBAL: 10k+ cities from geonames
+- UA_CITIES: Whitelist of Ukrainian cities
+- PRE-FILTER: Blocks non-UA cities BEFORE sending to Google
+- POST-FILTER: Cleans Google results from non-UA cities
+- Applied to ALL parsing methods (suffix, infix, morphology, adaptive_prefix)
+
+Previous (v5.3.2):
+- Added diagnostic logging for Pre-filter
 """
 
 
@@ -55,8 +58,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.3.2-diagnostic",
-    description="6 методов | 3 источника | Pre-filter with detailed logging | Level 2"
+    version="5.3.3",
+    description="6 методов | 3 источника | PRE+POST filter: UA cities whitelist | Level 2"
 )
 
 app.add_middleware(
@@ -116,6 +119,9 @@ MANUAL_RARE_CITIES = {
 
 def generate_geo_blacklist_full():
     """
+    Генерирует blacklist городов для каждой страны
+    + сохраняет ALL_CITIES_GLOBAL (все города мира)
+    + сохраняет UA_CITIES (белый список Украины)
     Returns:
     """
     try:
@@ -125,6 +131,7 @@ def generate_geo_blacklist_full():
         cities = gc.get_cities()
 
         cities_by_country = {}
+        all_cities_global = set()  # ВСЕ города мира
 
         for city_id, city_data in cities.items():
             country = city_data['countrycode']
@@ -134,6 +141,7 @@ def generate_geo_blacklist_full():
 
             name = city_data['name'].lower()
             cities_by_country[country].add(name)
+            all_cities_global.add(name)  # Добавляем в глобальный список
 
             for alt in city_data.get('alternatenames', []):
                 if ' ' in alt:
@@ -156,6 +164,18 @@ def generate_geo_blacklist_full():
 
                     if is_latin_cyrillic:
                         cities_by_country[country].add(alt.lower())
+                        all_cities_global.add(alt.lower())  # Добавляем в глобальный список
+
+        # Белый список украинских городов (разрешённые для UA)
+        ua_cities = cities_by_country.get('UA', set()) | {
+            'киев', 'харьков', 'одесса', 'днепр', 'львов', 'запорожье', 
+            'кривой рог', 'николаев', 'мариуполь', 'винница', 'херсон', 
+            'полтава', 'чернигов', 'черкассы', 'житомир', 'сумы', 
+            'хмельницкий', 'черновцы', 'ровно', 'ивано-франковск', 
+            'кременчуг', 'тернополь', 'луцк', 'белая церковь',
+            'днепропетровск', 'киев', 'kyiv', 'kiev', 'kharkiv', 
+            'odessa', 'lviv', 'dnipro', 'zaporizhzhia'
+        }
 
         blacklist = {}
 
@@ -195,19 +215,28 @@ def generate_geo_blacklist_full():
             geonames_count = len(cities_set - MANUAL_RARE_CITIES.get(country, set()))
             manual_count = len(MANUAL_RARE_CITIES.get(country, set()))
             print(f"   {country.upper()}: {len(cities_set)} городов (geonames: {geonames_count}, ручных: {manual_count})")
+        
+        print(f"✅ ALL_CITIES_GLOBAL: {len(all_cities_global)} городов мира")
+        print(f"✅ UA_CITIES (whitelist): {len(ua_cities)} украинских городов")
 
-        return blacklist
+        return blacklist, all_cities_global, ua_cities
 
     except ImportError:
         print("⚠️ geonamescache не установлен, используется минимальный blacklist")
-        return {
+        
+        all_cities_global = {'москва', 'спб', 'минск', 'киев', 'харьков', 'днепр'}
+        ua_cities = {'киев', 'харьков', 'одесса', 'днепр', 'львов'}
+        
+        blacklist = {
             "ua": {"москва", "мск", "спб", "питер", "санкт-петербург", "минск"} | MANUAL_RARE_CITIES.get("ua", set()),
             "ru": {"киев", "харьков", "днепр", "львов", "одесса"} | MANUAL_RARE_CITIES.get("ru", set()),
             "by": {"москва", "спб", "киев", "харьков"} | MANUAL_RARE_CITIES.get("by", set()),
             "kz": {"москва", "спб", "киев"} | MANUAL_RARE_CITIES.get("kz", set()),
         }
+        
+        return blacklist, all_cities_global, ua_cities
 
-GEO_BLACKLIST = generate_geo_blacklist_full()
+GEO_BLACKLIST, ALL_CITIES_GLOBAL, UA_CITIES = generate_geo_blacklist_full()
 
 class AdaptiveDelay:
     """Автоматическая оптимизация задержек между запросами"""
@@ -570,44 +599,112 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        Пре-фильтр v5.3.1: корректная обработка английских брендов и русских городов
-        + Логирование для диагностики
+        Пре-фильтр v5.3.3: НОВАЯ ЛОГИКА
+        - Если это город из МИРОВОЙ базы, НО его нет в UA_CITIES → БЛОКИРУЕМ
+        - Whitelist для брендов работает как раньше
         """
         import re
         
         q_lower = query.lower().strip()
         
-        # 1. Если в запросе есть бренд из Whitelist - ПРОВЕРКА ОКОНЧЕНА (разрешаем)
+        # 1. Whitelist брендов - разрешаем сразу
         if any(white in q_lower for white in WHITELIST_TOKENS):
             logger.info(f"✅ ALLOWED (whitelist): {query}")
             return True
         
-        # 2. Разбиваем на слова и проверяем каждое
+        # 2. Разбиваем на слова
         words = re.findall(r'[а-яёa-z0-9]+', q_lower)
-        blacklist = GEO_BLACKLIST.get(country.lower(), set())
         
         for word in words:
-            if len(word) < 2:
-                continue  # Игнорируем предлоги
+            if len(word) < 3:  # Пропускаем короткие (предлоги)
+                continue
             
-            # Проверка оригинала
-            if word in blacklist:
-                logger.warning(f"🚫 BLOCKED: {query} | Reason: word '{word}' in blacklist")
-                return False
+            # Проверяем оригинал слова
+            if word in ALL_CITIES_GLOBAL:
+                # Это город! Проверяем украинский ли?
+                if country.lower() == 'ua':
+                    if word not in UA_CITIES:
+                        logger.warning(f"🚫 NON-UA CITY BLOCKED: {query} | City: '{word}'")
+                        return False
             
-            # Проверка леммы (только для кириллицы)
+            # Проверяем лемму (только для кириллицы)
             if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
                 if hasattr(self, 'morph_ru'):
                     try:
                         lemma = self.morph_ru.parse(word)[0].normal_form
-                        if lemma in blacklist and lemma not in WHITELIST_TOKENS:
-                            logger.warning(f"🚫 BLOCKED: {query} | Reason: lemma '{lemma}' (from '{word}') in blacklist")
-                            return False
+                        
+                        # Если лемма - это город
+                        if lemma in ALL_CITIES_GLOBAL:
+                            if country.lower() == 'ua':
+                                if lemma not in UA_CITIES:
+                                    logger.warning(f"🚫 NON-UA CITY BLOCKED: {query} | Lemma: '{lemma}' (from '{word}')")
+                                    return False
                     except:
                         pass
         
         logger.info(f"✅ ALLOWED: {query}")
         return True
+    
+    def post_filter_cities(self, keywords: set, country: str) -> set:
+        """
+        POST-FILTER v5.3.3: Чистка результатов от Google
+        
+        Удаляет ключи которые содержат нецелевые города.
+        Например, для UA удаляет всё что содержит "москва", "минск", "спб"
+        
+        Args:
+            keywords: Множество ключевых слов от Google
+            country: Код страны (ua, ru, by, kz)
+        
+        Returns:
+            Очищенное множество ключевых слов
+        """
+        import re
+        
+        if country.lower() != 'ua':
+            return keywords  # Пока работаем только для UA
+        
+        cleaned = set()
+        removed_count = 0
+        
+        for keyword in keywords:
+            should_remove = False
+            kw_lower = keyword.lower()
+            
+            # Разбиваем на слова
+            words = re.findall(r'[а-яёa-z0-9]+', kw_lower)
+            
+            for word in words:
+                if len(word) < 3:
+                    continue
+                
+                # Проверяем оригинал
+                if word in ALL_CITIES_GLOBAL and word not in UA_CITIES:
+                    logger.info(f"🧹 POST-FILTER removed: '{keyword}' | Reason: city '{word}'")
+                    should_remove = True
+                    removed_count += 1
+                    break
+                
+                # Проверяем лемму
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    if hasattr(self, 'morph_ru'):
+                        try:
+                            lemma = self.morph_ru.parse(word)[0].normal_form
+                            if lemma in ALL_CITIES_GLOBAL and lemma not in UA_CITIES:
+                                logger.info(f"🧹 POST-FILTER removed: '{keyword}' | Reason: lemma '{lemma}' (from '{word}')")
+                                should_remove = True
+                                removed_count += 1
+                                break
+                        except:
+                            pass
+            
+            if not should_remove:
+                cleaned.add(keyword)
+        
+        if removed_count > 0:
+            logger.warning(f"🧹 POST-FILTER: Removed {removed_count} keywords with non-UA cities")
+        
+        return cleaned
 
     async def autocorrect_text(self, text: str, language: str) -> Dict:
         """Автокоррекция через Yandex Speller (ru/uk/en) или LanguageTool (остальные)"""
@@ -980,8 +1077,11 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
+        # POST-FILTER: Чистка от нецелевых городов
+        cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
+        
         # Фильтр релевантности (v5.2.0: subset matching)
-        filtered = await self.filter_relevant_keywords(result_raw['keywords'], seed, language)
+        filtered = await self.filter_relevant_keywords(list(cleaned_keywords), seed, language)
 
         elapsed = time.time() - start_time
 
@@ -1015,7 +1115,10 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        filtered_1 = await self.filter_infix_results(result_raw['keywords'], language)
+        # POST-FILTER: Чистка от нецелевых городов
+        cleaned_keywords = self.post_filter_cities(set(result_raw['keywords']), country)
+        
+        filtered_1 = await self.filter_infix_results(list(cleaned_keywords), language)
 
         # Фильтр 2: релевантность (v5.2.0: subset matching)
         filtered_2 = await self.filter_relevant_keywords(filtered_1, seed, language)
@@ -1094,6 +1197,9 @@ class GoogleAutocompleteParser:
             result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
             all_keywords.update(result['keywords'])
 
+        # POST-FILTER: Чистка от нецелевых городов
+        all_keywords = self.post_filter_cities(all_keywords, country)
+        
         filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
 
         elapsed = time.time() - start_time
@@ -1179,6 +1285,9 @@ class GoogleAutocompleteParser:
                 all_keywords.update(result['keywords'])
                 verified_prefixes.append(candidate)
 
+        # POST-FILTER: Чистка результатов от нецелевых городов
+        all_keywords = self.post_filter_cities(all_keywords, country)
+        
         filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
 
         elapsed = time.time() - start_time
