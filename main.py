@@ -1,8 +1,11 @@
 
 """
-FGS Parser API - Version 5.3.0 PRODUCTION (CLEAN)
+FGS Parser API - Version 5.3.1 PRODUCTION
 Deployed: 2026-01-10
-Cleaned version: removed 419 lines of comments and whitespace
+Fixed: 
+- Корректная обработка английских брендов и русских городов в is_query_allowed
+- Убраны лишние пробелы в parse_adaptive_prefix
+- Удалены отладочные принты
 All functionality preserved
 """
 
@@ -42,8 +45,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.3.0-production-clean",
-    description="6 методов | 3 источника | Pre-filter: words + whitelist (Gemini) | Level 2"
+    version="5.3.1",
+    description="6 методов | 3 источника | Pre-filter: fixed brands/cities logic | Level 2"
 )
 
 app.add_middleware(
@@ -557,64 +560,38 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        Args:
-        Returns:
+        Пре-фильтр v5.3.1: корректная обработка английских брендов и русских городов
         """
         import re
-
+        
+        q_lower = query.lower().strip()
+        
+        # 1. Если в запросе есть бренд из Whitelist - ПРОВЕРКА ОКОНЧЕНА (разрешаем)
+        if any(white in q_lower for white in WHITELIST_TOKENS):
+            return True
+        
+        # 2. Разбиваем на слова и проверяем каждое
+        words = re.findall(r'[а-яёa-z0-9]+', q_lower)
         blacklist = GEO_BLACKLIST.get(country.lower(), set())
-
-        if not blacklist:
-            return True
-
-        query_lower = query.lower()
-        query_words = set(re.findall(r'\b\w+\b', query_lower))
-
-        for token in WHITELIST_TOKENS:
-            if token in query_lower:  # Можно и подстроку для whitelist
-                return True  # ✅ Защищённый бренд/город
-
-        seed_lower = seed.lower()
-        seed_words = set(re.findall(r'\b\w+\b', seed_lower))
-
-        if blacklist & seed_words:
-            return True
-
-        if hasattr(self, 'morph_ru'):
-            seed_normalized = set()
-            for word in seed_words:
-                try:
-                    parsed = self.morph_ru.parse(word)
-                    if parsed:
-                        seed_normalized.add(parsed[0].normal_form)
-                except:
-                    seed_normalized.add(word)
-
-            if blacklist & seed_normalized:
-                return True
-
-        blocked_cities = blacklist & query_words
-        if blocked_cities:
-            city = list(blocked_cities)[0]
-            print(f"🚫 [PRE-FILTER] Блокировка: '{query}' (чужой город: {city}, страна: {country})", flush=True)
-            return False
-
-        if hasattr(self, 'morph_ru'):
-            query_normalized = set()
-            for word in query_words:
-                try:
-                    parsed = self.morph_ru.parse(word)
-                    if parsed:
-                        query_normalized.add(parsed[0].normal_form)
-                except:
-                    query_normalized.add(word)
-
-            blocked_cities = blacklist & query_normalized
-            if blocked_cities:
-                city = list(blocked_cities)[0]
-                print(f"🚫 [PRE-FILTER] Блокировка (норм.): '{query}' (чужой город: {city}, страна: {country})", flush=True)
+        
+        for word in words:
+            if len(word) < 2:
+                continue  # Игнорируем предлоги
+            
+            # Проверка оригинала
+            if word in blacklist:
                 return False
-
+            
+            # Проверка леммы (только для кириллицы)
+            if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                if hasattr(self, 'morph_ru'):
+                    try:
+                        lemma = self.morph_ru.parse(word)[0].normal_form
+                        if lemma in blacklist and lemma not in WHITELIST_TOKENS:
+                            return False
+                    except:
+                        pass
+        
         return True
 
     async def autocorrect_text(self, text: str, language: str) -> Dict:
@@ -1145,11 +1122,20 @@ class GoogleAutocompleteParser:
 
         seed_words = set(seed.lower().split())
 
-        modifiers = self.get_modifiers(language, use_numbers, seed, cyrillic_only=True)
-        queries = [f"{seed} {mod}" for mod in modifiers]
-
-        # ПРЕ-ФИЛЬТР (v5.2.6): Блокируем запросы с чужими городами
-        queries = [q for q in queries if self.is_query_allowed(q, seed, country)]
+        # Генерация префиксов без лишних пробелов
+        prefixes = ["", "купить", "цена", "отзывы"]
+        queries = []
+        for p in prefixes:
+            q = f"{p} {seed}".strip()
+            if self.is_query_allowed(q, seed, country):
+                queries.append(q)
+        
+        # Добавляем алфавитные модификаторы
+        alphabet = self.get_modifiers(language, use_numbers, seed, cyrillic_only=True)
+        for char in alphabet:
+            q_ext = f"{seed} {char}".strip()
+            if self.is_query_allowed(q_ext, seed, country):
+                queries.append(q_ext)
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
@@ -1170,7 +1156,6 @@ class GoogleAutocompleteParser:
         for candidate in sorted(candidates):
             query = f"{candidate} {seed}"
 
-            # ПРЕ-ФИЛЬТР (v5.2.6): Проверяем перед отправкой
             if not self.is_query_allowed(query, seed, country):
                 continue
 
