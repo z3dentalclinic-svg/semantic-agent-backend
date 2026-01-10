@@ -1,8 +1,9 @@
 """
-FGS Parser API - Version 5.5.5 PRODUCTION
-Deployed: 2026-01-10 (Force Deploy - Fixed Anchor Logic)
+FGS Parser API - Version 5.5.5 PRODUCTION FINAL
+Deployed: 2026-01-10 21:30 UTC (Critical Anchor Logic Fix)
+Build: 20260110213000
 
-КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ - ОПТИМИЗАЦИЯ is_query_allowed:
+КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v5.5.5 - ПРАВИЛЬНАЯ ЛОГИКА ЯКОРЕЙ:
 
 ПРОБЛЕМА:
 - Парсинг завис после v5.5.1
@@ -189,7 +190,7 @@ def generate_geo_blacklist_full():
                         if alt_lower not in all_cities_global:
                             all_cities_global[alt_lower] = country
 
-        print("✅ v5.4.0: Динамическая Гео-Фильтрация инициализирована")
+        print("✅ v5.5.5 FINAL: ПРАВИЛЬНАЯ ЛОГИКА ЯКОРЕЙ - Гео-Фильтрация инициализирована")
         print(f"   ALL_CITIES_GLOBAL: {len(all_cities_global)} городов с привязкой к странам")
         
         # Статистика по странам
