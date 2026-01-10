@@ -1,17 +1,22 @@
 
 """
-FGS Parser API - Version 5.3.3 PRODUCTION
+FGS Parser API - Version 5.4.0 PRODUCTION
 Deployed: 2026-01-10
-MAJOR CHANGES:
-- NEW LOGIC: Block ALL cities except UA cities (whitelist approach)
-- ALL_CITIES_GLOBAL: 10k+ cities from geonames
-- UA_CITIES: Whitelist of Ukrainian cities
-- PRE-FILTER: Blocks non-UA cities BEFORE sending to Google
-- POST-FILTER: Cleans Google results from non-UA cities
-- Applied to ALL parsing methods (suffix, infix, morphology, adaptive_prefix)
 
-Previous (v5.3.2):
-- Added diagnostic logging for Pre-filter
+ДИНАМИЧЕСКАЯ ГЕО-ФИЛЬТРАЦИЯ:
+- ALL_CITIES_GLOBAL: Словарь {город: код_страны} из geonames
+- is_city_allowed(): Динамическая проверка принадлежности города
+- Убраны ВСЕ ручные списки (GEO_BLACKLIST, UA_CITIES)
+- Масштабируемость: работает для ЛЮБОЙ страны автоматически
+- PRE-FILTER: Блокирует чужие города через is_city_allowed()
+- POST-FILTER: Чистит результаты через is_city_allowed()
+
+Architecture:
+- Запрос → PRE-FILTER → Google → POST-FILTER → Результат
+- Проверка: город в базе? → Да → Проверяем страну → Блокируем если чужая
+
+Previous (v5.3.3):
+- Статичные списки UA_CITIES, GEO_BLACKLIST
 """
 
 
@@ -58,8 +63,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="5.3.3",
-    description="6 методов | 3 источника | PRE+POST filter: UA cities whitelist | Level 2"
+    version="5.4.0",
+    description="6 методов | 3 источника | Dynamic Geo-Filter: ANY country support | Level 2"
 )
 
 app.add_middleware(
@@ -119,10 +124,14 @@ MANUAL_RARE_CITIES = {
 
 def generate_geo_blacklist_full():
     """
-    Генерирует blacklist городов для каждой страны
-    + сохраняет ALL_CITIES_GLOBAL (все города мира)
-    + сохраняет UA_CITIES (белый список Украины)
+    v5.4.0: Динамическая Гео-Фильтрация
+    
+    Генерирует:
+    - all_cities_global: {город: код_страны} - ВСЕ города мира
+    - Убраны статичные blacklist и ua_cities
+    
     Returns:
+        all_cities_global: dict - {город: код_страны}
     """
     try:
         from geonamescache import GeonamesCache
@@ -130,19 +139,16 @@ def generate_geo_blacklist_full():
         gc = GeonamesCache()
         cities = gc.get_cities()
 
-        cities_by_country = {}
-        all_cities_global = set()  # ВСЕ города мира
+        all_cities_global = {}  # {город: код_страны}
 
         for city_id, city_data in cities.items():
-            country = city_data['countrycode']
+            country = city_data['countrycode'].lower()  # 'RU', 'UA', 'BY' → 'ru', 'ua', 'by'
 
-            if country not in cities_by_country:
-                cities_by_country[country] = set()
-
+            # Основное название
             name = city_data['name'].lower()
-            cities_by_country[country].add(name)
-            all_cities_global.add(name)  # Добавляем в глобальный список
+            all_cities_global[name] = country
 
+            # Альтернативные названия
             for alt in city_data.get('alternatenames', []):
                 if ' ' in alt:
                     continue
@@ -153,90 +159,56 @@ def generate_geo_blacklist_full():
                 if not any(c.isalpha() for c in alt):
                     continue
 
-                alt_clean = alt.replace('-', '').replace("'", "")  # Убираем дефисы/апострофы для проверки
-                if alt_clean.isalpha():  # Только буквы
+                alt_clean = alt.replace('-', '').replace("'", "")
+                if alt_clean.isalpha():
                     is_latin_cyrillic = all(
                         ('\u0000' <= c <= '\u007F') or  # ASCII (латиница)
                         ('\u0400' <= c <= '\u04FF') or  # Кириллица
-                        c in ['-', "'"]                  # Дефис и апостроф OK
+                        c in ['-', "'"]
                         for c in alt
                     )
 
                     if is_latin_cyrillic:
-                        cities_by_country[country].add(alt.lower())
-                        all_cities_global.add(alt.lower())  # Добавляем в глобальный список
+                        alt_lower = alt.lower()
+                        # Если город уже есть, не перезаписываем (оставляем первое вхождение)
+                        if alt_lower not in all_cities_global:
+                            all_cities_global[alt_lower] = country
 
-        # Белый список украинских городов (разрешённые для UA)
-        ua_cities = cities_by_country.get('UA', set()) | {
-            'киев', 'харьков', 'одесса', 'днепр', 'львов', 'запорожье', 
-            'кривой рог', 'николаев', 'мариуполь', 'винница', 'херсон', 
-            'полтава', 'чернигов', 'черкассы', 'житомир', 'сумы', 
-            'хмельницкий', 'черновцы', 'ровно', 'ивано-франковск', 
-            'кременчуг', 'тернополь', 'луцк', 'белая церковь',
-            'днепропетровск', 'киев', 'kyiv', 'kiev', 'kharkiv', 
-            'odessa', 'lviv', 'dnipro', 'zaporizhzhia'
-        }
-
-        blacklist = {}
-
-        blacklist['ua'] = (
-            cities_by_country.get('RU', set()) |  # Россия
-            cities_by_country.get('BY', set()) |  # Беларусь
-            cities_by_country.get('KZ', set()) |  # Казахстан
-            cities_by_country.get('PL', set()) |  # Польша (Щецин!)
-            cities_by_country.get('LT', set()) |  # Литва
-            cities_by_country.get('LV', set()) |  # Латвия
-            cities_by_country.get('EE', set())    # Эстония
-        )
-
-        blacklist['ru'] = (
-            cities_by_country.get('UA', set()) |
-            cities_by_country.get('BY', set()) |
-            cities_by_country.get('KZ', set())
-        )
-
-        blacklist['by'] = (
-            cities_by_country.get('RU', set()) |
-            cities_by_country.get('UA', set())
-        )
-
-        blacklist['kz'] = (
-            cities_by_country.get('RU', set()) |
-            cities_by_country.get('UA', set()) |
-            cities_by_country.get('BY', set())
-        )
-
-        for country, cities_set in blacklist.items():
-            manual_cities = MANUAL_RARE_CITIES.get(country, set())
-            blacklist[country] = cities_set | manual_cities
-
-        print("✅ GEO_BLACKLIST сгенерирован из geonames + ручной список:")
-        for country, cities_set in blacklist.items():
-            geonames_count = len(cities_set - MANUAL_RARE_CITIES.get(country, set()))
-            manual_count = len(MANUAL_RARE_CITIES.get(country, set()))
-            print(f"   {country.upper()}: {len(cities_set)} городов (geonames: {geonames_count}, ручных: {manual_count})")
+        print("✅ v5.4.0: Динамическая Гео-Фильтрация инициализирована")
+        print(f"   ALL_CITIES_GLOBAL: {len(all_cities_global)} городов с привязкой к странам")
         
-        print(f"✅ ALL_CITIES_GLOBAL: {len(all_cities_global)} городов мира")
-        print(f"✅ UA_CITIES (whitelist): {len(ua_cities)} украинских городов")
+        # Статистика по странам
+        from collections import Counter
+        country_stats = Counter(all_cities_global.values())
+        print(f"   Топ-5 стран: {dict(country_stats.most_common(5))}")
 
-        return blacklist, all_cities_global, ua_cities
+        return all_cities_global
 
     except ImportError:
-        print("⚠️ geonamescache не установлен, используется минимальный blacklist")
+        print("⚠️ geonamescache не установлен, используется минимальный словарь")
         
-        all_cities_global = {'москва', 'спб', 'минск', 'киев', 'харьков', 'днепр'}
-        ua_cities = {'киев', 'харьков', 'одесса', 'днепр', 'львов'}
-        
-        blacklist = {
-            "ua": {"москва", "мск", "спб", "питер", "санкт-петербург", "минск"} | MANUAL_RARE_CITIES.get("ua", set()),
-            "ru": {"киев", "харьков", "днепр", "львов", "одесса"} | MANUAL_RARE_CITIES.get("ru", set()),
-            "by": {"москва", "спб", "киев", "харьков"} | MANUAL_RARE_CITIES.get("by", set()),
-            "kz": {"москва", "спб", "киев"} | MANUAL_RARE_CITIES.get("kz", set()),
+        # Минимальный fallback словарь
+        all_cities_global = {
+            # Россия
+            'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru', 
+            'санкт-петербург': 'ru', 'екатеринбург': 'ru', 'казань': 'ru',
+            'новосибирск': 'ru', 'челябинск': 'ru', 'омск': 'ru',
+            # Беларусь
+            'минск': 'by', 'гомель': 'by', 'витебск': 'by', 'могилев': 'by',
+            # Казахстан
+            'алматы': 'kz', 'астана': 'kz', 'караганда': 'kz',
+            # Украина
+            'киев': 'ua', 'харьков': 'ua', 'одесса': 'ua', 'днепр': 'ua',
+            'львов': 'ua', 'запорожье': 'ua', 'кривой рог': 'ua',
+            'николаев': 'ua', 'винница': 'ua', 'херсон': 'ua',
+            'полтава': 'ua', 'чернигов': 'ua', 'черкассы': 'ua',
+            'днепропетровск': 'ua', 'kyiv': 'ua', 'kiev': 'ua',
+            'kharkiv': 'ua', 'odessa': 'ua', 'lviv': 'ua', 'dnipro': 'ua',
         }
         
-        return blacklist, all_cities_global, ua_cities
+        return all_cities_global
 
-GEO_BLACKLIST, ALL_CITIES_GLOBAL, UA_CITIES = generate_geo_blacklist_full()
+ALL_CITIES_GLOBAL = generate_geo_blacklist_full()
 
 class AdaptiveDelay:
     """Автоматическая оптимизация задержек между запросами"""
@@ -441,6 +413,49 @@ class GoogleAutocompleteParser:
                    'a', 'ale', 'lub', 'czy', 'że', 'jak', 'gdzie', 'kiedy', 'dlaczego', 'co'}
         }
 
+    def is_city_allowed(self, word: str, target_country: str) -> bool:
+        """
+        v5.4.0: Динамическая проверка города
+        
+        Проверяет принадлежит ли город целевой стране.
+        Использует глобальный словарь ALL_CITIES_GLOBAL {город: код_страны}
+        
+        Args:
+            word: Слово для проверки
+            target_country: Код целевой страны ('ua', 'ru', 'by', 'kz')
+        
+        Returns:
+            True если город разрешён (принадлежит target_country или не город)
+            False если город запрещён (принадлежит другой стране)
+        
+        Примеры:
+            >>> is_city_allowed('киев', 'ua')
+            True  # Киев принадлежит UA
+            
+            >>> is_city_allowed('москва', 'ua')
+            False  # Москва принадлежит RU
+            
+            >>> is_city_allowed('ремонт', 'ua')
+            True  # "ремонт" не город - разрешаем
+        """
+        try:
+            parsed = self.morph_ru.parse(word.lower())[0]
+            lemma = parsed.normal_form
+        except:
+            lemma = word.lower()
+        
+        # Если слова нет в глобальной базе городов — оно безопасно
+        if lemma not in ALL_CITIES_GLOBAL:
+            return True
+        
+        # Если город есть в базе, проверяем его принадлежность
+        city_country = ALL_CITIES_GLOBAL.get(lemma)  # получаем код страны (напр. 'ru', 'kz', 'ua')
+        
+        if city_country == target_country.lower():
+            return True  # Город нашей страны — разрешаем
+        
+        return False  # Город чужой страны — блокируем
+
     def detect_seed_language(self, seed: str) -> str:
         """Автоопределение языка seed"""
         if any('\u0400' <= char <= '\u04FF' for char in seed):
@@ -599,9 +614,10 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
-        Пре-фильтр v5.3.3: НОВАЯ ЛОГИКА
-        - Если это город из МИРОВОЙ базы, НО его нет в UA_CITIES → БЛОКИРУЕМ
-        - Whitelist для брендов работает как раньше
+        Пре-фильтр v5.4.0: Динамическая Гео-Фильтрация
+        
+        Использует is_city_allowed() для проверки каждого слова.
+        Масштабируемо работает для ЛЮБОЙ страны без ручных списков.
         """
         import re
         
@@ -619,38 +635,20 @@ class GoogleAutocompleteParser:
             if len(word) < 3:  # Пропускаем короткие (предлоги)
                 continue
             
-            # Проверяем оригинал слова
-            if word in ALL_CITIES_GLOBAL:
-                # Это город! Проверяем украинский ли?
-                if country.lower() == 'ua':
-                    if word not in UA_CITIES:
-                        logger.warning(f"🚫 NON-UA CITY BLOCKED: {query} | City: '{word}'")
-                        return False
-            
-            # Проверяем лемму (только для кириллицы)
-            if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
-                if hasattr(self, 'morph_ru'):
-                    try:
-                        lemma = self.morph_ru.parse(word)[0].normal_form
-                        
-                        # Если лемма - это город
-                        if lemma in ALL_CITIES_GLOBAL:
-                            if country.lower() == 'ua':
-                                if lemma not in UA_CITIES:
-                                    logger.warning(f"🚫 NON-UA CITY BLOCKED: {query} | Lemma: '{lemma}' (from '{word}')")
-                                    return False
-                    except:
-                        pass
+            # Динамическая проверка через is_city_allowed
+            if not self.is_city_allowed(word, country):
+                logger.warning(f"🚫 BLOCKED (v5.4.0): {query} | City '{word}' not allowed for {country.upper()}")
+                return False
         
         logger.info(f"✅ ALLOWED: {query}")
         return True
     
     def post_filter_cities(self, keywords: set, country: str) -> set:
         """
-        POST-FILTER v5.3.3: Чистка результатов от Google
+        POST-FILTER v5.4.0: Динамическая чистка результатов
         
-        Удаляет ключи которые содержат нецелевые города.
-        Например, для UA удаляет всё что содержит "москва", "минск", "спб"
+        Использует is_city_allowed() для проверки каждого слова в ключе.
+        Масштабируемо работает для ЛЮБОЙ страны.
         
         Args:
             keywords: Множество ключевых слов от Google
@@ -660,9 +658,6 @@ class GoogleAutocompleteParser:
             Очищенное множество ключевых слов
         """
         import re
-        
-        if country.lower() != 'ua':
-            return keywords  # Пока работаем только для UA
         
         cleaned = set()
         removed_count = 0
@@ -678,31 +673,18 @@ class GoogleAutocompleteParser:
                 if len(word) < 3:
                     continue
                 
-                # Проверяем оригинал
-                if word in ALL_CITIES_GLOBAL and word not in UA_CITIES:
-                    logger.info(f"🧹 POST-FILTER removed: '{keyword}' | Reason: city '{word}'")
+                # Динамическая проверка через is_city_allowed
+                if not self.is_city_allowed(word, country):
+                    logger.info(f"🧹 POST-FILTER removed (v5.4.0): '{keyword}' | City '{word}' not allowed for {country.upper()}")
                     should_remove = True
                     removed_count += 1
                     break
-                
-                # Проверяем лемму
-                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
-                    if hasattr(self, 'morph_ru'):
-                        try:
-                            lemma = self.morph_ru.parse(word)[0].normal_form
-                            if lemma in ALL_CITIES_GLOBAL and lemma not in UA_CITIES:
-                                logger.info(f"🧹 POST-FILTER removed: '{keyword}' | Reason: lemma '{lemma}' (from '{word}')")
-                                should_remove = True
-                                removed_count += 1
-                                break
-                        except:
-                            pass
             
             if not should_remove:
                 cleaned.add(keyword)
         
         if removed_count > 0:
-            logger.warning(f"🧹 POST-FILTER: Removed {removed_count} keywords with non-UA cities")
+            logger.warning(f"🧹 POST-FILTER: Removed {removed_count} keywords with non-{country.upper()} cities")
         
         return cleaned
 
