@@ -1095,6 +1095,17 @@ class GoogleAutocompleteParser:
                 all_unique_keywords |= method_kw
             for method_anchors in all_anchors_by_source[source].values():
                 all_unique_anchors |= method_anchors
+        
+        # ✅ КРИТИЧНО: Финальная фильтрация ВСЕХ собранных keywords
+        final_filter = self.post_filter.filter_batch(
+            keywords=list(all_unique_keywords),
+            seed=seed,
+            country=country,
+            language=language
+        )
+        
+        all_unique_keywords = set(final_filter['keywords'])
+        all_unique_anchors = set(final_filter['anchors']) | all_unique_anchors
 
         elapsed = time.time() - start_time
 
