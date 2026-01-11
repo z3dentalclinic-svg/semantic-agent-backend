@@ -1,1 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FGS Parser API v6.0 FINAL</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            width: 100%;
+            background: white;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        
+        .version {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-bottom: 20px;
+        }
+        
+        .status {
+            display: inline-block;
+            background: #27ae60;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            margin-bottom: 30px;
+        }
+        
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+        
+        ul {
+            list-style: none;
+            margin-bottom: 20px;
+        }
+        
+        li {
+            padding: 10px 0;
+            padding-left: 30px;
+            position: relative;
+        }
+        
+        li:before {
+            content: "✅";
+            position: absolute;
+            left: 0;
+        }
+        
+        .links {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        a {
+            display: inline-block;
+            background: #3498db;
+            color: white;
+            padding: 12px 24px;
+            text-decoration: none;
+            border-radius: 8px;
+            transition: all 0.3s;
+        }
+        
+        a:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(52, 152, 219, 0.4);
+        }
+        
+        .feature-tag {
+            display: inline-block;
+            background: #e74c3c;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            margin-left: 10px;
+        }
+        
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ecf0f1;
+            text-align: center;
+            color: #95a5a6;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 FGS Parser API</h1>
+        <div class="version">Version 6.0 FINAL - Batch Post-Filter Integration</div>
+        <span class="status">✅ Server is running!</span>
+        
+        <h2>🎯 New Features</h2>
+        <ul>
+            <li>Batch Post-Filter with Pymorphy3 <span class="feature-tag">NEW</span></li>
+            <li>N-gram city detection ("набережные челны", "йошкар-ола")</li>
+            <li>Seed city allowance (smart filtering)</li>
+            <li>Extensible districts support (Чиланзар, Уручье)</li>
+            <li>135,624 cities worldwide database</li>
+            <li>Grammatical validation</li>
+            <li>Detailed filtering statistics</li>
+        </ul>
+        
+        <h2>📊 Performance</h2>
+        <ul>
+            <li>Batch lemmatization: 7x faster</li>
+            <li>Word boundary lookup: O(1) instead of O(N)</li>
+            <li>700 keywords processed in 0.1-0.2 seconds</li>
+            <li>19,374x speedup for geo-filtering</li>
+        </ul>
+        
+        <h2>📚 API Documentation</h2>
+        <div class="links">
+            <a href="/docs" target="_blank">📖 Swagger UI</a>
+            <a href="/redoc" target="_blank">📘 ReDoc</a>
+        </div>
+        
+        <h2>🔧 Endpoints</h2>
+        <ul>
+            <li><strong>POST /api/parse</strong> - Parse keywords with batch filtering</li>
+            <li><strong>GET /health</strong> - Health check</li>
+            <li><strong>GET /</strong> - This page</li>
+        </ul>
+        
+        <div class="footer">
+            Deployed on Render • Built with FastAPI • Powered by Pymorphy3 & Natasha
+        </div>
+    </div>
+</body>
+</html>
 
