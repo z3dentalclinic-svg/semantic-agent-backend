@@ -48,6 +48,7 @@ class BatchPostFilter:
         self.city_abbreviations = self._get_city_abbreviations()
         self.regions = self._get_regions()
         self.countries = self._get_countries()
+        self.manual_small_cities = self._get_manual_small_cities()  # v7.6: Малые города СНГ
         
         # v7.5: Перестраиваем индекс с учётом населения
         self.all_cities_global = self._build_filtered_geo_index()
@@ -151,6 +152,27 @@ class BatchPostFilter:
             'сша': 'us', 'америка': 'us', 'америке': 'us',
         }
     
+    def _get_manual_small_cities(self) -> Dict[str, str]:
+        """
+        v7.6: Ручной словарь малых городов СНГ
+        Города с населением < 5000 или короткие названия (< 3 символа)
+        которые не попадают в основную базу geonamescache
+        """
+        return {
+            # Короткие города (< 3 символа)
+            'ош': 'kg',  # Ош, Киргизия
+            
+            # Малые города Казахстана
+            'узынагаш': 'kz',  # Узынагаш, Казахстан
+            
+            # Малые города Крыма (оккупированная территория)
+            'щелкино': 'ru',  # Щёлкино, Крым
+            'щёлкino': 'ru',
+            
+            # Другие малые города которые могут появиться
+            'йота': 'unknown',  # Неизвестный город/бренд - на всякий случай
+        }
+    
     def _build_filtered_geo_index(self) -> Dict[str, str]:
         """
         v7.5: Создаём индекс городов с фильтром по населению
@@ -182,8 +204,8 @@ class BatchPostFilter:
                 
                 # Альтернативные названия
                 for alt in city_data.get('alternatenames', []):
-                    # v7.5 FIX: РАЗРЕШАЕМ пробелы для многословных городов!
-                    if not (3 <= len(alt) <= 50):  # Увеличили лимит
+                    # v7.6: Оставляем минимум 3 символа
+                    if not (3 <= len(alt) <= 50):
                         continue
                     if not any(c.isalpha() for c in alt):
                         continue
@@ -328,6 +350,16 @@ class BatchPostFilter:
                 ctry_code = self.countries[w]
                 if ctry_code != country.lower():
                     return False, f"страна '{w}' ({ctry_code})", f"{ctry_code}_countries"
+        
+        # --- 2.8. МАЛЫЕ ГОРОДА СНГ (v7.6) ---
+        for w in words + keyword_lemmas:
+            if w in self.manual_small_cities:
+                city_country = self.manual_small_cities[w]
+                if city_country == 'unknown':
+                    # Блокируем всегда (неизвестный источник)
+                    return False, f"неизвестный объект '{w}'", "unknown"
+                if city_country != country.lower():
+                    return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities"
 
         # --- 3. ГОРОДА (v7.5 с population filter) ---
         # Собираем все варианты для проверки (расширенный список)
