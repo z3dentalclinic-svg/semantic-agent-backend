@@ -684,34 +684,16 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        keywords = set()
-        internal_anchors = set()
+        keywords = set(result_raw['keywords'])
         
-        for kw in result_raw['keywords']:
-            if not self.is_query_allowed(kw, seed, country):
-                anchor = self.strip_geo_to_anchor(kw, seed, country)
-                if anchor and anchor != seed.lower() and len(anchor) > 5:
-                    internal_anchors.add(anchor)
-                continue  # НЕ добавляем мусор в keywords
-            
-            keywords.add(kw)
-        
-        all_with_anchors = keywords | internal_anchors
-        filtered = await self.filter_relevant_keywords(list(all_with_anchors), seed, language)
-        
-        filtered_set = set(filtered)
-        final_keywords = sorted(list(keywords & filtered_set))
-        final_anchors = sorted(list(internal_anchors & filtered_set))
+        filtered = await self.filter_relevant_keywords(list(keywords), seed, language)
         
         batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
+            keywords=filtered,
             seed=seed,
             country=country,
             language=language
         )
-        
-        # Объединяем якоря (старые + новые от batch_filter)
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -719,13 +701,13 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "suffix",
             "source": source,
-            "keywords": batch_result['keywords'],  # Очищенные через batch_filter
-            "anchors": sorted(list(combined_anchors)),
+            "keywords": batch_result['keywords'],
+            "anchors": batch_result['anchors'],
             "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "anchors_count": len(batch_result['anchors']),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
-            "batch_stats": batch_result['stats']  # Статистика фильтрации
+            "batch_stats": batch_result['stats']
         }
 
     async def parse_infix(self, seed: str, country: str, language: str, use_numbers: bool, 
@@ -748,35 +730,17 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        keywords = set()
-        internal_anchors = set()
+        keywords = set(result_raw['keywords'])
         
-        for kw in result_raw['keywords']:
-            if not self.is_query_allowed(kw, seed, country):
-                anchor = self.strip_geo_to_anchor(kw, seed, country)
-                if anchor and anchor != seed.lower() and len(anchor) > 5:
-                    internal_anchors.add(anchor)
-                continue  # НЕ добавляем мусор в keywords
-            
-            keywords.add(kw)
-        
-        all_with_anchors = keywords | internal_anchors
-        filtered_1 = await self.filter_infix_results(list(all_with_anchors), language)
-
+        filtered_1 = await self.filter_infix_results(list(keywords), language)
         filtered_2 = await self.filter_relevant_keywords(filtered_1, seed, language)
         
-        filtered_set = set(filtered_2)
-        final_keywords = sorted(list(keywords & filtered_set))
-        final_anchors = sorted(list(internal_anchors & filtered_set))
-        
         batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
+            keywords=filtered_2,
             seed=seed,
             country=country,
             language=language
         )
-        
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -785,9 +749,9 @@ class GoogleAutocompleteParser:
             "method": "infix",
             "source": source,
             "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
+            "anchors": batch_result['anchors'],
             "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "anchors_count": len(batch_result['anchors']),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
             "batch_stats": batch_result['stats']
@@ -855,32 +819,14 @@ class GoogleAutocompleteParser:
             result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
             all_keywords.update(result['keywords'])
 
-        keywords = set()
-        internal_anchors = set()
-        
-        for kw in all_keywords:
-            if not self.is_query_allowed(kw, seed, country):
-                anchor = self.strip_geo_to_anchor(kw, seed, country)
-                if anchor and anchor != seed.lower() and len(anchor) > 5:
-                    internal_anchors.add(anchor)
-                continue  # НЕ добавляем мусор в keywords
-            
-            keywords.add(kw)
-        
-        all_with_anchors = keywords | internal_anchors
-        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
-        
-        filtered_set = set(filtered)
-        final_keywords = sorted(list(keywords & filtered_set))
-        final_anchors = sorted(list(internal_anchors & filtered_set))
+        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
         
         batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
+            keywords=filtered,
             seed=seed,
             country=country,
             language=language
         )
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -889,9 +835,9 @@ class GoogleAutocompleteParser:
             "method": "morphology",
             "source": source,
             "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
+            "anchors": batch_result['anchors'],
             "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "anchors_count": len(batch_result['anchors']),
             "elapsed_time": round(elapsed, 2),
             "batch_stats": batch_result['stats']
         }
@@ -969,30 +915,16 @@ class GoogleAutocompleteParser:
             
             if result['keywords']:
                 verified_prefixes.append(candidate)
-                
-                for kw in result['keywords']:
-                    if not self.is_query_allowed(kw, seed, country):
-                        anchor = self.strip_geo_to_anchor(kw, seed, country)
-                        if anchor and anchor != seed.lower() and len(anchor) > 5:
-                            internal_anchors.add(anchor)
-                        continue  # НЕ добавляем мусор в keywords
-                    
-                    keywords.add(kw)
+                keywords.update(result['keywords'])
         
-        all_with_anchors = keywords | internal_anchors
-        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
-        
-        filtered_set = set(filtered)
-        final_keywords = sorted(list(keywords & filtered_set))
-        final_anchors = sorted(list(internal_anchors & filtered_set))
+        filtered = await self.filter_relevant_keywords(sorted(list(keywords)), seed, language)
         
         batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
+            keywords=filtered,
             seed=seed,
             country=country,
             language=language
         )
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -1001,9 +933,9 @@ class GoogleAutocompleteParser:
             "method": "adaptive_prefix",
             "source": source,
             "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
+            "anchors": batch_result['anchors'],
             "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "anchors_count": len(batch_result['anchors']),
             "candidates_found": len(candidates),
             "verified_prefixes": verified_prefixes,
             "elapsed_time": round(elapsed, 2),
