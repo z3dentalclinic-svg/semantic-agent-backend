@@ -410,15 +410,16 @@ class GoogleAutocompleteParser:
                 logger.debug(f"🚫 FORBIDDEN_GEO: '{query}' contains '{forbidden}'")
                 return False
         
-        # 2. Проверка городов через filtered_geo_index
+        # 2. Проверка городов через ALL_CITIES_GLOBAL
         words = q_lower.split()
         
         for word in words:
             if len(word) < 3:
                 continue
                 
-            if word in self.post_filter.filtered_geo_index:
-                city_country = self.post_filter.filtered_geo_index[word]
+            # Используем глобальный словарь вместо приватного атрибута
+            if word in ALL_CITIES_GLOBAL:
+                city_country = ALL_CITIES_GLOBAL[word]
                 if city_country != target_country:
                     logger.debug(f"🚫 GEO_BLOCK: '{word}' ({city_country}) in '{query}' for {target_country}")
                     return False
