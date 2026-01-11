@@ -15,6 +15,8 @@ FIXES v6.0 → v7.6:
 - Улучшена проверка common nouns через Pymorphy3
 - Более строгая логика для районов
 - Добавлен manual_small_cities для городов pop < 5000 (v7.6)
+- Добавлен ignored_words для частых ложных срабатываний (v7.6)
+- Защита от ложных срабатываний: если город из seed присутствует, запрос разрешается (v7.6)
 """
 
 import re
@@ -325,13 +327,22 @@ class BatchPostFilter:
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
                                   language: str) -> Tuple[bool, str, str]:
         """
-        v7.5: Улучшенная проверка с population filter и smart disambiguation
+        v7.6: Улучшенная проверка с population filter и smart disambiguation
+        + защита от ложных срабатываний (Алексеевка в Харькове)
         """
         words = re.findall(r'[а-яёa-z0-9-]+', keyword)
         if not words:
             return True, "", ""
 
         keyword_lemmas = [lemmas_map.get(w, w) for w in words]
+        
+        # --- 0. ПРИОРИТЕТ: ПРОВЕРКА SEED_CITY (v7.6) ---
+        # Если в запросе есть город из seed (например "харьков алексеевка"),
+        # то доверяем этому запросу и НЕ блокируем по другим словам
+        words_set = set(words + keyword_lemmas)
+        if any(city in words_set for city in seed_cities):
+            logger.debug(f"[v7.6] '{keyword}' contains seed city, auto-allow")
+            return True, "", ""
         
         # --- 1. HARD-BLACKLIST (приоритет #1) ---
         for check_val in words + keyword_lemmas:
