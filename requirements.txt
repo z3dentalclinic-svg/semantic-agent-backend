@@ -2,15 +2,12 @@
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.3
-
 # HTTP Client
 httpx==0.28.1
-
 # Optional (legacy dependencies)
 google-ads==28.4.1
 pyyaml==6.0.2
 setuptools>=65.0.0
-
 # Morphology & Lemmatization
 pymorphy3==2.0.2
 pymorphy3-dicts-ru==2.4.417150.4580142
@@ -18,14 +15,11 @@ pymorphy3-dicts-uk==2.4.1.1.1663094765
 dawg-python
 inflect
 lemminflect
-
 # Stemming (v5.2.0)
 nltk==3.9.2
-
 # NER для Entity Conflicts (v5.2.4)
 natasha>=1.6.0
 razdel>=0.5.0
 slovnet>=0.6.0
-
-# GEO Database для Pre-filter (v5.2.8) - НОВОЕ!
-geonamescache==2.0.0
+# GEO Database для Pre-filter (v5.2.8) - ОБНОВЛЕНО ДЛЯ ПОЛНОЙ БАЗЫ ГОРОДОВ!
+geonamescache>=3.0.0
