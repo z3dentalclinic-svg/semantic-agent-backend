@@ -91,6 +91,75 @@ MANUAL_RARE_CITIES = {
     "kz": set(),
 }
 
+def generate_geo_blacklist_full():
+    """Генерация словаря городов из geonamescache для BatchPostFilter"""
+    try:
+        from geonamescache import GeonamesCache
+
+        gc = GeonamesCache()
+        cities = gc.get_cities()
+
+        all_cities_global = {}  # {город: код_страны}
+
+        for city_id, city_data in cities.items():
+            country = city_data['countrycode'].lower()
+
+            name = city_data['name'].lower().strip()
+            all_cities_global[name] = country
+
+            for alt in city_data.get('alternatenames', []):
+                if ' ' in alt:
+                    continue
+
+                if not (3 <= len(alt) <= 30):
+                    continue
+
+                if not any(c.isalpha() for c in alt):
+                    continue
+
+                alt_clean = alt.replace('-', '').replace("'", "")
+                if alt_clean.isalpha():
+                    is_latin_cyrillic = all(
+                        ('\u0000' <= c <= '\u007F') or
+                        ('\u0400' <= c <= '\u04FF') or
+                        c in ['-', "'"]
+                        for c in alt
+                    )
+
+                    if is_latin_cyrillic:
+                        alt_lower = alt.lower().strip()
+                        if alt_lower not in all_cities_global:
+                            all_cities_global[alt_lower] = country
+
+        logger.info(f"✅ Geo dictionary loaded: {len(all_cities_global)} cities")
+        
+        from collections import Counter
+        country_stats = Counter(all_cities_global.values())
+        logger.info(f"   Top 5 countries: {dict(country_stats.most_common(5))}")
+
+        return all_cities_global
+
+    except ImportError:
+        logger.warning("⚠️ geonamescache not installed, using minimal dictionary")
+        
+        all_cities_global = {
+            'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru', 
+            'санкт-петербург': 'ru', 'екатеринбург': 'ru', 'казань': 'ru',
+            'новосибирск': 'ru', 'челябинск': 'ru', 'омск': 'ru',
+            'минск': 'by', 'гомель': 'by', 'витебск': 'by', 'могилев': 'by',
+            'алматы': 'kz', 'астана': 'kz', 'караганда': 'kz',
+            'киев': 'ua', 'харьков': 'ua', 'одесса': 'ua', 'днепр': 'ua',
+            'львов': 'ua', 'запорожье': 'ua', 'кривой рог': 'ua',
+            'николаев': 'ua', 'винница': 'ua', 'херсон': 'ua',
+            'полтава': 'ua', 'чернигов': 'ua', 'черкассы': 'ua',
+            'днепропетровск': 'ua', 'kyiv': 'ua', 'kiev': 'ua',
+            'kharkiv': 'ua', 'odessa': 'ua', 'lviv': 'ua', 'dnipro': 'ua',
+        }
+        
+        return all_cities_global
+
+ALL_CITIES_GLOBAL = generate_geo_blacklist_full()
+
 class AdaptiveDelay:
     """Автоматическая оптимизация задержек между запросами"""
 
@@ -183,7 +252,7 @@ class GoogleAutocompleteParser:
         }
         
         self.post_filter = BatchPostFilter(
-            all_cities_global={},
+            all_cities_global=ALL_CITIES_GLOBAL,
             forbidden_geo=self.forbidden_geo,
             districts=DISTRICTS_EXTENDED,
             population_threshold=5000
