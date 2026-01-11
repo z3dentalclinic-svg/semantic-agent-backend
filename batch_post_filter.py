@@ -73,10 +73,18 @@ class BatchPostFilter:
         self.all_cities_global = self._build_filtered_geo_index()
         
         # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
-        test_cities = ['ошмяны', 'фаниполь', 'oshmyany', 'fanipol']
-        found_test = {c: self.all_cities_global.get(c) for c in test_cities if c in self.all_cities_global}
-        logger.warning(f"🔍 v7.6 DEBUG: Test cities in index: {found_test}")
+        # Ищем любые варианты названий этих городов
+        test_patterns = ['oshmyan', 'fanipal', 'fanipol']  # латиница - надёжнее
+        found_test = {}
+        for key, val in self.all_cities_global.items():
+            if any(pattern in key for pattern in test_patterns):
+                found_test[key] = val
+                if len(found_test) >= 10:  # Ограничим вывод
+                    break
+        
+        logger.warning(f"🔍 v7.6 DEBUG: Cities matching 'oshmyan/fanipal': {found_test}")
         logger.warning(f"🔍 v7.6 DEBUG: Total index size: {len(self.all_cities_global)} entries")
+        logger.warning(f"🔍 v7.6 DEBUG: Sample keys (first 10): {list(self.all_cities_global.keys())[:10]}")
         
         # Инициализация Pymorphy3
         try:
@@ -300,8 +308,9 @@ class BatchPostFilter:
 
         # 4. Фильтруем с v7.5 логикой
         for kw in unique_raw:
-            # v7.6 DEBUG: логируем ВСЕ входящие keywords
-            if 'ошмяны' in kw or 'фаниполь' in kw:
+            # v7.6 DEBUG: логируем keywords содержащие oshmyan или fanipol
+            kw_lower = kw.lower()
+            if 'oshmyan' in kw_lower or 'fanipal' in kw_lower or 'fanipol' in kw_lower:
                 logger.warning(f"🔍 v7.6 DEBUG INPUT: '{kw}' → проверяем...")
             
             is_allowed, reason, category = self._check_geo_conflicts_v75(
@@ -437,6 +446,10 @@ class BatchPostFilter:
             
             found_country = self.all_cities_global.get(item)
             if found_country:
+                # v7.6 DEBUG: логируем находки Ошмян/Фаниполь
+                if 'oshmyan' in item or 'fanipal' in item or 'fanipol' in item:
+                    logger.warning(f"🔍 v7.6 DEBUG FOUND: '{item}' → {found_country} (target: {country})")
+                
                 # v7.5: Smart disambiguation
                 # Если слово похоже на обычное существительное - дополнительная проверка
                 if self._is_common_noun(item, language):
