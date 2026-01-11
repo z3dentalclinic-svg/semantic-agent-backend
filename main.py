@@ -323,7 +323,8 @@ class GoogleAutocompleteParser:
     def __init__(self):
         self.adaptive_delay = AdaptiveDelay()
 
-        self.entity_manager = EntityLogicManager()
+        # v7.6: ЗАКОММЕНТИРОВАНО - не используется, фильтрация только через BatchPostFilter
+        # self.entity_manager = EntityLogicManager()
 
         self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
         self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
@@ -988,20 +989,27 @@ class GoogleAutocompleteParser:
             if order_correct:
                 filtered.append(keyword)
 
-        filtered_final = []
-
-        for keyword in filtered:
-            is_conflict = await asyncio.to_thread(
-                self.entity_manager.check_conflict,
-                seed,
-                keyword,
-                language
-            )
-
-            if not is_conflict:
-                filtered_final.append(keyword)
-
-        return filtered_final
+        # ============================================
+        # v7.6 FIX: ЗАКОММЕНТИРОВАНО - ИСПОЛЬЗУЕМ ТОЛЬКО BatchPostFilter
+        # Старая логика EntityLogicManager создавала дубли и пропускала города
+        # ============================================
+        # filtered_final = []
+        #
+        # for keyword in filtered:
+        #     is_conflict = await asyncio.to_thread(
+        #         self.entity_manager.check_conflict,
+        #         seed,
+        #         keyword,
+        #         language
+        #     )
+        #
+        #     if not is_conflict:
+        #         filtered_final.append(keyword)
+        #
+        # return filtered_final
+        
+        # v7.6: Возвращаем filtered напрямую - фильтрация теперь только через BatchPostFilter
+        return filtered
 
     async def fetch_suggestions(self, query: str, country: str, language: str, client: httpx.AsyncClient) -> List[str]:
         """Google Autocomplete"""
