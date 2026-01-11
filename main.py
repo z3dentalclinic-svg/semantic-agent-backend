@@ -410,12 +410,15 @@ class GoogleAutocompleteParser:
                    'a', 'ale', 'lub', 'czy', 'że', 'jak', 'gdzie', 'kiedy', 'dlaczego', 'co'}
         }
         
+        # v7.6: BatchPostFilter сам загружает города через geonamescache
+        # Передаём пустой dict - он будет перестроен внутри с правильными настройками
         self.post_filter = BatchPostFilter(
-            all_cities_global=ALL_CITIES_GLOBAL,
+            all_cities_global={},  # Пустой - BatchPostFilter сам загрузит
             forbidden_geo=self.forbidden_geo,
-            districts=DISTRICTS_EXTENDED  # Опционально: районы Минска/Ташкента
+            districts=DISTRICTS_EXTENDED,
+            population_threshold=5000  # v7.6: Фильтр по населению
         )
-        logger.info("✅ Batch Post-Filter v6.0 initialized")
+        logger.info("✅ Batch Post-Filter v7.6 initialized")
 
     def is_city_allowed(self, word: str, target_country: str) -> bool:
         """
