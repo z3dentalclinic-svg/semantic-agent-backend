@@ -72,6 +72,12 @@ class BatchPostFilter:
         # v7.5: Перестраиваем индекс с учётом населения
         self.all_cities_global = self._build_filtered_geo_index()
         
+        # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
+        test_cities = ['ошмяны', 'фаниполь', 'oshmyany', 'fanipol']
+        found_test = {c: self.all_cities_global.get(c) for c in test_cities if c in self.all_cities_global}
+        logger.warning(f"🔍 v7.6 DEBUG: Test cities in index: {found_test}")
+        logger.warning(f"🔍 v7.6 DEBUG: Total index size: {len(self.all_cities_global)} entries")
+        
         # Инициализация Pymorphy3
         try:
             import pymorphy3
@@ -294,6 +300,10 @@ class BatchPostFilter:
 
         # 4. Фильтруем с v7.5 логикой
         for kw in unique_raw:
+            # v7.6 DEBUG: логируем ВСЕ входящие keywords
+            if 'ошмяны' in kw or 'фаниполь' in kw:
+                logger.warning(f"🔍 v7.6 DEBUG INPUT: '{kw}' → проверяем...")
+            
             is_allowed, reason, category = self._check_geo_conflicts_v75(
                 kw, country, lemmas_map, seed_cities, language
             )
