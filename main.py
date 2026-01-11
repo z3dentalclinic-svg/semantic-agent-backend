@@ -27,6 +27,13 @@ import nltk
 from nltk.stem import SnowballStemmer
 
 try:
+    from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
+    NATASHA_AVAILABLE = True
+except ImportError:
+    NATASHA_AVAILABLE = False
+    print("⚠️ Natasha не установлена. EntityLogicManager будет работать только с жёстким кешем.")
+
+try:
     nltk.download('punkt', quiet=True)
     nltk.download('stopwords', quiet=True)
 except Exception as e:
@@ -92,7 +99,8 @@ MANUAL_RARE_CITIES = {
 }
 
 def generate_geo_blacklist_full():
-    """Генерация словаря городов из geonamescache для BatchPostFilter"""
+    """
+    """
     try:
         from geonamescache import GeonamesCache
 
@@ -102,7 +110,7 @@ def generate_geo_blacklist_full():
         all_cities_global = {}  # {город: код_страны}
 
         for city_id, city_data in cities.items():
-            country = city_data['countrycode'].lower()
+            country = city_data['countrycode'].lower()  # 'RU', 'UA', 'BY' → 'ru', 'ua', 'by'
 
             name = city_data['name'].lower().strip()
             all_cities_global[name] = country
@@ -120,8 +128,8 @@ def generate_geo_blacklist_full():
                 alt_clean = alt.replace('-', '').replace("'", "")
                 if alt_clean.isalpha():
                     is_latin_cyrillic = all(
-                        ('\u0000' <= c <= '\u007F') or
-                        ('\u0400' <= c <= '\u04FF') or
+                        ('\u0000' <= c <= '\u007F') or  # ASCII (латиница)
+                        ('\u0400' <= c <= '\u04FF') or  # Кириллица
                         c in ['-', "'"]
                         for c in alt
                     )
@@ -131,16 +139,17 @@ def generate_geo_blacklist_full():
                         if alt_lower not in all_cities_global:
                             all_cities_global[alt_lower] = country
 
-        logger.info(f"✅ Geo dictionary loaded: {len(all_cities_global)} cities")
+        print("✅ v5.6.0 TURBO: O(1) WORD BOUNDARY LOOKUP - Гео-Фильтрация инициализирована")
+        print(f"   ALL_CITIES_GLOBAL: {len(all_cities_global)} городов с привязкой к странам")
         
         from collections import Counter
         country_stats = Counter(all_cities_global.values())
-        logger.info(f"   Top 5 countries: {dict(country_stats.most_common(5))}")
+        print(f"   Топ-5 стран: {dict(country_stats.most_common(5))}")
 
         return all_cities_global
 
     except ImportError:
-        logger.warning("⚠️ geonamescache not installed, using minimal dictionary")
+        print("⚠️ geonamescache не установлен, используется минимальный словарь")
         
         all_cities_global = {
             'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru', 
@@ -177,12 +186,162 @@ class AdaptiveDelay:
     def on_rate_limit(self):
         self.delay = min(self.max_delay, self.delay * 1.5)
 
+class EntityLogicManager:
+    """
+    """
+
+    def __init__(self):
+        self.cache = {}
+
+        try:
+            import pymorphy3
+            self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
+            self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+            self.morph_available = True
+        except Exception as e:
+            print(f"⚠️ Pymorphy3 не доступен для EntityLogicManager: {e}")
+            self.morph_available = False
+
+        self.hard_cache = {
+            'LOC': {
+                "киев", "днепр", "днепропетровск", "харьков", "одесса", "львов", 
+                "запорожье", "донецк", "кривой рог", "николаев", "луганск", 
+                "винница", "херсон", "полтава", "чернигов", "черкассы",
+                "житомир", "сумы", "хмельницкий", "ровно", "ивано-франковск",
+                "тернополь", "луцк", "ужгород", "черновцы",
+                "днепропетровская область", "днепропетровская",
+                "харьковская область", "харьковская",
+                "киевская область", "киевская",
+                "одесская область", "одесская",
+                "львовская область", "львовская",
+                "запорожская область", "запорожская",
+                "донецкая область", "донецкая",
+                "луганская область", "луганская",
+                "крым", "донбасс", "закарпатье",
+                "москва", "спб", "питер", "санкт-петербург", "екатеринбург", 
+                "новосибирск", "казань", "краснодар", "воронеж", "самара", 
+                "ростов", "уфа", "челябинск", "нижний новгород", "омск",
+                "красноярск", "пермь", "волгоград", "саратов", "тюмень",
+                "московская область", "московская",
+                "ленинградская область", "ленинградская",
+                "краснодарский край", "краснодарский",
+                "подмосковье",
+                "минск", "гомель", "могилев", "витебск", "гродно", "брест",
+                "астана", "алматы", "ташкент", "тбилиси", "ереван", "баку",
+                "кишинев", "рига", "таллин", "вильнюс", "прага", "варшава",
+                "симферополь", "севастополь", "ялта", "евпатория", "керчь", "феодосия",
+                "лимассол", "никосия", "ларнака", "пафос"
+            },
+            'ORG': {
+                "apple", "samsung", "xiaomi", "lg", "sony", "bosch",
+                "philips", "panasonic", "nokia", "huawei", "lenovo",
+                "dell", "hp", "asus", "acer", "msi", "intel", "amd",
+                "dyson", "karcher", "thomas", "electrolux", "siemens",
+                "ariston", "indesit", "candy", "zanussi", "beko",
+                "gorenje", "whirlpool", "hotpoint", "miele", "aeg"
+            }
+        }
+
+        self.natasha_available = NATASHA_AVAILABLE
+        if self.natasha_available:
+            try:
+                self.segmenter = Segmenter()
+                self.morph_vocab = MorphVocab()
+                self.emb = NewsEmbedding()
+                self.ner_tagger = NewsNERTagger(self.emb)
+            except Exception as e:
+                print(f"⚠️ Ошибка инициализации Natasha: {e}")
+                self.natasha_available = False
+
+    def get_entities(self, text: str, lang: str = 'ru') -> Dict[str, set]:
+        """
+        """
+        cache_key = f"{text}_{lang}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        text_lower = text.lower()
+        entities = {'LOC': set(), 'ORG': set()}
+
+        words_original = set(re.findall(r'\w+', text_lower))
+
+        for category, items in self.hard_cache.items():
+            intersection = words_original & items
+            if intersection:
+                entities[category].update(intersection)
+
+        if not any(entities.values()) and self.morph_available and lang in ['ru', 'uk']:
+            morph = self.morph_ru if lang == 'ru' else self.morph_uk
+            words_normalized = set()
+
+            for word in words_original:
+                try:
+                    parsed = morph.parse(word)
+                    if parsed:
+                        words_normalized.add(parsed[0].normal_form)
+                except:
+                    words_normalized.add(word)
+
+            for category, items in self.hard_cache.items():
+                intersection = words_normalized & items
+                if intersection:
+                    entities[category].update(intersection)
+
+        if not any(entities.values()) and lang == 'ru' and self.natasha_available:
+            try:
+                doc = Doc(text)
+                doc.segment(self.segmenter)
+                doc.tag_ner(self.ner_tagger)
+
+                for span in doc.spans:
+                    if span.type == 'LOC':
+                        entities['LOC'].add(span.text.lower())
+                    elif span.type == 'ORG':
+                        entities['ORG'].add(span.text.lower())
+            except Exception as e:
+                pass  # NER может упасть на некорректном тексте
+
+        self.cache[cache_key] = entities
+        return entities
+
+    def check_conflict(self, seed: str, keyword: str, lang: str = 'ru') -> bool:
+        """
+        """
+        seed_entities = self.get_entities(seed, lang)
+        kw_entities = self.get_entities(keyword, lang)
+
+        for entity_type in ['LOC', 'ORG']:
+            seed_set = seed_entities[entity_type]
+            kw_set = kw_entities[entity_type]
+
+            if seed_set and (kw_set - seed_set):
+                return True  # КОНФЛИКТ!
+
+        return False  # Нет конфликта
+
 class GoogleAutocompleteParser:
     def __init__(self):
         self.adaptive_delay = AdaptiveDelay()
 
+        # v7.6: ЗАКОММЕНТИРОВАНО - не используется, фильтрация только через BatchPostFilter
+        # self.entity_manager = EntityLogicManager()
+
         self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
         self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+        
+        if NATASHA_AVAILABLE:
+            try:
+                self.segmenter = Segmenter()
+                self.morph_vocab = MorphVocab()
+                self.emb = NewsEmbedding()
+                self.ner_tagger = NewsNERTagger(self.emb)
+                self.natasha_ready = True
+                print("✅ Natasha NER initialized for geo-filtering")
+            except Exception as e:
+                print(f"⚠️ Natasha initialization failed: {e}")
+                self.natasha_ready = False
+        else:
+            self.natasha_ready = False
         
         self.forbidden_geo = {
             'крым', 'crimea', 'крим', 'крым', 
@@ -251,13 +410,111 @@ class GoogleAutocompleteParser:
                    'a', 'ale', 'lub', 'czy', 'że', 'jak', 'gdzie', 'kiedy', 'dlaczego', 'co'}
         }
         
+        # v7.6: BatchPostFilter сам загружает города через geonamescache
+        # Передаём пустой dict - он будет перестроен внутри с правильными настройками
         self.post_filter = BatchPostFilter(
-            all_cities_global=ALL_CITIES_GLOBAL,
+            all_cities_global={},  # Пустой - BatchPostFilter сам загрузит
             forbidden_geo=self.forbidden_geo,
             districts=DISTRICTS_EXTENDED,
-            population_threshold=5000
+            population_threshold=5000  # v7.6: Фильтр по населению
         )
-        logger.info("✅ Batch Post-Filter initialized")
+        logger.info("✅ Batch Post-Filter v7.6 initialized")
+
+    def is_city_allowed(self, word: str, target_country: str) -> bool:
+        """
+        """
+        try:
+            parsed = self.morph_ru.parse(word.lower())[0]
+            lemma = parsed.normal_form
+        except:
+            lemma = word.lower()
+        
+        if lemma not in ALL_CITIES_GLOBAL:
+            return True
+        
+        city_country = ALL_CITIES_GLOBAL.get(lemma)  # получаем код страны (напр. 'ru', 'kz', 'ua')
+        
+        if city_country == target_country.lower():
+            return True  # Город нашей страны — разрешаем
+        
+        return False  # Город чужой страны — блокируем
+    
+    def strip_geo_to_anchor(self, text: str, seed: str, target_country: str) -> str:
+        """
+        """
+        import re
+        
+        seed_words = re.findall(r'[а-яёa-z0-9-]+', seed.lower())
+        seed_lemmas = set()
+        
+        for word in seed_words:
+            if len(word) < 2:
+                continue
+            try:
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    lemma = self.morph_ru.parse(word)[0].normal_form
+                    seed_lemmas.add(lemma)
+                else:
+                    seed_lemmas.add(word)  # Латиница как есть
+            except:
+                seed_lemmas.add(word)
+        
+        text_words = re.findall(r'[а-яёa-z0-9-]+', text.lower())
+        remaining_words = []
+        
+        for word in text_words:
+            if len(word) < 2:
+                remaining_words.append(word)
+                continue
+            
+            try:
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    word_lemma = self.morph_ru.parse(word)[0].normal_form
+                else:
+                    word_lemma = word
+            except:
+                word_lemma = word
+            
+            if word_lemma in seed_lemmas:
+                logger.info(f"🗑️ SEED REMOVED: '{word}' (lemma: {word_lemma}) from '{text}'")
+                continue
+            
+            remaining_words.append(word)
+        
+        clean_words = []
+        
+        for word in remaining_words:
+            if len(word) < 2:
+                clean_words.append(word)
+                continue
+            
+            try:
+                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+                    lemma = self.morph_ru.parse(word)[0].normal_form
+                else:
+                    lemma = word
+            except:
+                lemma = word
+            
+            city_country_word = ALL_CITIES_GLOBAL.get(word)
+            city_country_lemma = ALL_CITIES_GLOBAL.get(lemma)
+            
+            if city_country_word and city_country_word != target_country.lower():
+                logger.info(f"🧼 CITY REMOVED: '{word}' (city of {city_country_word}) from anchor")
+                continue
+            
+            if city_country_lemma and city_country_lemma != target_country.lower():
+                logger.info(f"🧼 CITY REMOVED: '{word}' (lemma '{lemma}' city of {city_country_lemma}) from anchor")
+                continue
+            
+            clean_words.append(word)
+        
+        anchor = " ".join(clean_words).strip()
+        
+        if anchor and anchor != text.lower():
+            logger.warning(f"⚓ ANCHOR CREATED: '{text}' → '{anchor}'")
+        
+        return anchor
 
     def detect_seed_language(self, seed: str) -> str:
         """Автоопределение языка seed"""
@@ -311,7 +568,8 @@ class GoogleAutocompleteParser:
         return sorted(list(forms))
 
     def _normalize_with_pymorphy(self, text: str, language: str) -> set:
-        """Нормализация текста через pymorphy3 (ru/uk)"""
+        """
+        """
         morph = self.morph_ru if language == 'ru' else self.morph_uk
 
         stop_words = self.stop_words.get(language, self.stop_words['ru'])
@@ -332,7 +590,8 @@ class GoogleAutocompleteParser:
         return lemmas
 
     def _normalize_with_snowball(self, text: str, language: str) -> set:
-        """Нормализация текста через Snowball stemmer (en/de/fr/es/it)"""
+        """
+        """
         stemmer = self.stemmers.get(language, self.stemmers['en'])
 
         stop_words = self.stop_words.get(language, self.stop_words['en'])
@@ -346,7 +605,8 @@ class GoogleAutocompleteParser:
         return stems
 
     def _are_words_similar(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
-        """Проверка схожести слов через SequenceMatcher"""
+        """
+        """
         if len(word1) <= 4 or len(word2) <= 4:
             return False
 
@@ -355,7 +615,8 @@ class GoogleAutocompleteParser:
         return similarity >= threshold
 
     def _normalize(self, text: str, language: str = 'ru') -> set:
-        """Универсальная нормализация для любого языка"""
+        """
+        """
 
         if language in ['ru', 'uk']:
             return self._normalize_with_pymorphy(text, language)
@@ -365,12 +626,13 @@ class GoogleAutocompleteParser:
 
         else:
             words = re.findall(r'\w+', text.lower())
-            stop_words = self.stop_words.get('en', set())
+            stop_words = self.stop_words.get('en', set())  # fallback на английские
             meaningful = [w for w in words if w not in stop_words and len(w) > 1]
             return set(meaningful)
 
     def is_grammatically_valid(self, seed_word: str, kw_word: str, language: str = 'ru') -> bool:
-        """Проверка грамматической валидности между seed и keyword"""
+        """
+        """
         if language not in ['ru', 'uk']:
             return True
 
@@ -400,31 +662,141 @@ class GoogleAutocompleteParser:
             return True
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
-        """Быстрая проверка ПЕРЕД отправкой в API - экономия квоты"""
-        q_lower = query.lower().strip()
-        target_country = country.lower()
+        """
+        v7.6: ПОЛНОСТЬЮ ОТКЛЮЧЕН - фильтрация теперь только через BatchPostFilter
+        Всегда возвращает True
         
-        # 1. Проверка forbidden_geo (Крым, оккупированные территории)
-        for forbidden in self.forbidden_geo:
-            if forbidden in q_lower:
-                logger.debug(f"🚫 FORBIDDEN_GEO: '{query}' contains '{forbidden}'")
-                return False
+        Старая логика закомментирована ниже - можно вернуть если понадобится
+        """
+        return True  # v7.6: Пропускаем всё, фильтрация в BatchPostFilter
         
-        # 2. Проверка городов через ALL_CITIES_GLOBAL
-        words = q_lower.split()
+        # ============================================
+        # v7.6: СТАРАЯ ЛОГИКА ЗАКОММЕНТИРОВАНА
+        # Раскомментируй если нужно вернуть старую фильтрацию
+        # ============================================
+        # import re
+        # 
+        # q_lower = query.lower().strip()
+        # target_country = country.lower()
+        # 
+        # for forbidden in self.forbidden_geo:
+        #     if forbidden in q_lower:
+        #         logger.warning(f"🚫 HARD-BLACKLIST: '{query}' contains '{forbidden}'")
+        #         return False
+        # 
+        # words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
+        # lemmas = set()
+        # 
+        # for word in words:
+        #     if len(word) < 3:
+        #         lemmas.add(word)
+        #         continue
+        #     
+        #     try:
+        #         if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+        #             lemma = self.morph_ru.parse(word)[0].normal_form
+        #             lemmas.add(lemma)
+        #         else:
+        #             lemmas.add(word)
+        #     except:
+        #         lemmas.add(word)
+        # 
+        # for forbidden in self.forbidden_geo:
+        #     if forbidden in lemmas:
+        #         logger.warning(f"🚫 HARD-BLACKLIST (lemma): '{query}' → lemma '{forbidden}'")
+        #         return False
+        # 
+        # stopwords = ['израиль', 'россия', 'казахстан', 'узбекистан', 'беларусь', 'молдова']
+        # if any(stop in q_lower for stop in stopwords):
+        #     if target_country == 'ua' and 'украина' not in q_lower:
+        #         logger.warning(f"🚫 COUNTRY BLOCK: '{query}' contains {[s for s in stopwords if s in q_lower]}")
+        #         return False
+        # 
+        # for word in words:
+        #     if len(word) < 3:
+        #         continue
+        #     
+        #     city_country_word = ALL_CITIES_GLOBAL.get(word)
+        #     
+        #     if city_country_word and city_country_word != target_country:
+        #         logger.warning(f"🚫 FAST BLOCK: '{word}' ({city_country_word}) in '{query}'")
+        #         return False
+        # 
+        # for lemma in lemmas:
+        #     if len(lemma) < 3:
+        #         continue
+        #     
+        #     city_country_lemma = ALL_CITIES_GLOBAL.get(lemma)
+        #     
+        #     if city_country_lemma and city_country_lemma != target_country:
+        #         logger.warning(f"🚫 FAST BLOCK (lemma): '{lemma}' ({city_country_lemma}) in '{query}'")
+        #         return False
+        # 
+        # if self.natasha_ready and NATASHA_AVAILABLE:
+        #     try:
+        #         from natasha import Doc
+        #         
+        #         doc = Doc(query)
+        #         doc.segment(self.segmenter)
+        #         doc.tag_ner(self.ner_tagger)
+        #         
+        #         for span in doc.spans:
+        #             if span.type == 'LOC':
+        #                 span.normalize(self.morph_vocab)
+        #                 loc_name = span.normal.lower()
+        #                 
+        #                 if loc_name in ALL_CITIES_GLOBAL:
+        #                     loc_country = ALL_CITIES_GLOBAL[loc_name]
+        #                     if loc_country != target_country:
+        #                         logger.warning(f"📍 NATASHA BLOCKED: '{loc_name}' ({loc_country}) in '{query}'")
+        #                         return False
+        #                 else:
+        #                     loc_words = loc_name.split()
+        #                     for loc_word in loc_words:
+        #                         if len(loc_word) < 3:
+        #                             continue
+        #                         word_country = ALL_CITIES_GLOBAL.get(loc_word)
+        #                         if word_country and word_country != target_country:
+        #                             logger.warning(f"📍 NATASHA BLOCKED (word): '{loc_word}' ({word_country}) in '{loc_name}'")
+        #                             return False
+        #                 
+        #     except Exception as e:
+        #         logger.debug(f"Natasha NER error: {e}")
+        # 
+        # logger.info(f"✅ ALLOWED: {query}")
+        # return True
+    
+    def post_filter_cities(self, keywords: set, country: str) -> set:
+        """
+        """
+        import re
         
-        for word in words:
-            if len(word) < 3:
-                continue
+        cleaned = set()
+        removed_count = 0
+        
+        for keyword in keywords:
+            should_remove = False
+            kw_lower = keyword.lower()
+            
+            words = re.findall(r'[а-яёa-z0-9-]+', kw_lower)
+            
+            for word in words:
+                if len(word) < 3:
+                    continue
                 
-            # Используем глобальный словарь вместо приватного атрибута
-            if word in ALL_CITIES_GLOBAL:
-                city_country = ALL_CITIES_GLOBAL[word]
-                if city_country != target_country:
-                    logger.debug(f"🚫 GEO_BLOCK: '{word}' ({city_country}) in '{query}' for {target_country}")
-                    return False
+                if not self.is_city_allowed(word, country):
+                    logger.info(f"🧹 POST-FILTER removed (v5.4.0): '{keyword}' | City '{word}' not allowed for {country.upper()}")
+                    should_remove = True
+                    removed_count += 1
+                    break
+            
+            if not should_remove:
+                cleaned.add(keyword)
         
-        return True
+        if removed_count > 0:
+            logger.warning(f"🧹 POST-FILTER: Removed {removed_count} keywords with non-{country.upper()} cities")
+        
+        return cleaned
 
     async def autocorrect_text(self, text: str, language: str) -> Dict:
         """Автокоррекция через Yandex Speller (ru/uk/en) или LanguageTool (остальные)"""
@@ -546,7 +918,8 @@ class GoogleAutocompleteParser:
         return filtered
 
     async def filter_relevant_keywords(self, keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
-        """TODO: Add description"""
+        """
+        """
 
         seed_lemmas = self._normalize(seed, language)
 
@@ -629,6 +1002,26 @@ class GoogleAutocompleteParser:
             if order_correct:
                 filtered.append(keyword)
 
+        # ============================================
+        # v7.6 FIX: ЗАКОММЕНТИРОВАНО - ИСПОЛЬЗУЕМ ТОЛЬКО BatchPostFilter
+        # Старая логика EntityLogicManager создавала дубли и пропускала города
+        # ============================================
+        # filtered_final = []
+        #
+        # for keyword in filtered:
+        #     is_conflict = await asyncio.to_thread(
+        #         self.entity_manager.check_conflict,
+        #         seed,
+        #         keyword,
+        #         language
+        #     )
+        #
+        #     if not is_conflict:
+        #         filtered_final.append(keyword)
+        #
+        # return filtered_final
+        
+        # v7.6: Возвращаем filtered напрямую - фильтрация теперь только через BatchPostFilter
         return filtered
 
     async def fetch_suggestions(self, query: str, country: str, language: str, client: httpx.AsyncClient) -> List[str]:
@@ -776,16 +1169,34 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        keywords = set(result_raw['keywords'])
+        keywords = set()
+        internal_anchors = set()
         
-        filtered = await self.filter_relevant_keywords(list(keywords), seed, language)
+        for kw in result_raw['keywords']:
+            if not self.is_query_allowed(kw, seed, country):
+                anchor = self.strip_geo_to_anchor(kw, seed, country)
+                if anchor and anchor != seed.lower() and len(anchor) > 5:
+                    internal_anchors.add(anchor)
+                continue  # НЕ добавляем мусор в keywords
+            
+            keywords.add(kw)
+        
+        all_with_anchors = keywords | internal_anchors
+        filtered = await self.filter_relevant_keywords(list(all_with_anchors), seed, language)
+        
+        filtered_set = set(filtered)
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
         
         batch_result = self.post_filter.filter_batch(
-            keywords=filtered,
+            keywords=final_keywords,
             seed=seed,
             country=country,
             language=language
         )
+        
+        # Объединяем якоря (старые + новые от batch_filter)
+        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -793,13 +1204,13 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "suffix",
             "source": source,
-            "keywords": batch_result['keywords'],
-            "anchors": batch_result['anchors'],
+            "keywords": batch_result['keywords'],  # Очищенные через batch_filter
+            "anchors": sorted(list(combined_anchors)),
             "count": len(batch_result['keywords']),
-            "anchors_count": len(batch_result['anchors']),
+            "anchors_count": len(combined_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
-            "batch_stats": batch_result['stats']
+            "batch_stats": batch_result['stats']  # Статистика фильтрации
         }
 
     async def parse_infix(self, seed: str, country: str, language: str, use_numbers: bool, 
@@ -822,17 +1233,35 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        keywords = set(result_raw['keywords'])
+        keywords = set()
+        internal_anchors = set()
         
-        filtered_1 = await self.filter_infix_results(list(keywords), language)
+        for kw in result_raw['keywords']:
+            if not self.is_query_allowed(kw, seed, country):
+                anchor = self.strip_geo_to_anchor(kw, seed, country)
+                if anchor and anchor != seed.lower() and len(anchor) > 5:
+                    internal_anchors.add(anchor)
+                continue  # НЕ добавляем мусор в keywords
+            
+            keywords.add(kw)
+        
+        all_with_anchors = keywords | internal_anchors
+        filtered_1 = await self.filter_infix_results(list(all_with_anchors), language)
+
         filtered_2 = await self.filter_relevant_keywords(filtered_1, seed, language)
         
+        filtered_set = set(filtered_2)
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
+        
         batch_result = self.post_filter.filter_batch(
-            keywords=filtered_2,
+            keywords=final_keywords,
             seed=seed,
             country=country,
             language=language
         )
+        
+        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -841,9 +1270,9 @@ class GoogleAutocompleteParser:
             "method": "infix",
             "source": source,
             "keywords": batch_result['keywords'],
-            "anchors": batch_result['anchors'],
+            "anchors": sorted(list(combined_anchors)),
             "count": len(batch_result['keywords']),
-            "anchors_count": len(batch_result['anchors']),
+            "anchors_count": len(combined_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
             "batch_stats": batch_result['stats']
@@ -911,14 +1340,32 @@ class GoogleAutocompleteParser:
             result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
             all_keywords.update(result['keywords'])
 
-        filtered = await self.filter_relevant_keywords(sorted(list(all_keywords)), seed, language)
+        keywords = set()
+        internal_anchors = set()
+        
+        for kw in all_keywords:
+            if not self.is_query_allowed(kw, seed, country):
+                anchor = self.strip_geo_to_anchor(kw, seed, country)
+                if anchor and anchor != seed.lower() and len(anchor) > 5:
+                    internal_anchors.add(anchor)
+                continue  # НЕ добавляем мусор в keywords
+            
+            keywords.add(kw)
+        
+        all_with_anchors = keywords | internal_anchors
+        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        
+        filtered_set = set(filtered)
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
         
         batch_result = self.post_filter.filter_batch(
-            keywords=filtered,
+            keywords=final_keywords,
             seed=seed,
             country=country,
             language=language
         )
+        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -927,9 +1374,9 @@ class GoogleAutocompleteParser:
             "method": "morphology",
             "source": source,
             "keywords": batch_result['keywords'],
-            "anchors": batch_result['anchors'],
+            "anchors": sorted(list(combined_anchors)),
             "count": len(batch_result['keywords']),
-            "anchors_count": len(batch_result['anchors']),
+            "anchors_count": len(combined_anchors),
             "elapsed_time": round(elapsed, 2),
             "batch_stats": batch_result['stats']
         }
@@ -982,19 +1429,10 @@ class GoogleAutocompleteParser:
 
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
 
-        # ✅ КРИТИЧНО: Фильтруем СРАЗУ чтобы мусорные города не попали в candidates!
-        filtered_raw = self.post_filter.filter_batch(
-            keywords=result_raw['keywords'],
-            seed=seed,
-            country=country,
-            language=language
-        )
-        
         from collections import Counter
         word_counter = Counter()
 
-        # Используем ОТФИЛЬТРОВАННЫЕ keywords для подсчёта частоты
-        for result in filtered_raw['keywords']:
+        for result in result_raw['keywords']:
             result_words = result.lower().split()
             for word in result_words:
                 if word not in seed_words and len(word) > 2:
@@ -1003,6 +1441,7 @@ class GoogleAutocompleteParser:
         candidates = {w for w, count in word_counter.items() if count >= 2}
 
         keywords = set()
+        internal_anchors = set()
         verified_prefixes = []
 
         for candidate in sorted(candidates):
@@ -1014,26 +1453,31 @@ class GoogleAutocompleteParser:
             result = await self.parse_with_semaphore([query], country, language, parallel_limit, source, region_id)
             
             if result['keywords']:
-                # КРИТИЧНО: Фильтруем СРАЗУ через BatchPostFilter
-                temp_batch = self.post_filter.filter_batch(
-                    keywords=result['keywords'],
-                    seed=seed,
-                    country=country,
-                    language=language
-                )
+                verified_prefixes.append(candidate)
                 
-                if temp_batch['keywords']:  # Если после фильтрации что-то осталось
-                    verified_prefixes.append(candidate)
-                    keywords.update(temp_batch['keywords'])  # Добавляем ТОЛЬКО отфильтрованные!
+                for kw in result['keywords']:
+                    if not self.is_query_allowed(kw, seed, country):
+                        anchor = self.strip_geo_to_anchor(kw, seed, country)
+                        if anchor and anchor != seed.lower() and len(anchor) > 5:
+                            internal_anchors.add(anchor)
+                        continue  # НЕ добавляем мусор в keywords
+                    
+                    keywords.add(kw)
         
-        filtered = await self.filter_relevant_keywords(sorted(list(keywords)), seed, language)
+        all_with_anchors = keywords | internal_anchors
+        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        
+        filtered_set = set(filtered)
+        final_keywords = sorted(list(keywords & filtered_set))
+        final_anchors = sorted(list(internal_anchors & filtered_set))
         
         batch_result = self.post_filter.filter_batch(
-            keywords=filtered,
+            keywords=final_keywords,
             seed=seed,
             country=country,
             language=language
         )
+        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -1042,9 +1486,9 @@ class GoogleAutocompleteParser:
             "method": "adaptive_prefix",
             "source": source,
             "keywords": batch_result['keywords'],
-            "anchors": batch_result['anchors'],
+            "anchors": sorted(list(combined_anchors)),
             "count": len(batch_result['keywords']),
-            "anchors_count": len(batch_result['anchors']),
+            "anchors_count": len(combined_anchors),
             "candidates_found": len(candidates),
             "verified_prefixes": verified_prefixes,
             "elapsed_time": round(elapsed, 2),
@@ -1096,7 +1540,7 @@ class GoogleAutocompleteParser:
             for method_anchors in all_anchors_by_source[source].values():
                 all_unique_anchors |= method_anchors
         
-        # ✅ КРИТИЧНО: Финальная фильтрация ВСЕХ собранных keywords
+        # ✅ ФИНАЛЬНАЯ ФИЛЬТРАЦИЯ
         final_filter = self.post_filter.filter_batch(
             keywords=list(all_unique_keywords),
             seed=seed,
