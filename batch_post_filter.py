@@ -52,6 +52,21 @@ class BatchPostFilter:
         self.countries = self._get_countries()
         self.manual_small_cities = self._get_manual_small_cities()  # v7.6: Малые города СНГ
         
+        # v7.6: Ignored words - обычные слова которые НЕ являются городами
+        # Даже если есть в базе geonamescache
+        self.ignored_words = {
+            "дом",      # Ghana (GH) - "выезд на дом"
+            "мир",      # Russia villages - "мир цен"
+            "бор",      # Serbia - "сосновый бор"  
+            "нива",     # Villages - "автомобиль нива"
+            "балка",    # Villages - "овражная балка"
+            "луч",      # Villages - "солнечный луч"
+            "спутник",  # Villages - "спутниковое тв"
+            "работа",   # Может быть городом - "ищу работу"
+            "цена",     # Может быть городом - "лучшая цена"
+            "выезд",    # Может быть городом - "выезд мастера"
+        }
+        
         # v7.5: Перестраиваем индекс с учётом населения
         self.all_cities_global = self._build_filtered_geo_index()
         
@@ -392,6 +407,11 @@ class BatchPostFilter:
 
         for item in search_items:
             if len(item) < 3:
+                continue
+            
+            # v7.6: ПРИОРИТЕТ - проверяем ignored_words ДО базы городов
+            if item in self.ignored_words:
+                logger.debug(f"[v7.6] '{item}' in ignored_words, skipping")
                 continue
             
             found_country = self.all_cities_global.get(item)
