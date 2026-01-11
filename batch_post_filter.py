@@ -1,18 +1,20 @@
 """
-Batch Post-Filter v7.5 - AUTONOMOUS GLOBAL GEO-FILTER
+Batch Post-Filter v7.6 - AUTONOMOUS GLOBAL GEO-FILTER
 Based on Gemini's recommendations for 187 countries support
 
-КРИТИЧЕСКИЕ УЛУЧШЕНИЯ v7.5:
+КРИТИЧЕСКИЕ УЛУЧШЕНИЯ v7.6:
 ✅ Population filter (> 5000) - игнорируем малые сёла-тёзки
 ✅ Smart disambiguation через Pymorphy3 (NOUN vs Geox)
 ✅ Улучшенная N-gram detection
 ✅ Автономная работа для любой из 187 стран
 ✅ O(1) lookup через предварительный индекс
+✅ Ручной словарь малых городов СНГ (ош, узынагаш, щелкино) **← НОВОЕ v7.6!**
 
-FIXES v6.0 → v7.5:
+FIXES v6.0 → v7.6:
 - Добавлен population threshold для устранения "дом", "мир" и т.д.
 - Улучшена проверка common nouns через Pymorphy3
 - Более строгая логика для районов
+- Добавлен manual_small_cities для городов pop < 5000 (v7.6)
 """
 
 import re
