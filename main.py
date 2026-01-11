@@ -660,98 +660,108 @@ class GoogleAutocompleteParser:
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
+        v7.6: ПОЛНОСТЬЮ ОТКЛЮЧЕН - фильтрация теперь только через BatchPostFilter
+        Всегда возвращает True
+        
+        Старая логика закомментирована ниже - можно вернуть если понадобится
         """
-        import re
+        return True  # v7.6: Пропускаем всё, фильтрация в BatchPostFilter
         
-        q_lower = query.lower().strip()
-        target_country = country.lower()
-        
-        for forbidden in self.forbidden_geo:
-            if forbidden in q_lower:
-                logger.warning(f"🚫 HARD-BLACKLIST: '{query}' contains '{forbidden}'")
-                return False
-        
-        words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
-        lemmas = set()
-        
-        for word in words:
-            if len(word) < 3:
-                lemmas.add(word)
-                continue
-            
-            try:
-                if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
-                    lemma = self.morph_ru.parse(word)[0].normal_form
-                    lemmas.add(lemma)
-                else:
-                    lemmas.add(word)
-            except:
-                lemmas.add(word)
-        
-        for forbidden in self.forbidden_geo:
-            if forbidden in lemmas:
-                logger.warning(f"🚫 HARD-BLACKLIST (lemma): '{query}' → lemma '{forbidden}'")
-                return False
-        
-        stopwords = ['израиль', 'россия', 'казахстан', 'узбекистан', 'беларусь', 'молдова']
-        if any(stop in q_lower for stop in stopwords):
-            if target_country == 'ua' and 'украина' not in q_lower:
-                logger.warning(f"🚫 COUNTRY BLOCK: '{query}' contains {[s for s in stopwords if s in q_lower]}")
-                return False
-        
-        for word in words:
-            if len(word) < 3:
-                continue
-            
-            city_country_word = ALL_CITIES_GLOBAL.get(word)
-            
-            if city_country_word and city_country_word != target_country:
-                logger.warning(f"🚫 FAST BLOCK: '{word}' ({city_country_word}) in '{query}'")
-                return False
-        
-        for lemma in lemmas:
-            if len(lemma) < 3:
-                continue
-            
-            city_country_lemma = ALL_CITIES_GLOBAL.get(lemma)
-            
-            if city_country_lemma and city_country_lemma != target_country:
-                logger.warning(f"🚫 FAST BLOCK (lemma): '{lemma}' ({city_country_lemma}) in '{query}'")
-                return False
-        
-        if self.natasha_ready and NATASHA_AVAILABLE:
-            try:
-                from natasha import Doc
-                
-                doc = Doc(query)
-                doc.segment(self.segmenter)
-                doc.tag_ner(self.ner_tagger)
-                
-                for span in doc.spans:
-                    if span.type == 'LOC':
-                        span.normalize(self.morph_vocab)
-                        loc_name = span.normal.lower()
-                        
-                        if loc_name in ALL_CITIES_GLOBAL:
-                            loc_country = ALL_CITIES_GLOBAL[loc_name]
-                            if loc_country != target_country:
-                                logger.warning(f"📍 NATASHA BLOCKED: '{loc_name}' ({loc_country}) in '{query}'")
-                                return False
-                        else:
-                            loc_words = loc_name.split()
-                            for loc_word in loc_words:
-                                if len(loc_word) < 3:
-                                    continue
-                                word_country = ALL_CITIES_GLOBAL.get(loc_word)
-                                if word_country and word_country != target_country:
-                                    logger.warning(f"📍 NATASHA BLOCKED (word): '{loc_word}' ({word_country}) in '{loc_name}'")
-                                    return False
-                        
-            except Exception as e:
-                logger.debug(f"Natasha NER error: {e}")
-        
-        logger.info(f"✅ ALLOWED: {query}")
-        return True
+        # ============================================
+        # v7.6: СТАРАЯ ЛОГИКА ЗАКОММЕНТИРОВАНА
+        # Раскомментируй если нужно вернуть старую фильтрацию
+        # ============================================
+        # import re
+        # 
+        # q_lower = query.lower().strip()
+        # target_country = country.lower()
+        # 
+        # for forbidden in self.forbidden_geo:
+        #     if forbidden in q_lower:
+        #         logger.warning(f"🚫 HARD-BLACKLIST: '{query}' contains '{forbidden}'")
+        #         return False
+        # 
+        # words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
+        # lemmas = set()
+        # 
+        # for word in words:
+        #     if len(word) < 3:
+        #         lemmas.add(word)
+        #         continue
+        #     
+        #     try:
+        #         if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
+        #             lemma = self.morph_ru.parse(word)[0].normal_form
+        #             lemmas.add(lemma)
+        #         else:
+        #             lemmas.add(word)
+        #     except:
+        #         lemmas.add(word)
+        # 
+        # for forbidden in self.forbidden_geo:
+        #     if forbidden in lemmas:
+        #         logger.warning(f"🚫 HARD-BLACKLIST (lemma): '{query}' → lemma '{forbidden}'")
+        #         return False
+        # 
+        # stopwords = ['израиль', 'россия', 'казахстан', 'узбекистан', 'беларусь', 'молдова']
+        # if any(stop in q_lower for stop in stopwords):
+        #     if target_country == 'ua' and 'украина' not in q_lower:
+        #         logger.warning(f"🚫 COUNTRY BLOCK: '{query}' contains {[s for s in stopwords if s in q_lower]}")
+        #         return False
+        # 
+        # for word in words:
+        #     if len(word) < 3:
+        #         continue
+        #     
+        #     city_country_word = ALL_CITIES_GLOBAL.get(word)
+        #     
+        #     if city_country_word and city_country_word != target_country:
+        #         logger.warning(f"🚫 FAST BLOCK: '{word}' ({city_country_word}) in '{query}'")
+        #         return False
+        # 
+        # for lemma in lemmas:
+        #     if len(lemma) < 3:
+        #         continue
+        #     
+        #     city_country_lemma = ALL_CITIES_GLOBAL.get(lemma)
+        #     
+        #     if city_country_lemma and city_country_lemma != target_country:
+        #         logger.warning(f"🚫 FAST BLOCK (lemma): '{lemma}' ({city_country_lemma}) in '{query}'")
+        #         return False
+        # 
+        # if self.natasha_ready and NATASHA_AVAILABLE:
+        #     try:
+        #         from natasha import Doc
+        #         
+        #         doc = Doc(query)
+        #         doc.segment(self.segmenter)
+        #         doc.tag_ner(self.ner_tagger)
+        #         
+        #         for span in doc.spans:
+        #             if span.type == 'LOC':
+        #                 span.normalize(self.morph_vocab)
+        #                 loc_name = span.normal.lower()
+        #                 
+        #                 if loc_name in ALL_CITIES_GLOBAL:
+        #                     loc_country = ALL_CITIES_GLOBAL[loc_name]
+        #                     if loc_country != target_country:
+        #                         logger.warning(f"📍 NATASHA BLOCKED: '{loc_name}' ({loc_country}) in '{query}'")
+        #                         return False
+        #                 else:
+        #                     loc_words = loc_name.split()
+        #                     for loc_word in loc_words:
+        #                         if len(loc_word) < 3:
+        #                             continue
+        #                         word_country = ALL_CITIES_GLOBAL.get(loc_word)
+        #                         if word_country and word_country != target_country:
+        #                             logger.warning(f"📍 NATASHA BLOCKED (word): '{loc_word}' ({word_country}) in '{loc_name}'")
+        #                             return False
+        #                 
+        #     except Exception as e:
+        #         logger.debug(f"Natasha NER error: {e}")
+        # 
+        # logger.info(f"✅ ALLOWED: {query}")
+        # return True
     
     def post_filter_cities(self, keywords: set, country: str) -> set:
         """
