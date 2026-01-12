@@ -413,7 +413,7 @@ class GoogleAutocompleteParser:
         # v7.6: BatchPostFilter сам загружает города через geonamescache
         # Передаём пустой dict - он будет перестроен внутри с правильными настройками
         self.post_filter = BatchPostFilter(
-            all_cities_global={},  # Пустой - BatchPostFilter сам загрузит
+            all_cities_global=ALL_CITIES_GLOBAL,  # ✅ Передаём базу городов
             forbidden_geo=self.forbidden_geo,
             districts=DISTRICTS_EXTENDED,
             population_threshold=5000  # v7.6: Фильтр по населению
