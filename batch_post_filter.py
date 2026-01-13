@@ -36,14 +36,18 @@ class BatchPostFilter:
                  districts: Optional[Dict[str, str]] = None,
                  population_threshold: int = 5000):
         """
-        v7.5 Constructor with population filtering
+        v7.7 FIXED Constructor - использует ПЕРЕДАННЫЙ словарь городов
         
         Args:
-            all_cities_global: Dict {city_name: country_code} (lowercase)
+            all_cities_global: Dict {city_name: country_code} (lowercase) - ОБЯЗАТЕЛЬНЫЙ!
             forbidden_geo: Set of forbidden locations (Крым/ОРДЛО - lemmatized)
             districts: Optional Dict {district_name: country_code}
-            population_threshold: Minimum city population to consider (default: 5000)
+            population_threshold: Minimum city population (НЕ используется если передан all_cities_global)
         """
+        logger.warning("="*60)
+        logger.warning("🚀 BatchPostFilter v7.7 INITIALIZATION")
+        logger.warning("="*60)
+        
         self.forbidden_geo = forbidden_geo
         self.districts = districts or {}
         self.population_threshold = population_threshold
@@ -52,44 +56,54 @@ class BatchPostFilter:
         self.city_abbreviations = self._get_city_abbreviations()
         self.regions = self._get_regions()
         self.countries = self._get_countries()
-        self.manual_small_cities = self._get_manual_small_cities()  # v7.6: Малые города СНГ
+        self.manual_small_cities = self._get_manual_small_cities()
         
         # v7.6: Ignored words - обычные слова которые НЕ являются городами
-        # Даже если есть в базе geonamescache
         self.ignored_words = {
-            "дом",      # Ghana (GH) - "выезд на дом"
-            "мир",      # Russia villages - "мир цен"
-            "бор",      # Serbia - "сосновый бор"  
-            "нива",     # Villages - "автомобиль нива"
-            "балка",    # Villages - "овражная балка"
-            "луч",      # Villages - "солнечный луч"
-            "спутник",  # Villages - "спутниковое тв"
-            "работа",   # Может быть городом - "ищу работу"
-            "цена",     # Может быть городом - "лучшая цена"
-            "выезд",    # Может быть городом - "выезд мастера"
+            "дом", "мир", "бор", "нива", "балка", "луч", 
+            "спутник", "работа", "цена", "выезд"
         }
         
-        # ✅ ИСПРАВЛЕНИЕ: Используем ПЕРЕДАННЫЙ словарь если не пустой
-        if all_cities_global:
+        # ✅ v7.7 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
+        # ВСЕГДА используем ПЕРЕДАННЫЙ словарь, НЕ создаём новый!
+        if all_cities_global and len(all_cities_global) > 0:
             self.all_cities_global = all_cities_global
-            logger.info(f"✅ Using provided ALL_CITIES_GLOBAL: {len(all_cities_global)} cities")
+            logger.warning(f"✅ v7.7: USING PROVIDED all_cities_global")
+            logger.warning(f"   📊 Size: {len(all_cities_global)} cities")
+            
+            # Проверяем наличие тестовых городов
+            test_cities = {
+                'барановичи': 'by', 'baranavičy': 'by', 'baranovichi': 'by',
+                'актобе': 'kz', 'aktobe': 'kz', 'aqtobe': 'kz',
+                'грозный': 'ru', 'grozny': 'ru', 'groznyy': 'ru',
+                'ошмяны': 'by', 'oshmyany': 'by', 'ashmyany': 'by',
+                'фаниполь': 'by', 'fanipol': 'by', 'dzerzhinsk': 'by'
+            }
+            
+            found_cities = {}
+            for test_name, expected_country in test_cities.items():
+                if test_name in all_cities_global:
+                    actual_country = all_cities_global[test_name]
+                    found_cities[test_name] = actual_country
+                    if actual_country != expected_country:
+                        logger.error(f"   ⚠️ WRONG COUNTRY: '{test_name}' → {actual_country} (expected {expected_country})")
+            
+            if found_cities:
+                logger.warning(f"   🔍 Test cities found: {found_cities}")
+            else:
+                logger.error(f"   ❌ NO TEST CITIES FOUND! Dict might be broken!")
+            
+            # Показываем примеры
+            sample_keys = list(all_cities_global.keys())[:20]
+            logger.warning(f"   📝 Sample (first 20): {sample_keys}")
+            
         else:
-            # v7.5: Перестраиваем индекс с учётом населения только если НЕ передан
+            # ⚠️ FALLBACK: создаём минимальный словарь только если НЕ передан
+            logger.error("❌ v7.7: all_cities_global is EMPTY! Using fallback!")
             self.all_cities_global = self._build_filtered_geo_index()
+            logger.warning(f"   📊 Fallback size: {len(self.all_cities_global)} cities")
         
-        # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
-        # Ищем любые варианты названий этих городов
-        test_patterns = ['oshmyan', 'fanipal', 'fanipol']  # латиница - надёжнее
-        found_test = {}
-        for key, val in self.all_cities_global.items():
-            if any(pattern in key for pattern in test_patterns):
-                found_test[key] = val
-                if len(found_test) >= 10:  # Ограничим вывод
-                    break
-        
-        logger.warning(f"🔍 v7.6 DEBUG: Cities matching 'oshmyan/fanipal': {found_test}")
-        logger.warning(f"🔍 v7.6 DEBUG: Total index size: {len(self.all_cities_global)} entries")
-        logger.warning(f"🔍 v7.6 DEBUG: Sample keys (first 10): {list(self.all_cities_global.keys())[:10]}")
+        logger.warning("="*60)
         
         # Инициализация Pymorphy3
         try:
@@ -97,7 +111,8 @@ class BatchPostFilter:
             self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
             self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
             self._has_morph = True
-            logger.info("✅ Pymorphy3 initialized for v7.5")
+            logger.info("✅ Pymorphy3 initialized for v7.7")
+
         except ImportError:
             logger.error("❌ Pymorphy3 not found!")
             self._has_morph = False
