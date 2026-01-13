@@ -1539,6 +1539,22 @@ class GoogleAutocompleteParser:
                 all_unique_keywords |= method_kw
             for method_anchors in all_anchors_by_source[source].values():
                 all_unique_anchors |= method_anchors
+        
+        # ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Финальная фильтрация всех собранных keywords
+        # Каждый метод фильтрует свои результаты, но при объединении могут просочиться мусорные города
+        logger.info(f"[Deep Search] Before final filter: {len(all_unique_keywords)} keywords")
+        
+        final_filter = self.post_filter.filter_batch(
+            keywords=list(all_unique_keywords),
+            seed=seed,
+            country=country,
+            language=language
+        )
+        
+        all_unique_keywords = set(final_filter['keywords'])
+        all_unique_anchors = set(final_filter['anchors']) | all_unique_anchors
+        
+        logger.info(f"[Deep Search] After final filter: {len(all_unique_keywords)} keywords, {len(all_unique_anchors)} anchors")
 
         elapsed = time.time() - start_time
 
