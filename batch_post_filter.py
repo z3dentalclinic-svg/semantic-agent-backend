@@ -474,7 +474,18 @@ class BatchPostFilter:
                 logger.debug(f"[v7.6] '{item}' in ignored_words, skipping")
                 continue
             
+            # ✅ v7.7 КРИТИЧЕСКИЙ ФИК: Проверяем оригинал + лемму
             found_country = self.all_cities_global.get(item)
+            
+            # Если не нашли оригинал - пробуем лемму
+            if not found_country and len(item) >= 3:
+                item_lemma = self._get_lemma(item, language)
+                if item_lemma != item:  # Только если лемма отличается
+                    found_country = self.all_cities_global.get(item_lemma)
+                    if found_country:
+                        logger.debug(f"[v7.7] Found via lemma: '{item}' → '{item_lemma}' → {found_country}")
+                        item = item_lemma  # Используем лемму дальше
+            
             if found_country:
                 # v7.6 DEBUG: логируем находки Ошмян/Фаниполь
                 if 'oshmyan' in item or 'fanipal' in item or 'fanipol' in item:
