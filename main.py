@@ -413,7 +413,7 @@ class GoogleAutocompleteParser:
         # v7.6: BatchPostFilter сам загружает города через geonamescache
         # Передаём пустой dict - он будет перестроен внутри с правильными настройками
         self.post_filter = BatchPostFilter(
-            all_cities_global=ALL_CITIES_GLOBAL,  # ✅ Передаём базу городов
+            all_cities_global={},  # Пустой - BatchPostFilter сам загрузит
             forbidden_geo=self.forbidden_geo,
             districts=DISTRICTS_EXTENDED,
             population_threshold=5000  # v7.6: Фильтр по населению
@@ -1539,17 +1539,6 @@ class GoogleAutocompleteParser:
                 all_unique_keywords |= method_kw
             for method_anchors in all_anchors_by_source[source].values():
                 all_unique_anchors |= method_anchors
-        
-        # ✅ ФИНАЛЬНАЯ ФИЛЬТРАЦИЯ
-        final_filter = self.post_filter.filter_batch(
-            keywords=list(all_unique_keywords),
-            seed=seed,
-            country=country,
-            language=language
-        )
-        
-        all_unique_keywords = set(final_filter['keywords'])
-        all_unique_anchors = set(final_filter['anchors']) | all_unique_anchors
 
         elapsed = time.time() - start_time
 
