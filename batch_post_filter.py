@@ -36,18 +36,14 @@ class BatchPostFilter:
                  districts: Optional[Dict[str, str]] = None,
                  population_threshold: int = 5000):
         """
-        v7.7 FIXED Constructor - использует ПЕРЕДАННЫЙ словарь городов
+        v7.5 Constructor with population filtering
         
         Args:
-            all_cities_global: Dict {city_name: country_code} (lowercase) - ОБЯЗАТЕЛЬНЫЙ!
+            all_cities_global: Dict {city_name: country_code} (lowercase)
             forbidden_geo: Set of forbidden locations (Крым/ОРДЛО - lemmatized)
             districts: Optional Dict {district_name: country_code}
-            population_threshold: Minimum city population (НЕ используется если передан all_cities_global)
+            population_threshold: Minimum city population to consider (default: 5000)
         """
-        logger.warning("="*60)
-        logger.warning("🚀 BatchPostFilter v7.7 INITIALIZATION")
-        logger.warning("="*60)
-        
         self.forbidden_geo = forbidden_geo
         self.districts = districts or {}
         self.population_threshold = population_threshold
@@ -56,54 +52,69 @@ class BatchPostFilter:
         self.city_abbreviations = self._get_city_abbreviations()
         self.regions = self._get_regions()
         self.countries = self._get_countries()
-        self.manual_small_cities = self._get_manual_small_cities()
+        self.manual_small_cities = self._get_manual_small_cities()  # v7.6: Малые города СНГ
         
         # v7.6: Ignored words - обычные слова которые НЕ являются городами
+        # Даже если есть в базе geonamescache
         self.ignored_words = {
-            "дом", "мир", "бор", "нива", "балка", "луч", 
-            "спутник", "работа", "цена", "выезд"
+            "дом",      # Ghana (GH) - "выезд на дом"
+            "мир",      # Russia villages - "мир цен"
+            "бор",      # Serbia - "сосновый бор"  
+            "нива",     # Villages - "автомобиль нива"
+            "балка",    # Villages - "овражная балка"
+            "луч",      # Villages - "солнечный луч"
+            "спутник",  # Villages - "спутниковое тв"
+            "работа",   # Может быть городом - "ищу работу"
+            "цена",     # Может быть городом - "лучшая цена"
+            "выезд",    # Может быть городом - "выезд мастера"
         }
         
-        # ✅ v7.7 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-        # ВСЕГДА используем ПЕРЕДАННЫЙ словарь, НЕ создаём новый!
-        if all_cities_global and len(all_cities_global) > 0:
-            self.all_cities_global = all_cities_global
-            logger.warning(f"✅ v7.7: USING PROVIDED all_cities_global")
-            logger.warning(f"   📊 Size: {len(all_cities_global)} cities")
-            
-            # Проверяем наличие тестовых городов
-            test_cities = {
-                'барановичи': 'by', 'baranavičy': 'by', 'baranovichi': 'by',
-                'актобе': 'kz', 'aktobe': 'kz', 'aqtobe': 'kz',
-                'грозный': 'ru', 'grozny': 'ru', 'groznyy': 'ru',
-                'ошмяны': 'by', 'oshmyany': 'by', 'ashmyany': 'by',
-                'фаниполь': 'by', 'fanipol': 'by', 'dzerzhinsk': 'by'
-            }
-            
-            found_cities = {}
-            for test_name, expected_country in test_cities.items():
-                if test_name in all_cities_global:
-                    actual_country = all_cities_global[test_name]
-                    found_cities[test_name] = actual_country
-                    if actual_country != expected_country:
-                        logger.error(f"   ⚠️ WRONG COUNTRY: '{test_name}' → {actual_country} (expected {expected_country})")
-            
-            if found_cities:
-                logger.warning(f"   🔍 Test cities found: {found_cities}")
-            else:
-                logger.error(f"   ❌ NO TEST CITIES FOUND! Dict might be broken!")
-            
-            # Показываем примеры
-            sample_keys = list(all_cities_global.keys())[:20]
-            logger.warning(f"   📝 Sample (first 20): {sample_keys}")
-            
-        else:
-            # ⚠️ FALLBACK: создаём минимальный словарь только если НЕ передан
-            logger.error("❌ v7.7: all_cities_global is EMPTY! Using fallback!")
-            self.all_cities_global = self._build_filtered_geo_index()
-            logger.warning(f"   📊 Fallback size: {len(self.all_cities_global)} cities")
+        # v7.5: Перестраиваем индекс с учётом населения
+        self.all_cities_global = self._build_filtered_geo_index()
         
-        logger.warning("="*60)
+        # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
+        # Ищем любые варианты названий этих городов
+        test_patterns = ['oshmyan', 'fanipal', 'fanipol']  # латиница - надёжнее
+        found_test = {}
+        for key, val in self.all_cities_global.items():
+            if any(pattern in key for pattern in test_patterns):
+                found_test[key] = val
+                if len(found_test) >= 10:  # Ограничим вывод
+                    break
+        
+        logger.warning(f"🔍 v7.6 DEBUG: Cities matching 'oshmyan/fanipal': {found_test}")
+        logger.warning(f"🔍 v7.6 DEBUG: Total index size: {len(self.all_cities_global)} entries")
+        logger.warning(f"🔍 v7.6 DEBUG: Sample keys (first 10): {list(self.all_cities_global.keys())[:10]}")
+        
+        # 🔥 КРИТИЧЕСКИЙ DEBUG v7.7 - ПРОВЕРКА ПРОБЛЕМНЫХ ГОРОДОВ
+        logger.error("="*60)
+        logger.error("🔥 v7.7 CRITICAL DEBUG - CHECKING PROBLEM CITIES")
+        logger.error("="*60)
+        logger.error(f"🔥 Dict size: {len(self.all_cities_global)} cities")
+        
+        test_problem_cities = {
+            'барановичи': 'by',
+            'baranavičy': 'by', 
+            'baranovichi': 'by',
+            'актобе': 'kz',
+            'aktobe': 'kz',
+            'aqtobe': 'kz',
+            'грозный': 'ru',
+            'grozny': 'ru',
+            'groznyy': 'ru',
+            'талдыкорган': 'kz',
+            'taldykorgan': 'kz',
+            'усть-каменогорск': 'kz',
+            'oskemen': 'kz'
+        }
+        
+        for city, expected in test_problem_cities.items():
+            in_dict = city in self.all_cities_global
+            actual = self.all_cities_global.get(city, 'NOT_FOUND')
+            status = "✅" if in_dict else "❌"
+            logger.error(f"{status} '{city}': in_dict={in_dict}, value={actual}, expected={expected}")
+        
+        logger.error("="*60)
         
         # Инициализация Pymorphy3
         try:
@@ -112,7 +123,6 @@ class BatchPostFilter:
             self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
             self._has_morph = True
             logger.info("✅ Pymorphy3 initialized for v7.7")
-
         except ImportError:
             logger.error("❌ Pymorphy3 not found!")
             self._has_morph = False
@@ -280,7 +290,7 @@ class BatchPostFilter:
                             if alt_dash != alt_lower:
                                 filtered_index[alt_dash] = country
             
-            logger.info(f"✅ v7.5 Geo Index built:")
+            logger.info(f"✅ v7.7 Geo Index built:")
             logger.info(f"   Cities with pop > {self.population_threshold}: {total_cities}")
             logger.info(f"   Total index entries (with alts): {len(filtered_index)}")
             logger.info(f"   Filtered out (pop < {self.population_threshold}): {filtered_out}")
@@ -308,7 +318,7 @@ class BatchPostFilter:
         
         # 2. Извлекаем города из seed
         seed_cities = self._extract_cities_from_seed(seed, country, language)
-        logger.info(f"[v7.5] Seed cities allowed: {seed_cities}")
+        logger.info(f"[v7.7] Seed cities allowed: {seed_cities}")
         
         # 3. Batch лемматизация
         all_words = set()
@@ -340,15 +350,15 @@ class BatchPostFilter:
             if is_allowed:
                 final_keywords.append(kw)
                 stats['allowed'] += 1
-                logger.debug(f"[v7.5] ✅ РАЗРЕШЕНО: '{kw}'")
+                logger.debug(f"[v7.7] ✅ РАЗРЕШЕНО: '{kw}'")
             else:
                 final_anchors.append(kw)
                 stats['blocked'] += 1
                 stats['reasons'][category] += 1
-                logger.warning(f"[v7.5] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
+                logger.warning(f"[v7.7] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
 
         elapsed = time.time() - start_time
-        logger.info(f"[v7.5] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
+        logger.info(f"[v7.7] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
 
         return {
             'keywords': final_keywords,
@@ -478,11 +488,11 @@ class BatchPostFilter:
                 
                 # Стандартная логика (КРИТИЧНО: оба в lowercase!)
                 if found_country == country.lower() or item in seed_cities:
-                    logger.debug(f"[v7.5] City '{item}' ({found_country}) - ALLOWED (target country)")
+                    logger.debug(f"[v7.7] City '{item}' ({found_country}) - ALLOWED (target country)")
                     continue
                 else:
                     # БЛОКИРУЕМ город из другой страны
-                    logger.warning(f"[v7.5] ⚓ BLOCKING '{item}' - {found_country.upper()} город")
+                    logger.warning(f"[v7.7] ⚓ BLOCKING '{item}' - {found_country.upper()} город")
                     return False, f"{found_country.upper()} город '{item}'", f"{found_country}_cities"
         
         # --- 4. ГРАММАТИКА ---
