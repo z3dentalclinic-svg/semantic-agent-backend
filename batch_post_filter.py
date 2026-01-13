@@ -69,8 +69,13 @@ class BatchPostFilter:
             "выезд",    # Может быть городом - "выезд мастера"
         }
         
-        # v7.5: Перестраиваем индекс с учётом населения
-        self.all_cities_global = self._build_filtered_geo_index()
+        # ✅ ИСПРАВЛЕНИЕ: Используем ПЕРЕДАННЫЙ словарь если не пустой
+        if all_cities_global:
+            self.all_cities_global = all_cities_global
+            logger.info(f"✅ Using provided ALL_CITIES_GLOBAL: {len(all_cities_global)} cities")
+        else:
+            # v7.5: Перестраиваем индекс с учётом населения только если НЕ передан
+            self.all_cities_global = self._build_filtered_geo_index()
         
         # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
         # Ищем любые варианты названий этих городов
