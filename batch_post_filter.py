@@ -86,43 +86,13 @@ class BatchPostFilter:
         logger.warning(f"🔍 v7.6 DEBUG: Total index size: {len(self.all_cities_global)} entries")
         logger.warning(f"🔍 v7.6 DEBUG: Sample keys (first 10): {list(self.all_cities_global.keys())[:10]}")
         
-        # 🔥 КРИТИЧЕСКИЙ DEBUG v7.7 - ПРОВЕРКА ПРОБЛЕМНЫХ ГОРОДОВ
-        logger.error("="*60)
-        logger.error("🔥 v7.7 CRITICAL DEBUG - CHECKING PROBLEM CITIES")
-        logger.error("="*60)
-        logger.error(f"🔥 Dict size: {len(self.all_cities_global)} cities")
-        
-        test_problem_cities = {
-            'барановичи': 'by',
-            'baranavičy': 'by', 
-            'baranovichi': 'by',
-            'актобе': 'kz',
-            'aktobe': 'kz',
-            'aqtobe': 'kz',
-            'грозный': 'ru',
-            'grozny': 'ru',
-            'groznyy': 'ru',
-            'талдыкорган': 'kz',
-            'taldykorgan': 'kz',
-            'усть-каменогорск': 'kz',
-            'oskemen': 'kz'
-        }
-        
-        for city, expected in test_problem_cities.items():
-            in_dict = city in self.all_cities_global
-            actual = self.all_cities_global.get(city, 'NOT_FOUND')
-            status = "✅" if in_dict else "❌"
-            logger.error(f"{status} '{city}': in_dict={in_dict}, value={actual}, expected={expected}")
-        
-        logger.error("="*60)
-        
         # Инициализация Pymorphy3
         try:
             import pymorphy3
             self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
             self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
             self._has_morph = True
-            logger.info("✅ Pymorphy3 initialized for v7.7")
+            logger.info("✅ Pymorphy3 initialized for v7.5")
         except ImportError:
             logger.error("❌ Pymorphy3 not found!")
             self._has_morph = False
@@ -290,7 +260,7 @@ class BatchPostFilter:
                             if alt_dash != alt_lower:
                                 filtered_index[alt_dash] = country
             
-            logger.info(f"✅ v7.7 Geo Index built:")
+            logger.info(f"✅ v7.5 Geo Index built:")
             logger.info(f"   Cities with pop > {self.population_threshold}: {total_cities}")
             logger.info(f"   Total index entries (with alts): {len(filtered_index)}")
             logger.info(f"   Filtered out (pop < {self.population_threshold}): {filtered_out}")
@@ -318,7 +288,7 @@ class BatchPostFilter:
         
         # 2. Извлекаем города из seed
         seed_cities = self._extract_cities_from_seed(seed, country, language)
-        logger.info(f"[v7.7] Seed cities allowed: {seed_cities}")
+        logger.info(f"[v7.5] Seed cities allowed: {seed_cities}")
         
         # 3. Batch лемматизация
         all_words = set()
@@ -350,15 +320,15 @@ class BatchPostFilter:
             if is_allowed:
                 final_keywords.append(kw)
                 stats['allowed'] += 1
-                logger.debug(f"[v7.7] ✅ РАЗРЕШЕНО: '{kw}'")
+                logger.debug(f"[v7.5] ✅ РАЗРЕШЕНО: '{kw}'")
             else:
                 final_anchors.append(kw)
                 stats['blocked'] += 1
                 stats['reasons'][category] += 1
-                logger.warning(f"[v7.7] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
+                logger.warning(f"[v7.5] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
 
         elapsed = time.time() - start_time
-        logger.info(f"[v7.7] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
+        logger.info(f"[v7.5] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
 
         return {
             'keywords': final_keywords,
@@ -474,18 +444,7 @@ class BatchPostFilter:
                 logger.debug(f"[v7.6] '{item}' in ignored_words, skipping")
                 continue
             
-            # ✅ v7.7 КРИТИЧЕСКИЙ ФИК: Проверяем оригинал + лемму
             found_country = self.all_cities_global.get(item)
-            
-            # Если не нашли оригинал - пробуем лемму
-            if not found_country and len(item) >= 3:
-                item_lemma = self._get_lemma(item, language)
-                if item_lemma != item:  # Только если лемма отличается
-                    found_country = self.all_cities_global.get(item_lemma)
-                    if found_country:
-                        logger.debug(f"[v7.7] Found via lemma: '{item}' → '{item_lemma}' → {found_country}")
-                        item = item_lemma  # Используем лемму дальше
-            
             if found_country:
                 # v7.6 DEBUG: логируем находки Ошмян/Фаниполь
                 if 'oshmyan' in item or 'fanipal' in item or 'fanipol' in item:
@@ -499,11 +458,11 @@ class BatchPostFilter:
                 
                 # Стандартная логика (КРИТИЧНО: оба в lowercase!)
                 if found_country == country.lower() or item in seed_cities:
-                    logger.debug(f"[v7.7] City '{item}' ({found_country}) - ALLOWED (target country)")
+                    logger.debug(f"[v7.5] City '{item}' ({found_country}) - ALLOWED (target country)")
                     continue
                 else:
                     # БЛОКИРУЕМ город из другой страны
-                    logger.warning(f"[v7.7] ⚓ BLOCKING '{item}' - {found_country.upper()} город")
+                    logger.warning(f"[v7.5] ⚓ BLOCKING '{item}' - {found_country.upper()} город")
                     return False, f"{found_country.upper()} город '{item}'", f"{found_country}_cities"
         
         # --- 4. ГРАММАТИКА ---
