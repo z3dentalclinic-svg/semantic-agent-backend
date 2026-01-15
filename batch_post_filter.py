@@ -1,6 +1,11 @@
 """
-Batch Post-Filter v7.7 - CRITICAL FIXES FOR LEMMATIZATION
+Batch Post-Filter v7.8 - CRITICAL FIX: CIS COUNTRIES HARD BLOCKING
 Based on Gemini's recommendations for 187 countries support
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.8:
+🔥 ИСПРАВЛЕНО: Убрана "умная" проверка _is_common_noun для городов СНГ
+🔥 РЕЗУЛЬТАТ: Барановичи, Лошица, Ждановичи, Талдыкорган теперь блокируются
+🔥 ЛОГИКА: Для СНГ→UA блокируем ЖЕСТКО, без проверки на "обычное слово"
 
 КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.7:
 🔥 ИСПРАВЛЕНО: Лемматизация теперь применяется ПЕРЕД поиском в базе городов
@@ -15,10 +20,12 @@ Based on Gemini's recommendations for 187 countries support
 ✅ O(1) lookup через предварительный индекс
 ✅ Ручной словарь малых городов СНГ (ош, узынагаш, щелкино)
 
-FIXES v7.6 → v7.7:
-- Лемматизация теперь выполняется ДО проверки в all_cities_global
-- Это решает проблему с "в актобе", "из фаниполя", "в ошмянах"
-- Добавлены отладочные логи для проблемных городов
+FIXES v7.7 → v7.8:
+- Для стран СНГ (BY, KZ, RU, GE, AM, UZ, etc.) при target=UA:
+  → НЕ применяем проверку _is_common_noun
+  → Блокируем НЕМЕДЛЕННО если код страны != UA
+- Это решает проблему с "барановичи", "лошица", "талдыкорган"
+- "Умная" проверка остаётся только для дальних стран (IL, PL, DE, etc.)
 """
 
 import re
@@ -496,20 +503,34 @@ class BatchPostFilter:
                 if 'oshmyan' in item_normalized or 'fanipal' in item_normalized or 'fanipol' in item_normalized:
                     logger.warning(f"🔍 v7.6 DEBUG FOUND: '{item}' → '{item_normalized}' → {found_country} (target: {country})")
                 
-                # v7.5: Smart disambiguation
-                # Если слово похоже на обычное существительное - дополнительная проверка
-                if self._is_common_noun(item_normalized, language):
-                    logger.debug(f"[v7.5] '{item_normalized}' looks like common noun, skipping geo-block")
-                    continue
+                # v7.8 КРИТИЧЕСКИЙ ФИК: Для стран СНГ НЕ применяем "умную" проверку
+                # Проблема: _is_common_noun пропускал "барановичи", "лошица", "талдыкорган"
+                # Решение: Если город из BY/KZ/RU/GE/AM и target=UA → блокируем ЖЕСТКО
+                cis_countries = {'by', 'kz', 'ru', 'ge', 'am', 'uz', 'tm', 'kg', 'tj', 'az', 'md'}
                 
-                # Стандартная логика (КРИТИЧНО: оба в lowercase!)
-                if found_country == country.lower() or item_normalized in seed_cities:
-                    logger.debug(f"[v7.7] City '{item_normalized}' ({found_country}) - ALLOWED (target country)")
-                    continue
+                if found_country in cis_countries and country.lower() == 'ua':
+                    # Для СНГ → UA: блокируем БЕЗ проверки на common_noun
+                    if found_country != country.lower() and item_normalized not in seed_cities:
+                        logger.warning(f"[v7.8] ⚓ BLOCKING CIS city '{item}' → '{item_normalized}' - {found_country.upper()}")
+                        return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
+                    else:
+                        logger.debug(f"[v7.8] City '{item_normalized}' ({found_country}) - ALLOWED (same country or in seed)")
+                        continue
                 else:
-                    # БЛОКИРУЕМ город из другой страны
-                    logger.warning(f"[v7.7] ⚓ BLOCKING '{item}' → '{item_normalized}' - {found_country.upper()} город")
-                    return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
+                    # v7.5: Smart disambiguation для ОСТАЛЬНЫХ стран
+                    # Если слово похоже на обычное существительное - дополнительная проверка
+                    if self._is_common_noun(item_normalized, language):
+                        logger.debug(f"[v7.5] '{item_normalized}' looks like common noun, skipping geo-block")
+                        continue
+                    
+                    # Стандартная логика (КРИТИЧНО: оба в lowercase!)
+                    if found_country == country.lower() or item_normalized in seed_cities:
+                        logger.debug(f"[v7.7] City '{item_normalized}' ({found_country}) - ALLOWED (target country)")
+                        continue
+                    else:
+                        # БЛОКИРУЕМ город из другой страны
+                        logger.warning(f"[v7.7] ⚓ BLOCKING '{item}' → '{item_normalized}' - {found_country.upper()} город")
+                        return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
         
         # --- 4. ГРАММАТИКА ---
         if not self._is_grammatically_valid(keyword, language):
