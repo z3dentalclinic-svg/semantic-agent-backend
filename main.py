@@ -126,15 +126,53 @@ def generate_geo_blacklist_full_v8():
     - Level 1: Cities with population >15k (global) - ~200k cities
     - Level 2: Cities with population >1k (CIS only: BY, KZ, RU, PL, LT, LV, EE) - ~27k new cities
     
+    Supports two loading modes:
+    1. From geonamescache (if installed) - generates database dynamically
+    2. From pre-built JSON file (fallback) - loads cis_extended_cities.json
+    
     Returns:
         dict: {city_name_lowercase: country_code_lowercase}
     """
+    import json
+    import os
+    
+    # ========== METHOD 1: Try pre-built JSON first (fastest) ==========
+    json_path = 'cis_extended_cities.json'
+    if os.path.exists(json_path):
+        try:
+            print("\n" + "="*70)
+            print("🌍 v8.0: Loading GEO DATABASE from pre-built JSON")
+            print("="*70)
+            
+            with open(json_path, 'r', encoding='utf-8') as f:
+                all_cities_global = json.load(f)
+            
+            print(f"\n✅ Loaded {len(all_cities_global):,} cities from {json_path}")
+            
+            # Show statistics
+            from collections import Counter
+            country_stats = Counter(all_cities_global.values())
+            print(f"\nTop 10 countries by coverage:")
+            for country, count in country_stats.most_common(10):
+                print(f"  {country.upper()}: {count:,} names")
+            
+            print("\n" + "="*70)
+            print("✅ v8.0 GEO DATABASE READY (from JSON)")
+            print("="*70 + "\n")
+            
+            return all_cities_global
+            
+        except Exception as e:
+            print(f"⚠️ Failed to load JSON: {e}")
+            print("   Falling back to geonamescache...")
+    
+    # ========== METHOD 2: Generate from geonamescache ==========
     try:
         from geonamescache import GeonamesCache
         from collections import Counter
 
         print("\n" + "="*70)
-        print("🌍 v8.0: Loading TWO-LEVEL Geo Database")
+        print("🌍 v8.0: Loading TWO-LEVEL Geo Database from geonamescache")
         print("="*70)
 
         all_cities_global = {}  # Combined result
@@ -264,13 +302,13 @@ def generate_geo_blacklist_full_v8():
             print(f"    {country.upper()}: {cis_stats[country]:,} names")
         
         print("="*70)
-        print("✅ v8.0 TWO-LEVEL GEO DATABASE READY")
+        print("✅ v8.0 TWO-LEVEL GEO DATABASE READY (from geonamescache)")
         print("="*70 + "\n")
         
         return all_cities_global
 
     except ImportError:
-        print("⚠️ geonamescache не установлен, используется минимальный словарь")
+        print("⚠️ geonamescache не установлен И нет файла cis_extended_cities.json")
         
         all_cities_global = {
             'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru', 
