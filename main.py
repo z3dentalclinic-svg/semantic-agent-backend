@@ -1,6 +1,11 @@
 """
-FGS Parser API v6.0 FINAL
+FGS Parser API v7.7 CRITICAL FIX
 Batch Post-Filter + O(1) Lookups + 3 Sources
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.7:
+🔥 ИСПРАВЛЕНО: В BatchPostFilter теперь передаётся РЕАЛЬНАЯ база городов
+🔥 ИСПРАВЛЕНО: Раньше передавался пустой словарь {} - фильтр не работал!
+🔥 РЕЗУЛЬТАТ: Актобе, Фаниполь, Ошмяны теперь правильно блокируются
 """
 
 from fastapi import FastAPI, Query
@@ -43,8 +48,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="6.0.0",
-    description="6 методов | 3 sources | Batch Post-Filter | O(1) lookups | v6.0 FINAL"
+    version="7.7.0",
+    description="6 методов | 3 sources | Batch Post-Filter | O(1) lookups | v7.7 CRITICAL FIX"
 )
 
 app.add_middleware(
@@ -410,15 +415,16 @@ class GoogleAutocompleteParser:
                    'a', 'ale', 'lub', 'czy', 'że', 'jak', 'gdzie', 'kiedy', 'dlaczego', 'co'}
         }
         
-        # v7.6: BatchPostFilter сам загружает города через geonamescache
-        # Передаём пустой dict - он будет перестроен внутри с правильными настройками
+        # v7.7 CRITICAL FIX: Передаём реальную базу городов ALL_CITIES_GLOBAL
+        # Исправлена критическая ошибка: раньше передавался пустой словарь {}
         self.post_filter = BatchPostFilter(
-            all_cities_global={},  # Пустой - BatchPostFilter сам загрузит
+            all_cities_global=ALL_CITIES_GLOBAL,  # ✅ ИСПРАВЛЕНО: передаём загруженную базу
             forbidden_geo=self.forbidden_geo,
             districts=DISTRICTS_EXTENDED,
             population_threshold=5000  # v7.6: Фильтр по населению
         )
-        logger.info("✅ Batch Post-Filter v7.6 initialized")
+        logger.info("✅ Batch Post-Filter v7.7 initialized with REAL cities database")
+        logger.info(f"   Database contains {len(ALL_CITIES_GLOBAL)} cities")
 
     def is_city_allowed(self, word: str, target_country: str) -> bool:
         """
