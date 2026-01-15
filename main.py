@@ -1,6 +1,11 @@
 """
-FGS Parser API v7.7 CRITICAL FIX
+FGS Parser API v7.8 CRITICAL FIX - CIS HARD BLOCKING
 Batch Post-Filter + O(1) Lookups + 3 Sources
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.8:
+🔥 ИСПРАВЛЕНО: Убрана "умная" проверка для городов СНГ
+🔥 РЕЗУЛЬТАТ: Барановичи, Лошица, Ждановичи, Талдыкорган блокируются
+🔥 ЛОГИКА: СНГ→UA = жесткая блокировка по коду страны
 
 КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.7:
 🔥 ИСПРАВЛЕНО: В BatchPostFilter теперь передаётся РЕАЛЬНАЯ база городов
@@ -48,8 +53,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="7.7.0",
-    description="6 методов | 3 sources | Batch Post-Filter | O(1) lookups | v7.7 CRITICAL FIX"
+    version="7.8.0",
+    description="6 методов | 3 sources | Batch Post-Filter | O(1) lookups | v7.8 CIS HARD BLOCK"
 )
 
 app.add_middleware(
@@ -423,8 +428,9 @@ class GoogleAutocompleteParser:
             districts=DISTRICTS_EXTENDED,
             population_threshold=5000  # v7.6: Фильтр по населению
         )
-        logger.info("✅ Batch Post-Filter v7.7 initialized with REAL cities database")
+        logger.info("✅ Batch Post-Filter v7.8 initialized with REAL cities database")
         logger.info(f"   Database contains {len(ALL_CITIES_GLOBAL)} cities")
+        logger.info("   CIS countries HARD BLOCKING enabled for UA target")
 
     def is_city_allowed(self, word: str, target_country: str) -> bool:
         """
