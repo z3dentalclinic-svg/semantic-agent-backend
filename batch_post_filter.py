@@ -1,6 +1,11 @@
 """
-Batch Post-Filter v7.6 - AUTONOMOUS GLOBAL GEO-FILTER
+Batch Post-Filter v7.7 - CRITICAL FIXES FOR LEMMATIZATION
 Based on Gemini's recommendations for 187 countries support
+
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.7:
+🔥 ИСПРАВЛЕНО: Лемматизация теперь применяется ПЕРЕД поиском в базе городов
+🔥 ИСПРАВЛЕНО: Все склонённые формы нормализуются ("в актобе" → "актобе")
+✅ Актобе, Фаниполь, Ошмяны теперь правильно блокируются
 
 КРИТИЧЕСКИЕ УЛУЧШЕНИЯ v7.6:
 ✅ Population filter (> 5000) - игнорируем малые сёла-тёзки
@@ -8,15 +13,12 @@ Based on Gemini's recommendations for 187 countries support
 ✅ Улучшенная N-gram detection
 ✅ Автономная работа для любой из 187 стран
 ✅ O(1) lookup через предварительный индекс
-✅ Ручной словарь малых городов СНГ (ош, узынагаш, щелкино) **← НОВОЕ v7.6!**
+✅ Ручной словарь малых городов СНГ (ош, узынагаш, щелкино)
 
-FIXES v6.0 → v7.6:
-- Добавлен population threshold для устранения "дом", "мир" и т.д.
-- Улучшена проверка common nouns через Pymorphy3
-- Более строгая логика для районов
-- Добавлен manual_small_cities для городов pop < 5000 (v7.6)
-- Добавлен ignored_words для частых ложных срабатываний (v7.6)
-- Защита от ложных срабатываний: если город из seed присутствует, запрос разрешается (v7.6)
+FIXES v7.6 → v7.7:
+- Лемматизация теперь выполняется ДО проверки в all_cities_global
+- Это решает проблему с "в актобе", "из фаниполя", "в ошмянах"
+- Добавлены отладочные логи для проблемных городов
 """
 
 import re
@@ -86,13 +88,43 @@ class BatchPostFilter:
         logger.warning(f"🔍 v7.6 DEBUG: Total index size: {len(self.all_cities_global)} entries")
         logger.warning(f"🔍 v7.6 DEBUG: Sample keys (first 10): {list(self.all_cities_global.keys())[:10]}")
         
+        # 🔥 КРИТИЧЕСКИЙ DEBUG v7.7 - ПРОВЕРКА ПРОБЛЕМНЫХ ГОРОДОВ
+        logger.error("="*60)
+        logger.error("🔥 v7.7 CRITICAL DEBUG - CHECKING PROBLEM CITIES")
+        logger.error("="*60)
+        logger.error(f"🔥 Dict size: {len(self.all_cities_global)} cities")
+        
+        test_problem_cities = {
+            'барановичи': 'by',
+            'baranavičy': 'by', 
+            'baranovichi': 'by',
+            'актобе': 'kz',
+            'aktobe': 'kz',
+            'aqtobe': 'kz',
+            'грозный': 'ru',
+            'grozny': 'ru',
+            'groznyy': 'ru',
+            'талдыкорган': 'kz',
+            'taldykorgan': 'kz',
+            'усть-каменогорск': 'kz',
+            'oskemen': 'kz'
+        }
+        
+        for city, expected in test_problem_cities.items():
+            in_dict = city in self.all_cities_global
+            actual = self.all_cities_global.get(city, 'NOT_FOUND')
+            status = "✅" if in_dict else "❌"
+            logger.error(f"{status} '{city}': in_dict={in_dict}, value={actual}, expected={expected}")
+        
+        logger.error("="*60)
+        
         # Инициализация Pymorphy3
         try:
             import pymorphy3
             self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
             self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
             self._has_morph = True
-            logger.info("✅ Pymorphy3 initialized for v7.5")
+            logger.info("✅ Pymorphy3 initialized for v7.7")
         except ImportError:
             logger.error("❌ Pymorphy3 not found!")
             self._has_morph = False
@@ -260,7 +292,7 @@ class BatchPostFilter:
                             if alt_dash != alt_lower:
                                 filtered_index[alt_dash] = country
             
-            logger.info(f"✅ v7.5 Geo Index built:")
+            logger.info(f"✅ v7.7 Geo Index built:")
             logger.info(f"   Cities with pop > {self.population_threshold}: {total_cities}")
             logger.info(f"   Total index entries (with alts): {len(filtered_index)}")
             logger.info(f"   Filtered out (pop < {self.population_threshold}): {filtered_out}")
@@ -288,7 +320,7 @@ class BatchPostFilter:
         
         # 2. Извлекаем города из seed
         seed_cities = self._extract_cities_from_seed(seed, country, language)
-        logger.info(f"[v7.5] Seed cities allowed: {seed_cities}")
+        logger.info(f"[v7.7] Seed cities allowed: {seed_cities}")
         
         # 3. Batch лемматизация
         all_words = set()
@@ -320,15 +352,15 @@ class BatchPostFilter:
             if is_allowed:
                 final_keywords.append(kw)
                 stats['allowed'] += 1
-                logger.debug(f"[v7.5] ✅ РАЗРЕШЕНО: '{kw}'")
+                logger.debug(f"[v7.7] ✅ РАЗРЕШЕНО: '{kw}'")
             else:
                 final_anchors.append(kw)
                 stats['blocked'] += 1
                 stats['reasons'][category] += 1
-                logger.warning(f"[v7.5] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
+                logger.warning(f"[v7.7] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
 
         elapsed = time.time() - start_time
-        logger.info(f"[v7.5] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
+        logger.info(f"[v7.7] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
 
         return {
             'keywords': final_keywords,
@@ -444,26 +476,40 @@ class BatchPostFilter:
                 logger.debug(f"[v7.6] '{item}' in ignored_words, skipping")
                 continue
             
-            found_country = self.all_cities_global.get(item)
+            # ✅ v7.7 КРИТИЧЕСКИЙ ФИК: ВСЕГДА нормализуем слово перед поиском
+            # Это решает проблему со склонёнными формами ("актобе" / "в актобе" / "актобой")
+            item_normalized = self._get_lemma(item, language)
+            
+            # Проверяем нормализованную форму
+            found_country = self.all_cities_global.get(item_normalized)
+            
+            # Если не нашли через лемму - проверим оригинал (на случай сокращений)
+            if not found_country:
+                found_country = self.all_cities_global.get(item)
+                if found_country:
+                    logger.debug(f"[v7.7] Found original (not lemma): '{item}' → {found_country}")
+            elif item_normalized != item:
+                logger.debug(f"[v7.7] Found via lemma: '{item}' → '{item_normalized}' → {found_country}")
+            
             if found_country:
                 # v7.6 DEBUG: логируем находки Ошмян/Фаниполь
-                if 'oshmyan' in item or 'fanipal' in item or 'fanipol' in item:
-                    logger.warning(f"🔍 v7.6 DEBUG FOUND: '{item}' → {found_country} (target: {country})")
+                if 'oshmyan' in item_normalized or 'fanipal' in item_normalized or 'fanipol' in item_normalized:
+                    logger.warning(f"🔍 v7.6 DEBUG FOUND: '{item}' → '{item_normalized}' → {found_country} (target: {country})")
                 
                 # v7.5: Smart disambiguation
                 # Если слово похоже на обычное существительное - дополнительная проверка
-                if self._is_common_noun(item, language):
-                    logger.debug(f"[v7.5] '{item}' looks like common noun, skipping geo-block")
+                if self._is_common_noun(item_normalized, language):
+                    logger.debug(f"[v7.5] '{item_normalized}' looks like common noun, skipping geo-block")
                     continue
                 
                 # Стандартная логика (КРИТИЧНО: оба в lowercase!)
-                if found_country == country.lower() or item in seed_cities:
-                    logger.debug(f"[v7.5] City '{item}' ({found_country}) - ALLOWED (target country)")
+                if found_country == country.lower() or item_normalized in seed_cities:
+                    logger.debug(f"[v7.7] City '{item_normalized}' ({found_country}) - ALLOWED (target country)")
                     continue
                 else:
                     # БЛОКИРУЕМ город из другой страны
-                    logger.warning(f"[v7.5] ⚓ BLOCKING '{item}' - {found_country.upper()} город")
-                    return False, f"{found_country.upper()} город '{item}'", f"{found_country}_cities"
+                    logger.warning(f"[v7.7] ⚓ BLOCKING '{item}' → '{item_normalized}' - {found_country.upper()} город")
+                    return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
         
         # --- 4. ГРАММАТИКА ---
         if not self._is_grammatically_valid(keyword, language):
@@ -473,10 +519,11 @@ class BatchPostFilter:
 
     def _is_common_noun(self, word: str, language: str) -> bool:
         """
-        v7.5: Smart disambiguation - проверяет является ли слово обычным существительным
+        v7.7 FIXED: Smart disambiguation с приоритетом Geox
         
         Примеры:
         - "дом" → True (обычное слово, НЕ город)
+        - "ошмяны" → False (Geox - географический объект)
         - "киев" → False (собственное имя, город)
         """
         if not self._has_morph or language not in ['ru', 'uk']:
@@ -487,18 +534,24 @@ class BatchPostFilter:
         try:
             parsed = morph.parse(word)
             if parsed:
-                tag = parsed[0].tag
+                # ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Проверяем ВСЕ варианты парсинга
+                for parse_variant in parsed:
+                    tag = parse_variant.tag
+                    
+                    # ПРИОРИТЕТ 1: Если хотя бы один вариант = Geox → это город!
+                    if 'Geox' in tag:
+                        logger.debug(f"[v7.7] '{word}' is Geox (geographic), NOT common noun")
+                        return False
+                    
+                    # ПРИОРИТЕТ 2: Если Name (собственное имя) → не обычное слово
+                    if 'Name' in tag:
+                        return False
                 
-                # Если это существительное (NOUN) и НЕ собственное имя
-                # Pymorphy3 не всегда корректно определяет Geox,
-                # поэтому используем косвенные признаки
-                
-                # Простая эвристика: если слово в нижнем регистре
-                # и является NOUN без одушевлённости - скорее всего обычное слово
-                if 'NOUN' in tag and word.islower():
-                    # Проверяем что это не название (Geox, Name)
-                    if 'Geox' not in tag and 'Name' not in tag:
-                        return True
+                # Только если НИ ОДИН вариант не Geox/Name - проверяем NOUN
+                first_tag = parsed[0].tag
+                if 'NOUN' in first_tag and word.islower():
+                    logger.debug(f"[v7.7] '{word}' is common noun")
+                    return True
         except:
             pass
         
