@@ -138,6 +138,13 @@ def generate_geo_blacklist_full_v8():
     
     # ========== METHOD 1: Try pre-built JSON first (fastest) ==========
     json_path = 'cis_extended_cities.json'
+    
+    # DEBUG: Проверка файла
+    print(f"\n🔍 DEBUG: Current working directory: {os.getcwd()}")
+    print(f"🔍 DEBUG: Looking for: {json_path}")
+    print(f"🔍 DEBUG: File exists: {os.path.exists(json_path)}")
+    print(f"🔍 DEBUG: Files in current dir: {os.listdir('.')}")
+    
     if os.path.exists(json_path):
         try:
             print("\n" + "="*70)
