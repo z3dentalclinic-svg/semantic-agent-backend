@@ -334,71 +334,60 @@ class BatchPostFilter:
                 'минск': 'by', 'алматы': 'kz', 'ташкент': 'uz'
             }
 
-    def filter_batch(self, keywords: List[str], seed: str, country: str, 
-                     language: str = 'ru') -> Dict:
+    def filter_batch(self, keywords: List[str], seed: str, country: str = "ua", 
+                     language: str = "ru") -> Dict:
         """
-        v7.5 Batch filtering with smart disambiguation
+        v8.5 ATOMIC FILTER - атомарная проверка слов
         """
-        start_time = time.time()
+        seed_words = set(re.findall(r'[а-яёa-z0-9]+', seed.lower()))
+        valid_keywords = []
+        blocked_keywords = []
         
-        # 1. Предварительная очистка
-        unique_raw = sorted(list(set([k.lower().strip() for k in keywords if k.strip()])))
-        
-        # 2. Извлекаем города из seed
-        seed_cities = self._extract_cities_from_seed(seed, country, language)
-        logger.info(f"[v7.7] Seed cities allowed: {seed_cities}")
-        
-        # 3. Batch лемматизация
-        all_words = set()
-        for kw in unique_raw:
-            all_words.update(re.findall(r'[а-яёa-z0-9-]+', kw))
-        
-        lemmas_map = self._batch_lemmatize(all_words, language)
-        
-        final_keywords = []
-        final_anchors = []
-        stats = {
-            'total': len(unique_raw),
-            'allowed': 0,
-            'blocked': 0,
-            'reasons': Counter()
-        }
-
-        # 4. Фильтруем с v7.5 логикой
-        for kw in unique_raw:
-            # v7.6 DEBUG: логируем keywords содержащие oshmyan или fanipol
-            kw_lower = kw.lower()
-            if 'oshmyan' in kw_lower or 'fanipal' in kw_lower or 'fanipol' in kw_lower:
-                logger.warning(f"🔍 v7.6 DEBUG INPUT: '{kw}' → проверяем...")
+        for kw in keywords:
+            is_valid = True
+            # ОЧЕНЬ ВАЖНО: Разбиваем строго по пробелам, берем чистые слова
+            words = re.findall(r'[а-яёa-z0-9]+', kw.lower())
             
-            is_allowed, reason, category = self._check_geo_conflicts_v75(
-                kw, country, lemmas_map, seed_cities, language
-            )
+            for word in words:
+                if len(word) < 3:
+                    continue  # Игнорируем предлоги 'в', 'на', 'с'
+                
+                # 🔍 ДИАГНОСТИКА
+                logger.info(f"🔍 [DIAGNOSTIC] Проверяем слово: '{word}'")
+                
+                # 1. Получаем чистую лемму ОДНОГО слова
+                lemma = self._get_lemma(word, language)
+                logger.info(f"🔍 [DIAGNOSTIC] Лемма: '{word}' → '{lemma}'")
+                
+                # 2. Проверяем базу
+                found_country = self.all_cities_global.get(lemma)
+                logger.info(f"🔍 [DIAGNOSTIC] База lookup: '{lemma}' → {found_country if found_country else 'НЕТ'}")
+                
+                # 3. ЛОГИКА БЛОКИРОВКИ
+                if found_country and found_country != country.lower():
+                    if lemma in seed_words:
+                        logger.info(f"✅ [SKIP] '{word}' найден в базе {found_country}, но в SEED - пропускаем")
+                        continue  # Твой запрос не трогаем
+                    
+                    logger.warning(f"⚓ [v8.5 BLOCK] Найдено: '{word}' (лемма: '{lemma}') -> Город в {found_country.upper()}")
+                    is_valid = False
+                    break
             
-            if is_allowed:
-                final_keywords.append(kw)
-                stats['allowed'] += 1
-                logger.debug(f"[v7.7] ✅ РАЗРЕШЕНО: '{kw}'")
+            if is_valid:
+                valid_keywords.append(kw)
             else:
-                final_anchors.append(kw)
-                stats['blocked'] += 1
-                stats['reasons'][category] += 1
-                logger.warning(f"[v7.7] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
-
-        elapsed = time.time() - start_time
-        logger.info(f"[v7.7] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
-
+                blocked_keywords.append(kw)
+        
         return {
-            'keywords': final_keywords,
-            'anchors': final_anchors,
-            'stats': {
-                'total': stats['total'],
-                'allowed': stats['allowed'],
-                'blocked': stats['blocked'],
-                'reasons': dict(stats['reasons']),
-                'elapsed_time': round(elapsed, 2)
+            "keywords": valid_keywords,
+            "anchors": blocked_keywords,
+            "stats": {
+                "total": len(keywords),
+                "allowed": len(valid_keywords),
+                "blocked": len(blocked_keywords)
             }
         }
+
 
     def _check_geo_conflicts_v75(self, keyword: str, country: str, 
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
