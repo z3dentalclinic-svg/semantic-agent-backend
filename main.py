@@ -1814,3 +1814,20 @@ async def parse_adaptive_prefix_endpoint(
 
     return result
 
+
+
+# 🧪 ДИАГНОСТИЧЕСКИЙ ТЕСТ ПРИ СТАРТЕ
+@app.on_event("startup")
+async def startup_event():
+    test_names = ["ждановичи", "лошица", "барановичи", "гродно", "актобе"]
+    logger.info("=" * 70)
+    logger.info("🧪 ПРОВЕРКА БАЗЫ ГОРОДОВ ПРИ СТАРТЕ:")
+    logger.info("=" * 70)
+    for name in test_names:
+        status = ALL_CITIES_GLOBAL.get(name)
+        if status:
+            logger.info(f"  ✅ '{name}': НАЙДЕН ({status.upper()})")
+        else:
+            logger.error(f"  ❌ '{name}': НЕ НАЙДЕН В БАЗЕ!")
+    logger.info("=" * 70)
+
