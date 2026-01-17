@@ -63,7 +63,7 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="8.1.0",
+    version="8.8.0",
     description="6 методов | 3 sources | Batch Post-Filter | O(1) lookups | v7.9 GEO DB PRIORITY"
 )
 
