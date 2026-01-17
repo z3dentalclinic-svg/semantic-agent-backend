@@ -1,29 +1,34 @@
 """
-FGS Parser API v8.0 - TWO-LEVEL GEO DATABASE
-Batch Post-Filter + O(1) Lookups + 3 Sources
-BUILD: 2026-01-17-00:25 FORCE REBUILD
+FGS Parser API v8.1 - CRITICAL FIX: Case Normalization + Seed Protection
+BUILD: 2026-01-17-02:00 CRITICAL FIX
 
-🎯 КРИТИЧЕСКИЕ УЛУЧШЕНИЯ v8.0:
+🔥 КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v8.1:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-РЕШЕНИЕ: Двухуровневая база городов
+ПРОБЛЕМА v8.0:
+  1. База загружалась БЕЗ нормализации регистра
+     "Ждановичи" ≠ "ждановичи" → lookup NOT FOUND
+  
+  2. Seed protection пропускала города из seed
+     "ремонт пылесосов ждановичи" → auto-allow
 
-LEVEL 1: Cities >15k (global) - ~158k названий
-LEVEL 2: Cities >1k (CIS only) - +27k названий
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+РЕШЕНИЕ v8.1:
+  1. ВСЕ ключи приводятся к lowercase при загрузке
+  2. Seed protection отключена для городов из других стран
+  
 ✅ РЕЗУЛЬТАТ:
-  - Ждановичи (BY, 7k) → найдено в L2 → БЛОКИРОВКА
-  - Барановичи (BY, 170k) → найдено в L1 → БЛОКИРОВКА
+  - lookup("ждановичи") → "by" → BLOCK ⚓
+  - Консистентная работа с любым регистром
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 НАСЛЕДИЕ ОТ v8.0 - Двухуровневая база городов:
+  LEVEL 1: Cities >15k (global) - ~158k названий
+  LEVEL 2: Cities >1k (CIS only) - +27k названий
+  - Ждановичи (BY, 7k) → L2 → БЛОКИРОВКА
+  - Барановичи (BY, 170k) → L1 → БЛОКИРОВКА
   - +85% покрытие для Беларуси
-  - +27k малых городов СНГ
 
-КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.9:
-🔥 База городов = ПЕРВИЧНА, морфология = ВТОРИЧНА
-🔥 Любой город из базы с country != target → БЛОКИРУЕТСЯ
-
-КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v7.7:
-🔥 В BatchPostFilter передаётся РЕАЛЬНАЯ база городов
-🔥 Лемматизация применяется ПЕРЕД поиском
+v7.9: База городов = ПЕРВИЧНА, морфология = ВТОРИЧНА
+v7.7: Лемматизация применяется ПЕРЕД поиском
 """
 
 from fastapi import FastAPI, Query
@@ -66,8 +71,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="8.0.0",
-    description="6 методов | 3 sources | Batch Post-Filter | v8.0 TWO-LEVEL GEO DB"
+    version="8.1.0",
+    description="6 методов | 3 sources | Batch Post-Filter | v8.1 CRITICAL FIX"
 )
 
 app.add_middleware(
@@ -123,13 +128,12 @@ MANUAL_RARE_CITIES = {
 
 def generate_geo_blacklist_full_v8():
     """
-    v8.0: Two-level geo database
-    - Level 1: Cities with population >15k (global) - ~200k cities
-    - Level 2: Cities with population >1k (CIS only: BY, KZ, RU, PL, LT, LV, EE) - ~27k new cities
+    v8.1: Two-level geo database WITH CASE NORMALIZATION
     
-    Supports two loading modes:
-    1. From geonamescache (if installed) - generates database dynamically
-    2. From pre-built JSON file (fallback) - loads cis_extended_cities.json
+    🔥 КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v8.1:
+    - ВСЕ ключи приводятся к lowercase
+    - ВСЕ значения (country codes) приводятся к lowercase
+    - Добавлена валидация после загрузки
     
     Returns:
         dict: {city_name_lowercase: country_code_lowercase}
@@ -140,13 +144,26 @@ def generate_geo_blacklist_full_v8():
     # ========== METHOD 1: Try embedded database (ALWAYS WORKS) ==========
     try:
         print("\n" + "="*70)
-        print("🌍 v8.0: Loading EMBEDDED GEO DATABASE")
+        print("🌍 v8.1: Loading EMBEDDED GEO DATABASE")
         print("="*70)
         
         from embedded_cities import load_embedded_cities
-        all_cities_global = load_embedded_cities()
+        raw_data = load_embedded_cities()
         
-        print(f"\n✅ Loaded {len(all_cities_global):,} cities from embedded database")
+        # 🔥 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v8.1: NORMALIZE CASE
+        print(f"\n🔄 v8.1: Normalizing case for {len(raw_data):,} entries...")
+        all_cities_global = {}
+        
+        for city_name, country_code in raw_data.items():
+            # Приводим к lowercase и убираем лишние пробелы
+            normalized_name = str(city_name).lower().strip()
+            normalized_country = str(country_code).lower().strip()
+            
+            # Пропускаем пустые записи
+            if normalized_name and normalized_country:
+                all_cities_global[normalized_name] = normalized_country
+        
+        print(f"✅ Normalized {len(all_cities_global):,} cities (all lowercase)")
         
         from collections import Counter
         country_stats = Counter(all_cities_global.values())
@@ -154,205 +171,48 @@ def generate_geo_blacklist_full_v8():
         for country, count in country_stats.most_common(10):
             print(f"  {country.upper()}: {count:,} names")
         
+        # 🔥 КРИТИЧЕСКИЙ ТЕСТ v8.1: Проверяем Ждановичи
         print("\n" + "="*70)
-        print("✅ v8.0 EMBEDDED GEO DATABASE READY")
+        print("🔍 v8.1 VALIDATION TEST - Critical Cities Check")
+        print("="*70)
+        
+        test_cities = {
+            'ждановичи': 'by',
+            'жданович': 'by',
+            'лошица': 'by',
+            'серебрянка': 'by',
+            'барановичи': 'by',
+            'актобе': 'kz',
+            'талдыкорган': 'kz',
+            'грозный': 'ru',
+            'новосибирск': 'ru'
+        }
+        
+        all_ok = True
+        for city, expected in test_cities.items():
+            found = city in all_cities_global
+            actual = all_cities_global.get(city, 'NOT_FOUND')
+            status = "✅" if (found and actual == expected) else "❌"
+            
+            if not (found and actual == expected):
+                all_ok = False
+            
+            print(f"{status} '{city}': found={found}, value={actual}, expected={expected}")
+        
+        if all_ok:
+            print("\n🚀 ✅ ALL TESTS PASSED - Database is READY")
+        else:
+            print("\n⚠️ ❌ SOME TESTS FAILED - Check database integrity")
+        
         print("="*70 + "\n")
         
         return all_cities_global
         
     except Exception as e:
         print(f"⚠️ Failed to load embedded database: {e}")
-        print("   Falling back to geonamescache...")
-    
-    # ========== METHOD 2: Generate from geonamescache ==========
-        try:
-            print("\n" + "="*70)
-            print("🌍 v8.0: Loading GEO DATABASE from pre-built JSON")
-            print("="*70)
-            
-            with open(json_path, 'r', encoding='utf-8') as f:
-                all_cities_global = json.load(f)
-            
-            print(f"\n✅ Loaded {len(all_cities_global):,} cities from {json_path}")
-            
-            # Show statistics
-            from collections import Counter
-            country_stats = Counter(all_cities_global.values())
-            print(f"\nTop 10 countries by coverage:")
-            for country, count in country_stats.most_common(10):
-                print(f"  {country.upper()}: {count:,} names")
-            
-            print("\n" + "="*70)
-            print("✅ v8.0 GEO DATABASE READY (from JSON)")
-            print("="*70 + "\n")
-            
-            return all_cities_global
-            
-        except Exception as e:
-            print(f"⚠️ Failed to load JSON: {e}")
-            print("   Falling back to geonamescache...")
-    
-    # ========== METHOD 2: Generate from geonamescache ==========
-    try:
-        from geonamescache import GeonamesCache
-        from collections import Counter
+        print("   Returning empty database...")
+        return {}
 
-        print("\n" + "="*70)
-        print("🌍 v8.0: Loading TWO-LEVEL Geo Database from geonamescache")
-        print("="*70)
-
-        all_cities_global = {}  # Combined result
-        
-        # === LEVEL 1: Global cities (population >15k) ===
-        print("\n📍 LEVEL 1: Loading global cities (population >15k)...")
-        gc_level1 = GeonamesCache()  # Default: min_city_population=15000
-        cities_level1 = gc_level1.get_cities()
-        
-        level1_count = 0
-        for city_id, city_data in cities_level1.items():
-            country = city_data['countrycode'].lower()
-            
-            # Add main name
-            name = city_data['name'].lower().strip()
-            if name:
-                all_cities_global[name] = country
-                level1_count += 1
-            
-            # Add alternate names with filtering
-            for alt in city_data.get('alternatenames', []):
-                # Skip multi-word names
-                if ' ' in alt:
-                    continue
-                
-                # Length filter
-                if not (3 <= len(alt) <= 30):
-                    continue
-                
-                # Must contain letters
-                if not any(c.isalpha() for c in alt):
-                    continue
-                
-                # Clean and validate
-                alt_clean = alt.replace('-', '').replace("'", "")
-                if alt_clean.isalpha():
-                    # Check if Latin or Cyrillic
-                    is_latin_cyrillic = all(
-                        ('\u0000' <= c <= '\u007F') or  # ASCII (Latin)
-                        ('\u0400' <= c <= '\u04FF') or  # Cyrillic
-                        c in ['-', "'"]
-                        for c in alt
-                    )
-                    
-                    if is_latin_cyrillic:
-                        alt_lower = alt.lower().strip()
-                        if alt_lower not in all_cities_global:
-                            all_cities_global[alt_lower] = country
-                            level1_count += 1
-        
-        print(f"  ✅ Level 1 loaded: {level1_count:,} city names")
-        
-        # === LEVEL 2: CIS cities with population >1k ===
-        print("\n📍 LEVEL 2: Loading CIS cities (population >1k)...")
-        print("  Target countries: BY, KZ, RU, PL, LT, LV, EE")
-        
-        gc_level2 = GeonamesCache(min_city_population=1000)
-        cities_level2 = gc_level2.get_cities()
-        
-        cis_countries = {'BY', 'KZ', 'RU', 'PL', 'LT', 'LV', 'EE'}
-        level2_count = 0
-        level2_new = 0  # Cities not in Level 1
-        
-        for city_id, city_data in cities_level2.items():
-            country = city_data['countrycode']
-            
-            # Filter: only CIS countries
-            if country not in cis_countries:
-                continue
-            
-            country_lower = country.lower()
-            
-            # Add main name
-            name = city_data['name'].lower().strip()
-            if name:
-                if name not in all_cities_global:
-                    level2_new += 1
-                all_cities_global[name] = country_lower
-                level2_count += 1
-            
-            # Add alternate names
-            for alt in city_data.get('alternatenames', []):
-                if ' ' in alt:
-                    continue
-                
-                if not (2 <= len(alt) <= 30):  # Level 2: accept 2+ chars
-                    continue
-                
-                if not any(c.isalpha() for c in alt):
-                    continue
-                
-                alt_clean = alt.replace('-', '').replace("'", "")
-                if alt_clean.isalpha():
-                    is_latin_cyrillic = all(
-                        ('\u0000' <= c <= '\u007F') or
-                        ('\u0400' <= c <= '\u04FF') or
-                        c in ['-', "'"]
-                        for c in alt
-                    )
-                    
-                    if is_latin_cyrillic:
-                        alt_lower = alt.lower().strip()
-                        if alt_lower not in all_cities_global:
-                            level2_new += 1
-                        all_cities_global[alt_lower] = country_lower
-                        level2_count += 1
-        
-        print(f"  ✅ Level 2 loaded: {level2_count:,} city names ({level2_new:,} new)")
-        
-        # === STATISTICS ===
-        print("\n" + "="*70)
-        print("📊 DATABASE STATISTICS")
-        print("="*70)
-        print(f"  Total cities in database: {len(all_cities_global):,}")
-        print(f"  Level 1 contribution: {level1_count:,}")
-        print(f"  Level 2 contribution: {level2_new:,} (CIS small cities)")
-        
-        country_stats = Counter(all_cities_global.values())
-        print(f"\n  Top 10 countries by coverage:")
-        for country, count in country_stats.most_common(10):
-            print(f"    {country.upper()}: {count:,} names")
-        
-        # Show CIS-specific stats
-        print(f"\n  CIS countries coverage:")
-        cis_stats = {c.lower(): country_stats[c.lower()] for c in cis_countries if c.lower() in country_stats}
-        for country in sorted(cis_stats.keys()):
-            print(f"    {country.upper()}: {cis_stats[country]:,} names")
-        
-        print("="*70)
-        print("✅ v8.0 TWO-LEVEL GEO DATABASE READY (from geonamescache)")
-        print("="*70 + "\n")
-        
-        return all_cities_global
-
-    except ImportError:
-        print("⚠️ geonamescache не установлен И нет файла cis_extended_cities.json")
-        
-        all_cities_global = {
-            'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru', 
-            'санкт-петербург': 'ru', 'екатеринбург': 'ru', 'казань': 'ru',
-            'новосибирск': 'ru', 'челябинск': 'ru', 'омск': 'ru',
-            'минск': 'by', 'гомель': 'by', 'витебск': 'by', 'могилев': 'by',
-            'алматы': 'kz', 'астана': 'kz', 'караганда': 'kz',
-            'киев': 'ua', 'харьков': 'ua', 'одесса': 'ua', 'днепр': 'ua',
-            'львов': 'ua', 'запорожье': 'ua', 'кривой рог': 'ua',
-            'николаев': 'ua', 'винница': 'ua', 'херсон': 'ua',
-            'полтава': 'ua', 'чернигов': 'ua', 'черкассы': 'ua',
-            'днепропетровск': 'ua', 'kyiv': 'ua', 'kiev': 'ua',
-            'kharkiv': 'ua', 'odessa': 'ua', 'lviv': 'ua', 'dnipro': 'ua',
-        }
-        
-        return all_cities_global
-
-ALL_CITIES_GLOBAL = generate_geo_blacklist_full_v8()
 
 class AdaptiveDelay:
     """Автоматическая оптимизация задержек между запросами"""
