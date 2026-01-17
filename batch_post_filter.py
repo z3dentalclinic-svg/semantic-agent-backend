@@ -337,41 +337,67 @@ class BatchPostFilter:
     def filter_batch(self, keywords: List[str], seed: str, country: str = "ua", 
                      language: str = "ru") -> Dict:
         """
-        v8.5 ATOMIC FILTER - атомарная проверка слов
+        v8.8 PURE LOGIC - гибридная проверка н-грамм (1-3 слова)
         """
-        seed_words = set(re.findall(r'[а-яёa-z0-9]+', seed.lower()))
+        # 1. Лемматизируем seed для защиты авторского запроса
+        seed_tokens = re.findall(r'[а-яёa-z0-9]+', seed.lower())
+        seed_lemmas = [self._get_lemma(word, language) for word in seed_tokens if len(word) >= 3]
+        
+        # Генерируем н-граммы из seed (1, 2, 3 слова)
+        seed_ngrams = set()
+        for i in range(len(seed_lemmas)):
+            seed_ngrams.add(seed_lemmas[i])  # 1-грамма
+            if i + 1 < len(seed_lemmas):
+                seed_ngrams.add(f"{seed_lemmas[i]} {seed_lemmas[i+1]}")  # 2-грамма
+            if i + 2 < len(seed_lemmas):
+                seed_ngrams.add(f"{seed_lemmas[i]} {seed_lemmas[i+1]} {seed_lemmas[i+2]}")  # 3-грамма
+        
+        logger.info(f"[v8.8] Seed n-grams: {seed_ngrams}")
+        
         valid_keywords = []
         blocked_keywords = []
         
         for kw in keywords:
             is_valid = True
-            # ОЧЕНЬ ВАЖНО: Разбиваем строго по пробелам, берем чистые слова
-            words = re.findall(r'[а-яёa-z0-9]+', kw.lower())
             
-            for word in words:
-                if len(word) < 3:
-                    continue  # Игнорируем предлоги 'в', 'на', 'с'
+            # 2. Чистая токенизация
+            tokens = re.findall(r'[а-яёa-z0-9]+', kw.lower())
+            
+            # 3. Атомарная лемматизация
+            lemmas = [self._get_lemma(token, language) for token in tokens if len(token) >= 3]
+            
+            if not lemmas:
+                valid_keywords.append(kw)
+                continue
+            
+            # 4. Генерация N-грамм (1, 2, 3 слова)
+            ngrams_to_check = []
+            for i in range(len(lemmas)):
+                ngrams_to_check.append(lemmas[i])  # 1-грамма
+                if i + 1 < len(lemmas):
+                    ngrams_to_check.append(f"{lemmas[i]} {lemmas[i+1]}")  # 2-грамма
+                if i + 2 < len(lemmas):
+                    ngrams_to_check.append(f"{lemmas[i]} {lemmas[i+1]} {lemmas[i+2]}")  # 3-грамма
+            
+            # 5. O(1) Lookup в базе
+            for ngram in ngrams_to_check:
+                logger.info(f"🔍 [v8.8] Проверяем н-грамму: '{ngram}'")
                 
-                # 🔍 ДИАГНОСТИКА
-                logger.info(f"🔍 [DIAGNOSTIC] Проверяем слово: '{word}'")
+                found_country = self.all_cities_global.get(ngram)
                 
-                # 1. Получаем чистую лемму ОДНОГО слова
-                lemma = self._get_lemma(word, language)
-                logger.info(f"🔍 [DIAGNOSTIC] Лемма: '{word}' → '{lemma}'")
-                
-                # 2. Проверяем базу
-                found_country = self.all_cities_global.get(lemma)
-                logger.info(f"🔍 [DIAGNOSTIC] База lookup: '{lemma}' → {found_country if found_country else 'НЕТ'}")
-                
-                # 3. ЛОГИКА БЛОКИРОВКИ
-                if found_country and found_country != country.lower():
-                    if lemma in seed_words:
-                        logger.info(f"✅ [SKIP] '{word}' найден в базе {found_country}, но в SEED - пропускаем")
-                        continue  # Твой запрос не трогаем
+                if found_country:
+                    logger.info(f"🔍 [v8.8] База: '{ngram}' → {found_country.upper()}")
                     
-                    logger.warning(f"⚓ [v8.5 BLOCK] Найдено: '{word}' (лемма: '{lemma}') -> Город в {found_country.upper()}")
-                    is_valid = False
-                    break
+                    # 6. Жесткий фильтр по Country Code
+                    if found_country != country.lower():
+                        # ИСКЛЮЧЕНИЕ: н-грамма из seed
+                        if ngram in seed_ngrams:
+                            logger.info(f"✅ [v8.8 SKIP] '{ngram}' в базе {found_country.upper()}, но в SEED - пропускаем")
+                            continue
+                        
+                        logger.warning(f"⚓ [v8.8 BLOCK] '{ngram}' → {found_country.upper()} (keyword: '{kw}')")
+                        is_valid = False
+                        break
             
             if is_valid:
                 valid_keywords.append(kw)
