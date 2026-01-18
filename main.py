@@ -35,7 +35,12 @@ import re
 import logging
 from difflib import SequenceMatcher
 
-from filters import BatchPostFilter, DISTRICTS_EXTENDED
+from filters import (
+    BatchPostFilter, 
+    DISTRICTS_EXTENDED,
+    filter_infix_results,
+    filter_relevant_keywords
+)
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
 
@@ -382,43 +387,6 @@ class GoogleAutocompleteParser:
                 pass
         return sorted(list(forms))
 
-    def _normalize_with_pymorphy(self, text: str, language: str) -> set:
-        """
-        """
-        morph = self.morph_ru if language == 'ru' else self.morph_uk
-
-        stop_words = self.stop_words.get(language, self.stop_words['ru'])
-
-        words = re.findall(r'\w+', text.lower())
-
-        meaningful = [w for w in words if w not in stop_words and len(w) > 1]
-
-        lemmas = set()
-        for word in meaningful:
-            try:
-                parsed = morph.parse(word)
-                if parsed:
-                    lemmas.add(parsed[0].normal_form)
-            except:
-                lemmas.add(word)
-
-        return lemmas
-
-    def _normalize_with_snowball(self, text: str, language: str) -> set:
-        """
-        """
-        stemmer = self.stemmers.get(language, self.stemmers['en'])
-
-        stop_words = self.stop_words.get(language, self.stop_words['en'])
-
-        words = re.findall(r'\w+', text.lower())
-
-        meaningful = [w for w in words if w not in stop_words and len(w) > 1]
-
-        stems = {stemmer.stem(w) for w in meaningful}
-
-        return stems
-
     def _are_words_similar(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
         """
         """
@@ -428,53 +396,6 @@ class GoogleAutocompleteParser:
         similarity = SequenceMatcher(None, word1, word2).ratio()
 
         return similarity >= threshold
-
-    def _normalize(self, text: str, language: str = 'ru') -> set:
-        """
-        """
-
-        if language in ['ru', 'uk']:
-            return self._normalize_with_pymorphy(text, language)
-
-        elif language in ['en', 'de', 'fr', 'es', 'it']:
-            return self._normalize_with_snowball(text, language)
-
-        else:
-            words = re.findall(r'\w+', text.lower())
-            stop_words = self.stop_words.get('en', set())  # fallback на английские
-            meaningful = [w for w in words if w not in stop_words and len(w) > 1]
-            return set(meaningful)
-
-    def is_grammatically_valid(self, seed_word: str, kw_word: str, language: str = 'ru') -> bool:
-        """
-        """
-        if language not in ['ru', 'uk']:
-            return True
-
-        try:
-            morph = self.morph_ru if language == 'ru' else self.morph_uk
-
-            parsed_seed = morph.parse(seed_word)
-            parsed_kw = morph.parse(kw_word)
-
-            if not parsed_seed or not parsed_kw:
-                return True  # Если не распарсилось - пропускаем
-
-            seed_form = parsed_seed[0]
-            kw_form = parsed_kw[0]
-
-            if seed_form.normal_form != kw_form.normal_form:
-                return True  # Разные слова - не наша проблема
-
-            invalid_tags = {'datv', 'ablt', 'loct'}
-
-            if 'plur' in kw_form.tag and any(tag in kw_form.tag for tag in invalid_tags):
-                return False  # Отсеиваем грамматический мусор!
-
-            return True  # Форма допустимая
-
-        except Exception as e:
-            return True
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
@@ -702,143 +623,6 @@ class GoogleAutocompleteParser:
             pass
         return {"original": text, "corrected": text, "corrections": [], "has_errors": False}
 
-    async def filter_infix_results(self, keywords: List[str], language: str) -> List[str]:
-        """Фильтр INFIX результатов: убирает мусорные одиночные буквы"""
-
-        if language.lower() == 'ru':
-            valid = {'в', 'на', 'у', 'к', 'от', 'из', 'по', 'о', 'об', 'с', 'со', 'за', 'для', 'и', 'а', 'но'}
-        elif language.lower() == 'uk':
-            valid = {'в', 'на', 'у', 'до', 'від', 'з', 'по', 'про', 'для', 'і', 'та', 'або'}
-        elif language.lower() == 'en':
-            valid = {'in', 'on', 'at', 'to', 'from', 'with', 'for', 'by', 'o', 'and', 'or', 'a', 'i'}
-        else:
-            valid = set()
-
-        filtered = []
-
-        for keyword in keywords:
-            keyword_lower = keyword.lower()
-            words = keyword_lower.split()
-
-            has_garbage = False
-            for i in range(1, len(words)):
-                word = words[i]
-                if len(word) == 1 and word not in valid:
-                    has_garbage = True
-                    break
-
-            if not has_garbage:
-                filtered.append(keyword)
-
-        return filtered
-
-    async def filter_relevant_keywords(self, keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
-        """
-        """
-
-        seed_lemmas = self._normalize(seed, language)
-
-        if not seed_lemmas:
-            return keywords
-
-        seed_lower = seed.lower()
-        seed_words_original = [w.lower() for w in re.findall(r'\w+', seed) if len(w) > 2]
-
-        stop_words = self.stop_words.get(language, self.stop_words['ru'])
-
-        seed_important_words = [w for w in seed_words_original if w not in stop_words]
-
-        if not seed_important_words:
-            seed_important_words = seed_words_original
-
-        filtered = []
-
-        for keyword in keywords:
-            kw_lower = keyword.lower()
-
-            kw_lemmas = self._normalize(keyword, language)
-            if not seed_lemmas.issubset(kw_lemmas):
-                continue  # Не про то - отсеиваем
-
-            kw_words = kw_lower.split()
-            matches = 0
-            grammatically_valid = True
-
-            for seed_word in seed_important_words:
-                found_match = False
-
-                for kw_word in kw_words:
-                    if seed_word in kw_word:
-                        if self.is_grammatically_valid(seed_word, kw_word, language):
-                            found_match = True
-                            break
-                        else:
-                            grammatically_valid = False
-                            break
-
-                if found_match:
-                    matches += 1
-
-            if not grammatically_valid:
-                continue
-
-            if len(seed_important_words) > 0:
-                match_ratio = matches / len(seed_important_words)
-                if match_ratio < 1.0:  # Если НЕ 100% - отсеиваем
-                    continue
-
-            first_seed_word = seed_important_words[0]
-            first_word_position = -1
-
-            for i, kw_word in enumerate(kw_words):
-                if first_seed_word in kw_word:
-                    first_word_position = i
-                    break
-
-            if first_word_position > 1:
-                continue
-
-            last_index = -1
-            order_correct = True
-
-            for seed_word in seed_important_words:
-                found_at = -1
-                for i, kw_word in enumerate(kw_words):
-                    if i > last_index and seed_word in kw_word:
-                        found_at = i
-                        break
-
-                if found_at == -1:
-                    order_correct = False
-                    break
-
-                last_index = found_at
-
-            if order_correct:
-                filtered.append(keyword)
-
-        # ============================================
-        # v7.6 FIX: ЗАКОММЕНТИРОВАНО - ИСПОЛЬЗУЕМ ТОЛЬКО BatchPostFilter
-        # Старая логика EntityLogicManager создавала дубли и пропускала города
-        # ============================================
-        # filtered_final = []
-        #
-        # for keyword in filtered:
-        #     is_conflict = await asyncio.to_thread(
-        #         self.entity_manager.check_conflict,
-        #         seed,
-        #         keyword,
-        #         language
-        #     )
-        #
-        #     if not is_conflict:
-        #         filtered_final.append(keyword)
-        #
-        # return filtered_final
-        
-        # v7.6: Возвращаем filtered напрямую - фильтрация теперь только через BatchPostFilter
-        return filtered
-
     async def fetch_suggestions(self, query: str, country: str, language: str, client: httpx.AsyncClient) -> List[str]:
         """Google Autocomplete"""
         url = "https://www.google.com/complete/search"
@@ -997,7 +781,7 @@ class GoogleAutocompleteParser:
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered = await self.filter_relevant_keywords(list(all_with_anchors), seed, language)
+        filtered = await filter_relevant_keywords(list(all_with_anchors), seed, language)
         
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -1061,9 +845,9 @@ class GoogleAutocompleteParser:
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered_1 = await self.filter_infix_results(list(all_with_anchors), language)
+        filtered_1 = await filter_infix_results(list(all_with_anchors), language)
 
-        filtered_2 = await self.filter_relevant_keywords(filtered_1, seed, language)
+        filtered_2 = await filter_relevant_keywords(filtered_1, seed, language)
         
         filtered_set = set(filtered_2)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -1168,7 +952,7 @@ class GoogleAutocompleteParser:
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
         
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -1280,7 +1064,7 @@ class GoogleAutocompleteParser:
                     keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered = await self.filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
         
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
