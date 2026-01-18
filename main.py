@@ -1,5 +1,5 @@
 """
-FGS Parser API v7.9 FUNDAMENTAL FIX - GEO DATABASE PRIORITY
+FGS Parser API v7.91 FUNDAMENTAL FIX - GEO DATABASE PRIORITY
 Batch Post-Filter + O(1) Lookups + 3 Sources
 
 🔥 ФУНДАМЕНТАЛЬНОЕ ИСПРАВЛЕНИЕ v7.9:
