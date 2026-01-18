@@ -1,4 +1,4 @@
-python"""
+"""
 Filters module for FGS Parser
 """
 
