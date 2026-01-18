@@ -38,6 +38,7 @@ async def filter_infix_results(keywords: List[str], language: str) -> List[str]:
             if len(word) == 1 and word not in valid:
                 has_garbage = True
                 break
+                
 
         if not has_garbage:
             filtered.append(keyword)
