@@ -468,38 +468,6 @@ class GoogleAutocompleteParser:
         # logger.info(f"✅ ALLOWED: {query}")
         # return True
     
-    def post_filter_cities(self, keywords: set, country: str) -> set:
-        """
-        """
-        import re
-        
-        cleaned = set()
-        removed_count = 0
-        
-        for keyword in keywords:
-            should_remove = False
-            kw_lower = keyword.lower()
-            
-            words = re.findall(r'[а-яёa-z0-9-]+', kw_lower)
-            
-            for word in words:
-                if len(word) < 3:
-                    continue
-                
-                if not self.is_city_allowed(word, country):
-                    logger.info(f"🧹 POST-FILTER removed (v5.4.0): '{keyword}' | City '{word}' not allowed for {country.upper()}")
-                    should_remove = True
-                    removed_count += 1
-                    break
-            
-            if not should_remove:
-                cleaned.add(keyword)
-        
-        if removed_count > 0:
-            logger.warning(f"🧹 POST-FILTER: Removed {removed_count} keywords with non-{country.upper()} cities")
-        
-        return cleaned
-
     async def autocorrect_text(self, text: str, language: str) -> Dict:
         """Автокоррекция через Yandex Speller (ru/uk/en) или LanguageTool (остальные)"""
 
