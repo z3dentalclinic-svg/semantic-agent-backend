@@ -35,7 +35,9 @@ import re
 import logging
 from difflib import SequenceMatcher
 
-from batch_post_filter import BatchPostFilter, DISTRICTS_EXTENDED
+from filters import BatchPostFilter, DISTRICTS_EXTENDED
+from geo import generate_geo_blacklist_full
+from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
 
 logging.basicConfig(
     level=logging.INFO,
