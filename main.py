@@ -35,7 +35,7 @@ import re
 import logging
 from difflib import SequenceMatcher
 
-from batch_post_filter import BatchPostFilter, DISTRICTS_EXTENDED
+from filters import BatchPostFilter, DISTRICTS_EXTENDED
 
 logging.basicConfig(
     level=logging.INFO,
