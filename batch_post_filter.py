@@ -97,17 +97,47 @@ class BatchPostFilter:
             "выезд",    # Может быть городом - "выезд мастера"
         }
         
-        # v7.9 FIX: Берём переданную базу + дополняем из GeoNames
-        # 1) Берём то, что пришло из main (embedded + generate_geo_blacklist_full)
+        # v7.9 FIX: Используем embedded_cities как основу
+        # 1) Берём то, что пришло из main (embedded_cities - 63k городов)
         base_index = {k.lower().strip(): v for k, v in (all_cities_global or {}).items()}
         
-        # 2) Строим дополнительный индекс по GeoNames с фильтром населения
+        # 2) Строим дополнительный индекс по GeoNames (если установлен)
         geo_index = self._build_filtered_geo_index()
         
-        # 3) Сливаем: не перетираем уже существующие ключи (особенно кириллицу)
-        base_index.update({k: v for k, v in geo_index.items() if k not in base_index})
+        # 3) ПРАВИЛЬНАЯ логика: geo дополняет base, а не наоборот
+        # Добавляем из geo только то, чего нет в base
+        for k, v in geo_index.items():
+            if k not in base_index:
+                base_index[k] = v
         
         self.all_cities_global = base_index
+        
+        # 🔥 v7.9 FIX: гарантируем наличие проблемных BY городов
+        forced_by_cities = {
+            "барановичи": "by",
+            "baranovichi": "by",
+            "ждановичи": "by",
+            "zhdanovichi": "by",
+            "лошица": "by",
+        }
+        
+        for name, code in forced_by_cities.items():
+            if name not in self.all_cities_global:
+                self.all_cities_global[name] = code
+                logger.info(f"[v7.9 GEO ADD] '{name}' -> {code}")
+        
+        # 🔍 ДИАГНОСТИКА: Проверяем что ждановичи точно в базе
+        test_cities = ["ждановичи", "барановичи", "лошица", "минск", "гродно"]
+        logger.error("="*70)
+        logger.error("🔍 DATABASE CHECK - Проверка наличия городов в self.all_cities_global")
+        logger.error("="*70)
+        for city in test_cities:
+            if city in self.all_cities_global:
+                logger.error(f"✅ '{city}': НАЙДЕН → {self.all_cities_global[city].upper()}")
+            else:
+                logger.error(f"❌ '{city}': НЕ НАЙДЕН В БАЗЕ!")
+        logger.error(f"📊 Всего городов в базе: {len(self.all_cities_global)}")
+        logger.error("="*70)
         
         # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
         # Ищем любые варианты названий этих городов
