@@ -18,3 +18,4 @@ __all__ = [
     'filter_infix_results',
     'filter_relevant_keywords'
 ]
+
