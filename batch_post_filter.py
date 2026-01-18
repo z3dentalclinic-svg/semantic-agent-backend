@@ -1,15 +1,15 @@
 """
-Batch Post-Filter v8.5 - FUNDAMENTAL FIX: GEO DATABASE PRIORITY
+Batch Post-Filter v7.9 - FUNDAMENTAL FIX: GEO DATABASE PRIORITY
 Based on Gemini's recommendations for 187 countries support
 
-🔥 ФУНДАМЕНТАЛЬНОЕ ИСПРАВЛЕНИЕ v8.5:
+🔥 ФУНДАМЕНТАЛЬНОЕ ИСПРАВЛЕНИЕ v7.9:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ПРОБЛЕМА v7.7-v7.8:
   Морфология (_is_common_noun) проверялась ДО блокировки
   → "барановичи" = NOUN → пропускался
   → "лошица" = NOUN → пропускался
   
-РЕШЕНИЕ v8.5:
+РЕШЕНИЕ v7.9:
   База городов = ПЕРВИЧНА
   Морфология = ВТОРИЧНА (только для слов ВНЕ базы)
   
@@ -20,7 +20,7 @@ Based on Gemini's recommendations for 187 countries support
   4. Если НЕ найдено → проверяем _is_common_noun
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✅ РЕЗУЛЬТАТ v8.5:
+✅ РЕЗУЛЬТАТ v7.9:
   - "барановичи" (BY) → найдено в базе → БЛОК ⚓
   - "лошица" (BY) → найдено в базе → БЛОК ⚓  
   - "талдыкорган" (KZ) → найдено в базе → БЛОК ⚓
@@ -39,7 +39,7 @@ Based on Gemini's recommendations for 187 countries support
 ✅ O(1) lookup через предварительный индекс
 ✅ Ручной словарь малых городов СНГ (ош, узынагаш, щелкино)
 
-FIXES v7.8 → v8.5:
+FIXES v7.8 → v7.9:
 - Убрана проверка _is_common_noun ДО блокировки городов
 - База городов теперь АБСОЛЮТНЫЙ приоритет
 - Морфология используется ТОЛЬКО для слов ВНЕ базы
@@ -97,8 +97,17 @@ class BatchPostFilter:
             "выезд",    # Может быть городом - "выезд мастера"
         }
         
-        # v7.5: Перестраиваем индекс с учётом населения
-        self.all_cities_global = self._build_filtered_geo_index()
+        # v7.9 FIX: Берём переданную базу + дополняем из GeoNames
+        # 1) Берём то, что пришло из main (embedded + generate_geo_blacklist_full)
+        base_index = {k.lower().strip(): v for k, v in (all_cities_global or {}).items()}
+        
+        # 2) Строим дополнительный индекс по GeoNames с фильтром населения
+        geo_index = self._build_filtered_geo_index()
+        
+        # 3) Сливаем: не перетираем уже существующие ключи (особенно кириллицу)
+        base_index.update({k: v for k, v in geo_index.items() if k not in base_index})
+        
+        self.all_cities_global = base_index
         
         # v7.6: КРИТИЧЕСКИЙ ЛОГ - проверяем есть ли Ошмяны и Фаниполь в индексе
         # Ищем любые варианты названий этих городов
@@ -295,28 +304,41 @@ class BatchPostFilter:
                 
                 # Альтернативные названия
                 for alt in city_data.get('alternatenames', []):
-                    # v7.6: Оставляем минимум 3 символа
+                    alt = alt.strip()
                     if not (3 <= len(alt) <= 50):
                         continue
                     if not any(c.isalpha() for c in alt):
                         continue
                     
-                    # Проверка на латиницу/кириллицу (с пробелами!)
+                    # Только латиница/кириллица/пробел/дефис/апостроф
                     is_latin_cyrillic = all(
                         ('\u0000' <= c <= '\u007F') or
                         ('\u0400' <= c <= '\u04FF') or
-                        c in ['-', "'", ' ']  # v7.5: Добавили пробел!
+                        c in ['-', "'", ' ']
                         for c in alt
                     )
+                    if not is_latin_cyrillic:
+                        continue
                     
-                    if is_latin_cyrillic:
-                        alt_lower = alt.lower().strip()
+                    alt_lower = alt.lower()
+                    
+                    # 1) Чисто кириллические формы — приоритетно сохраняем
+                    has_cyr = any('\u0400' <= c <= '\u04FF' for c in alt_lower)
+                    has_lat = any('a' <= c <= 'z' for c in alt_lower)
+                    
+                    if has_cyr and not has_lat:
+                        # Кириллица без латиницы: прямое ключевое имя города
                         if alt_lower not in filtered_index:
                             filtered_index[alt_lower] = country
-                            # Также добавляем вариант с дефисом
-                            alt_dash = alt_lower.replace(' ', '-')
-                            if alt_dash != alt_lower:
-                                filtered_index[alt_dash] = country
+                    
+                    # 2) Общий кейс: смешанные/латинские — тоже сохраняем
+                    if alt_lower not in filtered_index:
+                        filtered_index[alt_lower] = country
+                    
+                    # 3) Вариант с дефисом вместо пробела
+                    alt_dash = alt_lower.replace(' ', '-')
+                    if alt_dash != alt_lower and alt_dash not in filtered_index:
+                        filtered_index[alt_dash] = country
             
             logger.info(f"✅ v7.7 Geo Index built:")
             logger.info(f"   Cities with pop > {self.population_threshold}: {total_cities}")
@@ -334,86 +356,71 @@ class BatchPostFilter:
                 'минск': 'by', 'алматы': 'kz', 'ташкент': 'uz'
             }
 
-    def filter_batch(self, keywords: List[str], seed: str, country: str = "ua", 
-                     language: str = "ru") -> Dict:
+    def filter_batch(self, keywords: List[str], seed: str, country: str, 
+                     language: str = 'ru') -> Dict:
         """
-        v8.8 PURE LOGIC - гибридная проверка н-грамм (1-3 слова)
+        v7.5 Batch filtering with smart disambiguation
         """
-        # 1. Лемматизируем seed для защиты авторского запроса
-        seed_tokens = re.findall(r'[а-яёa-z0-9]+', seed.lower())
-        seed_lemmas = [self._get_lemma(word, language) for word in seed_tokens if len(word) >= 3]
+        start_time = time.time()
         
-        # Генерируем н-граммы из seed (1, 2, 3 слова)
-        seed_ngrams = set()
-        for i in range(len(seed_lemmas)):
-            seed_ngrams.add(seed_lemmas[i])  # 1-грамма
-            if i + 1 < len(seed_lemmas):
-                seed_ngrams.add(f"{seed_lemmas[i]} {seed_lemmas[i+1]}")  # 2-грамма
-            if i + 2 < len(seed_lemmas):
-                seed_ngrams.add(f"{seed_lemmas[i]} {seed_lemmas[i+1]} {seed_lemmas[i+2]}")  # 3-грамма
+        # 1. Предварительная очистка
+        unique_raw = sorted(list(set([k.lower().strip() for k in keywords if k.strip()])))
         
-        logger.info(f"[v8.8] Seed n-grams: {seed_ngrams}")
+        # 2. Извлекаем города из seed
+        seed_cities = self._extract_cities_from_seed(seed, country, language)
+        logger.info(f"[v7.7] Seed cities allowed: {seed_cities}")
         
-        valid_keywords = []
-        blocked_keywords = []
+        # 3. Batch лемматизация
+        all_words = set()
+        for kw in unique_raw:
+            all_words.update(re.findall(r'[а-яёa-z0-9-]+', kw))
         
-        for kw in keywords:
-            is_valid = True
-            
-            # 2. Чистая токенизация
-            tokens = re.findall(r'[а-яёa-z0-9]+', kw.lower())
-            
-            # 3. Атомарная лемматизация
-            lemmas = [self._get_lemma(token, language) for token in tokens if len(token) >= 3]
-            
-            if not lemmas:
-                valid_keywords.append(kw)
-                continue
-            
-            # 4. Генерация N-грамм (1, 2, 3 слова)
-            ngrams_to_check = []
-            for i in range(len(lemmas)):
-                ngrams_to_check.append(lemmas[i])  # 1-грамма
-                if i + 1 < len(lemmas):
-                    ngrams_to_check.append(f"{lemmas[i]} {lemmas[i+1]}")  # 2-грамма
-                if i + 2 < len(lemmas):
-                    ngrams_to_check.append(f"{lemmas[i]} {lemmas[i+1]} {lemmas[i+2]}")  # 3-грамма
-            
-            # 5. O(1) Lookup в базе
-            for ngram in ngrams_to_check:
-                logger.info(f"🔍 [v8.8] Проверяем н-грамму: '{ngram}'")
-                
-                found_country = self.all_cities_global.get(ngram)
-                
-                if found_country:
-                    logger.info(f"🔍 [v8.8] База: '{ngram}' → {found_country.upper()}")
-                    
-                    # 6. Жесткий фильтр по Country Code
-                    if found_country != country.lower():
-                        # ИСКЛЮЧЕНИЕ: н-грамма из seed
-                        if ngram in seed_ngrams:
-                            logger.info(f"✅ [v8.8 SKIP] '{ngram}' в базе {found_country.upper()}, но в SEED - пропускаем")
-                            continue
-                        
-                        logger.warning(f"⚓ [v8.8 BLOCK] '{ngram}' → {found_country.upper()} (keyword: '{kw}')")
-                        is_valid = False
-                        break
-            
-            if is_valid:
-                valid_keywords.append(kw)
-            else:
-                blocked_keywords.append(kw)
+        lemmas_map = self._batch_lemmatize(all_words, language)
         
-        return {
-            "keywords": valid_keywords,
-            "anchors": blocked_keywords,
-            "stats": {
-                "total": len(keywords),
-                "allowed": len(valid_keywords),
-                "blocked": len(blocked_keywords)
-            }
+        final_keywords = []
+        final_anchors = []
+        stats = {
+            'total': len(unique_raw),
+            'allowed': 0,
+            'blocked': 0,
+            'reasons': Counter()
         }
 
+        # 4. Фильтруем с v7.5 логикой
+        for kw in unique_raw:
+            # v7.6 DEBUG: логируем keywords содержащие oshmyan или fanipol
+            kw_lower = kw.lower()
+            if 'oshmyan' in kw_lower or 'fanipal' in kw_lower or 'fanipol' in kw_lower:
+                logger.warning(f"🔍 v7.6 DEBUG INPUT: '{kw}' → проверяем...")
+            
+            is_allowed, reason, category = self._check_geo_conflicts_v75(
+                kw, country, lemmas_map, seed_cities, language
+            )
+            
+            if is_allowed:
+                final_keywords.append(kw)
+                stats['allowed'] += 1
+                logger.debug(f"[v7.7] ✅ РАЗРЕШЕНО: '{kw}'")
+            else:
+                final_anchors.append(kw)
+                stats['blocked'] += 1
+                stats['reasons'][category] += 1
+                logger.warning(f"[v7.7] ⚓ ЯКОРЬ: '{kw}' (причина: {reason})")
+
+        elapsed = time.time() - start_time
+        logger.info(f"[v7.7] Finished in {elapsed:.2f}s. {stats['allowed']} OK / {stats['blocked']} Anchors")
+
+        return {
+            'keywords': final_keywords,
+            'anchors': final_anchors,
+            'stats': {
+                'total': stats['total'],
+                'allowed': stats['allowed'],
+                'blocked': stats['blocked'],
+                'reasons': dict(stats['reasons']),
+                'elapsed_time': round(elapsed, 2)
+            }
+        }
 
     def _check_geo_conflicts_v75(self, keyword: str, country: str, 
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
@@ -428,6 +435,13 @@ class BatchPostFilter:
 
         keyword_lemmas = [lemmas_map.get(w, w) for w in words]
         
+        # --- 0. ПРИОРИТЕТ: ПРОВЕРКА SEED_CITY (v7.6) ---
+        # Если в запросе есть город из seed (например "харьков алексеевка"),
+        # то доверяем этому запросу и НЕ блокируем по другим словам
+        words_set = set(words + keyword_lemmas)
+        if any(city in words_set for city in seed_cities):
+            logger.debug(f"[v7.6] '{keyword}' contains seed city, auto-allow")
+            return True, "", ""
         
         # --- 1. HARD-BLACKLIST (приоритет #1) ---
         for check_val in words + keyword_lemmas:
@@ -502,10 +516,6 @@ class BatchPostFilter:
         search_items.extend([tg.replace(' ', '-') for tg in trigrams])
 
         for item in search_items:
-
-            # 🔍 ДИАГНОСТИКА v8.5
-            if len(item) >= 3:
-                logger.info(f"🔍 [DIAGNOSTIC] Проверяем: '{item}'")
             if len(item) < 3:
                 continue
             
@@ -514,14 +524,14 @@ class BatchPostFilter:
                 logger.debug(f"[v7.6] '{item}' in ignored_words, skipping")
                 continue
             
-            # ✅ v8.5 ФУНДАМЕНТАЛЬНОЕ ИСПРАВЛЕНИЕ: БАЗА ГОРОДОВ = ПЕРВИЧНА
+            # ✅ v7.9 ФУНДАМЕНТАЛЬНОЕ ИСПРАВЛЕНИЕ: БАЗА ГОРОДОВ = ПЕРВИЧНА
             # 
             # СТАРАЯ ОШИБКА v7.7-v7.8: 
             #   1. Проверяли базу
             #   2. Если нашли → проверяли _is_common_noun 
             #   3. Если NOUN → пропускали ("лошица", "барановичи")
             #
-            # НОВАЯ ЛОГИКА v8.5:
+            # НОВАЯ ЛОГИКА v7.9:
             #   1. Проверяем базу
             #   2. Если нашли И город из другой страны → БЛОКИРУЕМ НЕМЕДЛЕННО
             #   3. Морфология НЕ ВЛИЯЕТ на решение
@@ -529,37 +539,36 @@ class BatchPostFilter:
             # Нормализуем слово (склонённые формы → базовая форма)
             item_normalized = self._get_lemma(item, language)
             
-            if len(item) >= 3:
-                logger.info(f"🔍 [DIAGNOSTIC] Лемма: '{item}' → '{item_normalized}'")
-            
             # Проверяем в базе: сначала нормализованная форма, потом оригинал
             found_country = self.all_cities_global.get(item_normalized)
-            
-            if len(item) >= 3:
-                logger.info(f"🔍 [DIAGNOSTIC] База lookup: '{item_normalized}' → {found_country if found_country else 'НЕТ'}")
             
             if not found_country:
                 # Не нашли лемму - пробуем оригинал (для сокращений типа "екб")
                 found_country = self.all_cities_global.get(item)
                 if found_country:
-                    logger.debug(f"[v8.5] Found original: '{item}' → {found_country}")
+                    logger.debug(f"[v7.9] Found original: '{item}' → {found_country}")
                     item_normalized = item  # Используем оригинал
             elif item_normalized != item:
-                logger.debug(f"[v8.5] Found via lemma: '{item}' → '{item_normalized}' → {found_country}")
+                logger.debug(f"[v7.9] Found via lemma: '{item}' → '{item_normalized}' → {found_country}")
             
-            # ========== КРИТИЧЕСКАЯ ЛОГИКА v8.5 ==========
+            # ========== КРИТИЧЕСКАЯ ЛОГИКА v7.9 ==========
             if found_country:
                 # Город найден в базе!
                 
                 # Проверка 1: Это наш целевой город? (например, Харьков в UA)
                 if found_country == country.lower():
-                    logger.debug(f"[v8.5] City '{item_normalized}' ({found_country}) - ALLOWED (target country)")
+                    logger.debug(f"[v7.9] City '{item_normalized}' ({found_country}) - ALLOWED (target country)")
                     continue
                 
+                # Проверка 2: Это город из seed? (защита от ложных срабатываний)
+                # Пример: seed="ремонт харьков алексеевка" → "алексеевка" может быть в RU, но это район Харькова
+                if item_normalized in seed_cities:
+                    logger.debug(f"[v7.9] City '{item_normalized}' in seed_cities - ALLOWED")
+                    continue
                 
-                # Проверка 2: Город из другой страны → БЛОКИРУЕМ
+                # Проверка 3: Город из другой страны → БЛОКИРУЕМ
                 # ⚠️ ВАЖНО: Морфология (NOUN/не-NOUN) НЕ ВЛИЯЕТ на это решение!
-                logger.warning(f"[v8.5] ⚓ BLOCKING foreign city: '{item}' → '{item_normalized}' ({found_country.upper()})")
+                logger.warning(f"[v7.9] ⚓ BLOCKING foreign city: '{item}' → '{item_normalized}' ({found_country.upper()})")
                 return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
             
             # ========== МОРФОЛОГИЯ = ВТОРИЧНА (только для слов ВНЕ базы) ==========
@@ -568,7 +577,7 @@ class BatchPostFilter:
             else:
                 # Слово не в базе городов - возможно это обычное слово?
                 if self._is_common_noun(item_normalized, language):
-                    logger.debug(f"[v8.5] '{item_normalized}' NOT in geo database + common noun - ALLOWED")
+                    logger.debug(f"[v7.9] '{item_normalized}' NOT in geo database + common noun - ALLOWED")
                     continue
                 # Если не NOUN и не в базе - тоже пропускаем (техническое слово)
         
