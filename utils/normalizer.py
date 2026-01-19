@@ -87,40 +87,72 @@ def normalize_word(word: str, language: str = 'ru') -> str:
     return word_lower
 
 
-def normalize_keyword(keyword: str, language: str = 'ru') -> str:
+def normalize_keyword(keyword: str, language: str = 'ru', seed: str = '') -> str:
     """
     Нормализует ключевое слово (фразу)
     
+    ВАЖНО: Нормализуем только первое слово из seed, остальное оставляем как есть
+    
     Примеры:
-        "ремонту пылесосов керхєр" → "ремонт пылесос керхер"
-        "ремонты стиральных машин" → "ремонт стиральный машина"
+        seed="ремонт пылесосов"
+        "ремонту пылесосов керхер" → "ремонт пылесосов керхер"
+        "ремонты пылесосов борк" → "ремонт пылесосов борк"
     
     Args:
         keyword: Ключевое слово/фраза
         language: Код языка
+        seed: Исходный seed (для определения что нормализовать)
         
     Returns:
         Нормализованное ключевое слово
     """
-    # Разбиваем на слова
-    words = re.findall(r'\w+', keyword.lower())
+    if not seed:
+        # Fallback: нормализуем всё (старое поведение)
+        words = re.findall(r'\w+', keyword.lower())
+        normalized_words = [normalize_word(word, language) for word in words]
+        return ' '.join(normalized_words)
     
-    # Нормализуем каждое слово
-    normalized_words = [normalize_word(word, language) for word in words]
+    # Получаем первое слово из seed
+    seed_words = re.findall(r'\w+', seed.lower())
+    if not seed_words:
+        return keyword.lower()
     
-    # Собираем обратно в строку
+    first_seed_word = seed_words[0]
+    
+    # Разбиваем keyword на слова
+    keyword_words = re.findall(r'\w+', keyword.lower())
+    
+    # Нормализуем только первое слово если оно похоже на первое слово seed
+    normalized_words = []
+    for i, word in enumerate(keyword_words):
+        if i == 0:
+            # Проверяем что это та же основа что и в seed
+            normalized_seed = normalize_word(first_seed_word, language)
+            normalized_word = normalize_word(word, language)
+            
+            if normalized_seed == normalized_word:
+                # Это склонение первого слова seed - нормализуем
+                normalized_words.append(normalized_seed)
+            else:
+                # Это другое слово - оставляем как есть
+                normalized_words.append(word)
+        else:
+            # Все остальные слова оставляем как есть
+            normalized_words.append(word)
+    
     return ' '.join(normalized_words)
 
 
-def normalize_keywords(keywords: List[str], language: str = 'ru') -> List[str]:
+def normalize_keywords(keywords: List[str], language: str = 'ru', seed: str = '') -> List[str]:
     """
     Нормализует список ключевых слов
     
     Args:
         keywords: Список ключевых слов
         language: Код языка
+        seed: Исходный seed (для определения что нормализовать)
         
     Returns:
         Список нормализованных ключевых слов
     """
-    return [normalize_keyword(kw, language) for kw in keywords]
+    return [normalize_keyword(kw, language, seed) for kw in keywords]
