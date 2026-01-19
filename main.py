@@ -1,4 +1,3 @@
-# NORMALIZATION: DISABLED FOR TESTING
 """
 FGS Parser API - Semantic keyword research with geo-filtering
 """
@@ -736,8 +735,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
+        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
 
         return {
             "seed": seed,
@@ -805,8 +803,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
+        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
 
         return {
             "seed": seed,
@@ -913,8 +910,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
+        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
 
         return {
             "seed": seed,
@@ -1029,8 +1025,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
+        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
 
         return {
             "seed": seed,
