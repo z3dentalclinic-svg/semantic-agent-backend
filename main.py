@@ -22,7 +22,7 @@ from filters import (
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
-# from utils import normalize_keywords  # TEMPORARILY DISABLED
+# from utils import normalize_keywords  # TEMP DISABLED
 
 logging.basicConfig(
     level=logging.INFO,
@@ -736,14 +736,15 @@ class GoogleAutocompleteParser:
 
         # Нормализация результатов
         # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
             "seed": seed,
             "method": "suffix",
             "source": source,
-            "keywords": batch_result['keywords'],  # normalized_keywords,
+            "keywords": normalized_keywords,
             "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),  # len(normalized_keywords),
+            "count": len(normalized_keywords),
             "anchors_count": len(combined_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
@@ -804,14 +805,15 @@ class GoogleAutocompleteParser:
 
         # Нормализация результатов
         # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
             "seed": seed,
             "method": "infix",
             "source": source,
-            "keywords": batch_result['keywords'],  # normalized_keywords,
+            "keywords": normalized_keywords,
             "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),  # len(normalized_keywords),
+            "count": len(normalized_keywords),
             "anchors_count": len(combined_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
@@ -911,14 +913,15 @@ class GoogleAutocompleteParser:
 
         # Нормализация результатов
         # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
             "seed": seed,
             "method": "morphology",
             "source": source,
-            "keywords": batch_result['keywords'],  # normalized_keywords,
+            "keywords": normalized_keywords,
             "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),  # len(normalized_keywords),
+            "count": len(normalized_keywords),
             "anchors_count": len(combined_anchors),
             "elapsed_time": round(elapsed, 2),
             "batch_stats": batch_result['stats']
@@ -1026,14 +1029,15 @@ class GoogleAutocompleteParser:
 
         # Нормализация результатов
         # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
             "seed": seed,
             "method": "adaptive_prefix",
             "source": source,
-            "keywords": batch_result['keywords'],  # normalized_keywords,
+            "keywords": normalized_keywords,
             "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),  # len(normalized_keywords),
+            "count": len(normalized_keywords),
             "anchors_count": len(combined_anchors),
             "candidates_found": len(candidates),
             "verified_prefixes": verified_prefixes,
@@ -1106,18 +1110,19 @@ class GoogleAutocompleteParser:
 
         # Нормализация результатов
         # normalized_keywords = normalize_keywords(sorted(list(all_unique_keywords)), language)
+        normalized_keywords = sorted(list(all_unique_keywords))  # TEMP: no normalization
         normalized_keywords = sorted(list(all_unique_keywords))  # TEMP: normalization disabled
 
         response = {
             "seed": original_seed,
             "corrected_seed": seed if correction.get("has_errors") else None,
             "corrections": correction.get("corrections", []) if correction.get("has_errors") else [],
-            "keywords": batch_result['keywords'],  # normalized_keywords,
+            "keywords": normalized_keywords,
             "anchors": sorted(list(all_unique_anchors)),
-            "count": len(batch_result['keywords']),  # len(normalized_keywords),
+            "count": len(normalized_keywords),
             "anchors_count": len(all_unique_anchors),
             "sources": sources,
-            "total_unique_keywords": len(all_unique_keywords),  # len(normalized_keywords),
+            "total_unique_keywords": len(normalized_keywords),
             "total_anchors": len(all_unique_anchors),
             "results_by_source": {
                 source: {
