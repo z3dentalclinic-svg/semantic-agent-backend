@@ -735,7 +735,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
         normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
@@ -804,7 +804,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
         normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
@@ -912,7 +912,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
         normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
@@ -1028,7 +1028,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(batch_result['keywords'], language)
+        # normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
         normalized_keywords = batch_result["keywords"]  # TEMP: no normalization
 
         return {
@@ -1109,7 +1109,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(sorted(list(all_unique_keywords)), language)
+        # normalized_keywords = normalize_keywords(sorted(list(all_unique_keywords)), language, seed)
         normalized_keywords = sorted(list(all_unique_keywords))  # TEMP: no normalization
         normalized_keywords = sorted(list(all_unique_keywords))  # TEMP: normalization disabled
 
