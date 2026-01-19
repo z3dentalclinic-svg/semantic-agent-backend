@@ -1,4 +1,4 @@
-"""
+""
 Utils module for FGS Parser
 Contains utility functions and helpers
 """
