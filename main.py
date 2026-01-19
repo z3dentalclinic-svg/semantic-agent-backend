@@ -1,3 +1,4 @@
+# NORMALIZATION: DISABLED FOR TESTING
 """
 FGS Parser API - Semantic keyword research with geo-filtering
 """
