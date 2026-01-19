@@ -22,7 +22,7 @@ from filters import (
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
-# from utils import normalize_keywords  # TEMP DISABLED
+from utils import normalize_keywords
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1105,9 +1105,7 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        # normalized_keywords = normalize_keywords(sorted(list(all_unique_keywords)), language, seed)
-        normalized_keywords = sorted(list(all_unique_keywords))  # TEMP: no normalization
-        normalized_keywords = sorted(list(all_unique_keywords))  # TEMP: normalization disabled
+        normalized_keywords = normalize_keywords(sorted(list(all_unique_keywords)), language, seed)
 
         response = {
             "seed": original_seed,
