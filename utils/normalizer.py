@@ -1,6 +1,6 @@
 """
-Keyword normalizer - converts keywords to their base forms
-Handles morphology normalization for multiple languages
+Keyword normalizer - Golden Seed Mask approach
+Normalizes keywords by mapping them to the exact forms used in the seed query
 """
 
 import re
@@ -15,144 +15,146 @@ except ImportError:
 from nltk.stem import SnowballStemmer
 
 
-# Морфологические анализаторы (ленивая инициализация)
-_morph_ru = None
-_morph_uk = None
-_stemmers = {}
-
-
-def _get_morph_ru():
-    """Ленивая инициализация morph_ru"""
-    global _morph_ru
-    if _morph_ru is None and PYMORPHY_AVAILABLE:
-        _morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
-    return _morph_ru
-
-
-def _get_morph_uk():
-    """Ленивая инициализация morph_uk"""
-    global _morph_uk
-    if _morph_uk is None and PYMORPHY_AVAILABLE:
-        _morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
-    return _morph_uk
-
-
-def _get_stemmer(language: str):
-    """Ленивая инициализация стеммеров"""
-    if language not in _stemmers:
-        lang_map = {
-            'en': 'english',
-            'de': 'german',
-            'fr': 'french',
-            'es': 'spanish',
-            'it': 'italian'
-        }
-        _stemmers[language] = SnowballStemmer(lang_map.get(language, 'english'))
-    return _stemmers[language]
-
-
-def normalize_word(word: str, language: str = 'ru') -> str:
-    """
-    Нормализует одно слово в начальную форму
+class GoldenNormalizer:
+    """Normalizes keywords using the Golden Seed Mask approach"""
     
-    Args:
-        word: Слово для нормализации
-        language: Код языка (ru, uk, en, de, fr, es, it)
+    def __init__(self):
+        self.morph_ru = None
+        self.morph_uk = None
+        self.stemmers = {}
+    
+    def _get_morph(self, language: str):
+        """Get morphology analyzer for language"""
+        if not PYMORPHY_AVAILABLE:
+            return None
+            
+        if language == 'ru':
+            if self.morph_ru is None:
+                self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
+            return self.morph_ru
+        elif language == 'uk':
+            if self.morph_uk is None:
+                self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+            return self.morph_uk
+        return None
+    
+    def _get_stemmer(self, language: str):
+        """Get stemmer for language"""
+        if language not in self.stemmers:
+            lang_map = {
+                'en': 'english',
+                'de': 'german',
+                'fr': 'french',
+                'es': 'spanish',
+                'it': 'italian'
+            }
+            self.stemmers[language] = SnowballStemmer(lang_map.get(language, 'english'))
+        return self.stemmers[language]
+    
+    def _get_lemma(self, word: str, language: str = 'ru') -> str:
+        """Get lemma (normal form) of a word"""
+        clean_word = word.lower().strip()
         
-    Returns:
-        Нормализованное слово
-    """
-    word_lower = word.lower()
-    
-    # Для ru/uk используем pymorphy3
-    if language in ['ru', 'uk'] and PYMORPHY_AVAILABLE:
-        morph = _get_morph_ru() if language == 'ru' else _get_morph_uk()
-        if morph:
+        # For ru/uk use pymorphy3
+        if language in ['ru', 'uk']:
+            morph = self._get_morph(language)
+            if morph:
+                try:
+                    return morph.parse(clean_word)[0].normal_form
+                except:
+                    pass
+        
+        # For western languages use stemmer
+        elif language in ['en', 'de', 'fr', 'es', 'it']:
+            stemmer = self._get_stemmer(language)
             try:
-                parsed = morph.parse(word_lower)
-                if parsed:
-                    return parsed[0].normal_form
+                return stemmer.stem(clean_word)
             except:
                 pass
-    
-    # Для западных языков используем Snowball Stemmer
-    elif language in ['en', 'de', 'fr', 'es', 'it']:
-        stemmer = _get_stemmer(language)
-        try:
-            return stemmer.stem(word_lower)
-        except:
-            pass
-    
-    # Fallback - возвращаем как есть
-    return word_lower
-
-
-def normalize_keyword(keyword: str, language: str = 'ru', seed: str = '') -> str:
-    """
-    Нормализует ключевое слово (фразу)
-    
-    ВАЖНО: Нормализуем только первое слово из seed, остальное оставляем как есть
-    
-    Примеры:
-        seed="ремонт пылесосов"
-        "ремонту пылесосов керхер" → "ремонт пылесосов керхер"
-        "ремонты пылесосов борк" → "ремонт пылесосов борк"
-    
-    Args:
-        keyword: Ключевое слово/фраза
-        language: Код языка
-        seed: Исходный seed (для определения что нормализовать)
         
-    Returns:
-        Нормализованное ключевое слово
-    """
-    if not seed:
-        # Fallback: нормализуем всё (старое поведение)
-        words = re.findall(r'\w+', keyword.lower())
-        normalized_words = [normalize_word(word, language) for word in words]
-        return ' '.join(normalized_words)
+        # Fallback
+        return clean_word
     
-    # Получаем первое слово из seed
-    seed_words = re.findall(r'\w+', seed.lower())
-    if not seed_words:
-        return keyword.lower()
-    
-    first_seed_word = seed_words[0]
-    
-    # Разбиваем keyword на слова
-    keyword_words = re.findall(r'\w+', keyword.lower())
-    
-    # Нормализуем только первое слово если оно похоже на первое слово seed
-    normalized_words = []
-    for i, word in enumerate(keyword_words):
-        if i == 0:
-            # Проверяем что это та же основа что и в seed
-            normalized_seed = normalize_word(first_seed_word, language)
-            normalized_word = normalize_word(word, language)
+    def normalize_by_golden_seed(self, keyword: str, golden_seed: str, language: str = 'ru') -> str:
+        """
+        Golden Seed Mask: normalize keyword using exact forms from seed
+        
+        Example:
+            golden_seed: "ремонт пылесосов"
+            keyword: "днепр ремонту пылесоса"
+            result: "днепр ремонт пылесосов"
+        
+        Args:
+            keyword: Keyword to normalize
+            golden_seed: Reference seed with correct forms
+            language: Language code
             
-            if normalized_seed == normalized_word:
-                # Это склонение первого слова seed - нормализуем
-                normalized_words.append(normalized_seed)
+        Returns:
+            Normalized keyword
+        """
+        # 1. Create golden map: {lemma: correct_form} from seed
+        seed_tokens = re.findall(r'[а-яёa-z0-9]+', golden_seed.lower())
+        golden_map = {}
+        for token in seed_tokens:
+            lemma = self._get_lemma(token, language)
+            golden_map[lemma] = token
+        
+        # 2. Split keyword into words
+        kw_tokens = re.findall(r'[а-яёa-z0-9]+', keyword.lower())
+        
+        result_tokens = []
+        for word in kw_tokens:
+            word_lemma = self._get_lemma(word, language)
+            
+            # 3. If word's lemma is in seed - replace with golden form
+            if word_lemma in golden_map:
+                result_tokens.append(golden_map[word_lemma])
             else:
-                # Это другое слово - оставляем как есть
-                normalized_words.append(word)
-        else:
-            # Все остальные слова оставляем как есть
-            normalized_words.append(word)
+                # 4. If word not in seed (city, brand, etc) - keep as is
+                result_tokens.append(word)
+        
+        return " ".join(result_tokens)
     
-    return ' '.join(normalized_words)
+    def process_batch(self, keywords: List[str], golden_seed: str, language: str = 'ru') -> List[str]:
+        """
+        Process batch of keywords and remove duplicates
+        
+        Args:
+            keywords: List of keywords
+            golden_seed: Reference seed
+            language: Language code
+            
+        Returns:
+            Normalized and deduplicated keywords
+        """
+        normalized = [self.normalize_by_golden_seed(kw, golden_seed, language) for kw in keywords]
+        # Remove duplicates while preserving order
+        return list(dict.fromkeys(normalized))
+
+
+# Global instance
+_normalizer = None
+
+def get_normalizer():
+    """Get global normalizer instance"""
+    global _normalizer
+    if _normalizer is None:
+        _normalizer = GoldenNormalizer()
+    return _normalizer
+
+
+# Convenience functions
+def normalize_keyword(keyword: str, language: str = 'ru', seed: str = '') -> str:
+    """Normalize single keyword"""
+    if not seed:
+        return keyword.lower()
+    normalizer = get_normalizer()
+    return normalizer.normalize_by_golden_seed(keyword, seed, language)
 
 
 def normalize_keywords(keywords: List[str], language: str = 'ru', seed: str = '') -> List[str]:
-    """
-    Нормализует список ключевых слов
-    
-    Args:
-        keywords: Список ключевых слов
-        language: Код языка
-        seed: Исходный seed (для определения что нормализовать)
-        
-    Returns:
-        Список нормализованных ключевых слов
-    """
-    return [normalize_keyword(kw, language, seed) for kw in keywords]
+    """Normalize list of keywords"""
+    if not seed:
+        return keywords
+    normalizer = get_normalizer()
+    return normalizer.process_batch(keywords, seed, language)
