@@ -909,7 +909,7 @@ class GoogleAutocompleteParser:
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
+    # # Нормализация результатов
         return {
             "seed": seed,
             "method": "morphology",
@@ -1022,7 +1022,7 @@ class GoogleAutocompleteParser:
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
+    # # Нормализация результатов
         return {
             "seed": seed,
             "method": "adaptive_prefix",
@@ -1187,19 +1187,19 @@ async def light_search_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed  # Передаём исходный seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
+    # # Нормализация результатов
+    # if result.get("keywords") and len(result["keywords"]) > 0:
+        # try:
+            # result["keywords"] = normalize_keywords(
+                # keywords=result["keywords"],
+                # language=language,
+                # seed=seed  # Передаём исходный seed
+            # )
+            # result["total_count"] = len(result["keywords"])
+        # except Exception as e:
             # Если нормализация упала - возвращаем ненормализованные данные
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
+            # print(f"Normalization error: {e}")
+            # result["total_count"] = len(result["keywords"])
 
     return result
 
@@ -1220,21 +1220,21 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed  # Передаём исходный seed
-            )
-            result["count"] = len(result["keywords"])
-            result["total_unique_keywords"] = len(result["keywords"])
-        except Exception as e:
+    # # Нормализация результатов
+    # if result.get("keywords") and len(result["keywords"]) > 0:
+        # try:
+            # result["keywords"] = normalize_keywords(
+                # keywords=result["keywords"],
+                # language=language,
+                # seed=seed  # Передаём исходный seed
+            # )
+            # result["count"] = len(result["keywords"])
+            # result["total_unique_keywords"] = len(result["keywords"])
+        # except Exception as e:
             # Если нормализация упала - возвращаем ненормализованные данные
-            print(f"Normalization error: {e}")
-            result["count"] = len(result["keywords"])
-            result["total_unique_keywords"] = len(result["keywords"])
+            # print(f"Normalization error: {e}")
+            # result["count"] = len(result["keywords"])
+            # result["total_unique_keywords"] = len(result["keywords"])
     
     return result
 
@@ -1281,19 +1281,19 @@ async def parse_suffix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed  # Передаём исходный seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
+    # # Нормализация результатов
+    # if result.get("keywords") and len(result["keywords"]) > 0:
+        # try:
+            # result["keywords"] = normalize_keywords(
+                # keywords=result["keywords"],
+                # language=language,
+                # seed=seed  # Передаём исходный seed
+            # )
+            # result["total_count"] = len(result["keywords"])
+        # except Exception as e:
             # Если нормализация упала - возвращаем ненормализованные данные
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
+            # print(f"Normalization error: {e}")
+            # result["total_count"] = len(result["keywords"])
 
     return result
 
@@ -1367,19 +1367,19 @@ async def parse_morphology_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed  # Передаём исходный seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
+    # # Нормализация результатов
+    # if result.get("keywords") and len(result["keywords"]) > 0:
+        # try:
+            # result["keywords"] = normalize_keywords(
+                # keywords=result["keywords"],
+                # language=language,
+                # seed=seed  # Передаём исходный seed
+            # )
+            # result["total_count"] = len(result["keywords"])
+        # except Exception as e:
             # Если нормализация упала - возвращаем ненормализованные данные
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
+            # print(f"Normalization error: {e}")
+            # result["total_count"] = len(result["keywords"])
 
     return result
 
@@ -1408,19 +1408,19 @@ async def parse_adaptive_prefix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed  # Передаём исходный seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
+    # # Нормализация результатов
+    # if result.get("keywords") and len(result["keywords"]) > 0:
+        # try:
+            # result["keywords"] = normalize_keywords(
+                # keywords=result["keywords"],
+                # language=language,
+                # seed=seed  # Передаём исходный seed
+            # )
+            # result["total_count"] = len(result["keywords"])
+        # except Exception as e:
             # Если нормализация упала - возвращаем ненормализованные данные
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
+            # print(f"Normalization error: {e}")
+            # result["total_count"] = len(result["keywords"])
 
     return result
 
