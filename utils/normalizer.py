@@ -84,8 +84,8 @@ class GoldenNormalizer:
         """
         Golden Seed Mask: normalize only words from seed
         
-        CRITICAL: If word base is NOT in seed dictionary (brand, city, detail),
-        return word in original form. DO NOT remove it!
+        CRITICAL: Preserve ALL characters (dashes, dots, etc)
+        Use split() instead of regex to avoid losing structure
         
         Examples:
             lang='ru', seed='ремонт пылесосов', kw='dreame ремонту пылесоса'
@@ -94,29 +94,38 @@ class GoldenNormalizer:
             lang='en', seed='vacuum repair', kw='london vacuums repairs'
             -> 'london vacuum repair'
         """
-        # 1. Create base dictionary from seed: {base: original_form}
-        seed_tokens = re.findall(r'[а-яёa-z0-9]+', golden_seed.lower())
+        # 1. Create base dictionary from seed using \w+ (letters/digits only for map)
+        seed_tokens = re.findall(r'\w+', golden_seed.lower())
         golden_map = {}
         for token in seed_tokens:
             base = self._get_base(token, language)
             golden_map[base] = token
         
-        # 2. Split keyword into words
-        # Regex catches ALL words: cyrillic, latin, numbers
-        kw_tokens = re.findall(r'[а-яёa-z0-9]+', keyword.lower())
+        # 2. CRITICAL: Process ENTIRE string without losing ANY characters
+        # Split by spaces to preserve dashes, dots, and structure
+        words = keyword.split()
+        result = []
         
-        result_tokens = []
-        for word in kw_tokens:
-            word_base = self._get_base(word, language)
+        for word in words:
+            # Clean word ONLY for base lookup, but preserve original in result
+            clean_word = re.sub(r'[^\w]', '', word.lower())
             
-            # 3. If base exists in seed dictionary - replace with seed form
-            if word_base in golden_map:
-                result_tokens.append(golden_map[word_base])
+            if not clean_word:
+                # If word is only punctuation (like "-"), keep it
+                result.append(word)
+                continue
+            
+            base = self._get_base(clean_word, language)
+            
+            if base in golden_map:
+                # If word is from seed - replace with golden form
+                result.append(golden_map[base])
             else:
-                # 4. CRITICAL: If base NOT in seed (brand/city/detail) - keep original
-                result_tokens.append(word)
+                # CRITICAL: If word NOT in seed (Dreame, Bosch, Адреса)
+                # Return it EXACTLY as it was in original keyword!
+                result.append(word)
         
-        return " ".join(result_tokens)
+        return " ".join(result)
     
     def process_batch(self, keywords: List[str], golden_seed: str, language: str = 'ru') -> List[str]:
         """
