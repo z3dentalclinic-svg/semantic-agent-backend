@@ -734,16 +734,13 @@ class GoogleAutocompleteParser:
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
-        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-
         return {
             "seed": seed,
             "method": "suffix",
             "source": source,
-            "keywords": normalized_keywords,
+            "keywords": batch_result['keywords'],
             "anchors": sorted(list(combined_anchors)),
-            "count": len(normalized_keywords),
+            "count": len(batch_result['keywords']),
             "anchors_count": len(combined_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
@@ -802,16 +799,13 @@ class GoogleAutocompleteParser:
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
-        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-
         return {
             "seed": seed,
             "method": "infix",
             "source": source,
-            "keywords": normalized_keywords,
+            "keywords": batch_result['keywords'],
             "anchors": sorted(list(combined_anchors)),
-            "count": len(normalized_keywords),
+            "count": len(batch_result['keywords']),
             "anchors_count": len(combined_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
@@ -910,15 +904,13 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-
         return {
             "seed": seed,
             "method": "morphology",
             "source": source,
-            "keywords": normalized_keywords,
+            "keywords": batch_result['keywords'],
             "anchors": sorted(list(combined_anchors)),
-            "count": len(normalized_keywords),
+            "count": len(batch_result['keywords']),
             "anchors_count": len(combined_anchors),
             "elapsed_time": round(elapsed, 2),
             "batch_stats": batch_result['stats']
@@ -1025,15 +1017,13 @@ class GoogleAutocompleteParser:
         elapsed = time.time() - start_time
 
         # Нормализация результатов
-        normalized_keywords = normalize_keywords(batch_result['keywords'], language, seed)
-
         return {
             "seed": seed,
             "method": "adaptive_prefix",
             "source": source,
-            "keywords": normalized_keywords,
+            "keywords": batch_result['keywords'],
             "anchors": sorted(list(combined_anchors)),
-            "count": len(normalized_keywords),
+            "count": len(batch_result['keywords']),
             "anchors_count": len(combined_anchors),
             "candidates_found": len(candidates),
             "verified_prefixes": verified_prefixes,
@@ -1104,19 +1094,16 @@ class GoogleAutocompleteParser:
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
-        normalized_keywords = normalize_keywords(sorted(list(all_unique_keywords)), language, seed)
-
         response = {
             "seed": original_seed,
             "corrected_seed": seed if correction.get("has_errors") else None,
             "corrections": correction.get("corrections", []) if correction.get("has_errors") else [],
-            "keywords": normalized_keywords,
+            "keywords": sorted(list(all_unique_keywords)),
             "anchors": sorted(list(all_unique_anchors)),
-            "count": len(normalized_keywords),
+            "count": len(all_unique_keywords),
             "anchors_count": len(all_unique_anchors),
             "sources": sources,
-            "total_unique_keywords": len(normalized_keywords),
+            "total_unique_keywords": len(all_unique_keywords),
             "total_anchors": len(all_unique_anchors),
             "results_by_source": {
                 source: {
@@ -1194,6 +1181,15 @@ async def light_search_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
+    # Нормализация результатов
+    if result.get("keywords") and len(result["keywords"]) > 0:
+        result["keywords"] = normalize_keywords(
+            keywords=result["keywords"],
+            language=language,
+            seed=seed
+        )
+        result["count"] = len(result["keywords"])
+
     return result
 
 @app.get("/api/deep-search")
@@ -1211,7 +1207,19 @@ async def deep_search_endpoint(
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    return await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
+    result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
+    
+    # Нормализация результатов
+    if result.get("keywords") and len(result["keywords"]) > 0:
+        result["keywords"] = normalize_keywords(
+            keywords=result["keywords"],
+            language=language,
+            seed=result.get("corrected_seed", seed)  # Используем исправленный seed если есть
+        )
+        result["count"] = len(result["keywords"])
+        result["total_unique_keywords"] = len(result["keywords"])
+    
+    return result
 
 @app.get("/api/compare")
 async def compare_methods(
@@ -1256,6 +1264,15 @@ async def parse_suffix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
+    # Нормализация результатов
+    if result.get("keywords") and len(result["keywords"]) > 0:
+        result["keywords"] = normalize_keywords(
+            keywords=result["keywords"],
+            language=language,
+            seed=seed
+        )
+        result["count"] = len(result["keywords"])
+
     return result
 
 @app.get("/api/parse/infix")
@@ -1283,6 +1300,20 @@ async def parse_infix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
+    # 1. Сначала фильтруем (это уже есть в коде)
+    result["keywords"] = filter_infix_results(result["keywords"], seed)
+
+    # 2. И ТОЛЬКО ПОТОМ нормализуем (перенеси этот блок ниже фильтра)
+    if result.get("keywords") and len(result["keywords"]) > 0:
+        from utils import normalize_keywords
+        result["keywords"] = normalize_keywords(
+            keywords=result["keywords"],
+            language=language,
+            seed=seed
+        )
+
+    # 3. В самом конце считаем итого
+    result["total_count"] = len(result["keywords"])
     return result
 
 @app.get("/api/parse/morphology")
@@ -1310,6 +1341,15 @@ async def parse_morphology_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
+    # Нормализация результатов
+    if result.get("keywords") and len(result["keywords"]) > 0:
+        result["keywords"] = normalize_keywords(
+            keywords=result["keywords"],
+            language=language,
+            seed=seed
+        )
+        result["count"] = len(result["keywords"])
+
     return result
 
 @app.get("/api/parse/adaptive-prefix")
@@ -1336,6 +1376,15 @@ async def parse_adaptive_prefix_endpoint(
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
+
+    # Нормализация результатов
+    if result.get("keywords") and len(result["keywords"]) > 0:
+        result["keywords"] = normalize_keywords(
+            keywords=result["keywords"],
+            language=language,
+            seed=seed
+        )
+        result["count"] = len(result["keywords"])
 
     return result
 
