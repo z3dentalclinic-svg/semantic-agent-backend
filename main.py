@@ -1212,7 +1212,7 @@ async def deep_search_endpoint(
     region_id: int = Query(143, description="ID региона для Yandex (143=Киев)"),
     language: str = Query("auto", description="Язык (auto/ru/uk/en)"),
     use_numbers: bool = Query(False, description="Добавить цифры 0-9"),
-    parallel_limit: int = Query(10, description="Параллельных запросов"),
+    parallel_limit: int = Query(10, description="Параллельных запросов", alias="parallel"),
     include_keywords: bool = Query(True, description="Включить список ключей")
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
