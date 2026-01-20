@@ -1183,12 +1183,25 @@ async def light_search_endpoint(
 
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
+        from utils.normalizer import get_normalizer
+        n = get_normalizer()
+        
+        # 1. Создаем эталон из основ (это решит проблему падежей)
+        # Мы берем каждое слово сида и приводим к начальной форме
+        golden_bases = []
+        for word in seed.lower().split():
+            parsed = n.morph.parse(word)[0]
+            golden_bases.append(parsed.normal_form)
+        
+        golden_base_seed = " ".join(golden_bases)
+        
+        # 2. Вызываем нормализацию
         result["keywords"] = normalize_keywords(
             keywords=result["keywords"],
             language=language,
-            seed=seed
+            seed=golden_base_seed  # ПЕРЕДАЕМ ОСНОВЫ
         )
-        result["count"] = len(result["keywords"])
+        result["total_count"] = len(result["keywords"])
 
     return result
 
@@ -1211,10 +1224,18 @@ async def deep_search_endpoint(
     
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
+        # Перед вызовом нормализации
+        from utils.normalizer import get_normalizer
+        n = get_normalizer()
+        # Используем исправленный seed если есть
+        seed_to_use = result.get("corrected_seed", seed)
+        # Создаем идеальный эталон (например, из "ремонту пылесосов" делаем "ремонт пылесос")
+        golden_base_seed = " ".join([n.morph.parse(word)[0].normal_form for word in seed_to_use.split()])
+        
         result["keywords"] = normalize_keywords(
             keywords=result["keywords"],
             language=language,
-            seed=result.get("corrected_seed", seed)  # Используем исправленный seed если есть
+            seed=golden_base_seed
         )
         result["count"] = len(result["keywords"])
         result["total_unique_keywords"] = len(result["keywords"])
@@ -1266,12 +1287,25 @@ async def parse_suffix_endpoint(
 
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
+        from utils.normalizer import get_normalizer
+        n = get_normalizer()
+        
+        # 1. Создаем эталон из основ (это решит проблему падежей)
+        # Мы берем каждое слово сида и приводим к начальной форме
+        golden_bases = []
+        for word in seed.lower().split():
+            parsed = n.morph.parse(word)[0]
+            golden_bases.append(parsed.normal_form)
+        
+        golden_base_seed = " ".join(golden_bases)
+        
+        # 2. Вызываем нормализацию
         result["keywords"] = normalize_keywords(
             keywords=result["keywords"],
             language=language,
-            seed=seed
+            seed=golden_base_seed  # ПЕРЕДАЕМ ОСНОВЫ
         )
-        result["count"] = len(result["keywords"])
+        result["total_count"] = len(result["keywords"])
 
     return result
 
@@ -1305,11 +1339,16 @@ async def parse_infix_endpoint(
 
     # 2. И ТОЛЬКО ПОТОМ нормализуем (перенеси этот блок ниже фильтра)
     if result.get("keywords") and len(result["keywords"]) > 0:
+        from utils.normalizer import get_normalizer
+        n = get_normalizer()
+        # Создаем идеальный эталон (например, из "ремонту пылесосов" делаем "ремонт пылесос")
+        golden_base_seed = " ".join([n.morph.parse(word)[0].normal_form for word in seed.split()])
+        
         from utils import normalize_keywords
         result["keywords"] = normalize_keywords(
             keywords=result["keywords"],
             language=language,
-            seed=seed
+            seed=golden_base_seed
         )
 
     # 3. В самом конце считаем итого
@@ -1343,12 +1382,25 @@ async def parse_morphology_endpoint(
 
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
+        from utils.normalizer import get_normalizer
+        n = get_normalizer()
+        
+        # 1. Создаем эталон из основ (это решит проблему падежей)
+        # Мы берем каждое слово сида и приводим к начальной форме
+        golden_bases = []
+        for word in seed.lower().split():
+            parsed = n.morph.parse(word)[0]
+            golden_bases.append(parsed.normal_form)
+        
+        golden_base_seed = " ".join(golden_bases)
+        
+        # 2. Вызываем нормализацию
         result["keywords"] = normalize_keywords(
             keywords=result["keywords"],
             language=language,
-            seed=seed
+            seed=golden_base_seed  # ПЕРЕДАЕМ ОСНОВЫ
         )
-        result["count"] = len(result["keywords"])
+        result["total_count"] = len(result["keywords"])
 
     return result
 
@@ -1379,12 +1431,25 @@ async def parse_adaptive_prefix_endpoint(
 
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
+        from utils.normalizer import get_normalizer
+        n = get_normalizer()
+        
+        # 1. Создаем эталон из основ (это решит проблему падежей)
+        # Мы берем каждое слово сида и приводим к начальной форме
+        golden_bases = []
+        for word in seed.lower().split():
+            parsed = n.morph.parse(word)[0]
+            golden_bases.append(parsed.normal_form)
+        
+        golden_base_seed = " ".join(golden_bases)
+        
+        # 2. Вызываем нормализацию
         result["keywords"] = normalize_keywords(
             keywords=result["keywords"],
             language=language,
-            seed=seed
+            seed=golden_base_seed  # ПЕРЕДАЕМ ОСНОВЫ
         )
-        result["count"] = len(result["keywords"])
+        result["total_count"] = len(result["keywords"])
 
     return result
 
