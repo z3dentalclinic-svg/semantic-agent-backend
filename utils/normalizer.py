@@ -1,53 +1,43 @@
 import re
 import pymorphy3
 from typing import List
-from nltk.stem import SnowballStemmer
 
 class GoldenNormalizer:
     def __init__(self):
-        self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
-        self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
-        self.stemmers = {'en': SnowballStemmer('english'), 'de': SnowballStemmer('german')}
+        self.morph = pymorphy3.MorphAnalyzer()
 
-    def _get_base(self, word: str, lang: str) -> str:
-        w = word.lower().strip().strip('.,!?()') # Чистим только для поиска базы
-        if not w: return ""
-        if lang == 'ru': return self.morph_ru.parse(w)[0].normal_form
-        if lang == 'uk': return self.morph_uk.parse(w)[0].normal_form
-        if lang in self.stemmers: return self.stemmers[lang].stem(w)
-        return w
+    def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
+        # 1. Берем основы слов из СИДА (например: ремонт, пылесос)
+        seed_bases = {}
+        for w in re.findall(r'\w+', golden_seed.lower()):
+            base = self.morph.parse(w)[0].normal_form
+            seed_bases[base] = w  # Запоминаем: для базы "ремонт" эталон — "ремонт"
 
-    def normalize_by_golden_seed(self, keyword: str, golden_seed: str, lang: str = 'ru') -> str:
-        if not golden_seed: return keyword
-        
-        # 1. Создаем карту основ из сида
-        seed_words = golden_seed.lower().split()
-        golden_map = {}
-        for sw in seed_words:
-            base = self._get_base(sw, lang)
-            if base: golden_map[base] = sw
+        # 2. Разбиваем ключ на токены, сохраняя всё остальное
+        tokens = keyword.split()
+        result = []
 
-        # 2. Обрабатываем ключевое слово БЕЗ потери элементов
-        # Используем split() чтобы сохранить количество слов 1-в-1
-        kw_words = keyword.split() 
-        final_result = []
+        for token in tokens:
+            # Очищаем только для проверки (штиль!, (штиль) -> штиль)
+            clean_token = token.lower().strip('.,!?() ')
+            p = self.morph.parse(clean_token)[0]
+            base = p.normal_form
 
-        for kw_word in kw_words:
-            base = self._get_base(kw_word, lang)
-            # Если это слово из сида - правим его
-            if base in golden_map:
-                final_result.append(golden_map[base])
+            if base in seed_bases:
+                # Если слово из сида — приводим к форме сида
+                result.append(seed_bases[base])
             else:
-                # ВАЖНО: Если слова нет в сиде - возвращаем его ЦЕЛИКОМ (как было в оригинале)
-                final_result.append(kw_word)
+                # ВАЖНО: Если слова НЕТ в сиде (штиль, xiaomi, авито) — 
+                # возвращаем его КАК ЕСТЬ, не меняя ни единой буквы!
+                result.append(token)
 
-        return " ".join(final_result)
+        return " ".join(result)
 
-    def process_batch(self, keywords: List[str], golden_seed: str, lang: str = 'ru') -> List[str]:
+    def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
         if not keywords or not golden_seed: return keywords
-        # 1. Нормализуем (длина списка и структура строк сохраняются)
-        normalized = [self.normalize_by_golden_seed(kw, golden_seed, lang) for kw in keywords]
-        # 2. Удаляем только ПОЛНЫЕ дубликаты
+        # Нормализуем каждый ключ
+        normalized = [self.normalize_by_golden_seed(kw, golden_seed) for kw in keywords]
+        # Убираем дубликаты, которые стали идентичными после правки окончаний
         return list(dict.fromkeys(normalized))
 
 
@@ -66,4 +56,4 @@ def normalize_keywords(keywords: List[str], language: str = 'ru', seed: str = ''
     if not seed:
         return keywords
     normalizer = get_normalizer()
-    return normalizer.process_batch(keywords, seed, language)
+    return normalizer.process_batch(keywords, seed)
