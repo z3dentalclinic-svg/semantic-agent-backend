@@ -7,6 +7,10 @@ class GoldenNormalizer:
         self.morph = pymorphy3.MorphAnalyzer()
 
     def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
+        # Проверка на None или пустую строку
+        if not golden_seed or not keyword:
+            return keyword
+            
         # 1. Берем основы слов из СИДА (например: ремонт, пылесос)
         seed_bases = {}
         for w in re.findall(r'\w+', golden_seed.lower()):
@@ -37,8 +41,8 @@ class GoldenNormalizer:
         if not keywords or not golden_seed: return keywords
         # Нормализуем каждый ключ
         normalized = [self.normalize_by_golden_seed(kw, golden_seed) for kw in keywords]
-        # Убираем дубликаты, которые стали идентичными после правки окончаний
-        return list(dict.fromkeys(normalized))
+        # Возвращаем полный список (даже если есть дубликаты)
+        return normalized
 
 
 # Global instance
