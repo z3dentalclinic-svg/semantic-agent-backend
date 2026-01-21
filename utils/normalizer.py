@@ -10,6 +10,9 @@ class GoldenNormalizer:
         # Проверка на None или пустую строку
         if not golden_seed or not keyword:
             return keyword
+        
+        # Логирование входного ключа
+        tokens_in = keyword.split()
             
         # 1. Берем основы слов из СИДА
         seed_bases = {}
@@ -58,12 +61,30 @@ class GoldenNormalizer:
                 # При любой ошибке - оставляем оригинальный токен
                 result.append(token)
 
-        return " ".join(result)
+        final_result = " ".join(result)
+        
+        # Логирование если токены потерялись
+        tokens_out = final_result.split() if final_result else []
+        if len(tokens_in) != len(tokens_out):
+            print(f"⚠️ ПОТЕРЯ ТОКЕНОВ: IN({len(tokens_in)}): '{keyword}' → OUT({len(tokens_out)}): '{final_result}'")
+        
+        return final_result
 
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
         if not keywords or not golden_seed: return keywords
+        
+        print(f"🔍 Normalization IN: {len(keywords)} keywords, seed: '{golden_seed}'")
+        
         # Нормализуем каждый ключ
         normalized = [self.normalize_by_golden_seed(kw, golden_seed) for kw in keywords]
+        
+        # Проверяем пустые результаты
+        empty_count = sum(1 for n in normalized if not n or not n.strip())
+        if empty_count > 0:
+            print(f"⚠️ ПУСТЫЕ результаты: {empty_count} из {len(normalized)}")
+        
+        print(f"🔍 Normalization OUT: {len(normalized)} keywords")
+        
         # Возвращаем полный список (даже если есть дубликаты)
         return normalized
 
