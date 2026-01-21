@@ -1188,12 +1188,11 @@ async def light_search_endpoint(
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
         try:
-            normalized = normalize_keywords(
+            result["keywords"] = normalize_keywords(
                 keywords=result["keywords"],
                 language=language,
                 seed=seed
             )
-            result["keywords"] = list(dict.fromkeys(normalized))
             result["total_count"] = len(result["keywords"])
         except Exception as e:
             print(f"Normalization error: {e}")
@@ -1224,12 +1223,11 @@ async def deep_search_endpoint(
             # Используем исправленный seed если есть
             seed_to_use = result.get("corrected_seed", seed)
             
-            normalized = normalize_keywords(
+            result["keywords"] = normalize_keywords(
                 keywords=result["keywords"],
                 language=language,
                 seed=seed_to_use
             )
-            result["keywords"] = list(dict.fromkeys(normalized))
             result["count"] = len(result["keywords"])
             result["total_unique_keywords"] = len(result["keywords"])
         except Exception as e:
@@ -1285,12 +1283,11 @@ async def parse_suffix_endpoint(
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
         try:
-            normalized = normalize_keywords(
+            result["keywords"] = normalize_keywords(
                 keywords=result["keywords"],
                 language=language,
                 seed=seed
             )
-            result["keywords"] = list(dict.fromkeys(normalized))
             result["total_count"] = len(result["keywords"])
         except Exception as e:
             print(f"Normalization error: {e}")
@@ -1326,12 +1323,11 @@ async def parse_infix_endpoint(
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
         try:
-            normalized = normalize_keywords(
+            result["keywords"] = normalize_keywords(
                 keywords=result["keywords"],
                 language=language,
                 seed=seed
             )
-            result["keywords"] = list(dict.fromkeys(normalized))
         except Exception as e:
             print(f"Normalization error: {e}")
 
@@ -1366,12 +1362,11 @@ async def parse_morphology_endpoint(
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
         try:
-            normalized = normalize_keywords(
+            result["keywords"] = normalize_keywords(
                 keywords=result["keywords"],
                 language=language,
                 seed=seed
             )
-            result["keywords"] = list(dict.fromkeys(normalized))
             result["total_count"] = len(result["keywords"])
         except Exception as e:
             print(f"Normalization error: {e}")
@@ -1407,12 +1402,11 @@ async def parse_adaptive_prefix_endpoint(
     # Нормализация результатов
     if result.get("keywords") and len(result["keywords"]) > 0:
         try:
-            normalized = normalize_keywords(
+            result["keywords"] = normalize_keywords(
                 keywords=result["keywords"],
                 language=language,
                 seed=seed
             )
-            result["keywords"] = list(dict.fromkeys(normalized))
             result["total_count"] = len(result["keywords"])
         except Exception as e:
             print(f"Normalization error: {e}")
