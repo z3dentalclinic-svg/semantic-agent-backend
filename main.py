@@ -1156,17 +1156,21 @@ class GoogleAutocompleteParser:
 parser = GoogleAutocompleteParser()
 
 def apply_smart_fix(result: dict, seed: str, language: str):
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        # ВАЖНО: Просто вызываем нормализатор. 
-        # Мы НЕ используем set(), НЕ используем dict.fromkeys()
-        # Мы сохраняем все 204 строки, просто меняя в них буквы.
-        norm_keywords = normalize_keywords(result["keywords"], language, seed)
+    if result.get("keywords"):
+        # 1. Получаем исходный список (со всеми городами и вариациями)
+        raw_keywords = result["keywords"]
         
+        # 2. Исправляем падежи через GoldenNormalizer
+        # Он заменит только слова из сида, города останутся нетронутыми
+        norm_keywords = normalize_keywords(raw_keywords, language, seed)
+        
+        # 3. Возвращаем ПОЛНЫЙ список. 
+        # Мы НЕ используем set(), чтобы не склеивать разные запросы с одинаковым смыслом.
         result["keywords"] = norm_keywords
         
-        # Обновляем счетчики по фактическому количеству (будет 204)
+        # 4. Обновляем все счётчики до реального количества слов
         total = len(norm_keywords)
-        result["count"] = total
+        if "count" in result: result["count"] = total
         if "total_count" in result: result["total_count"] = total
         if "total_unique_keywords" in result: result["total_unique_keywords"] = total
             
@@ -1192,7 +1196,6 @@ async def light_search_endpoint(
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    original_seed = seed
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
@@ -1203,7 +1206,7 @@ async def light_search_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, original_seed, language)
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/deep-search")
 async def deep_search_endpoint(
@@ -1217,14 +1220,14 @@ async def deep_search_endpoint(
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
-    original_seed = seed
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    # Нам плевать, что исправил Яндекс, нормализуем под то, что ввел пользователь
-    return apply_smart_fix(result, original_seed, language)
+    # Используем исправленный seed если есть
+    seed_to_use = result.get("corrected_seed", seed)
+    return apply_smart_fix(result, seed_to_use, language)
 
 @app.get("/api/compare")
 async def compare_methods(
@@ -1259,7 +1262,6 @@ async def parse_suffix_endpoint(
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    original_seed = seed
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
@@ -1270,7 +1272,7 @@ async def parse_suffix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, original_seed, language)
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/infix")
 async def parse_infix_endpoint(
@@ -1287,7 +1289,6 @@ async def parse_infix_endpoint(
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    original_seed = seed
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
@@ -1298,7 +1299,7 @@ async def parse_infix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, original_seed, language)
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/morphology")
 async def parse_morphology_endpoint(
@@ -1315,7 +1316,6 @@ async def parse_morphology_endpoint(
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    original_seed = seed
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
@@ -1326,7 +1326,7 @@ async def parse_morphology_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, original_seed, language)
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/adaptive-prefix")
 async def parse_adaptive_prefix_endpoint(
@@ -1343,7 +1343,6 @@ async def parse_adaptive_prefix_endpoint(
     if language == "auto":
         language = parser.detect_seed_language(seed)
 
-    original_seed = seed
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
@@ -1354,5 +1353,5 @@ async def parse_adaptive_prefix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, original_seed, language)
+    return apply_smart_fix(result, seed, language)
 
