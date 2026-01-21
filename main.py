@@ -22,7 +22,7 @@ from filters import (
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
-from utils import normalize_keywords
+from utils.normalizer import normalize_keywords
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1155,6 +1155,25 @@ class GoogleAutocompleteParser:
 
 parser = GoogleAutocompleteParser()
 
+def apply_smart_fix(result: dict, seed: str, language: str):
+    if result.get("keywords"):
+        # 1. Исправляем падежи, сохраняя города
+        norm_keywords = normalize_keywords(result["keywords"], language, seed)
+        # 2. Умная дедупликация (сохраняем уникальность фразы целиком)
+        seen = set()
+        unique = []
+        for kw in norm_keywords:
+            clean = kw.lower().strip()
+            if clean not in seen:
+                unique.append(kw)
+                seen.add(clean)
+        result["keywords"] = unique
+        # 3. Синхронизация счетчиков
+        new_count = len(unique)
+        for field in ["count", "total_count", "total_unique_keywords"]:
+            if field in result: result[field] = new_count
+    return result
+
 @app.get("/")
 async def root():
     """Главная страница"""
@@ -1185,20 +1204,7 @@ async def light_search_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
-
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/deep-search")
 async def deep_search_endpoint(
@@ -1217,25 +1223,9 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            # Используем исправленный seed если есть
-            seed_to_use = result.get("corrected_seed", seed)
-            
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed_to_use
-            )
-            result["count"] = len(result["keywords"])
-            result["total_unique_keywords"] = len(result["keywords"])
-        except Exception as e:
-            print(f"Normalization error: {e}")
-            result["count"] = len(result["keywords"])
-            result["total_unique_keywords"] = len(result["keywords"])
-    
-    return result
+    # Используем исправленный seed если есть
+    seed_to_use = result.get("corrected_seed", seed)
+    return apply_smart_fix(result, seed_to_use, language)
 
 @app.get("/api/compare")
 async def compare_methods(
@@ -1280,20 +1270,7 @@ async def parse_suffix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
-
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/infix")
 async def parse_infix_endpoint(
@@ -1320,19 +1297,7 @@ async def parse_infix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed
-            )
-        except Exception as e:
-            print(f"Normalization error: {e}")
-
-    result["total_count"] = len(result["keywords"])
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/morphology")
 async def parse_morphology_endpoint(
@@ -1359,20 +1324,7 @@ async def parse_morphology_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
-
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/adaptive-prefix")
 async def parse_adaptive_prefix_endpoint(
@@ -1399,18 +1351,5 @@ async def parse_adaptive_prefix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    # Нормализация результатов
-    if result.get("keywords") and len(result["keywords"]) > 0:
-        try:
-            result["keywords"] = normalize_keywords(
-                keywords=result["keywords"],
-                language=language,
-                seed=seed
-            )
-            result["total_count"] = len(result["keywords"])
-        except Exception as e:
-            print(f"Normalization error: {e}")
-            result["total_count"] = len(result["keywords"])
-
-    return result
+    return apply_smart_fix(result, seed, language)
 
