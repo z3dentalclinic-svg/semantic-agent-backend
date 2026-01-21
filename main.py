@@ -1157,21 +1157,23 @@ parser = GoogleAutocompleteParser()
 
 def apply_smart_fix(result: dict, seed: str, language: str):
     if result.get("keywords"):
-        # 1. Исправляем падежи, сохраняя города
-        norm_keywords = normalize_keywords(result["keywords"], language, seed)
-        # 2. Умная дедупликация (сохраняем уникальность фразы целиком)
-        seen = set()
-        unique = []
-        for kw in norm_keywords:
-            clean = kw.lower().strip()
-            if clean not in seen:
-                unique.append(kw)
-                seen.add(clean)
-        result["keywords"] = unique
-        # 3. Синхронизация счетчиков
-        new_count = len(unique)
-        for field in ["count", "total_count", "total_unique_keywords"]:
-            if field in result: result[field] = new_count
+        # 1. Получаем исходный список (со всеми городами и вариациями)
+        raw_keywords = result["keywords"]
+        
+        # 2. Исправляем падежи через GoldenNormalizer
+        # Он заменит только слова из сида, города останутся нетронутыми
+        norm_keywords = normalize_keywords(raw_keywords, language, seed)
+        
+        # 3. Возвращаем ПОЛНЫЙ список. 
+        # Мы НЕ используем set(), чтобы не склеивать разные запросы с одинаковым смыслом.
+        result["keywords"] = norm_keywords
+        
+        # 4. Обновляем все счётчики до реального количества слов
+        total = len(norm_keywords)
+        if "count" in result: result["count"] = total
+        if "total_count" in result: result["total_count"] = total
+        if "total_unique_keywords" in result: result["total_unique_keywords"] = total
+            
     return result
 
 @app.get("/")
