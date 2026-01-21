@@ -1,93 +1,71 @@
 import re
 import pymorphy3
 from typing import List
+from nltk.stem import SnowballStemmer
 
 class GoldenNormalizer:
     def __init__(self):
-        # Инициализация анализатора (делается один раз)
         self.morph = pymorphy3.MorphAnalyzer()
+        self.stemmer_ru = SnowballStemmer("russian")
+
+    def get_stem(self, word: str) -> str:
+        """Получает корень слова для железного сравнения"""
+        return self.stemmer_ru.stem(word.lower())
 
     def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
-        """
-        Принудительно меняет формы слов в ключе на те, что указаны в golden_seed.
-        Пример: если в сиде 'пылесосов', а в ключе 'пылесоса' -> станет 'пылесосов'.
-        """
         if not golden_seed or not keyword:
             return keyword
         
-        # 1. Составляем карту основ из ОРИГИНАЛЬНОГО сида (например, 'ремонт пылесосов')
-        # Извлекаем только слова (буквы), игнорируя символы
         seed_words = re.findall(r'[а-яёА-ЯЁa-zA-Z]+', golden_seed.lower())
-        seed_map = {}
+        seed_map = {} # Карта лемм
+        stem_map = {} # Карта корней (запасной вариант)
         
         for sw in seed_words:
-            # Получаем все возможные грамматические разборы слова из сида
-            parses = self.morph.parse(sw)
-            for p in parses:
-                # Каждой возможной нормальной форме (лемме) сопоставляем 
-                # именно то написание, которое ввел пользователь в сиде.
-                # 'пылесос' -> 'пылесосов'
+            # Вариант 1: По морфологии
+            for p in self.morph.parse(sw):
                 seed_map[p.normal_form] = sw
+            # Вариант 2: По корню (Stemming)
+            stem_map[self.get_stem(sw)] = sw
 
-        # 2. Разбиваем поисковую подсказку на токены (слова)
         tokens = keyword.split()
         normalized_tokens = []
         
         for t in tokens:
-            # Регулярка для отделения знаков препинания от самого слова
-            # Группа 1: символы в начале, Группа 2: буквы, Группа 3: символы в конце
             match = re.match(r'^([^а-яёА-ЯЁa-zA-Z]*)([а-яёА-ЯЁa-zA-Z]+)([^а-яёА-ЯЁa-zA-Z]*)$', t)
-            
             if not match:
-                # Если в токене нет букв (например, просто цифра или символ), оставляем как есть
-                normalized_tokens.append(t)
-                continue
+                normalized_tokens.append(t); continue
                 
             prefix, word_body, suffix = match.groups()
             word_lower = word_body.lower()
             
-            # Проверяем все варианты разбора текущего слова из ключа
-            p_token_list = self.morph.parse(word_lower)
-            found_in_seed = False
+            # 1. Пробуем через лемму (точно)
+            found = False
+            for p_token in self.morph.parse(word_lower):
+                if p_token.normal_form in seed_map:
+                    normalized_tokens.append(f"{prefix}{seed_map[p_token.normal_form]}{suffix}")
+                    found = True; break
             
-            for p_token in p_token_list:
-                t_base = p_token.normal_form # Нормальная форма (например, 'пылесос')
-                
-                if t_base in seed_map:
-                    # Если лемма слова совпала с леммой из сида — 
-                    # подменяем тело слова на форму из сида ('пылесосов')
-                    # Сохраняем знаки препинания (prefix/suffix), если они были
-                    normalized_tokens.append(f"{prefix}{seed_map[t_base]}{suffix}")
-                    found_in_seed = True
-                    break
+            # 2. Если не вышло — пробуем через корень (жестко)
+            if not found:
+                word_stem = self.get_stem(word_lower)
+                if word_stem in stem_map:
+                    normalized_tokens.append(f"{prefix}{stem_map[word_stem]}{suffix}")
+                    found = True
             
-            if not found_in_seed:
-                # Если слова нет в сиде (например, это город 'Киев'), оставляем оригинал
+            if not found:
                 normalized_tokens.append(t)
 
-        # Собираем фразу обратно. Количество слов не меняется.
         return " ".join(normalized_tokens)
 
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
-        """Обрабатывает список ключей, удаляя только полные дубликаты строк."""
-        if not keywords:
-            return []
-        
-        # Удаляем идентичные строки перед обработкой для скорости
-        unique_raw = list(dict.fromkeys(keywords))
-        
-        return [self.normalize_by_golden_seed(kw, golden_seed) for kw in unique_raw]
+        # Возвращаем список один-в-один, без удаления дублей здесь!
+        return [self.normalize_by_golden_seed(kw, golden_seed) for kw in keywords]
 
-# Синглтон для работы в API
 _normalizer = None
-
 def get_normalizer():
     global _normalizer
-    if _normalizer is None:
-        _normalizer = GoldenNormalizer()
+    if _normalizer is None: _normalizer = GoldenNormalizer()
     return _normalizer
 
 def normalize_keywords(keywords: List[str], language: str, seed: str) -> List[str]:
-    """Главная точка входа для main.py"""
-    n = get_normalizer()
-    return n.process_batch(keywords, seed)
+    return get_normalizer().process_batch(keywords, seed)
