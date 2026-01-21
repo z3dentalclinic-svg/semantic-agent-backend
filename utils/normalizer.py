@@ -11,28 +11,51 @@ class GoldenNormalizer:
         if not golden_seed or not keyword:
             return keyword
             
-        # 1. Берем основы слов из СИДА (например: ремонт, пылесос)
+        # 1. Берем основы слов из СИДА
         seed_bases = {}
         for w in re.findall(r'\w+', golden_seed.lower()):
-            base = self.morph.parse(w)[0].normal_form
-            seed_bases[base] = w  # Запоминаем: для базы "ремонт" эталон — "ремонт"
+            try:
+                parsed = self.morph.parse(w)
+                if parsed:
+                    base = parsed[0].normal_form
+                    seed_bases[base] = w
+                else:
+                    seed_bases[w] = w  # fallback
+            except Exception:
+                seed_bases[w] = w  # fallback при любой ошибке
 
-        # 2. Разбиваем ключ на токены, сохраняя всё остальное
+        # 2. Разбиваем ключ на токены
         tokens = keyword.split()
         result = []
 
         for token in tokens:
-            # Очищаем только для проверки (штиль!, (штиль) -> штиль)
-            clean_token = token.lower().strip('.,!?() ')
-            p = self.morph.parse(clean_token)[0]
-            base = p.normal_form
+            if not token:  # пропускаем пустые токены
+                continue
+            
+            try:
+                # Очищаем только для проверки
+                clean_token = token.lower().strip('.,!?() ')
+                if not clean_token:
+                    result.append(token)
+                    continue
+                
+                # Парсим с проверкой
+                parsed = self.morph.parse(clean_token)
+                if not parsed:
+                    # Если pymorphy не распознал - оставляем как есть
+                    result.append(token)
+                    continue
+                
+                base = parsed[0].normal_form
 
-            if base in seed_bases:
-                # Если слово из сида — приводим к форме сида
-                result.append(seed_bases[base])
-            else:
-                # ВАЖНО: Если слова НЕТ в сиде (штиль, xiaomi, авито) — 
-                # возвращаем его КАК ЕСТЬ, не меняя ни единой буквы!
+                if base in seed_bases:
+                    # Если слово из сида — приводим к форме сида
+                    result.append(seed_bases[base])
+                else:
+                    # Если слова НЕТ в сиде - возвращаем КАК ЕСТЬ
+                    result.append(token)
+            except Exception:
+                # При любой ошибке - оставляем оригинальный токен
                 result.append(token)
 
         return " ".join(result)
