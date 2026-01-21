@@ -4,6 +4,7 @@ from typing import List
 
 class GoldenNormalizer:
     def __init__(self):
+        # Инициализируем анализатор один раз для экономии памяти
         self.morph = pymorphy3.MorphAnalyzer()
 
     def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
@@ -11,44 +12,53 @@ class GoldenNormalizer:
             return keyword
         
         # 1. Составляем карту основ из ОРИГИНАЛЬНОГО сида
-        # Мы запоминаем, какая начальная форма соответствует слову из сида
         seed_words = re.findall(r'\w+', golden_seed.lower())
         seed_map = {}
+        
         for sw in seed_words:
-            p = self.morph.parse(sw)
-            if p:
-                base = p[0].normal_form
-                seed_map[base] = sw  # Например: {'ремонт': 'ремонт', 'пылесос': 'пылесосов'}
+            # Берем все варианты разбора слова из сида
+            parses = self.morph.parse(sw)
+            for p in parses:
+                # Каждой возможной нормальной форме сопоставляем слово из сида
+                # Например, для "пылесосов" нормальная форма "пылесос"
+                seed_map[p.normal_form] = sw
 
-        # 2. Обрабатываем ключ по словам, сохраняя структуру 1-в-1
+        # 2. Обрабатываем ключ по словам
         tokens = keyword.split()
         normalized_tokens = []
         
         for t in tokens:
-            # Очищаем только от крайних знаков препинания для поиска основы
-            t_clean = t.lower().strip(".,!?;:()")
-            if not t_clean:
+            # Сохраняем знаки препинания, если они приклеены к слову (например, "пылесос?")
+            match = re.match(r'^([^а-яёА-ЯЁa-zA-Z]*)([а-яёА-ЯЁa-zA-Z]+)([^а-яёА-ЯЁa-zA-Z]*)$', t)
+            
+            if not match:
                 normalized_tokens.append(t)
                 continue
                 
-            p_token = self.morph.parse(t_clean)
-            if p_token:
-                t_base = p_token[0].normal_form
-                # Если основа слова есть в нашем сиде - меняем на форму из сида
+            prefix, word_body, suffix = match.groups()
+            word_lower = word_body.lower()
+            
+            # Проверяем все варианты разбора текущего слова
+            p_token_list = self.morph.parse(word_lower)
+            found_in_seed = False
+            
+            for p_token in p_token_list:
+                t_base = p_token.normal_form
                 if t_base in seed_map:
-                    normalized_tokens.append(seed_map[t_base])
-                else:
-                    # Если это город, отзыв или другое слово - оставляем оригинал
-                    normalized_tokens.append(t)
-            else:
+                    # Если нашли основу в сиде, заменяем тело слова на форму из сида
+                    # Сохраняем оригинальные префиксы/суффиксы (знаки препинания)
+                    normalized_tokens.append(f"{prefix}{seed_map[t_base]}{suffix}")
+                    found_in_seed = True
+                    break
+            
+            if not found_in_seed:
+                # Если слова нет в сиде (город, спецслово), оставляем как было
                 normalized_tokens.append(t)
 
-        # Собираем обратно. Количество слов всегда равно исходному!
         return " ".join(normalized_tokens)
 
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
         if not keywords: return []
-        # Возвращаем список нормализованных фраз
         return [self.normalize_by_golden_seed(kw, golden_seed) for kw in keywords]
 
 _normalizer = None
