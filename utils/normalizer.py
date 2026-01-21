@@ -7,68 +7,38 @@ class GoldenNormalizer:
         self.morph = pymorphy3.MorphAnalyzer()
 
     def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
-        # Проверка на None или пустую строку
         if not golden_seed or not keyword:
             return keyword
         
-        # Логирование входного ключа
-        tokens_in = keyword.split()
-            
-        # 1. Берем основы слов из СИДА
+        # 1. Готовим словарь основ СИДА (оригинального, без принудительных основ от Клода!)
         seed_bases = {}
         for w in re.findall(r'\w+', golden_seed.lower()):
-            try:
-                parsed = self.morph.parse(w)
-                if parsed:
-                    base = parsed[0].normal_form
-                    seed_bases[base] = w
-                else:
-                    seed_bases[w] = w  # fallback
-            except Exception:
-                seed_bases[w] = w  # fallback при любой ошибке
+            base = self.morph.parse(w)[0].normal_form
+            seed_bases[base] = w  # Сопоставляем основу с формой, которую хочет юзер
 
-        # 2. Разбиваем ключ на токены
+        # 2. Обработка ключа
         tokens = keyword.split()
-        result = []
+        new_tokens = []
 
         for token in tokens:
-            if not token:  # пропускаем пустые токены
+            # Очищаем от знаков препинания для поиска основы
+            clean_word = re.sub(r'[^\w]', '', token.lower())
+            if not clean_word:
+                new_tokens.append(token)
                 continue
-            
-            try:
-                # Очищаем только для проверки
-                clean_token = token.lower().strip('.,!?() ')
-                if not clean_token:
-                    result.append(token)
-                    continue
                 
-                # Парсим с проверкой
-                parsed = self.morph.parse(clean_token)
-                if not parsed:
-                    # Если pymorphy не распознал - оставляем как есть
-                    result.append(token)
-                    continue
-                
-                base = parsed[0].normal_form
+            parsed = self.morph.parse(clean_word)[0]
+            base = parsed.normal_form
 
-                if base in seed_bases:
-                    # Если слово из сида — приводим к форме сида
-                    result.append(seed_bases[base])
-                else:
-                    # Если слова НЕТ в сиде - возвращаем КАК ЕСТЬ
-                    result.append(token)
-            except Exception:
-                # При любой ошибке - оставляем оригинальный токен
-                result.append(token)
+            # ЕСЛИ ОСНОВА ЕСТЬ В СИДЕ - МЕНЯЕМ ПАДЕЖ НА ТОТ, ЧТО В СИДЕ
+            if base in seed_bases:
+                new_tokens.append(seed_bases[base])
+            # ЕСЛИ НЕТ (это город, отзыв и т.д.) - ОСТАВЛЯЕМ КАК БЫЛО
+            else:
+                new_tokens.append(token)
 
-        final_result = " ".join(result)
-        
-        # Логирование если токены потерялись
-        tokens_out = final_result.split() if final_result else []
-        if len(tokens_in) != len(tokens_out):
-            print(f"⚠️ ПОТЕРЯ ТОКЕНОВ: IN({len(tokens_in)}): '{keyword}' → OUT({len(tokens_out)}): '{final_result}'")
-        
-        return final_result
+        # ГАРАНТИЯ: Количество слов на выходе ВСЕГДА равно количеству на входе
+        return " ".join(new_tokens)
 
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
         if not keywords or not golden_seed: return keywords
