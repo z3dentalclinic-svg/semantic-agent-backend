@@ -1157,26 +1157,16 @@ parser = GoogleAutocompleteParser()
 
 def apply_smart_fix(result: dict, seed: str, language: str):
     if result.get("keywords") and len(result["keywords"]) > 0:
-        # 1. Убираем дубликаты ПЕРЕД нормализацией
-        raw_list = list(dict.fromkeys(result["keywords"]))
+        # Просто вызываем нормализатор и перезаписываем список
+        # Никаких set(), никаких seen.add()!
+        norm_keywords = normalize_keywords(result["keywords"], language, seed)
         
-        try:
-            # 2. Вызываем нормализатор (код которого я дал выше)
-            norm_list = normalize_keywords(raw_list, language, seed)
-            
-            # 3. Финальная очистка (на случай если нормализация создала новые дубли)
-            final_list = list(dict.fromkeys(norm_list))
-            
-            result["keywords"] = final_list
-            
-            # 4. Считаем реальное количество
-            total = len(final_list)
-            result["count"] = total
-            if "total_count" in result: result["total_count"] = total
-            if "total_unique_keywords" in result: result["total_unique_keywords"] = total
-            
-        except Exception as e:
-            logger.error(f"Error in apply_smart_fix: {e}")
+        result["keywords"] = norm_keywords
+        
+        # Обновляем счетчик
+        total = len(norm_keywords)
+        result["count"] = total
+        if "total_count" in result: result["total_count"] = total
             
     return result
 
