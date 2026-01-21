@@ -1157,16 +1157,18 @@ parser = GoogleAutocompleteParser()
 
 def apply_smart_fix(result: dict, seed: str, language: str):
     if result.get("keywords") and len(result["keywords"]) > 0:
-        # Просто вызываем нормализатор и перезаписываем список
-        # Никаких set(), никаких seen.add()!
+        # ВАЖНО: Просто вызываем нормализатор. 
+        # Мы НЕ используем set(), НЕ используем dict.fromkeys()
+        # Мы сохраняем все 204 строки, просто меняя в них буквы.
         norm_keywords = normalize_keywords(result["keywords"], language, seed)
         
         result["keywords"] = norm_keywords
         
-        # Обновляем счетчик
+        # Обновляем счетчики по фактическому количеству (будет 204)
         total = len(norm_keywords)
         result["count"] = total
         if "total_count" in result: result["total_count"] = total
+        if "total_unique_keywords" in result: result["total_unique_keywords"] = total
             
     return result
 
