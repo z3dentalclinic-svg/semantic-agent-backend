@@ -1,6 +1,9 @@
 import re
 import pymorphy3
+import logging
 from typing import List
+
+logger = logging.getLogger("GoldenNormalizer")
 
 class GoldenNormalizer:
     def __init__(self):
@@ -12,51 +15,84 @@ class GoldenNormalizer:
 
         # 1. ВСЕ ФОРМЫ слов сида → эталон сида
         seed_forms = {}
+        seed_lemmas = set()
+
         for w in re.findall(r'\w+', golden_seed.lower()):
             try:
                 parsed = self.morph.parse(w)
                 if not parsed:
                     continue
-                seed_form = w  # форма ИЗ сида (эталон!)
-                
-                # Все формы этого слова → эталон сида
+                seed_form = w  # форма из сида (эталон)
+                base_lemma = parsed[0].normal_form
+                seed_lemmas.add(base_lemma)
+
                 for form_obj in parsed[0].lexeme:
                     seed_forms[form_obj.word.lower()] = seed_form
-            except:
+            except Exception as e:
+                logger.debug(f"[NORMALIZER] seed word parse fail: '{w}' → {e}")
                 continue
 
-        # 2. Нормализация ключа
         tokens = keyword.split()
-        result = []
+        result_tokens = []
+
+        # Для детального лога по одному ключу
+        changes = []
+        unmapped_seed_like = []
 
         for token in tokens:
             if not token:
                 continue
+
+            original = token
             clean_token = token.lower().strip('.,!?() ')
             if not clean_token:
-                result.append(token)
+                result_tokens.append(token)
                 continue
 
-            try:
-                # Пробуем точное совпадение формы
-                if clean_token in seed_forms:
-                    result.append(seed_forms[clean_token])
-                    continue
-                    
-                # Пробуем лемматизацию
-                parsed = self.morph.parse(clean_token)
-                if parsed:
-                    token_form = parsed[0].word.lower()
-                    if token_form in seed_forms:
-                        result.append(seed_forms[token_form])
-                    else:
-                        result.append(token)
-                else:
-                    result.append(token)
-            except:
-                result.append(token)
+            replaced = False
 
-        return " ".join(result)
+            try:
+                # 1) точная форма среди seed_forms
+                if clean_token in seed_forms:
+                    new = seed_forms[clean_token]
+                    result_tokens.append(new)
+                    changes.append((original, new, "direct_form"))
+                    replaced = True
+                else:
+                    # 2) пробуем морфологию
+                    parsed = self.morph.parse(clean_token)
+                    if parsed:
+                        lemma = parsed[0].normal_form
+                        form_word = parsed[0].word.lower()
+
+                        if form_word in seed_forms:
+                            new = seed_forms[form_word]
+                            result_tokens.append(new)
+                            changes.append((original, new, f"via_form:{form_word}"))
+                            replaced = True
+                        elif lemma in seed_lemmas:
+                            # Лемма совпадает с сидом, но форма не в seed_forms → кандидат на проблему
+                            result_tokens.append(token)
+                            unmapped_seed_like.append((original, lemma))
+                        else:
+                            result_tokens.append(token)
+                    else:
+                        result_tokens.append(token)
+            except Exception as e:
+                logger.debug(f"[NORMALIZER] token parse fail: '{token}' → {e}")
+                result_tokens.append(token)
+
+        normalized = " ".join(result_tokens)
+
+        # ЛОГИРУЕМ только проблемные случаи:
+        if unmapped_seed_like:
+            logger.warning(
+                f"[NORMALIZER] SEED-LEMMA UNMAPPED: seed='{golden_seed}' | "
+                f"keyword='{keyword}' → '{normalized}' | "
+                f"unmapped={unmapped_seed_like} | changes={changes}"
+            )
+
+        return normalized
     
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
         if not keywords or not golden_seed:
