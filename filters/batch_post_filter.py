@@ -31,6 +31,26 @@ class BatchPostFilter:
             "дом", "мир", "бор", "нива", "балка", "луч", "спутник", "работа", "цена", "выезд",
         }
         
+        # Список крупных городов/столиц которые ВСЕГДА блокируются (не бренды)
+        self.forbidden_major_cities = {
+            # Россия
+            "москва", "moscow", "санкт-петербург", "petersburg", "питер", "spb",
+            "новосибирск", "екатеринбург", "казань", "нижний новгород",
+            "челябинск", "самара", "омск", "ростов", "уфа", "красноярск",
+            # Беларусь (если таргет не BY)
+            "минск", "minsk", "гомель", "могилев", "витебск", "гродно", "брест",
+            # Казахстан (если таргет не KZ)
+            "алматы", "almaty", "астана", "nur-sultan", "шымкент",
+            # Другие страны
+            "киев", "kiev", "харьков", "одесса", "днепр", "львов", "lviv", # UA
+            "варшава", "warsaw", "краков", "krakow",  # PL
+            "берлин", "berlin", "мюнхен", "munich",  # DE
+            "париж", "paris", "лондон", "london",  # FR, GB
+            "рим", "rome", "милан", "milan",  # IT
+            "мадрид", "madrid", "барселона", "barcelona",  # ES
+        }
+
+        
         base_index = {k.lower().strip(): v for k, v in (all_cities_global or {}).items()}
         geo_index = self._build_filtered_geo_index()
         
@@ -165,6 +185,24 @@ class BatchPostFilter:
                 'киев': 'ua', 'харьков': 'ua', 'одесса': 'ua',
                 'минск': 'by', 'алматы': 'kz', 'ташкент': 'uz'
             }
+
+    def _is_brand_like(self, word: str) -> bool:
+        """Определяет, может ли слово быть брендом (спорное слово)"""
+        word_lower = word.lower()
+        
+        # Слова в ignored_words считаются не-городами
+        if word_lower in self.ignored_words:
+            return True
+        
+        # Латинские слова скорее бренды чем города
+        if word.isascii() and word.isalpha():
+            return True
+        
+        # Короткие слова (3-4 буквы) могут быть брендами
+        if len(word) <= 4:
+            return True
+        
+        return False
 
     def _has_seed_cores(self, keyword: str, seed: str) -> bool:
         """Проверяет наличие корней из сида в ключе (первые 5 букв)"""
@@ -327,12 +365,24 @@ class BatchPostFilter:
                     logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (есть в сиде)")
                     continue
 
-                # ШАГ 3: Если есть корни сида - ИГНОРИРУЕМ конфликт (бренд/контекст)
-                if has_seed:
-                    logger.info(f"[GEO_ALLOW] Город '{item}' ({found_country.upper()}) разрешен (есть корни сида - считаем брендом/контекстом)")
+                # ШАГ 3: ЛОГИКА "Свой/Чужой/Спорный"
+                
+                # 3.1: Проверка на явно ЧУЖОЙ крупный город
+                if item_normalized in self.forbidden_major_cities or item in self.forbidden_major_cities:
+                    # Это крупный город другой страны - БЛОКИРУЕМ ВСЕГДА
+                    reason = f"Слово '{item}' — это крупный город в {found_country.upper()}, а мы парсим {country.upper()}"
+                    logger.warning(f"!!! [GEO_ANCHOR] Ключ отправлен в якоря: '{keyword}' | Причина: {reason} (крупный город)")
+                    return False, reason, f"{found_country}_cities"
+                
+                # 3.2: СПОРНОЕ слово (может быть брендом)
+                is_brand_like = self._is_brand_like(item)
+                
+                if has_seed and is_brand_like:
+                    # Есть корни сида И слово похоже на бренд - РАЗРЕШАЕМ
+                    logger.info(f"[GEO_ALLOW] Город '{item}' ({found_country.upper()}) разрешен (есть корни сида + похоже на бренд/техно-термин)")
                     continue
-
-                # Блокируем только если нет сида и город чужой
+                
+                # 3.3: В остальных случаях - БЛОКИРУЕМ
                 reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
                 logger.warning(f"!!! [GEO_ANCHOR] Ключ отправлен в якоря: '{keyword}' | Причина: {reason}")
                 return False, reason, f"{found_country}_cities"
