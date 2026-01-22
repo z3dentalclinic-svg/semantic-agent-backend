@@ -4,8 +4,11 @@ IMPROVED VERSION: более мягкая фильтрация, разрешае
 """
 
 import re
+import logging
 from typing import List
 from difflib import SequenceMatcher
+
+logger = logging.getLogger("RelevanceFilter")
 
 
 def is_nearly_same(s1: str, s2: str) -> bool:
@@ -14,18 +17,14 @@ def is_nearly_same(s1: str, s2: str) -> bool:
 
 
 async def filter_relevant_keywords(keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
-    # Очищаем сид до базовых корней (ремонт, пылесос)
-    seed_words = [w.lower()[:5] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
-    
+    seed_roots = [w.lower()[:5] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
     filtered = []
+    
     for kw in keywords:
-        kw_lower = kw.lower()
-        # Если хотя бы ОДИН корень из сида есть в ключе - оставляем!
-        # Это спасет "ремонтам", "ремонтами" и т.д.
-        if any(root in kw_lower for root in seed_words):
+        has_core = any(root in kw.lower() for root in seed_roots)
+        if has_core:
             filtered.append(kw)
         else:
-            # Если это бренд или район, но основные слова потерялись - в якоря
-            pass 
+            logger.warning(f"!!! [RELEVANCE_DROP] Ключ: '{kw}' | Не найдены корни сида: {seed_roots}")
             
     return filtered
