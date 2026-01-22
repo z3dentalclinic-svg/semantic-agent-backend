@@ -72,6 +72,34 @@ class BatchPostFilter:
             if name not in self.all_cities_global:
                 self.all_cities_global[name] = code
         
+        # Украинские города (КРИТИЧНО: на случай если geonamescache не загружен)
+        forced_ua_cities = {
+            "львов": "ua",
+            "львів": "ua", 
+            "lviv": "ua",
+            "lvov": "ua",
+            "lemberg": "ua",
+            "киев": "ua",
+            "київ": "ua",
+            "kyiv": "ua",
+            "kiev": "ua",
+            "харьков": "ua",
+            "харків": "ua",
+            "kharkiv": "ua",
+            "одесса": "ua",
+            "одеса": "ua",
+            "odessa": "ua",
+            "днепр": "ua",
+            "дніпро": "ua",
+            "dnipro": "ua",
+            "запорожье": "ua",
+            "запоріжжя": "ua",
+            "zaporizhzhia": "ua",
+        }
+        
+        for name, code in forced_ua_cities.items():
+            self.all_cities_global[name] = code
+        
         try:
             import pymorphy3
             self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
@@ -131,6 +159,11 @@ class BatchPostFilter:
         try:
             import geonamescache
             gc = geonamescache.GeonamesCache()
+            
+            # КРИТИЧНО: Устанавливаем порог 5000 для загрузки cities5000.json (65k городов)
+            # По умолчанию загружается cities15000.json (32k городов)
+            gc.min_city_population = self.population_threshold  # 5000
+            
             cities = gc.get_cities()
             
             filtered_index = {}
@@ -192,6 +225,25 @@ class BatchPostFilter:
         
         # Слова в ignored_words считаются не-городами
         if word_lower in self.ignored_words:
+            return True
+        
+        # Известные бренды техники (кириллица и латиница)
+        known_brands = {
+            # Бренды техники (кириллица)
+            "редмонд", "redmond", "горенье", "gorenje", "бош", "bosch",
+            "самсунг", "samsung", "филипс", "philips", "браун", "braun",
+            "панасоник", "panasonic", "сименс", "siemens", "миле", "miele",
+            "электролюкс", "electrolux", "аег", "aeg", "занусси", "zanussi",
+            "индезит", "indesit", "аристон", "ariston", "канди", "candy",
+            "беко", "beko", "хотпоинт", "hotpoint", "вирпул", "whirlpool",
+            "дайсон", "dyson", "керхер", "karcher", "витек", "vitek",
+            "поларис", "polaris", "скарлет", "scarlett", "тефаль", "tefal",
+            "мулинекс", "moulinex", "крупс", "krups", "делонги", "delonghi",
+            "филко", "philco", "томас", "thomas", "зелмер", "zelmer",
+            # Добавить другие по необходимости
+        }
+        
+        if word_lower in known_brands:
             return True
         
         # Латинские слова скорее бренды чем города
@@ -369,7 +421,12 @@ class BatchPostFilter:
                 
                 # 3.1: Проверка на явно ЧУЖОЙ крупный город
                 if item_normalized in self.forbidden_major_cities or item in self.forbidden_major_cities:
-                    # Это крупный город другой страны - БЛОКИРУЕМ ВСЕГДА
+                    # УМНАЯ ПРОВЕРКА: Может это крупный город НАШЕЙ страны?
+                    if found_country == country.lower():
+                        logger.info(f"[GEO_ALLOW] Крупный город '{item}' разрешен (целевая страна {country.upper()})")
+                        continue
+                    
+                    # Это крупный город ДРУГОЙ страны - БЛОКИРУЕМ ВСЕГДА
                     reason = f"Слово '{item}' — это крупный город в {found_country.upper()}, а мы парсим {country.upper()}"
                     logger.warning(f"!!! [GEO_ANCHOR] Ключ отправлен в якоря: '{keyword}' | Причина: {reason} (крупный город)")
                     return False, reason, f"{found_country}_cities"
