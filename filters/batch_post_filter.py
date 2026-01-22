@@ -422,3 +422,24 @@ class BatchPostFilter:
                 pass
         
         return True
+
+
+# ============================================
+# DISTRICTS
+# ============================================
+
+DISTRICTS_MINSK = {
+    "уручье": "by",
+    "шабаны": "by",
+    "каменная горка": "by",
+    "серебрянка": "by"
+}
+
+DISTRICTS_TASHKENT = {
+    "чиланзар": "uz",
+    "юнусабад": "uz",
+    "сергели": "uz",
+    "яккасарай": "uz"
+}
+
+DISTRICTS_EXTENDED = {**DISTRICTS_MINSK, **DISTRICTS_TASHKENT}
