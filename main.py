@@ -1223,13 +1223,40 @@ class GoogleAutocompleteParser:
 parser = GoogleAutocompleteParser()
 
 def apply_smart_fix(result: dict, seed: str, language: str):
+    """
+    Финальная нормализация результатов
+    
+    УЛУЧШЕНИЯ:
+    - Лемматизация seed перед нормализацией (golden base)
+    - Удаление дубликатов через dict.fromkeys
+    """
     if result.get("keywords"):
         raw_keywords = result["keywords"]
-        norm_keywords = normalize_keywords(raw_keywords, language, seed)
         
-        result["keywords"] = norm_keywords
+        # Лемматизируем seed для создания golden base
+        golden_seed = seed
+        if language in ['ru', 'uk']:
+            try:
+                import pymorphy3
+                morph = pymorphy3.MorphAnalyzer(lang=language)
+                lemmatized_words = []
+                for word in seed.split():
+                    parsed = morph.parse(word)
+                    if parsed:
+                        lemmatized_words.append(parsed[0].normal_form)
+                    else:
+                        lemmatized_words.append(word)
+                golden_seed = " ".join(lemmatized_words)
+            except:
+                golden_seed = seed
         
-        total = len(norm_keywords)
+        # Нормализация с golden base
+        norm_keywords = normalize_keywords(raw_keywords, language, golden_seed)
+        
+        # Убираем дубликаты (сохраняя порядок)
+        result["keywords"] = list(dict.fromkeys(norm_keywords))
+        
+        total = len(result["keywords"])
         if "count" in result: result["count"] = total
         if "total_count" in result: result["total_count"] = total
         if "total_unique_keywords" in result: result["total_unique_keywords"] = total
