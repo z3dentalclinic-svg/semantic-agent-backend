@@ -7,58 +7,60 @@ class GoldenNormalizer:
         self.morph = pymorphy3.MorphAnalyzer()
 
     def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
+        # 0. Защита от пустых
         if not golden_seed or not keyword:
             return keyword
-        
-        # 1. Составляем карту основ из ОРИГИНАЛЬНОГО сида
-        # Мы запоминаем, какая начальная форма соответствует слову из сида
-        seed_words = re.findall(r'\w+', golden_seed.lower())
-        seed_map = {}
-        for sw in seed_words:
-            p = self.morph.parse(sw)
-            if p:
-                base = p[0].normal_form
-                seed_map[base] = sw  # Например: {'ремонт': 'ремонт', 'пылесос': 'пылесосов'}
 
-        # 2. Обрабатываем ключ по словам, сохраняя структуру 1-в-1
-        tokens = keyword.split()
-        normalized_tokens = []
-        
-        for t in tokens:
-            # Очищаем только от крайних знаков препинания для поиска основы
-            t_clean = t.lower().strip(".,!?;:()")
-            if not t_clean:
-                normalized_tokens.append(t)
+        # 1. База лемм из seed: "ремонты пылесосов" → {"ремонт": "ремонт", "пылесос": "пылесосов"}
+        seed_bases = {}
+        for w in re.findall(r'\w+', golden_seed.lower()):
+            try:
+                parsed = self.morph.parse(w)
+                if not parsed:
+                    continue
+                base = parsed[0].normal_form
+                seed_bases[base] = w
+            except Exception:
+                # если морфология не справилась — просто игнор seed-слово
                 continue
-                
-            p_token = self.morph.parse(t_clean)
-            if p_token:
-                t_base = p_token[0].normal_form
-                # Если основа слова есть в нашем сиде - меняем на форму из сида
-                if t_base in seed_map:
-                    normalized_tokens.append(seed_map[t_base])
-                else:
-                    # Если это город, отзыв или другое слово - оставляем оригинал
-                    normalized_tokens.append(t)
-            else:
-                normalized_tokens.append(t)
 
-        # Собираем обратно. Количество слов всегда равно исходному!
-        return " ".join(normalized_tokens)
+        # 2. Токены ключа (сохраняем оригинал)
+        tokens = keyword.split()
+        result = []
+
+        for token in tokens:
+            if not token:
+                continue
+
+            # чистим только для анализа, не для вывода
+            clean_token = token.lower().strip('.,!?() ')
+            if not clean_token:
+                # всё стерлось (например, один знак препинания) — оставляем оригинал
+                result.append(token)
+                continue
+
+            try:
+                parsed = self.morph.parse(clean_token)
+                if not parsed:
+                    # морфология не знает это слово — не трогаем
+                    result.append(token)
+                    continue
+
+                base = parsed[0].normal_form
+
+                if base in seed_bases:
+                    # слово из сида → приводим к форме сида
+                    result.append(seed_bases[base])
+                else:
+                    # не seed-слово → оставляем как есть (авито, youtube и т.п.)
+                    result.append(token)
+            except Exception:
+                # ЛЮБОЙ сбой морфологии → возвращаем исходный токен
+                result.append(token)
+
+        return " ".join(result)
 
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
-        if not keywords: return []
-        # Возвращаем список нормализованных фраз
+        if not keywords or not golden_seed:
+            return keywords
         return [self.normalize_by_golden_seed(kw, golden_seed) for kw in keywords]
-
-_normalizer = None
-
-def get_normalizer():
-    global _normalizer
-    if _normalizer is None:
-        _normalizer = GoldenNormalizer()
-    return _normalizer
-
-def normalize_keywords(keywords: List[str], language: str, seed: str) -> List[str]:
-    n = get_normalizer()
-    return n.process_batch(keywords, seed)
