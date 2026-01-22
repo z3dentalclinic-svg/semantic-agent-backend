@@ -166,6 +166,12 @@ class BatchPostFilter:
                 'минск': 'by', 'алматы': 'kz', 'ташкент': 'uz'
             }
 
+    def _has_seed_cores(self, keyword: str, seed: str) -> bool:
+        """Проверяет наличие корней из сида в ключе (первые 5 букв)"""
+        seed_roots = [w.lower()[:5] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
+        keyword_lower = keyword.lower()
+        return any(root in keyword_lower for root in seed_roots)
+
     def filter_batch(self, keywords: List[str], seed: str, country: str, 
                      language: str = 'ru') -> Dict:
         start_time = time.time()
@@ -196,7 +202,7 @@ class BatchPostFilter:
 
         for kw in unique_raw:
             is_allowed, reason, category = self._check_geo_conflicts_v75(
-                kw, country, lemmas_map, seed_cities, language
+                kw, country, lemmas_map, seed_cities, language, seed
             )
             
             if is_allowed:
@@ -226,9 +232,12 @@ class BatchPostFilter:
 
     def _check_geo_conflicts_v75(self, keyword: str, country: str, 
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
-                                  language: str) -> Tuple[bool, str, str]:
+                                  language: str, seed: str = "") -> Tuple[bool, str, str]:
+        # Проверяем наличие корней сида в ключе (ПРИОРИТЕТ СИДА)
+        has_seed = self._has_seed_cores(keyword, seed) if seed else False
+        
         logger.debug(f"[BPF] CHECK keyword='{keyword}' | country={country} | "
-                     f"seed_cities={seed_cities}")
+                     f"has_seed={has_seed} | seed_cities={seed_cities}")
         
         words = re.findall(r'[а-яёa-z0-9-]+', keyword)
         if not words:
@@ -295,25 +304,35 @@ class BatchPostFilter:
         search_items.extend([tg.replace(' ', '-') for tg in trigrams])
 
         for item in search_items:
+            # ШАГ 1: ПРИОРИТЕТ - проверка ignored_words ПЕРВЫМ
             if len(item) < 3 or item in self.ignored_words:
+                if item in self.ignored_words:
+                    logger.info(f"[GEO_SKIP] Слово '{item}' в ignored_words")
                 continue
             
             item_normalized = self._get_lemma(item, language)
             found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
             
             if found_country:
-                # 1. Сначала лог того, что вообще нашли гео-объект
+                # Лог того, что нашли гео-объект
                 logger.info(f"[GEO_DEBUG] Слово '{item}' (норма: '{item_normalized}') опознано как город страны: {found_country.upper()}")
 
+                # ШАГ 2: ПРИОРИТЕТ - Проверка целевой страны
                 if found_country == country.lower():
-                    logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (своя страна {country.upper()})")
+                    logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (целевая страна {country.upper()})")
                     continue
                 
+                # Проверка seed_cities
                 if item_normalized in seed_cities or item in seed_cities:
                     logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (есть в сиде)")
                     continue
 
-                # 2. Если все проверки провалены — ЛОГИРУЕМ ПРИЧИНУ ЯКОРЯ
+                # ШАГ 3: Если есть корни сида - ИГНОРИРУЕМ конфликт (бренд/контекст)
+                if has_seed:
+                    logger.info(f"[GEO_ALLOW] Город '{item}' ({found_country.upper()}) разрешен (есть корни сида - считаем брендом/контекстом)")
+                    continue
+
+                # Блокируем только если нет сида и город чужой
                 reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
                 logger.warning(f"!!! [GEO_ANCHOR] Ключ отправлен в якоря: '{keyword}' | Причина: {reason}")
                 return False, reason, f"{found_country}_cities"
