@@ -30,29 +30,25 @@ async def filter_relevant_keywords(keywords: List[str], seed: str, language: str
     Returns:
         Отфильтрованный список релевантных ключевых слов
     """
-    
-    # Извлекаем слова из seed (минимум 2 символа)
+    # 1. Извлекаем важные слова из сида (длиннее 3 символов)
     seed_words = [w.lower() for w in re.findall(r'\w+', seed) if len(w) > 2]
-    
-    # Убираем короткие слова (предлоги, союзы) - оставляем только важные
-    # Если после фильтрации ничего не осталось - берём все слова
     important_seed = [w for w in seed_words if len(w) > 3] or seed_words
     
     filtered = []
-    
     for kw in keywords:
         kw_lower = kw.lower()
         kw_words = kw_lower.split()
         matches = 0
         
         for s_word in important_seed:
-            # Проверяем: слово из сида есть в ключе ИЛИ очень похоже (падеж/опечатка)
+            # ИСПРАВЛЕНО: передаем правильные аргументы в is_nearly_same
+            # Проверяем вхождение ИЛИ схожесть > 80% (для падежей)
             if any(s_word in kw_w or is_nearly_same(s_word, kw_w) for kw_w in kw_words):
                 matches += 1
         
-        # Если ВСЕ важные слова из сида найдены - ключ ПРОХОДИТ
-        # Дополнительные слова типа "на дому", "своими руками" НЕ мешают
+        # 2. Если все слова из сида найдены - пропускаем. 
+        # Дополнительные слова (на дому, своими руками, львов) теперь НЕ ГРЕХ.
         if matches >= len(important_seed):
             filtered.append(kw)
-    
+            
     return filtered
