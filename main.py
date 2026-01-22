@@ -266,6 +266,24 @@ class GoogleAutocompleteParser:
                 seed_lemmas.add(word)
         
         text_words = re.findall(r'[а-яёa-z0-9-]+', text.lower())
+        
+        # NEW: если в тексте есть город из той же страны, что и target_country,
+        # НЕ превращаем этот текст в anchor вообще
+        has_local_city = False
+        for word in text_words:
+            if len(word) < 3:
+                continue
+            city_country = ALL_CITIES_GLOBAL.get(word)
+            if city_country and city_country == target_country.lower():
+                has_local_city = True
+                break
+
+        if has_local_city:
+            logger.info(
+                f"ANCHOR BLOCKED (local city present): text='{text}' | seed='{seed}' | country={target_country}"
+            )
+            return ""
+        
         remaining_words = []
         
         for word in text_words:
