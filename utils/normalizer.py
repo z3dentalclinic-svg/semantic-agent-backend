@@ -73,9 +73,31 @@ class GoldenNormalizer:
                             changes.append((original, new, f"via_form:{form_word}"))
                             replaced = True
                         elif lemma in seed_lemmas:
-                            # Лемма совпадает с сидом, но форма не в seed_forms → кандидат на проблему
-                            result_tokens.append(token)
-                            unmapped_seed_like.append((original, lemma))
+                            # Лемма совпадает с сидом, но форма не в seed_forms → насильно приводим к форме из сида
+                            # Находим любую seed-форму с такой леммой
+                            try:
+                                # Берём базовую форму из сида по этой лемме
+                                # Просто находим первое слово из golden_seed с такой леммой
+                                seed_tokens = re.findall(r'\w+', golden_seed.lower())
+                                seed_canonical = None
+                                for sw in seed_tokens:
+                                    parsed_seed = self.morph.parse(sw)
+                                    if parsed_seed and parsed_seed[0].normal_form == lemma:
+                                        seed_canonical = sw
+                                        break
+                                
+                                if seed_canonical:
+                                    new = seed_canonical
+                                    result_tokens.append(new)
+                                    changes.append((original, new, f"via_lemma:{lemma}"))
+                                    replaced = True
+                                else:
+                                    # На всякий случай fallback
+                                    result_tokens.append(token)
+                                    unmapped_seed_like.append((original, lemma))
+                            except Exception as e:
+                                logger.debug(f"[NORMALIZER] forced lemma map fail: '{token}' ({lemma}) → {e}")
+                                result_tokens.append(token)
                         else:
                             result_tokens.append(token)
                     else:
