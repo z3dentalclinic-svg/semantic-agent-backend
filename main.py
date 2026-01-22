@@ -1159,10 +1159,12 @@ def apply_smart_fix(result: dict, seed: str, language: str):
     if result.get("keywords"):
         # 1. Получаем исходный список (со всеми городами и вариациями)
         raw_keywords = result["keywords"]
+        print(f"🔍 BEFORE normalize_keywords: {len(raw_keywords)} keywords")
         
         # 2. Исправляем падежи через GoldenNormalizer
         # Он заменит только слова из сида, города останутся нетронутыми
         norm_keywords = normalize_keywords(raw_keywords, language, seed)
+        print(f"🔍 AFTER normalize_keywords: {len(norm_keywords)} keywords (diff: {len(raw_keywords) - len(norm_keywords)})")
         
         # 3. Возвращаем ПОЛНЫЙ список. 
         # Мы НЕ используем set(), чтобы не склеивать разные запросы с одинаковым смыслом.
@@ -1173,6 +1175,8 @@ def apply_smart_fix(result: dict, seed: str, language: str):
         if "count" in result: result["count"] = total
         if "total_count" in result: result["total_count"] = total
         if "total_unique_keywords" in result: result["total_unique_keywords"] = total
+        
+        print(f"🔍 FINAL result: {len(result['keywords'])} keywords, count={result.get('count')}, total_count={result.get('total_count')}")
             
     return result
 
@@ -1206,7 +1210,10 @@ async def light_search_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, seed, language)
+    print(f"🔍 [light-search] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    result = apply_smart_fix(result, seed, language)
+    print(f"🔍 [light-search] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    return result
 
 @app.get("/api/deep-search")
 async def deep_search_endpoint(
@@ -1227,7 +1234,10 @@ async def deep_search_endpoint(
     
     # Используем исправленный seed если есть
     seed_to_use = result.get("corrected_seed", seed)
-    return apply_smart_fix(result, seed_to_use, language)
+    print(f"🔍 [deep-search] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    result = apply_smart_fix(result, seed_to_use, language)
+    print(f"🔍 [deep-search] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    return result
 
 @app.get("/api/compare")
 async def compare_methods(
@@ -1272,7 +1282,10 @@ async def parse_suffix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, seed, language)
+    print(f"🔍 [suffix] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    result = apply_smart_fix(result, seed, language)
+    print(f"🔍 [suffix] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    return result
 
 @app.get("/api/parse/infix")
 async def parse_infix_endpoint(
@@ -1299,7 +1312,10 @@ async def parse_infix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, seed, language)
+    print(f"🔍 [infix] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    result = apply_smart_fix(result, seed, language)
+    print(f"🔍 [infix] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    return result
 
 @app.get("/api/parse/morphology")
 async def parse_morphology_endpoint(
@@ -1326,7 +1342,10 @@ async def parse_morphology_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, seed, language)
+    print(f"🔍 [morphology] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    result = apply_smart_fix(result, seed, language)
+    print(f"🔍 [morphology] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    return result
 
 @app.get("/api/parse/adaptive-prefix")
 async def parse_adaptive_prefix_endpoint(
@@ -1353,5 +1372,8 @@ async def parse_adaptive_prefix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    return apply_smart_fix(result, seed, language)
+    print(f"🔍 [adaptive-prefix] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    result = apply_smart_fix(result, seed, language)
+    print(f"🔍 [adaptive-prefix] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    return result
 
