@@ -1102,18 +1102,24 @@ class GoogleAutocompleteParser:
         
         logger.info(f"[Deep Search] After final filter: {len(all_unique_keywords)} keywords, {len(all_unique_anchors)} anchors")
 
+        # Нормализация - последний шаг, после всех фильтров
+        final_keywords = sorted(list(all_unique_keywords))
+        logger.info(f"🔍 BEFORE normalize_keywords: {len(final_keywords)} keywords")
+        normalized_keywords = normalize_keywords(final_keywords, language, seed)
+        logger.info(f"🔍 AFTER normalize_keywords: {len(normalized_keywords)} keywords (diff: {len(normalized_keywords) - len(final_keywords)})")
+
         elapsed = time.time() - start_time
 
         response = {
             "seed": original_seed,
             "corrected_seed": seed if correction.get("has_errors") else None,
             "corrections": correction.get("corrections", []) if correction.get("has_errors") else [],
-            "keywords": sorted(list(all_unique_keywords)),
+            "keywords": normalized_keywords,
             "anchors": sorted(list(all_unique_anchors)),
-            "count": len(all_unique_keywords),
+            "count": len(normalized_keywords),
             "anchors_count": len(all_unique_anchors),
             "sources": sources,
-            "total_unique_keywords": len(all_unique_keywords),
+            "total_unique_keywords": len(normalized_keywords),
             "total_anchors": len(all_unique_anchors),
             "results_by_source": {
                 source: {
@@ -1238,11 +1244,7 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    # Используем исправленный seed если есть
-    seed_to_use = result.get("corrected_seed", seed)
-    print(f"🔍 [deep-search] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    result = apply_smart_fix(result, seed_to_use, language)
-    print(f"🔍 [deep-search] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
+    # Нормализация уже происходит внутри parse_deep_search
     return result
 
 @app.get("/api/compare")
