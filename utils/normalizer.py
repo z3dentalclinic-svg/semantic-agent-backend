@@ -13,6 +13,8 @@ class GoldenNormalizer:
         if not golden_seed or not keyword:
             return keyword
 
+        logger.debug(f"[NORMALIZER] START: seed='{golden_seed}' | keyword='{keyword}'")
+
         # 1. ВСЕ ФОРМЫ слов сида → эталон сида
         seed_forms = {}
         seed_lemmas = set()
@@ -83,6 +85,9 @@ class GoldenNormalizer:
                 result_tokens.append(token)
 
         normalized = " ".join(result_tokens)
+
+        # DEBUG: всегда логируем unmapped (даже если пусто)
+        logger.debug(f"[NORMALIZER] END: unmapped_count={len(unmapped_seed_like)}, changes_count={len(changes)}")
 
         # ЛОГИРУЕМ только проблемные случаи:
         if unmapped_seed_like:
