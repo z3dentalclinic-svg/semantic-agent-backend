@@ -1,4 +1,5 @@
-# utils package
-from .normalizer import normalize_keywords
-
-__all__ = ['normalize_keywords']
+"""
+Utils module for FGS Parser
+"""
+# Пустой __init__.py - импортируй напрямую из подмодулей
+__all__ = []
