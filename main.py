@@ -717,6 +717,10 @@ class GoogleAutocompleteParser:
         for kw in result_raw['keywords']:
             if not self.is_query_allowed(kw, seed, country):
                 anchor = self.strip_geo_to_anchor(kw, seed, country)
+                logger.debug(
+                    f"[SUFFIX] BLOCK by is_query_allowed | kw='{kw}' | anchor='{anchor}' "
+                    f"| seed='{seed}' | country={country}"
+                )
                 if anchor and anchor != seed.lower() and len(anchor) > 5:
                     internal_anchors.add(anchor)
                 continue  # НЕ добавляем мусор в keywords
@@ -731,11 +735,11 @@ class GoogleAutocompleteParser:
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
         logger.info(
-            f"[PARSE_SUFFIX] CALL filter_batch | country={country} | lang={language} | "
-            f"seed='{seed}' | final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
+            f"[SUFFIX] BEFORE BPF | seed='{seed}' | country={country} | "
+            f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
         )
-        logger.debug(f"[PARSE_SUFFIX] final_keywords={final_keywords}")
-        logger.debug(f"[PARSE_SUFFIX] final_anchors={final_anchors}")
+        logger.debug(f"[SUFFIX] final_keywords={final_keywords}")
+        logger.debug(f"[SUFFIX] final_anchors={final_anchors}")
         
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
@@ -788,6 +792,10 @@ class GoogleAutocompleteParser:
         for kw in result_raw['keywords']:
             if not self.is_query_allowed(kw, seed, country):
                 anchor = self.strip_geo_to_anchor(kw, seed, country)
+                logger.debug(
+                    f"[INFIX] BLOCK by is_query_allowed | kw='{kw}' | anchor='{anchor}' "
+                    f"| seed='{seed}' | country={country}"
+                )
                 if anchor and anchor != seed.lower() and len(anchor) > 5:
                     internal_anchors.add(anchor)
                 continue  # НЕ добавляем мусор в keywords
@@ -804,11 +812,11 @@ class GoogleAutocompleteParser:
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
         logger.info(
-            f"[PARSE_INFIX] CALL filter_batch | country={country} | lang={language} | "
-            f"seed='{seed}' | final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
+            f"[INFIX] BEFORE BPF | seed='{seed}' | country={country} | "
+            f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
         )
-        logger.debug(f"[PARSE_INFIX] final_keywords={final_keywords}")
-        logger.debug(f"[PARSE_INFIX] final_anchors={final_anchors}")
+        logger.debug(f"[INFIX] final_keywords={final_keywords}")
+        logger.debug(f"[INFIX] final_anchors={final_anchors}")
         
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
@@ -902,6 +910,10 @@ class GoogleAutocompleteParser:
         for kw in all_keywords:
             if not self.is_query_allowed(kw, seed, country):
                 anchor = self.strip_geo_to_anchor(kw, seed, country)
+                logger.debug(
+                    f"[MORPH] BLOCK by is_query_allowed | kw='{kw}' | anchor='{anchor}' "
+                    f"| seed='{seed}' | country={country}"
+                )
                 if anchor and anchor != seed.lower() and len(anchor) > 5:
                     internal_anchors.add(anchor)
                 continue  # НЕ добавляем мусор в keywords
@@ -916,11 +928,11 @@ class GoogleAutocompleteParser:
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
         logger.info(
-            f"[PARSE_MORPH] CALL filter_batch | country={country} | lang={language} | "
-            f"seed='{seed}' | final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
+            f"[MORPH] BEFORE BPF | seed='{seed}' | country={country} | "
+            f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
         )
-        logger.debug(f"[PARSE_MORPH] final_keywords={final_keywords}")
-        logger.debug(f"[PARSE_MORPH] final_anchors={final_anchors}")
+        logger.debug(f"[MORPH] final_keywords={final_keywords}")
+        logger.debug(f"[MORPH] final_anchors={final_anchors}")
         
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
@@ -1022,6 +1034,10 @@ class GoogleAutocompleteParser:
                 for kw in result['keywords']:
                     if not self.is_query_allowed(kw, seed, country):
                         anchor = self.strip_geo_to_anchor(kw, seed, country)
+                        logger.debug(
+                            f"[ADAPTIVE_PREFIX] BLOCK by is_query_allowed | kw='{kw}' | anchor='{anchor}' "
+                            f"| seed='{seed}' | country={country}"
+                        )
                         if anchor and anchor != seed.lower() and len(anchor) > 5:
                             internal_anchors.add(anchor)
                         continue  # НЕ добавляем мусор в keywords
@@ -1034,6 +1050,13 @@ class GoogleAutocompleteParser:
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
+        
+        logger.info(
+            f"[ADAPTIVE_PREFIX] BEFORE BPF | seed='{seed}' | country={country} | "
+            f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}"
+        )
+        logger.debug(f"[ADAPTIVE_PREFIX] final_keywords={final_keywords}")
+        logger.debug(f"[ADAPTIVE_PREFIX] final_anchors={final_anchors}")
         
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
