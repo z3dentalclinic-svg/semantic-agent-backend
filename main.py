@@ -30,9 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Настройка логгера для нормализатора
+# Настройка логгера для нормализатора - ВАЖНО для диагностики!
 normalizer_logger = logging.getLogger("GoldenNormalizer")
-normalizer_logger.setLevel(logging.INFO)  # WARNING покажет только unmapped случаи
+normalizer_logger.setLevel(logging.DEBUG)  # DEBUG покажет все: START, END, и WARNING для unmapped
+# Убедимся что он пишет в тот же хендлер
+normalizer_logger.propagate = True  # Пробрасываем в root logger
 
 import nltk
 from nltk.stem import SnowballStemmer
