@@ -14,41 +14,18 @@ def is_nearly_same(s1: str, s2: str) -> bool:
 
 
 async def filter_relevant_keywords(keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
-    """
-    Улучшенный фильтр релевантности: оставляет ключевые слова релевантные seed
-    
-    ИЗМЕНЕНИЯ:
-    - Убраны стоп-слова из проверки (не фильтруем по "в", "на", "от")
-    - Разрешены фразы с дополнениями типа "на дому", "своими руками"
-    - Проверка схожести слов через SequenceMatcher для падежей
-    
-    Args:
-        keywords: Список ключевых слов
-        seed: Базовый запрос
-        language: Код языка
-        
-    Returns:
-        Отфильтрованный список релевантных ключевых слов
-    """
-    # 1. Извлекаем важные слова из сида (длиннее 3 символов)
-    seed_words = [w.lower() for w in re.findall(r'\w+', seed) if len(w) > 2]
-    important_seed = [w for w in seed_words if len(w) > 3] or seed_words
+    # Очищаем сид до базовых корней (ремонт, пылесос)
+    seed_words = [w.lower()[:5] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
     
     filtered = []
     for kw in keywords:
         kw_lower = kw.lower()
-        kw_words = kw_lower.split()
-        matches = 0
-        
-        for s_word in important_seed:
-            # ИСПРАВЛЕНО: передаем правильные аргументы в is_nearly_same
-            # Проверяем вхождение ИЛИ схожесть > 80% (для падежей)
-            if any(s_word in kw_w or is_nearly_same(s_word, kw_w) for kw_w in kw_words):
-                matches += 1
-        
-        # 2. Если все слова из сида найдены - пропускаем. 
-        # Дополнительные слова (на дому, своими руками, львов) теперь НЕ ГРЕХ.
-        if matches >= len(important_seed):
+        # Если хотя бы ОДИН корень из сида есть в ключе - оставляем!
+        # Это спасет "ремонтам", "ремонтами" и т.д.
+        if any(root in kw_lower for root in seed_words):
             filtered.append(kw)
+        else:
+            # Если это бренд или район, но основные слова потерялись - в якоря
+            pass 
             
     return filtered
