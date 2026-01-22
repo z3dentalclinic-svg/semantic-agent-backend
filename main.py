@@ -22,7 +22,7 @@ from filters import (
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
-# from utils.normalizer import normalize_keywords
+from utils.normalizer import normalize_keywords
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,11 +30,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Настройка логгера для нормализатора - ВАЖНО для диагностики!
 normalizer_logger = logging.getLogger("GoldenNormalizer")
-normalizer_logger.setLevel(logging.DEBUG)  # DEBUG покажет все: START, END, и WARNING для unmapped
-# Убедимся что он пишет в тот же хендлер
-normalizer_logger.propagate = True  # Пробрасываем в root logger
+normalizer_logger.setLevel(logging.DEBUG)
+normalizer_logger.propagate = True
 
 import nltk
 from nltk.stem import SnowballStemmer
@@ -1086,8 +1084,6 @@ class GoogleAutocompleteParser:
             for method_anchors in all_anchors_by_source[source].values():
                 all_unique_anchors |= method_anchors
         
-        # ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Финальная фильтрация всех собранных keywords
-        # Каждый метод фильтрует свои результаты, но при объединении могут просочиться мусорные города
         logger.info(f"[Deep Search] Before final filter: {len(all_unique_keywords)} keywords")
         
         final_filter = self.post_filter.filter_batch(
@@ -1102,12 +1098,8 @@ class GoogleAutocompleteParser:
         
         logger.info(f"[Deep Search] After final filter: {len(all_unique_keywords)} keywords, {len(all_unique_anchors)} anchors")
 
-        # Нормализация - последний шаг, после всех фильтров
         final_keywords = sorted(list(all_unique_keywords))
-        # logger.info(f"🔍 BEFORE normalize_keywords: {len(final_keywords)} keywords")
-        # normalized_keywords = normalize_keywords(final_keywords, language, seed)
-        # logger.info(f"🔍 AFTER normalize_keywords: {len(normalized_keywords)} keywords (diff: {len(normalized_keywords) - len(final_keywords)})")
-        normalized_keywords = final_keywords  # Нормализация отключена
+        normalized_keywords = normalize_keywords(final_keywords, language, seed)
 
         elapsed = time.time() - start_time
 
@@ -1170,29 +1162,15 @@ parser = GoogleAutocompleteParser()
 
 def apply_smart_fix(result: dict, seed: str, language: str):
     if result.get("keywords"):
-        # 1. Получаем исходный список (со всеми городами и вариациями)
         raw_keywords = result["keywords"]
-        # print(f"🔍 BEFORE normalize_keywords: {len(raw_keywords)} keywords")
+        norm_keywords = normalize_keywords(raw_keywords, language, seed)
         
-        # 2. Исправляем падежи через GoldenNormalizer
-        # Он заменит только слова из сида, города останутся нетронутыми
-        # norm_keywords = normalize_keywords(raw_keywords, language, seed)
-        # print(f"🔍 AFTER normalize_keywords: {len(norm_keywords)} keywords (diff: {len(raw_keywords) - len(norm_keywords)})")
-        
-        # Нормализация отключена
-        norm_keywords = raw_keywords
-        
-        # 3. Возвращаем ПОЛНЫЙ список. 
-        # Мы НЕ используем set(), чтобы не склеивать разные запросы с одинаковым смыслом.
         result["keywords"] = norm_keywords
         
-        # 4. Обновляем все счётчики до реального количества слов
         total = len(norm_keywords)
         if "count" in result: result["count"] = total
         if "total_count" in result: result["total_count"] = total
         if "total_unique_keywords" in result: result["total_unique_keywords"] = total
-        
-        # print(f"🔍 FINAL result: {len(result['keywords'])} keywords, count={result.get('count')}, total_count={result.get('total_count')}")
             
     return result
 
@@ -1226,10 +1204,7 @@ async def light_search_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    print(f"🔍 [light-search] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    result = apply_smart_fix(result, seed, language)
-    print(f"🔍 [light-search] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/deep-search")
 async def deep_search_endpoint(
@@ -1294,10 +1269,7 @@ async def parse_suffix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    print(f"🔍 [suffix] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    result = apply_smart_fix(result, seed, language)
-    print(f"🔍 [suffix] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/infix")
 async def parse_infix_endpoint(
@@ -1324,10 +1296,7 @@ async def parse_infix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    print(f"🔍 [infix] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    result = apply_smart_fix(result, seed, language)
-    print(f"🔍 [infix] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/morphology")
 async def parse_morphology_endpoint(
@@ -1354,10 +1323,7 @@ async def parse_morphology_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    print(f"🔍 [morphology] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    result = apply_smart_fix(result, seed, language)
-    print(f"🔍 [morphology] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    return result
+    return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/adaptive-prefix")
 async def parse_adaptive_prefix_endpoint(
@@ -1384,8 +1350,5 @@ async def parse_adaptive_prefix_endpoint(
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
 
-    print(f"🔍 [adaptive-prefix] BEFORE apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    result = apply_smart_fix(result, seed, language)
-    print(f"🔍 [adaptive-prefix] AFTER apply_smart_fix: {len(result.get('keywords', []))} keywords")
-    return result
+    return apply_smart_fix(result, seed, language)
 
