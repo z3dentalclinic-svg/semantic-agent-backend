@@ -170,9 +170,14 @@ class BatchPostFilter:
                      language: str = 'ru') -> Dict:
         start_time = time.time()
         
+        logger.info(f"[BPF] START filter_batch | country={country} | lang={language}")
+        logger.info(f"[BPF] RAW keywords ({len(keywords)}): {keywords}")
+        
         unique_raw = sorted(list(set([k.lower().strip() for k in keywords if k.strip()])))
+        logger.info(f"[BPF] UNIQUE_RAW ({len(unique_raw)}): {unique_raw}")
         
         seed_cities = self._extract_cities_from_seed(seed, country, language)
+        logger.info(f"[BPF] SEED='{seed}' | seed_cities={seed_cities}")
         
         all_words = set()
         for kw in unique_raw:
@@ -203,6 +208,9 @@ class BatchPostFilter:
                 stats['reasons'][category] += 1
 
         elapsed = time.time() - start_time
+        logger.info(f"[BPF] FINISH {elapsed:.2f}s | "
+                    f"allowed={len(final_keywords)} | anchors={len(final_anchors)} | "
+                    f"reasons={dict(stats['reasons'])}")
 
         return {
             'keywords': final_keywords,
@@ -219,6 +227,9 @@ class BatchPostFilter:
     def _check_geo_conflicts_v75(self, keyword: str, country: str, 
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
                                   language: str) -> Tuple[bool, str, str]:
+        logger.debug(f"[BPF] CHECK keyword='{keyword}' | country={country} | "
+                     f"seed_cities={seed_cities}")
+        
         words = re.findall(r'[а-яёa-z0-9-]+', keyword)
         if not words:
             return True, "", ""
@@ -227,6 +238,7 @@ class BatchPostFilter:
         
         words_set = set(words + keyword_lemmas)
         if any(city in words_set for city in seed_cities):
+            logger.debug(f"[BPF] ALLOW by seed_cities | keyword='{keyword}'")
             return True, "", ""
         
         for check_val in words + keyword_lemmas:
@@ -299,15 +311,23 @@ class BatchPostFilter:
             
             # 🔥 FIX: ПРИОРИТЕТ seed_cities
             if found_country:
+                logger.debug(f"[BPF] GEO HIT item='{item}' normalized='{item_normalized}' "
+                             f"found_country={found_country} | target={country} | "
+                             f"in_seed={item_normalized in seed_cities}")
+                
                 # СНАЧАЛА проверяем seed_cities
                 if item_normalized in seed_cities:
+                    logger.debug(f"[BPF] ALLOW city in seed_cities: '{item_normalized}'")
                     continue
                 
                 # Потом проверяем таргет-страну
                 if found_country == country.lower():
+                    logger.debug(f"[BPF] ALLOW city in target country: '{item_normalized}'")
                     continue
                 
                 # Блокируем чужой город
+                logger.warning(f"[BPF] BLOCK foreign city: '{item}' -> '{item_normalized}' "
+                               f"({found_country.upper()}) in keyword='{keyword}'")
                 return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
             
             else:
@@ -356,15 +376,19 @@ class BatchPostFilter:
         for word in words:
             # БЕЗ ПРОВЕРКИ country!
             if word in self.all_cities_global:
+                logger.debug(f"[BPF] seed_city WORD '{word}' -> {self.all_cities_global[word]}")
                 seed_cities.add(word)
             
             lemma = self._get_lemma(word, language)
             if lemma in self.all_cities_global:
+                logger.debug(f"[BPF] seed_city LEMMA '{lemma}' <- '{word}' "
+                             f"-> {self.all_cities_global[lemma]}")
                 seed_cities.add(lemma)
         
         bigrams = self._extract_ngrams(words, 2)
         for bigram in bigrams:
             if bigram in self.all_cities_global:
+                logger.debug(f"[BPF] seed_city BIGRAM '{bigram}' -> {self.all_cities_global[bigram]}")
                 seed_cities.add(bigram)
         
         return seed_cities
