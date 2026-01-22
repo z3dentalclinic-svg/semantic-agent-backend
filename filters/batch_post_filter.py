@@ -295,39 +295,23 @@ class BatchPostFilter:
         search_items.extend([tg.replace(' ', '-') for tg in trigrams])
 
         for item in search_items:
-            if len(item) < 3:
-                continue
-            
-            if item in self.ignored_words:
+            if len(item) < 3 or item in self.ignored_words:
                 continue
             
             item_normalized = self._get_lemma(item, language)
-            found_country = self.all_cities_global.get(item_normalized)
+            found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
             
-            if not found_country:
-                found_country = self.all_cities_global.get(item)
-                if found_country:
-                    item_normalized = item
-            
-            # 🔥 ПАТЧ: ПРИОРИТЕТ СВОЕЙ СТРАНЫ И SEED_CITIES
             if found_country:
-                logger.debug(f"[BPF] GEO HIT item='{item}' found_country={found_country}")
-                
-                # 1. АМНИСТИЯ: Если город из той же страны, которую мы парсим — ПРОПУСКАЕМ
-                if found_country == country.lower():
-                    logger.debug(f"[BPF] ALLOW: City '{item}' belongs to target country '{country}'")
+                # АМНИСТИЯ: Если это город нашей страны (UA) или он в SEED - ПРОПУСКАЕМ
+                if found_country == country.lower() or item_normalized in seed_cities:
                     continue
                 
-                # 2. АМНИСТИЯ: Если город был в самом поисковом запросе (seed) — ПРОПУСКАЕМ
-                if item_normalized in seed_cities or item in seed_cities:
-                    logger.debug(f"[BPF] ALLOW: City '{item}' found in seed_cities")
-                    continue
-                
-                # 3. БЛОКИРОВКА: Только если город РЕАЛЬНО чужой (другая страна)
-                logger.warning(f"[BPF] BLOCK foreign city: '{item}' ({found_country.upper()})")
-                return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
+                # БЛОКИРУЕМ ТОЛЬКО РЕАЛЬНО ЧУЖИЕ СТРАНЫ
+                return False, f"Foreign city {found_country}", f"{found_country}_cities"
             
-            else:
+            # 🔥 НОВОЕ: Если это район или микрорайон (Черемушки, Алексеевка), 
+            # и он не распознан как чужой город - МЫ ЕГО НЕ ТРОГАЕМ (True)
+
                 if self._is_common_noun(item_normalized, language):
                     continue
         
@@ -425,24 +409,7 @@ class BatchPostFilter:
         return [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
 
     def _is_grammatically_valid(self, keyword: str, language: str) -> bool:
-        if not self._has_morph or language not in ['ru', 'uk']:
-            return True
-        
-        morph = self.morph_ru if language == 'ru' else self.morph_uk
-        words = re.findall(r'[а-яёa-z]+', keyword.lower())
-        
-        for word in words:
-            try:
-                parsed = morph.parse(word)
-                if parsed:
-                    tag = parsed[0].tag
-                    invalid_tags = {'datv', 'ablt', 'loct'}
-                    if 'plur' in tag and any(bad in tag for bad in invalid_tags):
-                        return False
-            except:
-                pass
-        
-        return True
+        return True  # Временная полная амнистия, чтобы спасти ключи
 
 
 # ============================================
