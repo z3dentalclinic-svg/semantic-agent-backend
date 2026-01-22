@@ -30,6 +30,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Настройка логгера для нормализатора
+normalizer_logger = logging.getLogger("GoldenNormalizer")
+normalizer_logger.setLevel(logging.INFO)  # WARNING покажет только unmapped случаи
+
 import nltk
 from nltk.stem import SnowballStemmer
 
