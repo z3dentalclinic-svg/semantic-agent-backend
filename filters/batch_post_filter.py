@@ -302,17 +302,20 @@ class BatchPostFilter:
             found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
             
             if found_country:
-                # Проверка на исключения
-                if item_normalized in self.ignored_words:
-                    logger.info(f"--- [GEO_SKIP] Слово '{item}' в игноре (не город)")
-                    continue
+                # 1. Сначала лог того, что вообще нашли гео-объект
+                logger.info(f"[GEO_DEBUG] Слово '{item}' (норма: '{item_normalized}') опознано как город страны: {found_country.upper()}")
 
                 if found_country == country.lower():
+                    logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (своя страна {country.upper()})")
                     continue
                 
-                # ЛОГИРУЕМ ПРИЧИНУ ОТСЕВА
-                reason = f"Слово '{item}' распознано как город страны {found_country.upper()}"
-                logger.warning(f"!!! [GEO_ANCHOR] Ключ: '{keyword}' | Причина: {reason}")
+                if item_normalized in seed_cities or item in seed_cities:
+                    logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (есть в сиде)")
+                    continue
+
+                # 2. Если все проверки провалены — ЛОГИРУЕМ ПРИЧИНУ ЯКОРЯ
+                reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
+                logger.warning(f"!!! [GEO_ANCHOR] Ключ отправлен в якоря: '{keyword}' | Причина: {reason}")
                 return False, reason, f"{found_country}_cities"
             
             # 🔥 НОВОЕ: Если это район или микрорайон (Черемушки, Алексеевка), 
