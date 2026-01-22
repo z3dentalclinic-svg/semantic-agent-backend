@@ -27,9 +27,15 @@ def simple_normalize_keyword(keyword: str, seed: str) -> str:
                 replacements[k] = s
                 continue
             
-            # 2) Похожесть по SequenceMatcher (порог 0.8)
+            # 2) Общий префикс (для «ремонт*/пылесос*»)
+            prefix_len = 5
+            if len(k) >= prefix_len and len(s) >= prefix_len and k[:prefix_len] == s[:prefix_len]:
+                replacements[k] = s
+                continue
+            
+            # 3) Похожесть по SequenceMatcher (порог понижен до 0.7)
             sim = SequenceMatcher(None, k, s).ratio()
-            if sim >= 0.8:
+            if sim >= 0.7:
                 replacements[k] = s
     
     # Применяем замены к исходному keyword
