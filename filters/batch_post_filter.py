@@ -302,12 +302,18 @@ class BatchPostFilter:
             found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
             
             if found_country:
-                # АМНИСТИЯ: Если это город нашей страны (UA) или он в SEED - ПРОПУСКАЕМ
-                if found_country == country.lower() or item_normalized in seed_cities:
+                # Проверка на исключения
+                if item_normalized in self.ignored_words:
+                    logger.info(f"--- [GEO_SKIP] Слово '{item}' в игноре (не город)")
+                    continue
+
+                if found_country == country.lower():
                     continue
                 
-                # БЛОКИРУЕМ ТОЛЬКО РЕАЛЬНО ЧУЖИЕ СТРАНЫ
-                return False, f"Foreign city {found_country}", f"{found_country}_cities"
+                # ЛОГИРУЕМ ПРИЧИНУ ОТСЕВА
+                reason = f"Слово '{item}' распознано как город страны {found_country.upper()}"
+                logger.warning(f"!!! [GEO_ANCHOR] Ключ: '{keyword}' | Причина: {reason}")
+                return False, reason, f"{found_country}_cities"
             
             # 🔥 НОВОЕ: Если это район или микрорайон (Черемушки, Алексеевка), 
             # и он не распознан как чужой город - МЫ ЕГО НЕ ТРОГАЕМ (True)
