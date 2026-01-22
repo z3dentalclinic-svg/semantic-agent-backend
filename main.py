@@ -730,6 +730,12 @@ class GoogleAutocompleteParser:
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
+        logger.info(f"[PARSE_SUFFIX] CALL filter_batch | country={country} | "
+                    f"seed='{seed}' | lang={language} | "
+                    f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}")
+        logger.debug(f"[PARSE_SUFFIX] final_keywords={final_keywords}")
+        logger.debug(f"[PARSE_SUFFIX] final_anchors={final_anchors}")
+        
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
             seed=seed,
@@ -795,6 +801,12 @@ class GoogleAutocompleteParser:
         filtered_set = set(filtered_2)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
+        
+        logger.info(f"[PARSE_INFIX] CALL filter_batch | country={country} | "
+                    f"seed='{seed}' | lang={language} | "
+                    f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}")
+        logger.debug(f"[PARSE_INFIX] final_keywords={final_keywords}")
+        logger.debug(f"[PARSE_INFIX] final_anchors={final_anchors}")
         
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
@@ -900,6 +912,12 @@ class GoogleAutocompleteParser:
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
+        
+        logger.info(f"[PARSE_MORPHOLOGY] CALL filter_batch | country={country} | "
+                    f"seed='{seed}' | lang={language} | "
+                    f"final_keywords={len(final_keywords)} | final_anchors={len(final_anchors)}")
+        logger.debug(f"[PARSE_MORPHOLOGY] final_keywords={final_keywords}")
+        logger.debug(f"[PARSE_MORPHOLOGY] final_anchors={final_anchors}")
         
         batch_result = self.post_filter.filter_batch(
             keywords=final_keywords,
