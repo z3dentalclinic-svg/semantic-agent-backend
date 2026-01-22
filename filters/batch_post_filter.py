@@ -309,25 +309,22 @@ class BatchPostFilter:
                 if found_country:
                     item_normalized = item
             
-            # 🔥 FIX: ПРИОРИТЕТ seed_cities
+            # 🔥 ПАТЧ: ПРИОРИТЕТ СВОЕЙ СТРАНЫ И SEED_CITIES
             if found_country:
-                logger.debug(f"[BPF] GEO HIT item='{item}' normalized='{item_normalized}' "
-                             f"found_country={found_country} | target={country} | "
-                             f"in_seed={item_normalized in seed_cities}")
+                logger.debug(f"[BPF] GEO HIT item='{item}' found_country={found_country}")
                 
-                # СНАЧАЛА проверяем seed_cities
-                if item_normalized in seed_cities:
-                    logger.debug(f"[BPF] ALLOW city in seed_cities: '{item_normalized}'")
-                    continue
-                
-                # Потом проверяем таргет-страну
+                # 1. АМНИСТИЯ: Если город из той же страны, которую мы парсим — ПРОПУСКАЕМ
                 if found_country == country.lower():
-                    logger.debug(f"[BPF] ALLOW city in target country: '{item_normalized}'")
+                    logger.debug(f"[BPF] ALLOW: City '{item}' belongs to target country '{country}'")
                     continue
                 
-                # Блокируем чужой город
-                logger.warning(f"[BPF] BLOCK foreign city: '{item}' -> '{item_normalized}' "
-                               f"({found_country.upper()}) in keyword='{keyword}'")
+                # 2. АМНИСТИЯ: Если город был в самом поисковом запросе (seed) — ПРОПУСКАЕМ
+                if item_normalized in seed_cities or item in seed_cities:
+                    logger.debug(f"[BPF] ALLOW: City '{item}' found in seed_cities")
+                    continue
+                
+                # 3. БЛОКИРОВКА: Только если город РЕАЛЬНО чужой (другая страна)
+                logger.warning(f"[BPF] BLOCK foreign city: '{item}' ({found_country.upper()})")
                 return False, f"{found_country.upper()} город '{item_normalized}'", f"{found_country}_cities"
             
             else:
