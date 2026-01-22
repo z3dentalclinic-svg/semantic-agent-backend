@@ -7,57 +7,55 @@ class GoldenNormalizer:
         self.morph = pymorphy3.MorphAnalyzer()
     
     def normalize_by_golden_seed(self, keyword: str, golden_seed: str) -> str:
-        # 0. Защита от пустых
         if not golden_seed or not keyword:
             return keyword
-        
-        # 1. База лемм из seed: "ремонты пылесосов" → {"ремонт": "ремонт", "пылесос": "пылесосов"}
-        seed_bases = {}
+
+        # 1. ВСЕ ФОРМЫ слов сида → эталон сида
+        seed_forms = {}
         for w in re.findall(r'\w+', golden_seed.lower()):
             try:
                 parsed = self.morph.parse(w)
                 if not parsed:
                     continue
-                base = parsed[0].normal_form
-                seed_bases[base] = w
-            except Exception:
-                # если морфология не справилась — просто игнор seed-слово
+                seed_form = w  # форма ИЗ сида (эталон!)
+                
+                # Все формы этого слова → эталон сида
+                for form_obj in parsed[0].lexeme:
+                    seed_forms[form_obj.word.lower()] = seed_form
+            except:
                 continue
-        
-        # 2. Токены ключа (сохраняем оригинал)
+
+        # 2. Нормализация ключа
         tokens = keyword.split()
         result = []
-        
+
         for token in tokens:
             if not token:
                 continue
-            
-            # чистим только для анализа, не для вывода
             clean_token = token.lower().strip('.,!?() ')
             if not clean_token:
-                # всё стерлось (например, один знак препинания) — оставляем оригинал
                 result.append(token)
                 continue
-            
+
             try:
-                parsed = self.morph.parse(clean_token)
-                if not parsed:
-                    # морфология не знает это слово — не трогаем
-                    result.append(token)
+                # Пробуем точное совпадение формы
+                if clean_token in seed_forms:
+                    result.append(seed_forms[clean_token])
                     continue
-                
-                base = parsed[0].normal_form
-                
-                if base in seed_bases:
-                    # слово из сида → приводим к форме сида
-                    result.append(seed_bases[base])
+                    
+                # Пробуем лемматизацию
+                parsed = self.morph.parse(clean_token)
+                if parsed:
+                    token_form = parsed[0].word.lower()
+                    if token_form in seed_forms:
+                        result.append(seed_forms[token_form])
+                    else:
+                        result.append(token)
                 else:
-                    # не seed-слово → оставляем как есть (авито, youtube и т.п.)
                     result.append(token)
-            except Exception:
-                # ЛЮБОЙ сбой морфологии → возвращаем исходный токен
+            except:
                 result.append(token)
-        
+
         return " ".join(result)
     
     def process_batch(self, keywords: List[str], golden_seed: str) -> List[str]:
