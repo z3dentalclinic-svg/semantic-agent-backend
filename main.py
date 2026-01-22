@@ -22,7 +22,7 @@ from filters import (
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
-from utils.normalizer import normalize_keywords
+# from utils.normalizer import normalize_keywords
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1104,9 +1104,10 @@ class GoogleAutocompleteParser:
 
         # Нормализация - последний шаг, после всех фильтров
         final_keywords = sorted(list(all_unique_keywords))
-        logger.info(f"🔍 BEFORE normalize_keywords: {len(final_keywords)} keywords")
-        normalized_keywords = normalize_keywords(final_keywords, language, seed)
-        logger.info(f"🔍 AFTER normalize_keywords: {len(normalized_keywords)} keywords (diff: {len(normalized_keywords) - len(final_keywords)})")
+        # logger.info(f"🔍 BEFORE normalize_keywords: {len(final_keywords)} keywords")
+        # normalized_keywords = normalize_keywords(final_keywords, language, seed)
+        # logger.info(f"🔍 AFTER normalize_keywords: {len(normalized_keywords)} keywords (diff: {len(normalized_keywords) - len(final_keywords)})")
+        normalized_keywords = final_keywords  # Нормализация отключена
 
         elapsed = time.time() - start_time
 
@@ -1171,12 +1172,15 @@ def apply_smart_fix(result: dict, seed: str, language: str):
     if result.get("keywords"):
         # 1. Получаем исходный список (со всеми городами и вариациями)
         raw_keywords = result["keywords"]
-        print(f"🔍 BEFORE normalize_keywords: {len(raw_keywords)} keywords")
+        # print(f"🔍 BEFORE normalize_keywords: {len(raw_keywords)} keywords")
         
         # 2. Исправляем падежи через GoldenNormalizer
         # Он заменит только слова из сида, города останутся нетронутыми
-        norm_keywords = normalize_keywords(raw_keywords, language, seed)
-        print(f"🔍 AFTER normalize_keywords: {len(norm_keywords)} keywords (diff: {len(raw_keywords) - len(norm_keywords)})")
+        # norm_keywords = normalize_keywords(raw_keywords, language, seed)
+        # print(f"🔍 AFTER normalize_keywords: {len(norm_keywords)} keywords (diff: {len(raw_keywords) - len(norm_keywords)})")
+        
+        # Нормализация отключена
+        norm_keywords = raw_keywords
         
         # 3. Возвращаем ПОЛНЫЙ список. 
         # Мы НЕ используем set(), чтобы не склеивать разные запросы с одинаковым смыслом.
@@ -1188,7 +1192,7 @@ def apply_smart_fix(result: dict, seed: str, language: str):
         if "total_count" in result: result["total_count"] = total
         if "total_unique_keywords" in result: result["total_unique_keywords"] = total
         
-        print(f"🔍 FINAL result: {len(result['keywords'])} keywords, count={result.get('count')}, total_count={result.get('total_count')}")
+        # print(f"🔍 FINAL result: {len(result['keywords'])} keywords, count={result.get('count')}, total_count={result.get('total_count')}")
             
     return result
 
