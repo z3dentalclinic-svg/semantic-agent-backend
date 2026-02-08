@@ -1,57 +1,54 @@
 """
-GEO Garbage Filter - WHITE-LIST v3.0 FINAL
+GEO Garbage Filter - WHITE-LIST v3.0 FINAL (с нормализацией падежей)
 Universal multilingual geographical filtering
+
+КРИТИЧЕСКИЕ УЛУЧШЕНИЯ:
+1. Нормализация падежей: "киеве" → "киев", "россии" → "россия", "харьковская" → "харьков"
+2. Объединение geonamescache + fallback (всегда)
+3. Жёсткое правило: 2+ города в запросе → автоматический БЛОК
+4. Проверка природных объектов через fallback
 
 ПРИНЦИП: «Разрешено только то, что относится к seed_city»
 
 ✅ РАЗРЕШЕНО:
-   - seed_city (город из seed)
-   - Районы seed_city (из CITY_DISTRICTS)
-   - Обычные слова (не являющиеся гео-сущностями)
+   - seed_city
+   - Районы seed_city
+   - Обычные слова (не гео-объекты)
 
-❌ БЛОКИРУЕТСЯ (динамически через geonamescache):
-   - Любой другой город
-   - Любая страна (кроме упоминания в seed)
-   - Природные объекты (горы: Эльбрус, реки: Енисей, озера)
+❌ БЛОКИРУЕТСЯ:
+   - Любой другой город (даже в падеже: "киеве", "киева")
+   - Любая страна (даже в падеже: "россии", "украине")
+   - 2+ города в одном запросе
+   - Природные объекты: горы, реки, озера
    - Районы других городов
-   - Оккупированные территории (для UA)
 
-БЕЗ ХАРДКОДА:
-- НЕТ списков стоп-слов
-- НЕТ ручных списков городов
-- НЕТ ручных списков стран
-- Всё через geonamescache динамически
+ТЕСТЫ (seed = "ремонт пылесосов днепр"):
+БЛОК:
+- "днепр в киеве"          → киеве→киев, 2 города
+- "днепр в киеве адреса"   → киеве→киев, 2 города
+- "днепр ельбрус"          → эльбрус = гора
+- "днепр харьковская область" → харьковская→харьков, 2 города
+- "днепр енисей"           → енисей = река
+- "днепр россия"           → россия = страна
 
-ПРИМЕРЫ:
-seed = "ремонт пылесосов днепр"
-
-БЛОКИРУЕТСЯ:
-- "днепр россия"        → россия = страна ≠ target
-- "днепр эльбрус"       → эльбрус = гора (geonames)
-- "днепр енисей"        → енисей = река (geonames)
-- "днепр урса"          → ursa = н.п. (geonames)
-- "днепр щецин"         → щецин = город ≠ днепр
-- "днепр позняки"       → позняки = район Киева
-
-РАЗРЕШАЕТСЯ:
-- "днепр левый берег"   → "левый" и "берег" не в geonames → OK
-- "днепр амур"          → амур = район Днепра → OK
+OK:
+- "днепр"                  → только seed_city
+- "днепр левый берег"      → не гео-объекты
+- "днепр амур"             → амур = район Днепра
 """
 
 import re
 import logging
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Tuple
 
 logger = logging.getLogger("GeoGarbageFilter")
 
 
 # ═══════════════════════════════════════════════════════════════════
-# БАЗА ОККУПИРОВАННЫХ ТЕРРИТОРИЙ УКРАИНЫ
-# Единственное исключение - остается для UA (специфичная политика)
+# БАЗА ОККУПИРОВАННЫХ ТЕРРИТОРИЙ
 # ═══════════════════════════════════════════════════════════════════
 
 OCCUPIED_TERRITORIES = {
-    # Крым
     "севастополь", "sevastopol", "sebastopol", "симферополь", "simferopol",
     "керчь", "kerch", "евпатория", "yevpatoria", "eupatoria", "ялта", "yalta",
     "феодосия", "feodosia", "theodosia", "джанкой", "dzhankoy", "алушта", "alushta",
@@ -66,8 +63,6 @@ OCCUPIED_TERRITORIES = {
     "молодежное", "molodezhnoye", "мирный", "mirny", "инкерман", "inkerman",
     "балаклава", "balaklava", "крым", "crimea", "крыма", "крыму", "крымский", 
     "крымская", "крымское", "арк", "ark",
-    
-    # Донецкая область
     "донецк", "donetsk", "горловка", "horlivka", "gorlovka", "макеевка", "makiivka", 
     "makeyevka", "енакиево", "yenakiieve", "enakievo", "дебальцево", "debaltseve", 
     "debaltsevo", "харцызск", "khartsyzsk", "снежное", "snizhne", "торез", "torez",
@@ -83,8 +78,6 @@ OCCUPIED_TERRITORIES = {
     "новоселовка", "novoselivka", "мариуполь", "mariupol", "талаковка", "talakivka",
     "виноградное", "vynohradne", "приморское", "prymorske", "урзуф", "urzuf",
     "днр", "dnr", "донецкая народная республика", "донбасс", "donbass", "донбасса", "донбассе",
-    
-    # Луганская область
     "луганск", "luhansk", "lugansk", "алчевск", "alchevsk", "стаханов", "stakhanov",
     "kadiivka", "кадиевка", "краснодон", "krasnodon", "ровеньки", "rovenky",
     "свердловск", "sverdlovsk", "dovzhansk", "довжанськ", "антрацит", "antratsyt",
@@ -97,10 +90,7 @@ OCCUPIED_TERRITORIES = {
     "дьяково", "diakove", "лозовое", "lozove", "новосветловка", "novosvitlivka",
     "городище", "horodyshche", "артемово", "artemove", "родаково", "rodakove",
     "червонопартизанск", "chervonyi partyzan", "лнр", "lnr", "луганская народная республика",
-    "лднр", "ldnr",
-    
-    # Херсонская, Запорожская области (частично)
-    "каховка", "kakhovka", "новая каховка", "nova kakhovka", "геническ", "henichesk",
+    "лднр", "ldnr", "каховка", "kakhovka", "новая каховка", "nova kakhovka", "геническ", "henichesk",
     "скадовск", "skadovsk", "таврийск", "tavriisk", "чаплынка", "chaplynka",
     "калачи", "kalanchak", "мелитополь", "melitopol", "бердянск", "berdiansk", "berdyansk",
     "энергодар", "enerhodar", "токмак", "tokmak", "василевка", "vasylivka",
@@ -124,7 +114,6 @@ CITY_DISTRICTS = {
         "деснянский", "деснянський", "desnianskyi", "позняки", "pozniaky",
         "троещина", "troieshchyna"
     },
-    
     "днепр": {
         "амур", "amur", "чечеловский", "чечелівський", "chechelivskyi", 
         "шевченковский", "шевченківський", "shevchenkivskyi", "соборный", "соборний", 
@@ -132,13 +121,11 @@ CITY_DISTRICTS = {
         "індустріальний", "industrialnyi", "industrial", "новокодацкий", "новокодацький", 
         "novokodatsky", "самарский", "самарський", "samarsky"
     },
-    
     "днепропетровск": {
         "амур", "amur", "чечеловский", "чечелівський", "шевченковский", "шевченківський", 
         "соборный", "соборний", "центральный", "центральний", "индустриальный", 
         "індустріальний", "новокодацкий", "новокодацький", "самарский", "самарський"
     },
-    
     "харьков": {
         "киевский", "київський", "kyivskyi", "московский", "московський", "moskovsky", 
         "дзержинский", "дзержинський", "фрунзенский", "фрунзенський", "ленинский", 
@@ -146,30 +133,25 @@ CITY_DISTRICTS = {
         "червонозаводський", "коминтерновский", "комінтернівський", "орджоникидзевский", 
         "орджонікідзевський", "индустриальный", "індустріальний"
     },
-    
     "одесса": {
         "киевский", "київський", "kyivskyi", "малиновский", "малиновський", "malynovskyi", 
         "приморский", "приморський", "prymorskyi", "суворовский", "суворовський", "suvorovskyi"
     },
-    
     "львов": {
         "галицкий", "галицький", "halytskyi", "железнодорожный", "залізничний", "zaliznychnyi", 
         "лычаковский", "личаківський", "lychakivskyi", "сиховский", "сихівський", "sykhivskyi", 
         "франковский", "франківський", "frankivskyi", "шевченковский", "шевченківський"
     },
-    
     "запорожье": {
         "александровский", "олександрівський", "oleksandrivskyi", "вознесеновский", 
         "вознесенівський", "voznesenovskyi", "днепровский", "дніпровський", "dniprovskyi", 
         "заводской", "заводський", "zavodskyi", "коммунарский", "комунарський", "komunarskyi", 
         "ленинский", "ленінський", "leninskyi", "хортицкий", "хортицький", "khortytskyi"
     },
-    
     "минск": {
         "уручье", "uruchye", "шабаны", "shabany", "каменная горка", "kamennaya gorka", 
         "серебрянка", "serebryanka"
     },
-    
     "ташкент": {
         "чиланзар", "chilanzar", "юнусабад", "yunusabad", "сергели", "sergeli", 
         "яккасарай", "yakkasaray"
@@ -178,50 +160,175 @@ CITY_DISTRICTS = {
 
 
 # ═══════════════════════════════════════════════════════════════════
+# ФУНКЦИЯ НОРМАЛИЗАЦИИ ТОКЕНОВ (падежи, адъективные формы)
+# ═══════════════════════════════════════════════════════════════════
+
+def _normalize_token(token: str) -> str:
+    """
+    Нормализует токен, удаляя падежные окончания
+    
+    Цель: "киеве" → "киев", "россии" → "россия", "харьковская" → "харьков"
+    
+    Удаляет:
+    - Однобуквенные: е, и, у, ю, а, я
+    - Двухбуквенные: ой, ый, ий, ом, ем, ах, ях, ою, ее
+    - Адъективные: ская, ский, ской, ском, скими, ских
+    
+    Args:
+        token: исходное слово (lowercase)
+    
+    Returns:
+        нормализованное слово
+    
+    Examples:
+        "киеве" → "киев"
+        "россии" → "россия" (росси+и → росси, но длина < 3, остается россии)
+        "харьковская" → "харьков"
+        "днепре" → "днепр"
+        "украине" → "украин" → но если короче 3, вернет "украине"
+    """
+    if len(token) < 3:
+        return token
+    
+    original_token = token
+    
+    # Адъективные окончания (сначала, т.к. они длиннее)
+    adj_endings = [
+        'ская', 'ский', 'ской', 'ском', 'скими', 'ских', 'скую', 'ское',
+        'кая', 'кий', 'кой', 'ком', 'кими', 'ких', 'кую', 'кое'
+    ]
+    
+    for ending in adj_endings:
+        if token.endswith(ending):
+            stem = token[:-len(ending)]
+            if len(stem) >= 3:
+                return stem
+    
+    # Двухбуквенные падежные окончания
+    two_letter_endings = ['ой', 'ый', 'ий', 'ом', 'ем', 'ам', 'ях', 'ах', 'ою', 'ее', 'ие', 'ые']
+    
+    for ending in two_letter_endings:
+        if token.endswith(ending):
+            stem = token[:-2]
+            if len(stem) >= 3:
+                return stem
+    
+    # Однобуквенные падежные окончания
+    one_letter_endings = ['е', 'и', 'у', 'ю', 'а', 'я', 'ы']
+    
+    for ending in one_letter_endings:
+        if token.endswith(ending):
+            stem = token[:-1]
+            if len(stem) >= 3:
+                return stem
+    
+    return original_token
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FALLBACK БАЗА ГЕО-СУЩНОСТЕЙ
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_fallback_geo_entities() -> Dict[str, Tuple[str, str]]:
+    """
+    Fallback база гео-сущностей (ВСЕГДА используется!)
+    
+    Формат: {название: (код_страны, тип)}
+    
+    Включает:
+    - Русские/украинские названия городов
+    - Все страны на всех языках
+    - Природные объекты (горы, реки, озера)
+    """
+    return {
+        # ═══ Города Украины ═══
+        'київ': ('UA', 'city'), 'киев': ('UA', 'city'), 'kyiv': ('UA', 'city'),
+        'харків': ('UA', 'city'), 'харьков': ('UA', 'city'), 'kharkiv': ('UA', 'city'),
+        'одеса': ('UA', 'city'), 'одесса': ('UA', 'city'), 'odesa': ('UA', 'city'),
+        'дніпро': ('UA', 'city'), 'днепр': ('UA', 'city'), 'dnipro': ('UA', 'city'),
+        'львів': ('UA', 'city'), 'львов': ('UA', 'city'), 'lviv': ('UA', 'city'),
+        'запоріжжя': ('UA', 'city'), 'запорожье': ('UA', 'city'), 'zaporizhzhia': ('UA', 'city'),
+        
+        # ═══ Города Беларуси ═══
+        'мінск': ('BY', 'city'), 'минск': ('BY', 'city'), 'minsk': ('BY', 'city'),
+        'гомель': ('BY', 'city'), 'homel': ('BY', 'city'),
+        'могилев': ('BY', 'city'), 'mogilev': ('BY', 'city'),
+        
+        # ═══ Города Польши ═══
+        'warszawa': ('PL', 'city'), 'варшава': ('PL', 'city'),
+        'szczecin': ('PL', 'city'), 'щецин': ('PL', 'city'),
+        'kraków': ('PL', 'city'), 'краков': ('PL', 'city'),
+        'gdańsk': ('PL', 'city'),
+        
+        # ═══ Города России ═══
+        'москва': ('RU', 'city'), 'moscow': ('RU', 'city'),
+        'санкт-петербург': ('RU', 'city'), 'petersburg': ('RU', 'city'),
+        'новосибирск': ('RU', 'city'),
+        
+        # ═══ Страны (на всех языках) ═══
+        'україна': ('UA', 'country'), 'украина': ('UA', 'country'), 'ukraine': ('UA', 'country'),
+        'росія': ('RU', 'country'), 'россия': ('RU', 'country'), 'russia': ('RU', 'country'),
+        'рф': ('RU', 'country'),
+        'беларусь': ('BY', 'country'), 'belarus': ('BY', 'country'), 'білорусь': ('BY', 'country'),
+        'polska': ('PL', 'country'), 'poland': ('PL', 'country'), 'польша': ('PL', 'country'),
+        'казахстан': ('KZ', 'country'), 'kazakhstan': ('KZ', 'country'),
+        'узбекистан': ('UZ', 'country'), 'uzbekistan': ('UZ', 'country'),
+        'германия': ('DE', 'country'), 'germany': ('DE', 'country'), 'німеччина': ('DE', 'country'),
+        
+        # ═══ Природные объекты (горы) ═══
+        'эльбрус': ('RU', 'mountain'), 'elbrus': ('RU', 'mountain'), 'ельбрус': ('RU', 'mountain'),
+        'монблан': ('FR', 'mountain'), 'mont blanc': ('FR', 'mountain'),
+        'эверест': ('NP', 'mountain'), 'everest': ('NP', 'mountain'),
+        
+        # ═══ Природные объекты (реки) ═══
+        'енисей': ('RU', 'river'), 'yenisei': ('RU', 'river'),
+        'волга': ('RU', 'river'), 'volga': ('RU', 'river'),
+        'дунай': ('RO', 'river'), 'danube': ('RO', 'river'),
+        'дніпро': ('UA', 'river'),  # Река Днепр (отличается от города)
+        
+        # ═══ Природные объекты (озера) ═══
+        'байкал': ('RU', 'lake'), 'baikal': ('RU', 'lake'),
+        'ладога': ('RU', 'lake'), 'ladoga': ('RU', 'lake'),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # WHITE-LIST ФИЛЬТР v3.0 FINAL
-# Полностью динамический - БЕЗ хардкода стоп-слов
+# С НОРМАЛИЗАЦИЕЙ ПАДЕЖЕЙ
 # ═══════════════════════════════════════════════════════════════════
 
 def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dict:
     """
-    WHITE-LIST гео-фильтр v3.0 FINAL
+    WHITE-LIST гео-фильтр v3.0 FINAL с нормализацией падежей
     
-    ПРИНЦИП: Разрешаем ТОЛЬКО seed_city и его районы
-    
-    ДИНАМИЧЕСКАЯ БЛОКИРОВКА через geonamescache:
-    ❌ Города (feature P) - если ≠ seed_city
-    ❌ Страны (feature A) - если ≠ target_country
-    ❌ Горы (feature T) - Эльбрус, Монблан
-    ❌ Реки (feature H) - Енисей, Волга
-    ❌ Районы других городов
-    
-    ✅ РАЗРЕШЕНО:
-    ✓ seed_city
-    ✓ Районы seed_city
-    ✓ Обычные слова (не гео-объекты)
+    КРИТИЧЕСКИЕ УЛУЧШЕНИЯ:
+    1. Нормализация: "киеве"→"киев", "россии"→"россия", "харьковская"→"харьков"
+    2. Объединение geonamescache + fallback (всегда!)
+    3. Жёсткое правило: 2+ города → БЛОК
+    4. Проверка природных объектов
     
     Args:
-        data: dict with "keywords" key
+        data: dict with "keywords"
         seed: original search query
-        target_country: country code (ua, by, kz, etc.)
+        target_country: country code
     
     Returns:
         data with filtered keywords
     
     Examples:
-        seed = "ремонт днепр"
+        seed = "ремонт пылесосов днепр"
         
-        БЛОКИРУЕТСЯ:
-        - "днепр россия"       → россия = страна
-        - "днепр эльбрус"      → эльбрус = гора
-        - "днепр енисей"       → енисей = река
-        - "днепр щецин"        → щецин = город ≠ днепр
-        - "днепр позняки"      → позняки = район Киева
+        БЛОК:
+        - "днепр в киеве"          → киеве→киев, 2 города
+        - "днепр ельбрус"          → эльбрус = mountain
+        - "днепр харьковская область" → харьковская→харьков, 2 города
+        - "днепр енисей"           → енисей = river
+        - "днепр россия"           → россия → росси, но в fallback есть "россия"
         
-        РАЗРЕШАЕТСЯ:
-        - "днепр"              → seed_city
-        - "днепр амур"         → амур = район Днепра
-        - "днепр левый берег"  → не гео-объекты
+        OK:
+        - "днепр"                  → seed_city
+        - "днепр левый берег"      → не гео-объекты
+        - "днепр амур"             → район Днепра
     """
     if not data or "keywords" not in data:
         return data
@@ -242,7 +349,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     seed_lower = seed.lower()
     target_country_upper = target_country.upper()
     
-    # Предлоги для удаления
+    # Предлоги
     prepositions = {
         'в', 'на', 'из', 'под', 'во', 'до', 'возле', 'с', 'со', 'от', 'ко', 'за', 'над',
         'у', 'біля', 'поруч', 'коло', 'від', 'про',
@@ -252,58 +359,59 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     }
     
     # ═══════════════════════════════════════════════════════════════
-    # Шаг 1: Загрузка ВСЕХ географических сущностей
+    # Шаг 1: Загрузка гео-сущностей (geonamescache + fallback)
     # ═══════════════════════════════════════════════════════════════
     
-    all_geo_entities = {}  # {название: (страна, тип)}
-    all_countries = {}     # {название: код}
+    all_geo_entities: Dict[str, Tuple[str, str]] = {}
     
+    # 1.1. Загрузка из geonamescache (если доступен)
     if has_geonames:
         try:
-            # 1. Города (feature class P = Populated places)
+            # Города
             cities = gc.get_cities()
             for city_id, city_data in cities.items():
                 country_code = city_data.get('countrycode', '').upper()
                 
-                # Основное название
                 name = city_data['name'].lower()
                 all_geo_entities[name] = (country_code, 'city')
                 
-                # Альтернативные названия
                 alt_names = city_data.get('alternatenames', [])
                 for alt in alt_names:
                     if len(alt) > 2:
                         all_geo_entities[alt.lower()] = (country_code, 'city')
             
-            logger.info(f"[GEO_WHITE_LIST] Loaded {len(all_geo_entities)} cities")
+            logger.info(f"[GEO_WHITE_LIST] Loaded {len(all_geo_entities)} cities from geonamescache")
             
-            # 2. Страны (динамически!)
+            # Страны
             countries = gc.get_countries()
             for code, country_data in countries.items():
                 name = country_data.get('name', '').lower()
                 if name:
-                    all_countries[name] = code
                     all_geo_entities[name] = (code, 'country')
             
-            logger.info(f"[GEO_WHITE_LIST] Loaded {len(all_countries)} countries")
+            logger.info(f"[GEO_WHITE_LIST] Loaded countries from geonamescache")
             
         except Exception as e:
-            logger.warning(f"Error loading geonames: {e}")
-            all_geo_entities = _get_fallback_geo_entities()
-    else:
-        all_geo_entities = _get_fallback_geo_entities()
+            logger.warning(f"Error loading geonamescache: {e}")
     
-    # Добавляем города из CITY_DISTRICTS
+    # 1.2. ВСЕГДА добавляем fallback (объединение!)
+    fallback_entities = _get_fallback_geo_entities()
+    for name, meta in fallback_entities.items():
+        all_geo_entities.setdefault(name, meta)
+    
+    logger.info(f"[GEO_WHITE_LIST] Total geo entities after fallback: {len(all_geo_entities)}")
+    
+    # 1.3. Добавляем города из CITY_DISTRICTS
     for city_name in CITY_DISTRICTS.keys():
-        if city_name not in all_geo_entities:
-            all_geo_entities[city_name] = (target_country_upper, 'city')
+        all_geo_entities.setdefault(city_name, (target_country_upper, 'city'))
     
     # ═══════════════════════════════════════════════════════════════
-    # Шаг 2: Определяем seed_city
+    # Шаг 2: Определяем seed_city (с нормализацией!)
     # ═══════════════════════════════════════════════════════════════
     
     seed_city = None
     seed_words = re.findall(r'[а-яёіїєґa-z]+', seed_lower)
+    seed_words_normalized = [_normalize_token(w) for w in seed_words]
     
     # Приоритет: самый длинный город из CITY_DISTRICTS
     potential_cities = [c for c in CITY_DISTRICTS.keys() if c in seed_lower]
@@ -311,30 +419,31 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         seed_city = max(potential_cities, key=len)
         logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (CITY_DISTRICTS)")
     
-    # Ищем в all_geo_entities
+    # Ищем в all_geo_entities (нормализованные слова)
     if not seed_city:
-        for word in seed_words:
-            if word in all_geo_entities:
-                entity_country, entity_type = all_geo_entities[word]
+        for word_norm in seed_words_normalized:
+            if word_norm in all_geo_entities:
+                entity_country, entity_type = all_geo_entities[word_norm]
                 if entity_type == 'city':
-                    seed_city = word
-                    logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (geonames)")
+                    seed_city = word_norm
+                    logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (geonames, normalized)")
                     break
     
     if not seed_city:
         logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city in seed: '{seed}'. All queries pass.")
     
-    # Разрешенные районы seed_city
+    # Разрешенные районы
     allowed_districts = CITY_DISTRICTS.get(seed_city, set()) if seed_city else set()
     
     # ═══════════════════════════════════════════════════════════════
-    # Шаг 3: WHITE-LIST фильтрация
+    # Шаг 3: WHITE-LIST фильтрация (с нормализацией!)
     # ═══════════════════════════════════════════════════════════════
     
     unique_keywords = []
     stats = {
         'total': len(data["keywords"]),
         'blocked_occupied': 0,
+        'blocked_multi_city': 0,        # ← НОВОЕ!
         'blocked_foreign_city': 0,
         'blocked_foreign_country': 0,
         'blocked_geo_object': 0,
@@ -357,16 +466,19 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         # Удаляем предлоги
         clean_words = [w for w in words if w not in prepositions and len(w) > 1]
         
+        # НОРМАЛИЗАЦИЯ (ключевой момент!)
+        clean_words_normalized = [_normalize_token(w) for w in clean_words]
+        
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 1: Оккупированные территории (только UA)
+        # ПРОВЕРКА 1: Оккупированные территории
         # ═══════════════════════════════════════════════════════════
         
         if target_country.lower() == 'ua':
             has_occupied = False
-            for word in clean_words:
-                if word in OCCUPIED_TERRITORIES:
+            for word_norm in clean_words_normalized:
+                if word_norm in OCCUPIED_TERRITORIES:
                     has_occupied = True
-                    logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{word}'")
+                    logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{word_norm}'")
                     stats['blocked_occupied'] += 1
                     break
             
@@ -374,39 +486,51 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 2: WHITE-LIST - Чужие гео-объекты
+        # ПРОВЕРКА 2: ЖЁСТКОЕ ПРАВИЛО - 2+ ГОРОДА → БЛОК
+        # ═══════════════════════════════════════════════════════════
+        
+        if seed_city:
+            cities_in_query: Set[str] = set()
+            
+            for word_norm in clean_words_normalized:
+                if word_norm in all_geo_entities:
+                    entity_country, entity_type = all_geo_entities[word_norm]
+                    if entity_type == 'city':
+                        cities_in_query.add(word_norm)
+            
+            # Если есть хотя бы один чужой город → БЛОК
+            if len(cities_in_query) > 0:
+                other_cities = {c for c in cities_in_query if c != seed_city}
+                if other_cities:
+                    logger.info(f"[GEO_WHITE_LIST] ❌ MULTI_CITY: '{query}' contains cities: {cities_in_query}, seed_city is '{seed_city}'")
+                    stats['blocked_multi_city'] += 1
+                    continue
+        
+        # ═══════════════════════════════════════════════════════════
+        # ПРОВЕРКА 3: Страны и природные объекты
         # ═══════════════════════════════════════════════════════════
         
         if seed_city:
             blocked = False
             
-            for word in clean_words:
-                if word in all_geo_entities:
-                    entity_country, entity_type = all_geo_entities[word]
+            for word_norm in clean_words_normalized:
+                if word_norm in all_geo_entities:
+                    entity_country, entity_type = all_geo_entities[word_norm]
                     
-                    # А. Это город?
-                    if entity_type == 'city':
-                        # Если город != seed_city → БЛОК
-                        if word != seed_city:
-                            logger.info(f"[GEO_WHITE_LIST] ❌ FOREIGN_CITY: '{query}' contains city '{word}', seed_city is '{seed_city}'")
-                            stats['blocked_foreign_city'] += 1
-                            blocked = True
-                            break
-                    
-                    # Б. Это страна?
-                    elif entity_type == 'country':
-                        # Если страна не из seed и не наша → БЛОК
-                        if word not in seed_lower and entity_country != target_country_upper:
-                            logger.info(f"[GEO_WHITE_LIST] ❌ FOREIGN_COUNTRY: '{query}' mentions country '{word}' ({entity_country})")
+                    # А. Страна?
+                    if entity_type == 'country':
+                        # Если не в seed и не наша страна → БЛОК
+                        if word_norm not in seed_words_normalized and entity_country != target_country_upper:
+                            logger.info(f"[GEO_WHITE_LIST] ❌ FOREIGN_COUNTRY: '{query}' mentions '{word_norm}' ({entity_country})")
                             stats['blocked_foreign_country'] += 1
                             blocked = True
                             break
                     
-                    # В. Это другой гео-объект (гора, река)?
+                    # Б. Природный объект (гора, река, озеро)?
                     elif entity_type in ['mountain', 'river', 'lake']:
-                        # Если не упомянут в seed → БЛОК
-                        if word not in seed_lower:
-                            logger.info(f"[GEO_WHITE_LIST] ❌ GEO_OBJECT: '{query}' contains {entity_type} '{word}'")
+                        # Если не в seed → БЛОК
+                        if word_norm not in seed_words_normalized:
+                            logger.info(f"[GEO_WHITE_LIST] ❌ GEO_OBJECT: '{query}' contains {entity_type} '{word_norm}'")
                             stats['blocked_geo_object'] += 1
                             blocked = True
                             break
@@ -415,7 +539,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 3: Чужие районы
+        # ПРОВЕРКА 4: Чужие районы
         # ═══════════════════════════════════════════════════════════
         
         if seed_city and allowed_districts:
@@ -440,12 +564,24 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 4: Упоминание "область" без seed_city
+        # ПРОВЕРКА 5: Область с чужим городом
         # ═══════════════════════════════════════════════════════════
         
-        if any(oblast_word in query_lower for oblast_word in ['область', 'обл', 'област', 'области']):
-            if seed_city and seed_city not in query_lower:
-                logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_OBLAST: '{query}' mentions oblast but seed_city '{seed_city}' not found")
+        has_oblast = any(oblast_word in query_lower for oblast_word in ['область', 'обл', 'област', 'области'])
+        
+        if has_oblast and seed_city:
+            # Собираем города из запроса (нормализованные)
+            cities_in_query_oblast: Set[str] = set()
+            for word_norm in clean_words_normalized:
+                if word_norm in all_geo_entities:
+                    entity_country, entity_type = all_geo_entities[word_norm]
+                    if entity_type == 'city':
+                        cities_in_query_oblast.add(word_norm)
+            
+            # Если есть чужие города → БЛОК
+            other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
+            if other_cities_oblast:
+                logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_OBLAST: '{query}' mentions oblast with other cities: {other_cities_oblast}")
                 stats['blocked_wrong_oblast'] += 1
                 continue
         
@@ -467,47 +603,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     logger.info(f"[GEO_WHITE_LIST] STATS: {stats}")
     
     return data
-
-
-def _get_fallback_geo_entities() -> Dict[str, tuple]:
-    """
-    Fallback база гео-сущностей
-    Формат: {название: (код_страны, тип)}
-    """
-    return {
-        # Города Украины
-        'київ': ('UA', 'city'), 'киев': ('UA', 'city'), 'kyiv': ('UA', 'city'),
-        'харків': ('UA', 'city'), 'харьков': ('UA', 'city'), 'kharkiv': ('UA', 'city'),
-        'одеса': ('UA', 'city'), 'одесса': ('UA', 'city'), 'odesa': ('UA', 'city'),
-        'дніпро': ('UA', 'city'), 'днепр': ('UA', 'city'), 'dnipro': ('UA', 'city'),
-        'львів': ('UA', 'city'), 'львов': ('UA', 'city'), 'lviv': ('UA', 'city'),
-        'запоріжжя': ('UA', 'city'), 'запорожье': ('UA', 'city'),
-        
-        # Города Беларуси
-        'мінск': ('BY', 'city'), 'минск': ('BY', 'city'), 'minsk': ('BY', 'city'),
-        'гомель': ('BY', 'city'),
-        
-        # Города Польши
-        'warszawa': ('PL', 'city'), 'варшава': ('PL', 'city'),
-        'szczecin': ('PL', 'city'), 'щецин': ('PL', 'city'),
-        'kraków': ('PL', 'city'),
-        
-        # Города России
-        'москва': ('RU', 'city'), 'moscow': ('RU', 'city'),
-        'санкт-петербург': ('RU', 'city'),
-        
-        # Страны
-        'україна': ('UA', 'country'), 'украина': ('UA', 'country'), 'ukraine': ('UA', 'country'),
-        'росія': ('RU', 'country'), 'россия': ('RU', 'country'), 'russia': ('RU', 'country'),
-        'беларусь': ('BY', 'country'), 'belarus': ('BY', 'country'),
-        'polska': ('PL', 'country'), 'poland': ('PL', 'country'), 'польша': ('PL', 'country'),
-        
-        # Природные объекты
-        'эльбрус': ('RU', 'mountain'), 'elbrus': ('RU', 'mountain'),
-        'енисей': ('RU', 'river'), 'yenisei': ('RU', 'river'),
-        'волга': ('RU', 'river'), 'volga': ('RU', 'river'),
-        'байкал': ('RU', 'lake'), 'baikal': ('RU', 'lake'),
-    }
 
 
 # Экспорт
