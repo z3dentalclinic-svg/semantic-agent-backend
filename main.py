@@ -18,7 +18,8 @@ from filters import (
     BatchPostFilter, 
     DISTRICTS_EXTENDED,
     filter_infix_results,
-    filter_relevant_keywords
+    filter_relevant_keywords,
+    filter_geo_garbage
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
@@ -1350,6 +1351,9 @@ async def deep_search_endpoint(
         language = parser.detect_seed_language(seed)
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
+    
+    # ✅ ГЕО-ФИЛЬТР (сначала чистим гео-мусор, потом дедупликация)
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
     
     # ✅ ДЕДУПЛИКАЦИЯ ДЛЯ DEEP SEARCH
     result = deduplicate_final_results(result)
