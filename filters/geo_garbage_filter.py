@@ -249,6 +249,17 @@ def _get_fallback_geo_entities() -> Dict[str, Tuple[str, str]]:
         'львів': ('UA', 'city'), 'львов': ('UA', 'city'), 'lviv': ('UA', 'city'),
         'запоріжжя': ('UA', 'city'), 'запорожье': ('UA', 'city'), 'zaporizhzhia': ('UA', 'city'),
         
+        # ═══ Оккупированные города (тоже city для блокировки через MULTI_CITY) ═══
+        'севастополь': ('UA', 'city'), 'sevastopol': ('UA', 'city'),
+        'симферополь': ('UA', 'city'), 'simferopol': ('UA', 'city'),
+        'ялта': ('UA', 'city'), 'yalta': ('UA', 'city'),
+        'керчь': ('UA', 'city'), 'kerch': ('UA', 'city'),
+        'донецк': ('UA', 'city'), 'donetsk': ('UA', 'city'),
+        'луганск': ('UA', 'city'), 'luhansk': ('UA', 'city'),
+        'мариуполь': ('UA', 'city'), 'mariupol': ('UA', 'city'),
+        'мелитополь': ('UA', 'city'), 'melitopol': ('UA', 'city'),
+        'бердянск': ('UA', 'city'), 'berdiansk': ('UA', 'city'),
+        
         # ═══ Города Беларуси ═══
         'мінск': ('BY', 'city'), 'минск': ('BY', 'city'), 'minsk': ('BY', 'city'),
         'гомель': ('BY', 'city'), 'homel': ('BY', 'city'),
@@ -470,20 +481,20 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         clean_words_normalized = [_normalize_token(w) for w in clean_words]
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 1: Оккупированные территории
+        # ПРОВЕРКА 1: Оккупированные территории (блокируем ВСЕГДА!)
+        # Убрано условие target_country == 'ua'
         # ═══════════════════════════════════════════════════════════
         
-        if target_country.lower() == 'ua':
-            has_occupied = False
-            for word_norm in clean_words_normalized:
-                if word_norm in OCCUPIED_TERRITORIES:
-                    has_occupied = True
-                    logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{word_norm}'")
-                    stats['blocked_occupied'] += 1
-                    break
-            
-            if has_occupied:
-                continue
+        has_occupied = False
+        for word_norm in clean_words_normalized:
+            if word_norm in OCCUPIED_TERRITORIES:
+                has_occupied = True
+                logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{word_norm}'")
+                stats['blocked_occupied'] += 1
+                break
+        
+        if has_occupied:
+            continue
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 2: ЖЁСТКОЕ ПРАВИЛО - 2+ ГОРОДА → БЛОК
@@ -519,8 +530,8 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                     
                     # А. Страна?
                     if entity_type == 'country':
-                        # Если не в seed и не наша страна → БЛОК
-                        if word_norm not in seed_words_normalized and entity_country != target_country_upper:
+                        # УПРОЩЕНО: любая страна не из seed → БЛОК (независимо от target_country)
+                        if word_norm not in seed_words_normalized:
                             logger.info(f"[GEO_WHITE_LIST] ❌ FOREIGN_COUNTRY: '{query}' mentions '{word_norm}' ({entity_country})")
                             stats['blocked_foreign_country'] += 1
                             blocked = True
