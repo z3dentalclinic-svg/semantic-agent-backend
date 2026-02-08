@@ -1,6 +1,7 @@
 """
 FGS Parser API - Semantic keyword research with geo-filtering
 """
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -12,8 +13,9 @@ import random
 import re
 import logging
 from difflib import SequenceMatcher
+
 from filters import (
-    BatchPostFilter,
+    BatchPostFilter, 
     DISTRICTS_EXTENDED,
     filter_infix_results,
     filter_relevant_keywords
@@ -27,6 +29,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
 normalizer_logger = logging.getLogger("GoldenNormalizer")
 normalizer_logger.setLevel(logging.DEBUG)
 normalizer_logger.propagate = True
@@ -72,20 +75,28 @@ def generate_geo_blacklist_full():
     """
     try:
         from geonamescache import GeonamesCache
+
         gc = GeonamesCache()
         cities = gc.get_cities()
+
         all_cities_global = {}  # {город: код_страны}
+
         for city_id, city_data in cities.items():
             country = city_data['countrycode'].lower()  # 'RU', 'UA', 'BY' → 'ru', 'ua', 'by'
+
             name = city_data['name'].lower().strip()
             all_cities_global[name] = country
+
             for alt in city_data.get('alternatenames', []):
                 if ' ' in alt:
                     continue
+
                 if not (3 <= len(alt) <= 30):
                     continue
+
                 if not any(c.isalpha() for c in alt):
                     continue
+
                 alt_clean = alt.replace('-', '').replace("'", "")
                 if alt_clean.isalpha():
                     is_latin_cyrillic = all(
@@ -94,20 +105,26 @@ def generate_geo_blacklist_full():
                         c in ['-', "'"]
                         for c in alt
                     )
+
                     if is_latin_cyrillic:
                         alt_lower = alt.lower().strip()
                         if alt_lower not in all_cities_global:
                             all_cities_global[alt_lower] = country
+
         print("✅ v5.6.0 TURBO: O(1) WORD BOUNDARY LOOKUP - Гео-Фильтрация инициализирована")
         print(f"   ALL_CITIES_GLOBAL: {len(all_cities_global)} городов с привязкой к странам")
+        
         from collections import Counter
         country_stats = Counter(all_cities_global.values())
         print(f"   Топ-5 стран: {dict(country_stats.most_common(5))}")
+
         return all_cities_global
+
     except ImportError:
         print("⚠️ geonamescache не установлен, используется минимальный словарь")
+        
         all_cities_global = {
-            'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru',
+            'москва': 'ru', 'мск': 'ru', 'спб': 'ru', 'питер': 'ru', 
             'санкт-петербург': 'ru', 'екатеринбург': 'ru', 'казань': 'ru',
             'новосибирск': 'ru', 'челябинск': 'ru', 'омск': 'ru',
             'минск': 'by', 'гомель': 'by', 'витебск': 'by', 'могилев': 'by',
@@ -119,6 +136,7 @@ def generate_geo_blacklist_full():
             'днепропетровск': 'ua', 'kyiv': 'ua', 'kiev': 'ua',
             'kharkiv': 'ua', 'odessa': 'ua', 'lviv': 'ua', 'dnipro': 'ua',
         }
+        
         return all_cities_global
 
 ALL_CITIES_GLOBAL = generate_geo_blacklist_full()
@@ -156,12 +174,15 @@ def deduplicate_final_results(data: dict) -> dict:
         data["total_count"] = len(unique_keywords)
     if "count" in data:
         data["count"] = len(unique_keywords)
+    if "total_unique_keywords" in data:
+        data["total_unique_keywords"] = len(unique_keywords)
     
     return data
 
 
 class AdaptiveDelay:
     """Автоматическая оптимизация задержек между запросами"""
+
     def __init__(self, initial_delay: float = 0.2, min_delay: float = 0.1, max_delay: float = 1.0):
         self.delay = initial_delay
         self.min_delay = min_delay
@@ -179,6 +200,8 @@ class AdaptiveDelay:
 class GoogleAutocompleteParser:
     def __init__(self):
         self.adaptive_delay = AdaptiveDelay()
+
+
         self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
         self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
         
@@ -197,7 +220,7 @@ class GoogleAutocompleteParser:
             self.natasha_ready = False
         
         self.forbidden_geo = FORBIDDEN_GEO
-        
+
         self.stemmers = {
             'en': SnowballStemmer("english"),
             'de': SnowballStemmer("german"),
@@ -205,17 +228,17 @@ class GoogleAutocompleteParser:
             'es': SnowballStemmer("spanish"),
             'it': SnowballStemmer("italian"),
         }
-        
+
         self.stop_words = {
-            'ru': {'и', 'в', 'во', 'не', 'на', 'с', 'от', 'для', 'по', 'о', 'об', 'к', 'у', 'за',
-                   'из', 'со', 'до', 'при', 'без', 'над', 'под', 'а', 'но', 'да', 'или', 'чтобы',
+            'ru': {'и', 'в', 'во', 'не', 'на', 'с', 'от', 'для', 'по', 'о', 'об', 'к', 'у', 'за', 
+                   'из', 'со', 'до', 'при', 'без', 'над', 'под', 'а', 'но', 'да', 'или', 'чтобы', 
                    'что', 'как', 'где', 'когда', 'куда', 'откуда', 'почему'},
-            'uk': {'і', 'в', 'на', 'з', 'від', 'для', 'по', 'о', 'до', 'при', 'без', 'над', 'під',
+            'uk': {'і', 'в', 'на', 'з', 'від', 'для', 'по', 'о', 'до', 'при', 'без', 'над', 'під', 
                    'а', 'але', 'та', 'або', 'що', 'як', 'де', 'коли', 'куди', 'звідки', 'чому'},
-            'en': {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'o', 'with', 'by', 'from',
-                   'up', 'about', 'into', 'through', 'during', 'and', 'or', 'but', 'i', 'when',
+            'en': {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'o', 'with', 'by', 'from', 
+                   'up', 'about', 'into', 'through', 'during', 'and', 'or', 'but', 'i', 'when', 
                    'where', 'how', 'why', 'what'},
-            'de': {'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einen', 'einem',
+            'de': {'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einen', 'einem', 
                    'und', 'oder', 'aber', 'in', 'au', 'von', 'zu', 'mit', 'für', 'bei', 'nach',
                    'wie', 'wo', 'wann', 'warum', 'was', 'wer'},
             'fr': {'le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'et', 'ou', 'mais', 'dans',
@@ -257,10 +280,10 @@ class GoogleAutocompleteParser:
         city_country = ALL_CITIES_GLOBAL.get(lemma)  # получаем код страны (напр. 'ru', 'kz', 'ua')
         
         if city_country == target_country.lower():
-            return True  # Город нашей страны --- разрешаем
+            return True  # Город нашей страны — разрешаем
         
-        return False  # Город чужой страны --- блокируем
-
+        return False  # Город чужой страны — блокируем
+    
     def strip_geo_to_anchor(self, text: str, seed: str, target_country: str) -> str:
         """
         """
@@ -293,7 +316,7 @@ class GoogleAutocompleteParser:
             if city_country and city_country == target_country.lower():
                 has_local_city = True
                 break
-        
+
         if has_local_city:
             logger.info(
                 f"ANCHOR BLOCKED (local city present): text='{text}' | seed='{seed}' | country={target_country}"
@@ -301,6 +324,7 @@ class GoogleAutocompleteParser:
             return ""
         
         remaining_words = []
+        
         for word in text_words:
             if len(word) < 2:
                 remaining_words.append(word)
@@ -321,6 +345,7 @@ class GoogleAutocompleteParser:
             remaining_words.append(word)
         
         clean_words = []
+        
         for word in remaining_words:
             if len(word) < 2:
                 clean_words.append(word)
@@ -365,35 +390,37 @@ class GoogleAutocompleteParser:
     def get_modifiers(self, language: str, use_numbers: bool, seed: str, cyrillic_only: bool = False) -> List[str]:
         """Получить модификаторы для языка с умной фильтрацией"""
         modifiers = []
+
         seed_lower = seed.lower()
         has_cyrillic = any('\u0400' <= c <= '\u04FF' for c in seed_lower)
         has_latin = any('a' <= c <= 'z' for c in seed_lower)
-        
+
         if language.lower() == 'ru':
             modifiers.extend(list("абвгдежзийклмнопрстуфхцчшщэюя"))
         elif language.lower() == 'uk':
             modifiers.extend(list("абвгдежзийклмнопрстуфхцчшщюяіїєґ"))
-        
+
         if not cyrillic_only:
             if has_cyrillic and not has_latin and language.lower() not in ['en', 'de', 'fr', 'es', 'pl']:
                 pass
             else:
                 modifiers.extend(list("abcdefghijklmnopqrstuvwxyz"))
-        
+
         if use_numbers:
             modifiers.extend([str(i) for i in range(10)])
-        
+
         return modifiers
 
     def get_morphological_forms(self, word: str, language: str) -> List[str]:
         """Получить морфологические формы слова через pymorphy3"""
         forms = set([word])
-        
+
         if language.lower() in ['ru', 'uk']:
             try:
                 import pymorphy3
                 morph = pymorphy3.MorphAnalyzer()
                 parsed = morph.parse(word)
+
                 if parsed:
                     for form in parsed[0].lexeme:
                         pos = form.tag.POS
@@ -401,13 +428,13 @@ class GoogleAutocompleteParser:
                             forms.add(form.word)
             except:
                 pass
-        
         return sorted(list(forms))
 
     def is_query_allowed(self, query: str, seed: str, country: str) -> bool:
         """
         v7.6: ПОЛНОСТЬЮ ОТКЛЮЧЕН - фильтрация теперь только через BatchPostFilter
         Всегда возвращает True
+        
         Старая логика закомментирована ниже - можно вернуть если понадобится
         """
         return True
@@ -416,23 +443,23 @@ class GoogleAutocompleteParser:
         # Раскомментируй если нужно вернуть старую фильтрацию
         # ============================================
         # import re
-        #
+        # 
         # q_lower = query.lower().strip()
         # target_country = country.lower()
-        #
+        # 
         # for forbidden in self.forbidden_geo:
         #     if forbidden in q_lower:
         #         logger.warning(f"🚫 HARD-BLACKLIST: '{query}' contains '{forbidden}'")
         #         return False
-        #
+        # 
         # words = re.findall(r'[а-яёa-z0-9-]+', q_lower)
         # lemmas = set()
-        #
+        # 
         # for word in words:
         #     if len(word) < 3:
         #         lemmas.add(word)
         #         continue
-        #
+        #     
         #     try:
         #         if any(c in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя' for c in word):
         #             lemma = self.morph_ru.parse(word)[0].normal_form
@@ -441,51 +468,51 @@ class GoogleAutocompleteParser:
         #             lemmas.add(word)
         #     except:
         #         lemmas.add(word)
-        #
+        # 
         # for forbidden in self.forbidden_geo:
         #     if forbidden in lemmas:
         #         logger.warning(f"🚫 HARD-BLACKLIST (lemma): '{query}' → lemma '{forbidden}'")
         #         return False
-        #
+        # 
         # stopwords = ['израиль', 'россия', 'казахстан', 'узбекистан', 'беларусь', 'молдова']
         # if any(stop in q_lower for stop in stopwords):
         #     if target_country == 'ua' and 'украина' not in q_lower:
         #         logger.warning(f"🚫 COUNTRY BLOCK: '{query}' contains {[s for s in stopwords if s in q_lower]}")
         #         return False
-        #
+        # 
         # for word in words:
         #     if len(word) < 3:
         #         continue
-        #
+        #     
         #     city_country_word = ALL_CITIES_GLOBAL.get(word)
-        #
+        #     
         #     if city_country_word and city_country_word != target_country:
         #         logger.warning(f"🚫 FAST BLOCK: '{word}' ({city_country_word}) in '{query}'")
         #         return False
-        #
+        # 
         # for lemma in lemmas:
         #     if len(lemma) < 3:
         #         continue
-        #
+        #     
         #     city_country_lemma = ALL_CITIES_GLOBAL.get(lemma)
-        #
+        #     
         #     if city_country_lemma and city_country_lemma != target_country:
         #         logger.warning(f"🚫 FAST BLOCK (lemma): '{lemma}' ({city_country_lemma}) in '{query}'")
         #         return False
-        #
+        # 
         # if self.natasha_ready and NATASHA_AVAILABLE:
         #     try:
         #         from natasha import Doc
-        #
+        #         
         #         doc = Doc(query)
         #         doc.segment(self.segmenter)
         #         doc.tag_ner(self.ner_tagger)
-        #
+        #         
         #         for span in doc.spans:
         #             if span.type == 'LOC':
         #                 span.normalize(self.morph_vocab)
         #                 loc_name = span.normal.lower()
-        #
+        #                 
         #                 if loc_name in ALL_CITIES_GLOBAL:
         #                     loc_country = ALL_CITIES_GLOBAL[loc_name]
         #                     if loc_country != target_country:
@@ -500,42 +527,47 @@ class GoogleAutocompleteParser:
         #                         if word_country and word_country != target_country:
         #                             logger.warning(f"📍 NATASHA BLOCKED (word): '{loc_word}' ({word_country}) in '{loc_name}'")
         #                             return False
-        #
+        #                 
         #     except Exception as e:
         #         logger.debug(f"Natasha NER error: {e}")
-        #
+        # 
         # logger.info(f"✅ ALLOWED: {query}")
         # return True
-
+    
     async def autocorrect_text(self, text: str, language: str) -> Dict:
         """Автокоррекция через Yandex Speller (ru/uk/en) или LanguageTool (остальные)"""
+
         if language.lower() in ['ru', 'uk', 'en']:
             url = "https://speller.yandex.net/services/spellservice.json/checkText"
             lang_map = {'ru': 'ru', 'uk': 'uk', 'en': 'en'}
             yandex_lang = lang_map.get(language.lower(), 'ru')
+
             params = {"text": text, "lang": yandex_lang, "options": 0}
-            
+
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     response = await client.get(url, params=params)
+
                     if response.status_code == 200:
                         errors = response.json()
+
                         if not errors:
                             return {"original": text, "corrected": text, "corrections": [], "has_errors": False}
-                        
+
                         corrected = text
                         corrections = []
                         errors_sorted = sorted(errors, key=lambda x: x.get('pos', 0), reverse=True)
-                        
+
                         for error in errors_sorted:
                             word = error.get('word', '')
                             suggestions = error.get('s', [])
+
                             if suggestions:
                                 suggestion = suggestions[0]
                                 pos = error.get('pos', 0)
                                 corrected = corrected[:pos] + suggestion + corrected[pos + len(word):]
                                 corrections.append({"word": word, "suggestion": suggestion})
-                        
+
                         return {
                             "original": text,
                             "corrected": corrected,
@@ -544,42 +576,43 @@ class GoogleAutocompleteParser:
                         }
             except:
                 pass
-        
         return await self.autocorrect_languagetool(text, language)
 
     async def autocorrect_languagetool(self, text: str, language: str) -> Dict:
         """Автокоррекция через LanguageTool API (30+ языков)"""
         url = "https://api.languagetool.org/v2/check"
+
         data = {
             "text": text,
             "language": language.lower(),
             "enabledOnly": "false"
         }
-        
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(url, data=data)
+
                 if response.status_code == 200:
                     result = response.json()
                     matches = result.get('matches', [])
-                    
+
                     if not matches:
                         return {"original": text, "corrected": text, "corrections": [], "has_errors": False}
-                    
+
                     corrected = text
                     corrections = []
-                    
+
                     for match in reversed(matches):
                         offset = match.get('offset', 0)
                         length = match.get('length', 0)
                         replacements = match.get('replacements', [])
-                        
+
                         if replacements:
                             suggestion = replacements[0].get('value', '')
                             word = text[offset:offset+length]
                             corrected = corrected[:offset] + suggestion + corrected[offset+length:]
                             corrections.append({"word": word, "suggestion": suggestion})
-                    
+
                     return {
                         "original": text,
                         "corrected": corrected,
@@ -588,7 +621,6 @@ class GoogleAutocompleteParser:
                     }
         except:
             pass
-        
         return {"original": text, "corrected": text, "corrections": [], "has_errors": False}
 
     async def fetch_suggestions(self, query: str, country: str, language: str, client: httpx.AsyncClient) -> List[str]:
@@ -596,25 +628,27 @@ class GoogleAutocompleteParser:
         url = "https://www.google.com/complete/search"
         params = {"q": query, "client": "firefox", "hl": language, "gl": country}
         headers = {"User-Agent": random.choice(USER_AGENTS)}
-        
+
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
+
             if response.status_code == 429:
                 self.adaptive_delay.on_rate_limit()
                 return []
-            
+
             self.adaptive_delay.on_success()
+
             if response.status_code == 200:
                 data = response.json()
                 return data[1] if len(data) > 1 else []
         except:
             pass
-        
         return []
 
     async def fetch_suggestions_yandex(self, query: str, language: str, region_id: int, client: httpx.AsyncClient) -> List[str]:
         """Yandex Suggest"""
         url = "https://suggest-maps.yandex.ru/suggest-geo"
+
         params = {
             "v": "9",
             "search_type": "tp",
@@ -624,72 +658,79 @@ class GoogleAutocompleteParser:
             "geo": str(region_id),
             "fullpath": "1"
         }
+
         headers = {"User-Agent": random.choice(USER_AGENTS)}
-        
+
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
+
             if response.status_code == 429:
                 self.adaptive_delay.on_rate_limit()
                 return []
-            
+
             self.adaptive_delay.on_success()
+
             if response.status_code == 200:
                 data = response.json()
                 results = data.get('results', [])
                 return [item.get('text', '') for item in results if item.get('text')]
         except:
             pass
-        
         return []
 
     async def fetch_suggestions_bing(self, query: str, language: str, country: str, client: httpx.AsyncClient) -> List[str]:
         """Bing Autosuggest"""
         url = "https://www.bing.com/AS/Suggestions"
+
         params = {
             "q": query,
             "mkt": f"{language}-{country}",
             "cvid": "0",
             "qry": query
         }
+
         headers = {"User-Agent": random.choice(USER_AGENTS)}
-        
+
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
+
             if response.status_code == 429:
                 self.adaptive_delay.on_rate_limit()
                 return []
-            
+
             self.adaptive_delay.on_success()
+
             if response.status_code == 200:
                 data = response.json()
                 suggestion_groups = data.get('AS', {}).get('Results', [])
+
                 suggestions = []
-                
                 for group in suggestion_groups:
                     for item in group.get('Suggests', []):
                         text = item.get('Txt', '')
                         if text:
                             suggestions.append(text)
-                
+
                 return suggestions
         except:
             pass
-        
         return []
 
-    async def parse_with_semaphore(self, queries: List[str], country: str, language: str,
-                                    parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+    async def parse_with_semaphore(self, queries: List[str], country: str, language: str, 
+                                   parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
         """Парсинг с ограничением параллельности и выбором источника"""
+
         semaphore = asyncio.Semaphore(parallel_limit)
         all_keywords = set()
         success_count = 0
         failed_count = 0
-        
+
         async def fetch_with_limit(query: str, client: httpx.AsyncClient):
             nonlocal success_count, failed_count
+
             async with semaphore:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
-                
+
                 if source == "google":
                     results = await self.fetch_suggestions(query, country, language, client)
                 elif source == "yandex":
@@ -698,35 +739,35 @@ class GoogleAutocompleteParser:
                     results = await self.fetch_suggestions_bing(query, language, country, client)
                 else:
                     results = []
-                
+
                 if results:
                     all_keywords.update(results)
                     success_count += 1
                 else:
                     failed_count += 1
-                
+
                 return results
-        
+
         async with httpx.AsyncClient() as client:
             tasks = [fetch_with_limit(q, client) for q in queries]
             await asyncio.gather(*tasks)
-        
+
         return {
             "keywords": sorted(list(all_keywords)),
             "success": success_count,
             "failed": failed_count
         }
 
-    async def parse_suffix(self, seed: str, country: str, language: str, use_numbers: bool,
-                           parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+    async def parse_suffix(self, seed: str, country: str, language: str, use_numbers: bool, 
+                          parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
         """SUFFIX метод: seed + модификатор"""
         start_time = time.time()
-        
+
         modifiers = self.get_modifiers(language, use_numbers, seed)
         queries = [f"{seed} {mod}" for mod in modifiers]
-        
+
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
-        
+
         keywords = set()
         internal_anchors = set()
         
@@ -740,12 +781,13 @@ class GoogleAutocompleteParser:
                 if anchor and anchor != seed.lower() and len(anchor) > 5:
                     internal_anchors.add(anchor)
                 continue  # НЕ добавляем мусор в keywords
+            
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
         filtered = await filter_relevant_keywords(list(all_with_anchors), seed, language)
-        filtered_set = set(filtered)
         
+        filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
@@ -765,9 +807,9 @@ class GoogleAutocompleteParser:
         
         # Объединяем якоря (старые + новые от batch_filter)
         combined_anchors = set(final_anchors) | set(batch_result['anchors'])
-        
+
         elapsed = time.time() - start_time
-        
+
         return {
             "seed": seed,
             "method": "suffix",
@@ -781,25 +823,26 @@ class GoogleAutocompleteParser:
             "batch_stats": batch_result['stats']
         }
 
-    async def parse_infix(self, seed: str, country: str, language: str, use_numbers: bool,
-                          parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+    async def parse_infix(self, seed: str, country: str, language: str, use_numbers: bool, 
+                         parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
         """INFIX метод: вставка модификаторов между словами"""
         start_time = time.time()
-        
+
         words = seed.strip().split()
+
         if len(words) < 2:
             return {"error": "INFIX требует минимум 2 слова", "seed": seed}
-        
+
         modifiers = self.get_modifiers(language, use_numbers, seed, cyrillic_only=True)
-        
         queries = []
+
         for i in range(1, len(words)):
             for mod in modifiers:
                 query = ' '.join(words[:i]) + f' {mod} ' + ' '.join(words[i:])
                 queries.append(query)
-        
+
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
-        
+
         keywords = set()
         internal_anchors = set()
         
@@ -813,14 +856,15 @@ class GoogleAutocompleteParser:
                 if anchor and anchor != seed.lower() and len(anchor) > 5:
                     internal_anchors.add(anchor)
                 continue  # НЕ добавляем мусор в keywords
+            
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        
         filtered_1 = await filter_infix_results(list(all_with_anchors), language)
+
         filtered_2 = await filter_relevant_keywords(filtered_1, seed, language)
-        filtered_set = set(filtered_2)
         
+        filtered_set = set(filtered_2)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
@@ -839,9 +883,9 @@ class GoogleAutocompleteParser:
         )
         
         combined_anchors = set(final_anchors) | set(batch_result['anchors'])
-        
+
         elapsed = time.time() - start_time
-        
+
         return {
             "seed": seed,
             "method": "infix",
@@ -855,19 +899,19 @@ class GoogleAutocompleteParser:
             "batch_stats": batch_result['stats']
         }
 
-    async def parse_morphology(self, seed: str, country: str, language: str, use_numbers: bool,
+    async def parse_morphology(self, seed: str, country: str, language: str, use_numbers: bool, 
                                parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
         """MORPHOLOGY метод: модификация форм существительных"""
         start_time = time.time()
-        
+
         words = seed.strip().split()
+
         nouns_to_modify = []
-        
+
         if language.lower() in ['ru', 'uk']:
             try:
                 import pymorphy3
                 morph = pymorphy3.MorphAnalyzer()
-                
                 for idx, word in enumerate(words):
                     parsed = morph.parse(word)
                     if parsed and parsed[0].tag.POS == 'NOUN':
@@ -876,7 +920,7 @@ class GoogleAutocompleteParser:
                             'word': word,
                             'forms': self.get_morphological_forms(word, language)
                         })
-                
+
                 if not nouns_to_modify:
                     last_word = words[-1]
                     nouns_to_modify.append({
@@ -898,7 +942,7 @@ class GoogleAutocompleteParser:
                 'word': last_word,
                 'forms': self.get_morphological_forms(last_word, language)
             })
-        
+
         all_seeds = []
         if len(nouns_to_modify) >= 1:
             noun = nouns_to_modify[0]
@@ -906,17 +950,17 @@ class GoogleAutocompleteParser:
                 new_words = words.copy()
                 new_words[noun['index']] = form
                 all_seeds.append(' '.join(new_words))
-        
+
         unique_seeds = list(set(all_seeds))
-        
+
         all_keywords = set()
         modifiers = self.get_modifiers(language, use_numbers, seed)
-        
+
         for seed_variant in unique_seeds:
             queries = [f"{seed_variant} {mod}" for mod in modifiers]
             result = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
             all_keywords.update(result['keywords'])
-        
+
         keywords = set()
         internal_anchors = set()
         
@@ -930,12 +974,13 @@ class GoogleAutocompleteParser:
                 if anchor and anchor != seed.lower() and len(anchor) > 5:
                     internal_anchors.add(anchor)
                 continue  # НЕ добавляем мусор в keywords
+            
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
         filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
-        filtered_set = set(filtered)
         
+        filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
@@ -952,11 +997,10 @@ class GoogleAutocompleteParser:
             country=country,
             language=language
         )
-        
         combined_anchors = set(final_anchors) | set(batch_result['anchors'])
-        
+
         elapsed = time.time() - start_time
-        
+
         # Нормализация результатов
         return {
             "seed": seed,
@@ -970,19 +1014,19 @@ class GoogleAutocompleteParser:
             "batch_stats": batch_result['stats']
         }
 
-    async def parse_light_search(self, seed: str, country: str, language: str, use_numbers: bool,
-                                  parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+    async def parse_light_search(self, seed: str, country: str, language: str, use_numbers: bool, 
+                                 parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
         """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
         start_time = time.time()
-        
+
         suffix_result = await self.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
         infix_result = await self.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-        
+
         all_keywords = set(suffix_result["keywords"]) | set(infix_result.get("keywords", []))
         all_anchors = set(suffix_result.get("anchors", [])) | set(infix_result.get("anchors", []))
-        
+
         elapsed = time.time() - start_time
-        
+
         return {
             "seed": seed,
             "method": "light_search",
@@ -996,16 +1040,15 @@ class GoogleAutocompleteParser:
             "elapsed_time": round(elapsed, 2)
         }
 
-    async def parse_adaptive_prefix(self, seed: str, country: str, language: str, use_numbers: bool,
-                                     parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
+    async def parse_adaptive_prefix(self, seed: str, country: str, language: str, use_numbers: bool, 
+                                    parallel_limit: int, source: str = "google", region_id: int = 0) -> Dict:
         """ADAPTIVE PREFIX метод: извлечение слов из SUFFIX + PREFIX проверка"""
         start_time = time.time()
-        
+
         seed_words = set(seed.lower().split())
-        
+
         prefixes = ["", "купить", "цена", "отзывы"]
         queries = []
-        
         for p in prefixes:
             q = f"{p} {seed}".strip()
             if self.is_query_allowed(q, seed, country):
@@ -1016,29 +1059,30 @@ class GoogleAutocompleteParser:
             q_ext = f"{seed} {char}".strip()
             if self.is_query_allowed(q_ext, seed, country):
                 queries.append(q_ext)
-        
+
         result_raw = await self.parse_with_semaphore(queries, country, language, parallel_limit, source, region_id)
-        
+
         from collections import Counter
         word_counter = Counter()
-        
+
         for result in result_raw['keywords']:
             result_words = result.lower().split()
             for word in result_words:
                 if word not in seed_words and len(word) > 2:
                     word_counter[word] += 1
-        
+
         candidates = {w for w, count in word_counter.items() if count >= 2}
-        
+
         keywords = set()
         internal_anchors = set()
         verified_prefixes = []
-        
+
         for candidate in sorted(candidates):
             query = f"{candidate} {seed}"
+
             if not self.is_query_allowed(query, seed, country):
                 continue
-            
+
             result = await self.parse_with_semaphore([query], country, language, parallel_limit, source, region_id)
             
             if result['keywords']:
@@ -1054,12 +1098,13 @@ class GoogleAutocompleteParser:
                         if anchor and anchor != seed.lower() and len(anchor) > 5:
                             internal_anchors.add(anchor)
                         continue  # НЕ добавляем мусор в keywords
+                    
                     keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
         filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
-        filtered_set = set(filtered)
         
+        filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
         final_anchors = sorted(list(internal_anchors & filtered_set))
         
@@ -1076,11 +1121,10 @@ class GoogleAutocompleteParser:
             country=country,
             language=language
         )
-        
         combined_anchors = set(final_anchors) | set(batch_result['anchors'])
-        
+
         elapsed = time.time() - start_time
-        
+
         # Нормализация результатов
         return {
             "seed": seed,
@@ -1096,15 +1140,16 @@ class GoogleAutocompleteParser:
             "batch_stats": batch_result['stats']
         }
 
-    async def parse_deep_search(self, seed: str, country: str, region_id: int, language: str,
+    async def parse_deep_search(self, seed: str, country: str, region_id: int, language: str, 
                                 use_numbers: bool, parallel_limit: int, include_keywords: bool) -> Dict:
         """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
+
         correction = await self.autocorrect_text(seed, language)
         original_seed = seed
-        
+
         if correction.get("has_errors"):
             seed = correction["corrected"]
-        
+
         start_time = time.time()
         
         sources = ["google", "yandex", "bing"]
@@ -1153,12 +1198,12 @@ class GoogleAutocompleteParser:
         all_unique_anchors = set(final_filter['anchors']) | all_unique_anchors
         
         logger.info(f"[Deep Search] After final filter: {len(all_unique_keywords)} keywords, {len(all_unique_anchors)} anchors")
-        
+
         final_keywords = sorted(list(all_unique_keywords))
         normalized_keywords = normalize_keywords(final_keywords, language, seed)
-        
+
         elapsed = time.time() - start_time
-        
+
         response = {
             "seed": original_seed,
             "corrected_seed": seed if correction.get("has_errors") else None,
@@ -1185,7 +1230,7 @@ class GoogleAutocompleteParser:
             },
             "elapsed_time": round(elapsed, 2)
         }
-        
+
         if include_keywords:
             response["keywords_detailed"] = {
                 **{
@@ -1199,7 +1244,6 @@ class GoogleAutocompleteParser:
                     for source in sources
                 }
             }
-            
             response["anchors_detailed"] = {
                 **{
                     source: {
@@ -1212,7 +1256,7 @@ class GoogleAutocompleteParser:
                     for source in sources
                 }
             }
-        
+
         return response
 
 parser = GoogleAutocompleteParser()
@@ -1220,6 +1264,7 @@ parser = GoogleAutocompleteParser()
 def apply_smart_fix(result: dict, seed: str, language: str):
     """
     Финальная нормализация результатов
+    
     УЛУЧШЕНИЯ:
     - Лемматизация seed перед нормализацией (golden base)
     - Удаление дубликатов через dict.fromkeys
@@ -1254,7 +1299,7 @@ def apply_smart_fix(result: dict, seed: str, language: str):
         if "count" in result: result["count"] = total
         if "total_count" in result: result["total_count"] = total
         if "total_unique_keywords" in result: result["total_unique_keywords"] = total
-    
+            
     return result
 
 @app.get("/")
@@ -1273,19 +1318,20 @@ async def light_search_endpoint(
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
     """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
-    
+
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
-    
+
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
-    
+
     return apply_smart_fix(result, seed, language)
 
 @app.get("/api/deep-search")
@@ -1299,10 +1345,14 @@ async def deep_search_endpoint(
     include_keywords: bool = Query(True, description="Включить список ключей")
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
+    
+    # ✅ ДЕДУПЛИКАЦИЯ ДЛЯ DEEP SEARCH
+    result = deduplicate_final_results(result)
     
     # Нормализация уже происходит внутри parse_deep_search
     return result
@@ -1319,9 +1369,10 @@ async def compare_methods(
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
     """[DEPRECATED] Используйте /api/deep-search"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     return await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords, source)
 
 @app.get("/api/parse/suffix")
@@ -1335,19 +1386,20 @@ async def parse_suffix_endpoint(
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
     """Только SUFFIX метод"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
-    
+
     result = await parser.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-    
+
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
-    
+
     return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/infix")
@@ -1361,20 +1413,20 @@ async def parse_infix_endpoint(
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
     """Только INFIX метод"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
-    
+
     result = await parser.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-    result = deduplicate_final_results(result)
-    
+
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
-    
+
     return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/morphology")
@@ -1388,20 +1440,20 @@ async def parse_morphology_endpoint(
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
     """Только MORPHOLOGY метод"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
-    
+
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
-    result = deduplicate_final_results(result)
-    
+
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
-    
+
     return apply_smart_fix(result, seed, language)
 
 @app.get("/api/parse/adaptive-prefix")
@@ -1415,18 +1467,18 @@ async def parse_adaptive_prefix_endpoint(
     source: str = Query("google", description="Источник: google/yandex/bing")
 ):
     """ADAPTIVE PREFIX метод (находит PREFIX запросы типа 'киев ремонт пылесосов')"""
+
     if language == "auto":
         language = parser.detect_seed_language(seed)
-    
+
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
         seed = correction["corrected"]
-    
+
     result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
-    result = deduplicate_final_results(result)
-    
+
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
         result["corrections"] = correction.get("corrections", [])
-    
+
     return apply_smart_fix(result, seed, language)
