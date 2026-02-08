@@ -1352,7 +1352,7 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    # ✅ ГЕО-ФИЛЬТР (сначала чистим гео-мусор, потом дедупликация)
+    # ✅ ГЕО-ФИЛЬТР v2.0 (УЛУЧШЕННЫЙ: блокирует "днепр в киеве", "днепр голосеевский", "днепр в симферополе")
     result = filter_geo_garbage(result, seed=seed, target_country=country)
     
     # ✅ ДЕДУПЛИКАЦИЯ ДЛЯ DEEP SEARCH
