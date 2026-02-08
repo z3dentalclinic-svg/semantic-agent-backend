@@ -1,29 +1,38 @@
 """
-GEO Garbage Filter - Universal multilingual geographical filtering
-Works for ALL countries and ALL languages
+GEO Garbage Filter - WHITE-LIST Approach (v3.0)
+Universal multilingual geographical filtering
 
-УЛУЧШЕННАЯ ВЕРСИЯ v2.0:
-- Удаляет предлоги для выявления склеек ("днепр в киеве" → "днепр киев")
-- Блокирует чужие районы через внутреннюю базу CITY_DISTRICTS
-- Проверяет упоминания областей
-- Мультиязычная поддержка всех стран
+ПРИНЦИП WHITE-LIST (РАЗРЕШАЮЩАЯ ЛОГИКА):
+✅ Разрешено ТОЛЬКО:
+   - seed_city (город из seed)
+   - Официальные районы seed_city
+   
+❌ Блокируется ВСЁ остальное:
+   - Любой другой город из geonamescache
+   - Любой район другого города
+   - Природные объекты (горы, реки, озера)
+   - Упоминания областей без seed_city
+   - Оккупированные территории (для UA)
 
-Removes:
-1. Queries with occupied territories (Ukraine-specific)
-2. Queries with 2+ cities (after preposition removal)
-3. Queries with districts from OTHER cities or countries
-4. Queries mentioning other countries
-5. Queries with oblast mentions without seed city
+КЛЮЧЕВОЕ ОТЛИЧИЕ от v2.0:
+- НЕТ черных списков городов
+- НЕТ ручного добавления стоп-слов
+- Динамическая проверка через geonamescache
+- Если город не seed_city → автоматический БЛОК
 
-UNIVERSAL SUPPORT:
-- Works for ANY country via target_country parameter (ua, by, kz, uz, pl, us, de, etc.)
-- Loads cities automatically via geonamescache for ANY country
-- Multilingual: supports all languages in geonamescache database
-- Uses filters.DISTRICTS_EXTENDED for district validation
+ПРИМЕРЫ:
+seed = "ремонт днепр"
 
-REQUIREMENTS:
-- geonamescache - loads cities for any country
-- filters.DISTRICTS_EXTENDED - district-to-country mapping {район: код_страны}
+БЛОКИРУЕТСЯ (автоматически):
+- "ремонт днепр щецин"         → щецин = город ≠ днепр → БЛОК
+- "ремонт днепр эльбрус"       → эльбрус = локация ≠ днепр → БЛОК
+- "ремонт днепр киев"          → киев = город ≠ днепр → БЛОК
+- "ремонт днепр голосеевский"  → голосеевский = район Киева ≠ днепр → БЛОК
+
+РАЗРЕШАЕТСЯ:
+- "ремонт днепр"               → только seed_city → ОК
+- "ремонт днепр амур"          → амур = район Днепра → ОК
+- "ремонт днепр центральный"   → центральный = район Днепра → ОК
 """
 
 import re
@@ -35,290 +44,214 @@ logger = logging.getLogger("GeoGarbageFilter")
 
 # ═══════════════════════════════════════════════════════════════════
 # БАЗА ОККУПИРОВАННЫХ ТЕРРИТОРИЙ УКРАИНЫ
-# Ukraine-specific: Crimea, Donetsk, Luhansk regions (since 2014)
-# Kherson, Zaporizhzhia regions (partially, since 2022)
+# Остается для специфичной блокировки (только для target_country='ua')
 # ═══════════════════════════════════════════════════════════════════
 
 OCCUPIED_TERRITORIES = {
-    # ═══ КРЫМ / CRIMEA ═══
-    "севастополь", "sevastopol", "sebastopol",
-    "симферополь", "simferopol",
-    "керчь", "kerch",
-    "евпатория", "yevpatoria", "eupatoria",
-    "ялта", "yalta",
-    "феодосия", "feodosia", "theodosia",
-    "джанкой", "dzhankoy",
-    "алушта", "alushta",
-    "бахчисарай", "bakhchisaray",
-    "красноперекопск", "krasnoperekopsk",
-    "армянск", "armyansk",
-    "саки", "saki",
-    "судак", "sudak",
-    "белогорск", "belogorsk",
-    "старый крым", "stary krym",
-    "алупка", "alupka",
-    "гурзуф", "gurzuf",
-    "ливадия", "livadia",
-    "массандра", "massandra",
-    "гаспра", "gaspra",
-    "форос", "foros",
-    "партенит", "partenit",
-    "коктебель", "koktebel",
-    "новый свет", "novyi svet",
-    "щелкино", "shchelkino",
-    "ленино", "lenino",
-    "красногвардейское", "krasnogvardeyskoye",
-    "нижнегорский", "nizhnegorsky",
-    "советский", "sovetsky",
-    "кировское", "kirovskoye",
-    "черноморское", "chernomorskoye",
-    "раздольное", "razdolnoye",
-    "первомайское", "pervomaiske",
-    "октябрьское", "oktyabrskoye",
-    "молодежное", "molodezhnoye",
-    "мирный", "mirny",
-    "инкерман", "inkerman",
-    "балаклава", "balaklava",
-    "крым", "crimea", "крыма", "крыму", "крымский", "крымская", "крымское",
-    "арк", "ark",
+    # Крым
+    "севастополь", "sevastopol", "sebastopol", "симферополь", "simferopol",
+    "керчь", "kerch", "евпатория", "yevpatoria", "eupatoria", "ялта", "yalta",
+    "феодосия", "feodosia", "theodosia", "джанкой", "dzhankoy", "алушта", "alushta",
+    "бахчисарай", "bakhchisaray", "красноперекопск", "krasnoperekopsk", "армянск", "armyansk",
+    "саки", "saki", "судак", "sudak", "белогорск", "belogorsk", "старый крым", "stary krym",
+    "алупка", "alupka", "гурзуф", "gurzuf", "ливадия", "livadia", "массандра", "massandra",
+    "гаспра", "gaspra", "форос", "foros", "партенит", "partenit", "коктебель", "koktebel",
+    "новый свет", "novyi svet", "щелкино", "shchelkino", "ленино", "lenino",
+    "красногвардейское", "krasnogvardeyskoye", "нижнегорский", "nizhnegorsky",
+    "советский", "sovetsky", "кировское", "kirovskoye", "черноморское", "chernomorskoye",
+    "раздольное", "razdolnoye", "первомайское", "pervomaiske", "октябрьское", "oktyabrskoye",
+    "молодежное", "molodezhnoye", "мирный", "mirny", "инкерман", "inkerman",
+    "балаклава", "balaklava", "крым", "crimea", "крыма", "крыму", "крымский", 
+    "крымская", "крымское", "арк", "ark",
     
-    # ═══ ДОНЕЦКАЯ ОБЛАСТЬ / DONETSK REGION ═══
-    "донецк", "donetsk",
-    "горловка", "horlivka", "gorlovka",
-    "макеевка", "makiivka", "makeyevka",
-    "енакиево", "yenakiieve", "enakievo",
-    "дебальцево", "debaltseve", "debaltsevo",
-    "харцызск", "khartsyzsk",
-    "снежное", "snizhne",
-    "торез", "torez",
-    "шахтерск", "shakhtarsk",
-    "красноармейск", "krasnoarmiysk",
-    "иловайск", "ilovaisk",
-    "амвросиевка", "amvrosiivka",
-    "старобешево", "starobesheve",
-    "тельманово", "telmanove",
-    "новоазовск", "novoazovsk",
-    "ясиноватая", "yasynuvata",
-    "авдеевка", "avdiivka", "avdeevka",
-    "докучаевск", "dokuchaievsk",
-    "зугрэс", "zuhres",
-    "моспино", "mospyne",
-    "углегорск", "vuhledar", "uglegorsk",
-    "дзержинск", "toretsk", "dzerzhinsk",
-    "горняк", "hirnyak",
-    "комсомольское", "komsomolske",
-    "новоселидовка", "novoselidivka",
-    "седово", "siedove",
-    "безыменное", "bezimenne",
-    "сартана", "sartana",
-    "старогнатовка", "starohnativka",
-    "мангуш", "manhush",
-    "володарское", "volodarske",
-    "новотроицкое", "novotroitske",
-    "оленовка", "olenivka",
-    "еленовка", "yelenivka",
-    "новоселовка", "novoselivka",
-    "мариуполь", "mariupol",
-    "талаковка", "talakivka",
-    "виноградное", "vynohradne",
-    "приморское", "prymorske",
-    "урзуф", "urzuf",
-    "днр", "dnr", "донецкая народная республика",
-    "донбасс", "donbass", "донбасса", "донбассе",
+    # Донецкая область
+    "донецк", "donetsk", "горловка", "horlivka", "gorlovka", "макеевка", "makiivka", 
+    "makeyevka", "енакиево", "yenakiieve", "enakievo", "дебальцево", "debaltseve", 
+    "debaltsevo", "харцызск", "khartsyzsk", "снежное", "snizhne", "торез", "torez",
+    "шахтерск", "shakhtarsk", "красноармейск", "krasnoarmiysk", "иловайск", "ilovaisk",
+    "амвросиевка", "amvrosiivka", "старобешево", "starobesheve", "тельманово", "telmanove",
+    "новоазовск", "novoazovsk", "ясиноватая", "yasynuvata", "авдеевка", "avdiivka", 
+    "avdeevka", "докучаевск", "dokuchaievsk", "зугрэс", "zuhres", "моспино", "mospyne",
+    "углегорск", "vuhledar", "uglegorsk", "дзержинск", "toretsk", "dzerzhinsk",
+    "горняк", "hirnyak", "комсомольское", "komsomolske", "новоселидовка", "novoselidivka",
+    "седово", "siedove", "безыменное", "bezimenne", "сартана", "sartana",
+    "старогнатовка", "starohnativka", "мангуш", "manhush", "володарское", "volodarske",
+    "новотроицкое", "novotroitske", "оленовка", "olenivka", "еленовка", "yelenivka",
+    "новоселовка", "novoselivka", "мариуполь", "mariupol", "талаковка", "talakivka",
+    "виноградное", "vynohradne", "приморское", "prymorske", "урзуф", "urzuf",
+    "днр", "dnr", "донецкая народная республика", "донбасс", "donbass", "донбасса", "донбассе",
     
-    # ═══ ЛУГАНСКАЯ ОБЛАСТЬ / LUHANSK REGION ═══
-    "луганск", "luhansk", "lugansk",
-    "алчевск", "alchevsk",
-    "стаханов", "stakhanov", "kadiivka", "кадиевка",
-    "краснодон", "krasnodon",
-    "ровеньки", "rovenky",
-    "свердловск", "sverdlovsk", "dovzhansk", "довжанськ",
-    "антрацит", "antratsyt",
-    "брянка", "brianka",
-    "красный луч", "krasny luch", "khrustalnyi", "хрустальный",
-    "первомайск", "pervomaisk",
-    "молодогвардейск", "molodohvardiisk",
-    "лутугино", "lutuhyne",
-    "ирмино", "irmino",
-    "зоринск", "zorynsk",
-    "перевальск", "perevalsk",
-    "кировск", "kirovsk",
-    "александровск", "oleksandrivsk",
-    "суходольск", "sukhodilsk",
-    "хрящеватое", "khriashchuvate",
-    "металлист", "metalist",
-    "георгиевка", "heorgiivka",
-    "успенка", "uspenka",
-    "изварино", "izvaryne",
-    "краснодонецкое", "krasnodonetske",
-    "петровское", "petrivske",
-    "дьяково", "diakove",
-    "лозовое", "lozove",
-    "новосветловка", "novosvitlivka",
-    "городище", "horodyshche",
-    "артемово", "artemove",
-    "родаково", "rodakove",
-    "червонопартизанск", "chervonyi partyzan",
-    "лнр", "lnr", "луганская народная республика",
+    # Луганская область
+    "луганск", "luhansk", "lugansk", "алчевск", "alchevsk", "стаханов", "stakhanov",
+    "kadiivka", "кадиевка", "краснодон", "krasnodon", "ровеньки", "rovenky",
+    "свердловск", "sverdlovsk", "dovzhansk", "довжанськ", "антрацит", "antratsyt",
+    "брянка", "brianka", "красный луч", "krasny luch", "khrustalnyi", "хрустальный",
+    "первомайск", "pervomaisk", "молодогвардейск", "molodohvardiisk", "лутугино", "lutuhyne",
+    "ирмино", "irmino", "зоринск", "zorynsk", "перевальск", "perevalsk", "кировск", "kirovsk",
+    "александровск", "oleksandrivsk", "суходольск", "sukhodilsk", "хрящеватое", "khriashchuvate",
+    "металлист", "metalist", "георгиевка", "heorgiivka", "успенка", "uspenka",
+    "изварино", "izvaryne", "краснодонецкое", "krasnodonetske", "петровское", "petrivske",
+    "дьяково", "diakove", "лозовое", "lozove", "новосветловка", "novosvitlivka",
+    "городище", "horodyshche", "артемово", "artemove", "родаково", "rodakove",
+    "червонопартизанск", "chervonyi partyzan", "лнр", "lnr", "луганская народная республика",
     "лднр", "ldnr",
     
-    # ═══ ХЕРСОНСКАЯ ОБЛАСТЬ / KHERSON REGION (частично) ═══
-    "каховка", "kakhovka",
-    "новая каховка", "nova kakhovka",
-    "геническ", "henichesk",
-    "скадовск", "skadovsk",
-    "таврийск", "tavriisk",
-    "чаплынка", "chaplynka",
+    # Херсонская область (частично)
+    "каховка", "kakhovka", "новая каховка", "nova kakhovka", "геническ", "henichesk",
+    "скадовск", "skadovsk", "таврийск", "tavriisk", "чаплынка", "chaplynka",
     "калачи", "kalanchak",
     
-    # ═══ ЗАПОРОЖСКАЯ ОБЛАСТЬ / ZAPORIZHZHIA REGION (частично) ═══
-    "мелитополь", "melitopol",
-    "бердянск", "berdiansk", "berdyansk",
-    "энергодар", "enerhodar",
-    "токмак", "tokmak",
-    "василевка", "vasylivka",
-    "приморск", "prymorsk",
-    "пологи", "polohy",
-    "михайловка", "mykhailivka",
-    "молочанск", "molochansk",
-    "якимовка", "yakymivka",
+    # Запорожская область (частично)
+    "мелитополь", "melitopol", "бердянск", "berdiansk", "berdyansk", "энергодар", "enerhodar",
+    "токмак", "tokmak", "василевка", "vasylivka", "приморск", "prymorsk", "пологи", "polohy",
+    "михайловка", "mykhailivka", "молочанск", "molochansk", "якимовка", "yakymivka",
 }
 
 
 # ═══════════════════════════════════════════════════════════════════
-# УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ФИЛЬТРАЦИИ (УЛУЧШЕННАЯ v2.0)
-# Universal filtering for ALL countries and ALL languages
+# БАЗА РАЙОНОВ ГОРОДОВ
+# Для определения разрешенных районов seed_city
+# ═══════════════════════════════════════════════════════════════════
+
+CITY_DISTRICTS = {
+    "киев": {
+        "голосеевский", "голосіївський", "holosiivskyi", "obolon", "оболонь", 
+        "оболонський", "obolonsky", "печерск", "печерський", "pechersk", "pechersky", 
+        "подол", "подільський", "podil", "podilsky", "шевченковский", "шевченківський", 
+        "shevchenkivskyi", "святошин", "святошинський", "sviatoshyn", "sviatoshynsky", 
+        "соломенка", "соломʼянський", "solomianskyi", "дарница", "дарницький", 
+        "darnytsia", "darnytsky", "днепровский", "дніпровський", "dniprovskyi", 
+        "деснянский", "деснянський", "desnianskyi"
+    },
+    
+    "днепр": {
+        "амур", "amur", "чечеловский", "чечелівський", "chechelivskyi", 
+        "шевченковский", "шевченківський", "shevchenkivskyi", "соборный", "соборний", 
+        "soborny", "центральный", "центральний", "tsentralnyi", "central", "индустриальный", 
+        "індустріальний", "industrialnyi", "industrial", "новокодацкий", "новокодацький", 
+        "novokodatsky", "самарский", "самарський", "samarsky"
+    },
+    
+    "днепропетровск": {
+        "амур", "amur", "чечеловский", "чечелівський", "шевченковский", "шевченківський", 
+        "соборный", "соборний", "центральный", "центральний", "индустриальный", 
+        "індустріальний", "новокодацкий", "новокодацький", "самарский", "самарський"
+    },
+    
+    "харьков": {
+        "киевский", "київський", "kyivskyi", "московский", "московський", "moskovsky", 
+        "дзержинский", "дзержинський", "фрунзенский", "фрунзенський", "ленинский", 
+        "ленінський", "октябрьский", "жовтневий", "zhovtnevyi", "червонозаводской", 
+        "червонозаводський", "коминтерновский", "комінтернівський", "орджоникидзевский", 
+        "орджонікідзевський", "индустриальный", "індустріальний"
+    },
+    
+    "одесса": {
+        "киевский", "київський", "kyivskyi", "малиновский", "малиновський", "malynovskyi", 
+        "приморский", "приморський", "prymorskyi", "суворовский", "суворовський", "suvorovskyi"
+    },
+    
+    "львов": {
+        "галицкий", "галицький", "halytskyi", "железнодорожный", "залізничний", "zaliznychnyi", 
+        "лычаковский", "личаківський", "lychakivskyi", "сиховский", "сихівський", "sykhivskyi", 
+        "франковский", "франківський", "frankivskyi", "шевченковский", "шевченківський"
+    },
+    
+    "запорожье": {
+        "александровский", "олександрівський", "oleksandrivskyi", "вознесеновский", 
+        "вознесенівський", "voznesenovskyi", "днепровский", "дніпровський", "dniprovskyi", 
+        "заводской", "заводський", "zavodskyi", "коммунарский", "комунарський", "komunarskyi", 
+        "ленинский", "ленінський", "leninskyi", "хортицкий", "хортицький", "khortytskyi"
+    },
+    
+    "минск": {
+        "уручье", "uruchye", "шабаны", "shabany", "каменная горка", "kamennaya gorka", 
+        "серебрянка", "serebryanka"
+    },
+    
+    "ташкент": {
+        "чиланзар", "chilanzar", "юнусабад", "yunusabad", "сергели", "sergeli", 
+        "яккасарай", "yakkasaray"
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WHITE-LIST ФИЛЬТР v3.0
+# Разрешаем только seed_city и его районы, всё остальное - БЛОК
 # ═══════════════════════════════════════════════════════════════════
 
 def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dict:
     """
-    УЛУЧШЕННАЯ универсальная мультиязычная гео-фильтрация
+    WHITE-LIST гео-фильтр: разрешаем ТОЛЬКО seed_city и его районы
     
-    NEW FEATURES v2.0:
-    - Удаление предлогов для выявления склеек ("днепр в киеве" → "днепр киев" → БЛОК)
-    - Проверка чужих районов через встроенную базу CITY_DISTRICTS
-    - Блокировка упоминаний областей без города из seed
-    - Улучшенная нормализация запросов
+    ПРИНЦИП:
+    ✅ РАЗРЕШЕНО:
+       - seed_city (город из seed)
+       - Районы seed_city (из CITY_DISTRICTS)
+       
+    ❌ БЛОКИРУЕТСЯ всё остальное:
+       - Любой другой город (динамически из geonamescache)
+       - Любой район другого города
+       - Природные объекты (горы, реки, озера)
+       - Оккупированные территории (для UA)
+       - Упоминания областей без seed_city
     
     Args:
         data: dict with "keywords" key (list of strings or dicts)
         seed: original search query
-        target_country: country code (ua, by, kz, uz, pl, us, de, fr, es, etc.)
+        target_country: country code (ua, by, kz, uz, pl, us, de, etc.)
     
     Returns:
         data with filtered keywords
     
     Examples:
-        # Блокирует "днепр в киеве" (2 города после удаления предлога "в")
-        filter_geo_garbage(data, "ремонт днепр", "ua")
+        seed = "ремонт пылесосов днепр"
         
-        # Блокирует "днепр голосеевский" (район Киева, не Днепра)
-        filter_geo_garbage(data, "ремонт днепр", "ua")
+        БЛОКИРУЕТСЯ:
+        - "ремонт днепр щецин"         → щецин = город ≠ днепр
+        - "ремонт днепр эльбрус"       → эльбрус = локация ≠ днепр
+        - "ремонт днепр киев"          → киев = город ≠ днепр
+        - "ремонт днепр голосеевский"  → район Киева ≠ Днепра
         
-        # Блокирует "днепр в симферополе" (оккупированная территория)
-        filter_geo_garbage(data, "ремонт днепр", "ua")
+        РАЗРЕШАЕТСЯ:
+        - "ремонт днепр"               → только seed_city
+        - "ремонт днепр амур"          → амур = район Днепра
+        - "ремонт днепр центральный"   → центральный = район Днепра
     """
     if not data or "keywords" not in data:
         return data
     
     # ═══════════════════════════════════════════════════════════════
-    # Импорт DISTRICTS_EXTENDED из filters
-    # ═══════════════════════════════════════════════════════════════
-    
-    try:
-        from filters import DISTRICTS_EXTENDED
-        logger.info(f"[GEO_GARBAGE] Loaded {len(DISTRICTS_EXTENDED)} districts from DISTRICTS_EXTENDED")
-    except ImportError:
-        logger.warning("⚠️ DISTRICTS_EXTENDED not found in filters, using empty dict")
-        DISTRICTS_EXTENDED = {}
-    
-    # ═══════════════════════════════════════════════════════════════
-    # ВСТРОЕННАЯ БАЗА: Город → Районы (для проверки "чужих районов")
-    # ═══════════════════════════════════════════════════════════════
-    
-    CITY_DISTRICTS = {
-        "киев": ["голосеевский", "голосіївський", "holosiivskyi", "obolon", "оболонь", 
-                 "оболонський", "obolonsky", "печерск", "печерський", "pechersk", "pechersky", 
-                 "подол", "подільський", "podil", "podilsky", "шевченковский", "шевченківський", 
-                 "shevchenkivskyi", "святошин", "святошинський", "sviatoshyn", "sviatoshynsky", 
-                 "соломенка", "соломʼянський", "solomianskyi", "дарница", "дарницький", 
-                 "darnytsia", "darnytsky", "днепровский", "дніпровський", "dniprovskyi", 
-                 "деснянский", "деснянський", "desnianskyi"],
-        
-        "днепр": ["амур", "amur", "чечеловский", "чечелівський", "chechelivskyi", 
-                  "шевченковский", "шевченківський", "shevchenkivskyi", "соборный", "соборний", 
-                  "soborny", "центральный", "центральний", "tsentralnyi", "central", "индустриальный", 
-                  "індустріальний", "industrialnyi", "industrial", "новокодацкий", "новокодацький", 
-                  "novokodatsky", "самарский", "самарський", "samarsky"],
-        
-        "днепропетровск": ["амур", "amur", "чечеловский", "чечелівський", "шевченковский", 
-                           "шевченківський", "соборный", "соборний", "центральный", "центральний", 
-                           "индустриальный", "індустріальний", "новокодацкий", "новокодацький", 
-                           "самарский", "самарський"],
-        
-        "харьков": ["киевский", "київський", "kyivskyi", "московский", "московський", "moskovsky", 
-                    "дзержинский", "дзержинський", "фрунзенский", "фрунзенський", "ленинский", 
-                    "ленінський", "октябрьский", "жовтневий", "zhovtnevyi", "червонозаводской", 
-                    "червонозаводський", "коминтерновский", "комінтернівський", "орджоникидзевский", 
-                    "орджонікідзевський", "индустриальный", "індустріальний"],
-        
-        "одесса": ["киевский", "київський", "kyivskyi", "малиновский", "малиновський", "malynovskyi", 
-                   "приморский", "приморський", "prymorskyi", "суворовский", "суворовський", "suvorovskyi"],
-        
-        "львов": ["галицкий", "галицький", "halytskyi", "железнодорожный", "залізничний", "zaliznychnyi", 
-                  "лычаковский", "личаківський", "lychakivskyi", "сиховский", "сихівський", "sykhivskyi", 
-                  "франковский", "франківський", "frankivskyi", "шевченковский", "шевченківський", "shevchenkivskyi"],
-        
-        "запорожье": ["александровский", "олександрівський", "oleksandrivskyi", "вознесеновский", 
-                      "вознесенівський", "voznesenovskyi", "днепровский", "дніпровський", "dniprovskyi", 
-                      "заводской", "заводський", "zavodskyi", "коммунарский", "комунарський", "komunarskyi", 
-                      "ленинский", "ленінський", "leninskyi", "хортицкий", "хортицький", "khortytskyi", 
-                      "шевченковский", "шевченківський", "shevchenkivskyi"],
-        
-        "минск": ["уручье", "uruchye", "шабаны", "shabany", "каменная горка", "kamennaya gorka", "серебрянка", "serebryanka"],
-        
-        "ташкент": ["чиланзар", "chilanzar", "юнусабад", "yunusabad", "сергели", "sergeli", "яккасарай", "yakkasaray"],
-    }
-    
-    # ═══════════════════════════════════════════════════════════════
-    # Загрузка базы городов через geonamescache
+    # Загрузка geonamescache
     # ═══════════════════════════════════════════════════════════════
     
     try:
         import geonamescache
         gc = geonamescache.GeonamesCache()
         has_geonames = True
-        logger.info(f"[GEO_GARBAGE] geonamescache loaded successfully")
+        logger.info(f"[GEO_WHITE_LIST] geonamescache loaded successfully")
     except ImportError:
-        logger.warning("⚠️ geonamescache not installed, using minimal fallback database")
+        logger.warning("⚠️ geonamescache not installed, using minimal fallback")
         has_geonames = False
     
     seed_lower = seed.lower()
     target_country_upper = target_country.upper()
     
-    # ═══════════════════════════════════════════════════════════════
-    # СПИСОК ПРЕДЛОГОВ для удаления (выявление склеек)
-    # "днепр в киеве" → "днепр киев" → 2 города → БЛОК!
-    # ═══════════════════════════════════════════════════════════════
-    
+    # Предлоги для удаления (выявление склеек)
     prepositions = {
-        # Русский
-        'в', 'на', 'из', 'под', 'во', 'до', 'возле', 'с', 'со', 'от', 'ко', 'за', 'над', 'для', 'при', 'о', 'об',
-        # Українська
-        'у', 'біля', 'поруч', 'коло', 'від', 'до', 'за', 'над', 'про',
-        # English
+        'в', 'на', 'из', 'под', 'во', 'до', 'возле', 'с', 'со', 'от', 'ко', 'за', 'над',
+        'у', 'біля', 'поруч', 'коло', 'від', 'про',
         'in', 'at', 'near', 'from', 'to', 'on', 'by', 'with', 'for', 'of', 'about',
-        # Беларуская
         'ў', 'каля', 'ля', 'пры',
-        # Polski
         'w', 'na', 'przy', 'od', 'do', 'z', 'o',
     }
     
     # ═══════════════════════════════════════════════════════════════
-    # Загрузка городов целевой страны + альтернативных названий
+    # Шаг 1: Загрузка ВСЕХ городов из geonamescache (ALL countries!)
     # ═══════════════════════════════════════════════════════════════
     
-    all_cities = {}  # {название: 'city'}
+    all_cities_global = {}  # {название: страна}
     
     if has_geonames:
         try:
@@ -327,65 +260,67 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
             for city_id, city_data in cities.items():
                 country_code = city_data.get('countrycode', '').upper()
                 
-                if country_code != target_country_upper:
-                    continue
-                
                 # Основное название
                 name = city_data['name'].lower()
-                all_cities[name] = 'city'
+                all_cities_global[name] = country_code
                 
                 # Альтернативные названия (мультиязычные)
                 alt_names = city_data.get('alternatenames', [])
                 for alt in alt_names:
                     if len(alt) > 2:
-                        all_cities[alt.lower()] = 'city'
+                        all_cities_global[alt.lower()] = country_code
             
-            logger.info(f"[GEO_GARBAGE] Loaded {len(all_cities)} city names for {target_country_upper}")
+            logger.info(f"[GEO_WHITE_LIST] Loaded {len(all_cities_global)} city names from ALL countries")
             
         except Exception as e:
-            logger.warning(f"Error loading geonamescache cities: {e}")
-            all_cities = _get_fallback_cities(target_country)
+            logger.warning(f"Error loading geonamescache: {e}")
+            all_cities_global = _get_fallback_cities_all()
     else:
-        all_cities = _get_fallback_cities(target_country)
+        all_cities_global = _get_fallback_cities_all()
     
     # Добавляем города из CITY_DISTRICTS
     for city_name in CITY_DISTRICTS.keys():
-        all_cities[city_name] = 'city'
+        if city_name not in all_cities_global:
+            all_cities_global[city_name] = target_country_upper
     
     # ═══════════════════════════════════════════════════════════════
-    # Определяем город из seed (если есть)
+    # Шаг 2: Определяем seed_city
     # ═══════════════════════════════════════════════════════════════
     
     seed_city = None
     seed_words = re.findall(r'[а-яёіїєґa-z]+', seed_lower)
     
-    # Ищем в CITY_DISTRICTS (приоритет - самый длинный город)
+    # Приоритет: ищем самый длинный город из CITY_DISTRICTS
     potential_cities = [c for c in CITY_DISTRICTS.keys() if c in seed_lower]
     if potential_cities:
-        seed_city = max(potential_cities, key=len)  # Самый длинный = самый точный
-        logger.info(f"[GEO_GARBAGE] Detected city in seed (CITY_DISTRICTS): '{seed_city}'")
+        seed_city = max(potential_cities, key=len)
+        logger.info(f"[GEO_WHITE_LIST] Detected seed_city: '{seed_city}' (from CITY_DISTRICTS)")
     
-    # Если не нашли, ищем в all_cities
+    # Если не нашли, ищем в all_cities_global
     if not seed_city:
         for word in seed_words:
-            if word in all_cities and all_cities[word] == 'city':
+            if word in all_cities_global:
                 seed_city = word
-                logger.info(f"[GEO_GARBAGE] Detected city in seed (geonames): '{seed_city}'")
+                logger.info(f"[GEO_WHITE_LIST] Detected seed_city: '{seed_city}' (from geonames)")
                 break
     
+    if not seed_city:
+        logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city detected in seed: '{seed}'. All queries will pass.")
+    
+    # Получаем разрешенные районы seed_city
+    allowed_districts = CITY_DISTRICTS.get(seed_city, set()) if seed_city else set()
+    
     # ═══════════════════════════════════════════════════════════════
-    # Фильтрация keywords (УЛУЧШЕННАЯ ВЕРСИЯ)
+    # Шаг 3: Фильтрация keywords (WHITE-LIST логика)
     # ═══════════════════════════════════════════════════════════════
     
     unique_keywords = []
     stats = {
         'total': len(data["keywords"]),
         'blocked_occupied': 0,
-        'blocked_multiple_cities': 0,
-        'blocked_foreign_district': 0,
+        'blocked_foreign_city': 0,      # ← НОВОЕ! Чужой город из geonames
         'blocked_wrong_district': 0,
         'blocked_wrong_oblast': 0,
-        'blocked_other_country': 0,
         'allowed': 0,
     }
     
@@ -401,13 +336,8 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         query_lower = query.lower()
         words = re.findall(r'[а-яёіїєґa-z0-9]+', query_lower)
         
-        # ═══════════════════════════════════════════════════════════
-        # ЖЕСТКАЯ НОРМАЛИЗАЦИЯ: Удаляем предлоги для выявления склеек
-        # "днепр в киеве" → "днепр киев" → 2 города → БЛОК!
-        # ═══════════════════════════════════════════════════════════
-        
+        # Удаляем предлоги
         clean_words = [w for w in words if w not in prepositions and len(w) > 1]
-        clean_query_flat = " ".join(clean_words)
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 1: Оккупированные территории (только для UA)
@@ -418,7 +348,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
             for word in clean_words:
                 if word in OCCUPIED_TERRITORIES:
                     has_occupied = True
-                    logger.info(f"[GEO_GARBAGE] ❌ OCCUPIED: '{query}' contains '{word}'")
+                    logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{word}'")
                     stats['blocked_occupied'] += 1
                     break
             
@@ -426,46 +356,44 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 2: Множественные города (УЛУЧШЕННАЯ)
-        # Проверяем как в оригинальных словах, так и в clean_words
+        # ПРОВЕРКА 2: WHITE-LIST логика - ЧУЖИЕ ГОРОДА
+        # Если город != seed_city → БЛОК (динамически из geonames)
         # ═══════════════════════════════════════════════════════════
         
-        found_cities = set()
-        
-        # Проверяем города из CITY_DISTRICTS (точные совпадения)
-        for city in CITY_DISTRICTS.keys():
-            if city in clean_query_flat and city != seed_city:
-                found_cities.add(city)
-        
-        # Проверяем города из all_cities (по словам)
-        for word in clean_words:
-            if word in all_cities and all_cities[word] == 'city':
-                if word != seed_city:
-                    found_cities.add(word)
-        
-        if len(found_cities) >= 1:
-            logger.info(f"[GEO_GARBAGE] ❌ MULTIPLE_CITIES: '{query}' contains cities: {found_cities}")
-            stats['blocked_multiple_cities'] += 1
-            continue
+        if seed_city:
+            found_foreign_cities = []
+            
+            for word in clean_words:
+                # Проверяем в глобальной базе городов
+                if word in all_cities_global:
+                    # Если это НЕ seed_city → это чужой город → БЛОК
+                    if word != seed_city:
+                        found_foreign_cities.append(word)
+            
+            if found_foreign_cities:
+                logger.info(f"[GEO_WHITE_LIST] ❌ FOREIGN_CITY: '{query}' contains cities: {found_foreign_cities}, but seed_city is '{seed_city}'")
+                stats['blocked_foreign_city'] += 1
+                continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 3: Чужие районы через CITY_DISTRICTS
-        # Если seed="днепр", а query="голосеевский" (район Киева) → БЛОК
+        # ПРОВЕРКА 3: WHITE-LIST логика - ЧУЖИЕ РАЙОНЫ
+        # Если район != район seed_city → БЛОК
         # ═══════════════════════════════════════════════════════════
         
-        if seed_city and seed_city in CITY_DISTRICTS:
+        if seed_city and allowed_districts:
             has_wrong_district = False
             
+            # Проверяем все районы из CITY_DISTRICTS
             for city, districts in CITY_DISTRICTS.items():
                 if city == seed_city:
                     continue  # Пропускаем свой город
                 
-                # Проверяем каждый район другого города
+                # Если нашли район другого города → БЛОК
                 for district in districts:
                     if district in query_lower:
                         has_wrong_district = True
-                        logger.info(f"[GEO_GARBAGE] ❌ WRONG_DISTRICT: '{query}' contains district '{district}' "
-                                  f"from city '{city}', but seed city is '{seed_city}'")
+                        logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_DISTRICT: '{query}' contains district '{district}' "
+                                  f"from city '{city}', but seed_city is '{seed_city}'")
                         stats['blocked_wrong_district'] += 1
                         break
                 
@@ -476,110 +404,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 4: Районы из других стран (через DISTRICTS_EXTENDED)
-        # ═══════════════════════════════════════════════════════════
-        
-        has_foreign_district = False
-        
-        for word in clean_words:
-            if word in DISTRICTS_EXTENDED:
-                district_country = DISTRICTS_EXTENDED[word]
-                
-                # Если район принадлежит другой стране - блокируем
-                if district_country != target_country.lower():
-                    has_foreign_district = True
-                    logger.info(f"[GEO_GARBAGE] ❌ FOREIGN_DISTRICT: '{query}' contains district '{word}' "
-                              f"from {district_country.upper()}, but target is {target_country_upper}")
-                    stats['blocked_foreign_district'] += 1
-                    break
-        
-        if has_foreign_district:
-            continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 5: Упоминание "область/обл" без города из seed
-        # "харьковская область" при seed="днепр" → БЛОК
+        # ПРОВЕРКА 4: Упоминание "область/обл" без seed_city
         # ═══════════════════════════════════════════════════════════
         
         if any(oblast_word in query_lower for oblast_word in ['область', 'обл', 'област', 'области']):
             if seed_city and seed_city not in query_lower:
-                logger.info(f"[GEO_GARBAGE] ❌ WRONG_OBLAST: '{query}' mentions oblast but seed city '{seed_city}' not found")
+                logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_OBLAST: '{query}' mentions oblast but seed_city '{seed_city}' not found")
                 stats['blocked_wrong_oblast'] += 1
                 continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 6: Упоминание других стран
-        # ═══════════════════════════════════════════════════════════
-        
-        # Мультиязычные названия стран
-        other_countries = {
-            # Русский
-            'россия': 'ru', 'рф': 'ru', 'российская': 'ru', 'россии': 'ru', 'росії': 'ru',
-            'беларусь': 'by', 'белоруссия': 'by', 'беларуси': 'by', 'білорусь': 'by',
-            'украина': 'ua', 'украине': 'ua', 'украины': 'ua', 'україна': 'ua',
-            'польша': 'pl', 'польше': 'pl', 'польщі': 'pl',
-            'казахстан': 'kz', 'казахстане': 'kz',
-            'узбекистан': 'uz', 'узбекистане': 'uz',
-            'молдова': 'md', 'молдавия': 'md',
-            'израиль': 'il', 'израиле': 'il',
-            'германия': 'de', 'германии': 'de', 'німеччина': 'de',
-            'франция': 'fr', 'францию': 'fr', 'франції': 'fr',
-            'испания': 'es', 'италия': 'it',
-            
-            # English
-            'russia': 'ru', 'russian': 'ru',
-            'belarus': 'by', 'belarusian': 'by',
-            'ukraine': 'ua', 'ukrainian': 'ua',
-            'poland': 'pl', 'polish': 'pl',
-            'kazakhstan': 'kz', 'kazakh': 'kz',
-            'uzbekistan': 'uz', 'uzbek': 'uz',
-            'moldova': 'md', 'moldovan': 'md',
-            'israel': 'il', 'israeli': 'il',
-            'germany': 'de', 'german': 'de',
-            'france': 'fr', 'french': 'fr',
-            'spain': 'es', 'spanish': 'es',
-            'italy': 'it', 'italian': 'it',
-            'usa': 'us', 'america': 'us', 'american': 'us',
-            
-            # Беларуская
-            'расія': 'ru', 'расіі': 'ru',
-            'украіна': 'ua',
-            
-            # Українська
-            'росія': 'ru', 'російська': 'ru',
-            
-            # Polski
-            'rosja': 'ru', 'rosyjski': 'ru',
-            'białoruś': 'by',
-            'ukraina': 'ua', 'ukraiński': 'ua',
-            'polska': 'pl', 'polski': 'pl',
-            
-            # Deutsch
-            'russland': 'ru',
-            'weißrussland': 'by',
-            'deutschland': 'de',
-        }
-        
-        has_other_country = False
-        for word in clean_words:
-            if word in other_countries:
-                country_code = other_countries[word]
-                
-                # Игнорируем если это наша страна
-                if country_code == target_country.lower():
-                    continue
-                
-                # Игнорируем если слово есть в seed
-                if word in seed_lower:
-                    continue
-                
-                has_other_country = True
-                logger.info(f"[GEO_GARBAGE] ❌ OTHER_COUNTRY: '{query}' mentions '{word}' ({country_code.upper()})")
-                stats['blocked_other_country'] += 1
-                break
-        
-        if has_other_country:
-            continue
         
         # ═══════════════════════════════════════════════════════════
         # Запрос прошел все проверки - разрешаем
@@ -599,69 +431,70 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     if "count" in data:
         data["count"] = len(unique_keywords)
     
-    logger.info(f"[GEO_GARBAGE] STATS for {target_country_upper}: {stats}")
+    logger.info(f"[GEO_WHITE_LIST] STATS: {stats}")
     
     return data
 
 
-def _get_fallback_cities(country_code: str) -> Dict[str, str]:
+def _get_fallback_cities_all() -> Dict[str, str]:
     """
-    Minimal fallback city database if geonamescache unavailable
-    Supports multiple countries
+    Минимальная база городов ВСЕХ стран (fallback)
+    Формат: {город: код_страны}
     """
-    fallback_db = {
-        'ua': {
-            'київ': 'city', 'киев': 'city', 'kyiv': 'city',
-            'харків': 'city', 'харьков': 'city', 'kharkiv': 'city',
-            'одеса': 'city', 'одесса': 'city', 'odesa': 'city',
-            'дніпро': 'city', 'днепр': 'city', 'dnipro': 'city',
-            'львів': 'city', 'львов': 'city', 'lviv': 'city',
-            'запоріжжя': 'city', 'запорожье': 'city', 'zaporizhzhia': 'city',
-            'україна': 'country', 'украина': 'country', 'ukraine': 'country',
-        },
-        'by': {
-            'мінск': 'city', 'минск': 'city', 'minsk': 'city',
-            'гомель': 'city', 'homel': 'city',
-            'магілёў': 'city', 'могилев': 'city', 'mogilev': 'city',
-            'беларусь': 'country', 'belarus': 'country',
-        },
-        'kz': {
-            'алматы': 'city', 'almaty': 'city',
-            'астана': 'city', 'нұр-сұлтан': 'city', 'nur-sultan': 'city',
-            'шымкент': 'city', 'shymkent': 'city',
-            'қазақстан': 'country', 'казахстан': 'country', 'kazakhstan': 'country',
-        },
-        'uz': {
-            'ташкент': 'city', 'tashkent': 'city',
-            'самарканд': 'city', 'samarkand': 'city',
-            'бухара': 'city', 'bukhara': 'city',
-            'ўзбекистон': 'country', 'узбекистан': 'country', 'uzbekistan': 'country',
-        },
-        'pl': {
-            'warszawa': 'city', 'варшава': 'city',
-            'kraków': 'city', 'краков': 'city',
-            'wrocław': 'city',
-            'polska': 'country', 'poland': 'country', 'польша': 'country',
-        },
-        'us': {
-            'new york': 'city', 'нью-йорк': 'city',
-            'los angeles': 'city', 'лос-анджелес': 'city',
-            'chicago': 'city', 'чикаго': 'city',
-            'usa': 'country', 'united states': 'country', 'сша': 'country',
-        },
-        'de': {
-            'berlin': 'city', 'берлин': 'city',
-            'münchen': 'city', 'мюнхен': 'city',
-            'hamburg': 'city', 'гамбург': 'city',
-            'deutschland': 'country', 'germany': 'country', 'германия': 'country',
-        },
+    return {
+        # Украина
+        'київ': 'UA', 'киев': 'UA', 'kyiv': 'UA',
+        'харків': 'UA', 'харьков': 'UA', 'kharkiv': 'UA',
+        'одеса': 'UA', 'одесса': 'UA', 'odesa': 'UA',
+        'дніпро': 'UA', 'днепр': 'UA', 'dnipro': 'UA',
+        'львів': 'UA', 'львов': 'UA', 'lviv': 'UA',
+        'запоріжжя': 'UA', 'запорожье': 'UA', 'zaporizhzhia': 'UA',
+        
+        # Беларусь
+        'мінск': 'BY', 'минск': 'BY', 'minsk': 'BY',
+        'гомель': 'BY', 'homel': 'BY',
+        'могилев': 'BY', 'mogilev': 'BY',
+        
+        # Польша
+        'warszawa': 'PL', 'варшава': 'PL',
+        'kraków': 'PL', 'краков': 'PL',
+        'wrocław': 'PL',
+        'szczecin': 'PL', 'щецин': 'PL',  # ← Важно для блокировки!
+        'gdańsk': 'PL',
+        
+        # Казахстан
+        'алматы': 'KZ', 'almaty': 'KZ',
+        'астана': 'KZ', 'nur-sultan': 'KZ',
+        'шымкент': 'KZ', 'shymkent': 'KZ',
+        
+        # Узбекистан
+        'ташкент': 'UZ', 'tashkent': 'UZ',
+        'самарканд': 'UZ', 'samarkand': 'UZ',
+        
+        # Россия (для блокировки)
+        'москва': 'RU', 'moscow': 'RU',
+        'санкт-петербург': 'RU', 'petersburg': 'RU',
+        'новосибирск': 'RU', 'novosibirsk': 'RU',
+        
+        # США
+        'new york': 'US',
+        'los angeles': 'US',
+        'chicago': 'US',
+        
+        # Германия
+        'berlin': 'DE', 'берлин': 'DE',
+        'münchen': 'DE', 'мюнхен': 'DE',
+        'hamburg': 'DE',
+        
+        # Природные объекты (для блокировки)
+        'эльбрус': 'RU',  # ← Гора, блокируется автоматически
+        'elbrus': 'RU',
     }
-    
-    return fallback_db.get(country_code.lower(), {})
 
 
 # Экспорт
 __all__ = [
     'filter_geo_garbage',
     'OCCUPIED_TERRITORIES',
+    'CITY_DISTRICTS',
 ]
