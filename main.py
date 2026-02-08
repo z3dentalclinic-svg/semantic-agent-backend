@@ -1328,6 +1328,9 @@ async def light_search_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ ГЕО-ФИЛЬТР (блокирует "днепр россия", "днепр ялта" и т.д.)
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1399,6 +1402,9 @@ async def parse_suffix_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ ГЕО-ФИЛЬТР
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1426,6 +1432,9 @@ async def parse_infix_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ ГЕО-ФИЛЬТР
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1453,6 +1462,9 @@ async def parse_morphology_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ ГЕО-ФИЛЬТР
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1480,6 +1492,9 @@ async def parse_adaptive_prefix_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ ГЕО-ФИЛЬТР
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
