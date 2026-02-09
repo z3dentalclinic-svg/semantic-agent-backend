@@ -1,5 +1,5 @@
 """
-Filters module for FGS Parser
+Filters module for FGS Parser1
 Contains all filtering logic:
 - batch_post_filter: Main geo-filter with multi-layer checks
 - geo_garbage_filter: Advanced geo-filter (occupied territories, multiple cities, districts)
