@@ -19,7 +19,8 @@ from filters import (
     DISTRICTS_EXTENDED,
     filter_infix_results,
     filter_relevant_keywords,
-    filter_geo_garbage
+    filter_geo_garbage,
+    apply_pre_filter  # ← санитарная очистка парсинга (ДО гео-фильтра)
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
@@ -1329,6 +1330,9 @@ async def light_search_endpoint(
 
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
+    # ✅ PRE-ФИЛЬТР (убирает дубли seed, повторы слов)
+    result = apply_pre_filter(result, seed=seed)
+    
     # ✅ ГЕО-ФИЛЬТР (блокирует "днепр россия", "днепр ялта" и т.д.)
     result = filter_geo_garbage(result, seed=seed, target_country=country)
 
@@ -1354,6 +1358,9 @@ async def deep_search_endpoint(
         language = parser.detect_seed_language(seed)
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
+    
+    # ✅ PRE-ФИЛЬТР (убирает дубли seed, повторы слов)
+    result = apply_pre_filter(result, seed=seed)
     
     # ✅ ГЕО-ФИЛЬТР v2.0 (УЛУЧШЕННЫЙ: блокирует "днепр в киеве", "днепр голосеевский", "днепр в симферополе")
     result = filter_geo_garbage(result, seed=seed, target_country=country)
@@ -1403,6 +1410,9 @@ async def parse_suffix_endpoint(
 
     result = await parser.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
+    # ✅ PRE-ФИЛЬТР
+    result = apply_pre_filter(result, seed=seed)
+    
     # ✅ ГЕО-ФИЛЬТР
     result = filter_geo_garbage(result, seed=seed, target_country=country)
 
@@ -1432,6 +1442,9 @@ async def parse_infix_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ PRE-ФИЛЬТР
+    result = apply_pre_filter(result, seed=seed)
     
     # ✅ ГЕО-ФИЛЬТР
     result = filter_geo_garbage(result, seed=seed, target_country=country)
@@ -1463,6 +1476,9 @@ async def parse_morphology_endpoint(
 
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
+    # ✅ PRE-ФИЛЬТР
+    result = apply_pre_filter(result, seed=seed)
+    
     # ✅ ГЕО-ФИЛЬТР
     result = filter_geo_garbage(result, seed=seed, target_country=country)
 
@@ -1492,6 +1508,9 @@ async def parse_adaptive_prefix_endpoint(
         seed = correction["corrected"]
 
     result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
+    
+    # ✅ PRE-ФИЛЬТР
+    result = apply_pre_filter(result, seed=seed)
     
     # ✅ ГЕО-ФИЛЬТР
     result = filter_geo_garbage(result, seed=seed, target_country=country)
