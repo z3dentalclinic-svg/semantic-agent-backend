@@ -23,3 +23,4 @@ __all__ = [
     'apply_pre_filter',
     'filter_infix_results',
     'filter_relevant_keywords'
+]
