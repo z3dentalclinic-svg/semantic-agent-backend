@@ -65,6 +65,52 @@ def pre_filter(query: str, seed: str) -> tuple:
     return False, None
 
 
+# ═══════════════════════════════════════════════════════════════════
+# WRAPPER для API: apply_pre_filter
+# ═══════════════════════════════════════════════════════════════════
+
+def apply_pre_filter(data: dict, seed: str) -> dict:
+    """
+    Применяет pre_filter к каждому query в data["keywords"]
+    
+    Args:
+        data: dict с ключом "keywords" (list)
+        seed: базовый запрос
+    
+    Returns:
+        data с отфильтрованными keywords
+    """
+    if not data or "keywords" not in data:
+        return data
+    
+    filtered_keywords = []
+    
+    for item in data["keywords"]:
+        # Поддержка строк и dict
+        if isinstance(item, str):
+            query = item
+        elif isinstance(item, dict):
+            query = item.get("query", "")
+        else:
+            continue
+        
+        # Проверка через pre_filter
+        is_trash, reason = pre_filter(query, seed)
+        
+        if not is_trash:
+            filtered_keywords.append(item)
+    
+    # Обновляем данные
+    data["keywords"] = filtered_keywords
+    
+    if "total_count" in data:
+        data["total_count"] = len(filtered_keywords)
+    if "count" in data:
+        data["count"] = len(filtered_keywords)
+    
+    return data
+
+
 # ==================== ТЕСТ ====================
 
 if __name__ == "__main__":
