@@ -1,6 +1,4 @@
 from typing import List
-from __future__ import annotations
-
 import re
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -9,6 +7,40 @@ from typing import Iterable, List
 import pymorphy3
 from nltk.stem.snowball import SnowballStemmer
 
+def simple_normalize_keyword(keyword: str, seed: str) -> str:
+    if not keyword or not seed:
+        return keyword
+    
+    seed_tokens = seed.lower().split()
+    kw_tokens = keyword.lower().split()
+    
+    replacements = {}
+    
+    for s in seed_tokens:
+        for k in kw_tokens:
+            if k == s:
+                replacements[k] = s
+                continue
+            
+            prefix_len = 5
+            if len(k) >= prefix_len and len(s) >= prefix_len and k[:prefix_len] == s[:prefix_len]:
+                replacements[k] = s
+                continue
+            
+            sim = SequenceMatcher(None, k, s).ratio()
+            if sim >= 0.7:
+                replacements[k] = s
+    
+    result = []
+    
+    for token in keyword.split():
+        low = token.lower()
+        if low in replacements:
+            result.append(replacements[low])
+        else:
+            result.append(token)
+    
+    return " ".join(result)
 WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
 CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁіїєґІЇЄҐ]")
 UK_SPECIFIC_RE = re.compile(r"[іїєґІЇЄҐ]")
@@ -35,7 +67,7 @@ _SNOWBALL_LANGUAGE_MAP = {
 
 
 @lru_cache(maxsize=32)
-def _get_snowball_stemmer(language: str) -> SnowballStemmer | None:
+def _get_snowball_stemmer(language: str):
     name = _SNOWBALL_LANGUAGE_MAP.get(language.lower())
     if not name:
         return None
@@ -89,40 +121,6 @@ def _normalize_token_ru_uk(token: str) -> str:
     if not parses:
         return token.lower()
 
-def simple_normalize_keyword(keyword: str, seed: str) -> str:
-    if not keyword or not seed:
-        return keyword
-    
-    seed_tokens = seed.lower().split()
-    kw_tokens = keyword.lower().split()
-    
-    replacements = {}
-    
-    for s in seed_tokens:
-        for k in kw_tokens:
-            if k == s:
-                replacements[k] = s
-                continue
-            
-            prefix_len = 5
-            if len(k) >= prefix_len and len(s) >= prefix_len and k[:prefix_len] == s[:prefix_len]:
-                replacements[k] = s
-                continue
-            
-            sim = SequenceMatcher(None, k, s).ratio()
-            if sim >= 0.7:
-                replacements[k] = s
-    
-    result = []
-    
-    for token in keyword.split():
-        low = token.lower()
-        if low in replacements:
-            result.append(replacements[low])
-        else:
-            result.append(token)
-    
-    return " ".join(result)
     best = parses[0]
     pos = best.tag.POS
     number = best.tag.number
