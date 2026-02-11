@@ -65,6 +65,36 @@ _SNOWBALL_LANGUAGE_MAP = {
     "ru": "russian",
 }
 
+_LANGUAGE_ALIASES = {
+    "ru-ru": "ru",
+    "ru_ru": "ru",
+    "russian": "ru",
+    "uk-ua": "uk",
+    "uk_ua": "uk",
+    "ukrainian": "uk",
+    "en-us": "en",
+    "en_us": "en",
+    "en-gb": "en",
+    "en_gb": "en",
+    "english": "en",
+}
+
+
+def _canonicalize_language(language: str) -> str:
+    if not language:
+        return "auto"
+
+    lang = language.strip().lower()
+    if lang in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[lang]
+
+    if "-" in lang:
+        lang = lang.split("-", 1)[0]
+    elif "_" in lang:
+        lang = lang.split("_", 1)[0]
+
+    return _LANGUAGE_ALIASES.get(lang, lang)
+
 
 @lru_cache(maxsize=32)
 def _get_snowball_stemmer(language: str):
@@ -95,8 +125,20 @@ def _looks_like_brand_or_model(token: str) -> bool:
 
 
 def _resolve_language(language: str, seed: str, keywords: List[str]) -> str:
-    if language and language.lower() != "auto":
-        return language.lower()
+    lang = _canonicalize_language(language)
+
+    if lang != "auto":
+        if lang in {"ru", "uk", "en"} or lang in _SNOWBALL_LANGUAGE_MAP:
+            return lang
+
+        # Нестандартные коды/мусор: выбираем по фактическому скрипту,
+        # чтобы не уехать в seed-alignment для кириллицы.
+        text = " ".join([seed or ""] + (keywords or []))
+        if CYRILLIC_RE.search(text):
+            if UK_SPECIFIC_RE.search(text):
+                return "uk"
+            return "ru"
+        return "en"
 
     text = " ".join([seed or ""] + (keywords or []))
     if UK_SPECIFIC_RE.search(text):
