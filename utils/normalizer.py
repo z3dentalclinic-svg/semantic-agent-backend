@@ -188,10 +188,11 @@ def _normalize_phrase(keyword: str, language: str, seed: str) -> str:
     tokens = [t.lower() for t in _tokenize(keyword)]
 
     if language in {"ru", "uk"}:
+        # Для RU/UK не выравниваем к seed, чтобы не схлопывать формы под сид.
         normalized = [_normalize_token_ru_uk(t) for t in tokens]
-    else:
-        normalized = [_normalize_token_stemmed(t, language) for t in tokens]
+        return " ".join(normalized)
 
+    normalized = [_normalize_token_stemmed(t, language) for t in tokens]
     aligned = _align_with_seed(normalized, seed)
     return " ".join(aligned)
 
