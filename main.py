@@ -25,6 +25,7 @@ from filters import (
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
 from utils.normalizer import normalize_keywords
+from utils.tracer import FilterTracer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -266,6 +267,9 @@ class GoogleAutocompleteParser:
         logger.info("✅ Batch Post-Filter v7.9 initialized with REAL cities database")
         logger.info(f"   Database contains {len(ALL_CITIES_GLOBAL)} cities")
         logger.info("   GEO DATABASE = PRIMARY, morphology = secondary")
+
+        # Трассировщик фильтрации
+        self.tracer = FilterTracer(enabled=True)
 
     def is_city_allowed(self, word: str, target_country: str) -> bool:
         """
@@ -1309,6 +1313,54 @@ async def root():
     """Главная страница"""
     return FileResponse('static/index.html')
 
+
+def apply_filters_traced(result: dict, seed: str, country: str, 
+                          method: str, deduplicate: bool = False) -> dict:
+    """
+    Применяет цепочку фильтров с трассировкой.
+    Используется во всех эндпоинтах.
+    """
+    parser.tracer.start_request(seed=seed, country=country, method=method)
+    
+    # PRE-ФИЛЬТР
+    parser.tracer.before_filter("pre_filter", result.get("keywords", []))
+    result = apply_pre_filter(result, seed=seed)
+    parser.tracer.after_filter("pre_filter", result.get("keywords", []))
+    
+    # ГЕО-ФИЛЬТР
+    parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
+    result = filter_geo_garbage(result, seed=seed, target_country=country)
+    parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
+    
+    # ДЕДУПЛИКАЦИЯ (опционально)
+    if deduplicate:
+        parser.tracer.before_filter("deduplicate", result.get("keywords", []))
+        result = deduplicate_final_results(result)
+        parser.tracer.after_filter("deduplicate", result.get("keywords", []))
+    
+    result["_trace"] = parser.tracer.finish_request()
+    return result
+
+
+@app.get("/api/trace/last")
+async def get_last_trace():
+    """Возвращает последний отчёт трассировки"""
+    return parser.tracer.finish_request() if parser.tracer.stages else {"message": "No trace available"}
+
+
+@app.get("/api/trace/keyword")
+async def trace_keyword(keyword: str = Query(..., description="Ключевое слово для трассировки")):
+    """Трассировка конкретного ключевого слова через все фильтры"""
+    return parser.tracer.get_keyword_trace(keyword)
+
+
+@app.get("/api/trace/toggle")
+async def toggle_tracer(enabled: bool = Query(True, description="Включить/выключить трассировку")):
+    """Включение/выключение трассировки"""
+    parser.tracer.enabled = enabled
+    return {"tracer_enabled": enabled}
+
+
 @app.get("/api/light-search")
 async def light_search_endpoint(
     seed: str = Query(..., description="Базовый запрос"),
@@ -1330,11 +1382,7 @@ async def light_search_endpoint(
 
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    # ✅ PRE-ФИЛЬТР (убирает дубли seed, повторы слов)
-    result = apply_pre_filter(result, seed=seed)
-    
-    # ✅ ГЕО-ФИЛЬТР (блокирует "днепр россия", "днепр ялта" и т.д.)
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
+    result = apply_filters_traced(result, seed, country, method="light-search")
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1359,16 +1407,8 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    # ✅ PRE-ФИЛЬТР (убирает дубли seed, повторы слов)
-    result = apply_pre_filter(result, seed=seed)
+    result = apply_filters_traced(result, seed, country, method="deep-search", deduplicate=True)
     
-    # ✅ ГЕО-ФИЛЬТР v2.0 (УЛУЧШЕННЫЙ: блокирует "днепр в киеве", "днепр голосеевский", "днепр в симферополе")
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
-    
-    # ✅ ДЕДУПЛИКАЦИЯ ДЛЯ DEEP SEARCH
-    result = deduplicate_final_results(result)
-    
-    # Нормализация уже происходит внутри parse_deep_search
     return result
 
 @app.get("/api/compare")
@@ -1410,11 +1450,7 @@ async def parse_suffix_endpoint(
 
     result = await parser.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    # ✅ PRE-ФИЛЬТР
-    result = apply_pre_filter(result, seed=seed)
-    
-    # ✅ ГЕО-ФИЛЬТР
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
+    result = apply_filters_traced(result, seed, country, method="suffix")
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1443,11 +1479,7 @@ async def parse_infix_endpoint(
 
     result = await parser.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    # ✅ PRE-ФИЛЬТР
-    result = apply_pre_filter(result, seed=seed)
-    
-    # ✅ ГЕО-ФИЛЬТР
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
+    result = apply_filters_traced(result, seed, country, method="infix")
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1476,11 +1508,7 @@ async def parse_morphology_endpoint(
 
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    # ✅ PRE-ФИЛЬТР
-    result = apply_pre_filter(result, seed=seed)
-    
-    # ✅ ГЕО-ФИЛЬТР
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
+    result = apply_filters_traced(result, seed, country, method="morphology")
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1509,11 +1537,7 @@ async def parse_adaptive_prefix_endpoint(
 
     result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    # ✅ PRE-ФИЛЬТР
-    result = apply_pre_filter(result, seed=seed)
-    
-    # ✅ ГЕО-ФИЛЬТР
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
+    result = apply_filters_traced(result, seed, country, method="adaptive-prefix")
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
