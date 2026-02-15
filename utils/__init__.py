@@ -1,5 +1,6 @@
 """
 Utils module for FGS Parser
 """
-# Пустой __init__.py - импортируй напрямую из подмодулей
-__all__ = []
+from .tracer import FilterTracer
+
+__all__ = ['FilterTracer']
