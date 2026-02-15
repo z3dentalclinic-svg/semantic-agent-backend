@@ -1318,25 +1318,51 @@ def apply_filters_traced(result: dict, seed: str, country: str,
                           method: str, deduplicate: bool = False) -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
-    Используется во всех эндпоинтах.
+    Заблокированные ключи добавляются в result["anchors"] с указанием фильтра.
     """
     parser.tracer.start_request(seed=seed, country=country, method=method)
+    
+    if "anchors" not in result:
+        result["anchors"] = []
+    
+    before_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
     
     # PRE-ФИЛЬТР
     parser.tracer.before_filter("pre_filter", result.get("keywords", []))
     result = apply_pre_filter(result, seed=seed)
     parser.tracer.after_filter("pre_filter", result.get("keywords", []))
     
+    after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+    for kw in (before_set - after_set):
+        result["anchors"].append(kw)
+    
+    before_set = after_set
+    
     # ГЕО-ФИЛЬТР
     parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
     result = filter_geo_garbage(result, seed=seed, target_country=country)
     parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
+    
+    after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+    for kw in (before_set - after_set):
+        result["anchors"].append(kw)
     
     # ДЕДУПЛИКАЦИЯ (опционально)
     if deduplicate:
         parser.tracer.before_filter("deduplicate", result.get("keywords", []))
         result = deduplicate_final_results(result)
         parser.tracer.after_filter("deduplicate", result.get("keywords", []))
+    
+    # Дедупликация anchors
+    seen = set()
+    unique_anchors = []
+    for a in result["anchors"]:
+        key = a.lower().strip() if isinstance(a, str) else ""
+        if key and key not in seen:
+            seen.add(key)
+            unique_anchors.append(a)
+    result["anchors"] = sorted(unique_anchors)
+    result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
     return result
