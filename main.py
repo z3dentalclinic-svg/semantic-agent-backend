@@ -804,15 +804,14 @@ class GoogleAutocompleteParser:
         logger.debug(f"[SUFFIX] final_keywords={final_keywords}")
         logger.debug(f"[SUFFIX] final_anchors={final_anchors}")
         
-        batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
-            seed=seed,
-            country=country,
-            language=language
-        )
-        
-        # Объединяем якоря (старые + новые от batch_filter)
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
+        # === BPF ПЕРЕНЕСЁН В apply_filters_traced (endpoint) ===
+        # batch_result = self.post_filter.filter_batch(
+        #     keywords=final_keywords,
+        #     seed=seed,
+        #     country=country,
+        #     language=language
+        # )
+        # combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -820,13 +819,13 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "suffix",
             "source": source,
-            "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "keywords": final_keywords,
+            "anchors": sorted(list(final_anchors)),
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
-            "batch_stats": batch_result['stats']
+            "batch_stats": {}
         }
 
     async def parse_infix(self, seed: str, country: str, language: str, use_numbers: bool, 
@@ -881,14 +880,14 @@ class GoogleAutocompleteParser:
         logger.debug(f"[INFIX] final_keywords={final_keywords}")
         logger.debug(f"[INFIX] final_anchors={final_anchors}")
         
-        batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
-            seed=seed,
-            country=country,
-            language=language
-        )
-        
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
+        # === BPF ПЕРЕНЕСЁН В apply_filters_traced (endpoint) ===
+        # batch_result = self.post_filter.filter_batch(
+        #     keywords=final_keywords,
+        #     seed=seed,
+        #     country=country,
+        #     language=language
+        # )
+        # combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
@@ -896,13 +895,13 @@ class GoogleAutocompleteParser:
             "seed": seed,
             "method": "infix",
             "source": source,
-            "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "keywords": final_keywords,
+            "anchors": sorted(list(final_anchors)),
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "queries": len(queries),
             "elapsed_time": round(elapsed, 2),
-            "batch_stats": batch_result['stats']
+            "batch_stats": {}
         }
 
     async def parse_morphology(self, seed: str, country: str, language: str, use_numbers: bool, 
@@ -997,27 +996,27 @@ class GoogleAutocompleteParser:
         logger.debug(f"[MORPH] final_keywords={final_keywords}")
         logger.debug(f"[MORPH] final_anchors={final_anchors}")
         
-        batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
-            seed=seed,
-            country=country,
-            language=language
-        )
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
+        # === BPF ПЕРЕНЕСЁН В apply_filters_traced (endpoint) ===
+        # batch_result = self.post_filter.filter_batch(
+        #     keywords=final_keywords,
+        #     seed=seed,
+        #     country=country,
+        #     language=language
+        # )
+        # combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
         return {
             "seed": seed,
             "method": "morphology",
             "source": source,
-            "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "keywords": final_keywords,
+            "anchors": sorted(list(final_anchors)),
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "elapsed_time": round(elapsed, 2),
-            "batch_stats": batch_result['stats']
+            "batch_stats": {}
         }
 
     async def parse_light_search(self, seed: str, country: str, language: str, use_numbers: bool, 
@@ -1121,29 +1120,29 @@ class GoogleAutocompleteParser:
         logger.debug(f"[ADAPTIVE_PREFIX] final_keywords={final_keywords}")
         logger.debug(f"[ADAPTIVE_PREFIX] final_anchors={final_anchors}")
         
-        batch_result = self.post_filter.filter_batch(
-            keywords=final_keywords,
-            seed=seed,
-            country=country,
-            language=language
-        )
-        combined_anchors = set(final_anchors) | set(batch_result['anchors'])
+        # === BPF ПЕРЕНЕСЁН В apply_filters_traced (endpoint) ===
+        # batch_result = self.post_filter.filter_batch(
+        #     keywords=final_keywords,
+        #     seed=seed,
+        #     country=country,
+        #     language=language
+        # )
+        # combined_anchors = set(final_anchors) | set(batch_result['anchors'])
 
         elapsed = time.time() - start_time
 
-        # Нормализация результатов
         return {
             "seed": seed,
             "method": "adaptive_prefix",
             "source": source,
-            "keywords": batch_result['keywords'],
-            "anchors": sorted(list(combined_anchors)),
-            "count": len(batch_result['keywords']),
-            "anchors_count": len(combined_anchors),
+            "keywords": final_keywords,
+            "anchors": sorted(list(final_anchors)),
+            "count": len(final_keywords),
+            "anchors_count": len(final_anchors),
             "candidates_found": len(candidates),
             "verified_prefixes": verified_prefixes,
             "elapsed_time": round(elapsed, 2),
-            "batch_stats": batch_result['stats']
+            "batch_stats": {}
         }
 
     async def parse_deep_search(self, seed: str, country: str, region_id: int, language: str, 
@@ -1193,17 +1192,17 @@ class GoogleAutocompleteParser:
         
         logger.info(f"[Deep Search] Before final filter: {len(all_unique_keywords)} keywords")
         
-        final_filter = self.post_filter.filter_batch(
-            keywords=list(all_unique_keywords),
-            seed=seed,
-            country=country,
-            language=language
-        )
+        # === BPF ПЕРЕНЕСЁН В apply_filters_traced (endpoint) ===
+        # final_filter = self.post_filter.filter_batch(
+        #     keywords=list(all_unique_keywords),
+        #     seed=seed,
+        #     country=country,
+        #     language=language
+        # )
+        # all_unique_keywords = set(final_filter['keywords'])
+        # all_unique_anchors = set(final_filter['anchors']) | all_unique_anchors
         
-        all_unique_keywords = set(final_filter['keywords'])
-        all_unique_anchors = set(final_filter['anchors']) | all_unique_anchors
-        
-        logger.info(f"[Deep Search] After final filter: {len(all_unique_keywords)} keywords, {len(all_unique_anchors)} anchors")
+        logger.info(f"[Deep Search] After merge: {len(all_unique_keywords)} keywords, {len(all_unique_anchors)} anchors")
 
         final_keywords = sorted(list(all_unique_keywords))
         normalized_keywords = normalize_keywords(final_keywords, language, seed)
@@ -1315,9 +1314,10 @@ async def root():
 
 
 def apply_filters_traced(result: dict, seed: str, country: str, 
-                          method: str, deduplicate: bool = False) -> dict:
+                          method: str, language: str = "ru", deduplicate: bool = False) -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
+    Порядок: pre_filter → geo_garbage → BPF → deduplicate
     Заблокированные ключи добавляются в result["anchors"] с указанием фильтра.
     """
     parser.tracer.start_request(seed=seed, country=country, method=method)
@@ -1342,6 +1342,23 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
     result = filter_geo_garbage(result, seed=seed, target_country=country)
     parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
+    
+    after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+    for kw in (before_set - after_set):
+        result["anchors"].append(kw)
+    
+    before_set = after_set
+    
+    # BATCH POST-FILTER
+    parser.tracer.before_filter("batch_post_filter", result.get("keywords", []))
+    bpf_result = parser.post_filter.filter_batch(
+        keywords=result.get("keywords", []),
+        seed=seed,
+        country=country,
+        language=language
+    )
+    result["keywords"] = bpf_result["keywords"]
+    parser.tracer.after_filter("batch_post_filter", result.get("keywords", []))
     
     after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
     for kw in (before_set - after_set):
@@ -1408,7 +1425,7 @@ async def light_search_endpoint(
 
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="light-search")
+    result = apply_filters_traced(result, seed, country, method="light-search", language=language)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1433,7 +1450,7 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    result = apply_filters_traced(result, seed, country, method="deep-search", deduplicate=True)
+    result = apply_filters_traced(result, seed, country, method="deep-search", language=language, deduplicate=True)
     
     return result
 
@@ -1476,7 +1493,7 @@ async def parse_suffix_endpoint(
 
     result = await parser.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="suffix")
+    result = apply_filters_traced(result, seed, country, method="suffix", language=language)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1505,7 +1522,7 @@ async def parse_infix_endpoint(
 
     result = await parser.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="infix")
+    result = apply_filters_traced(result, seed, country, method="infix", language=language)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1534,7 +1551,7 @@ async def parse_morphology_endpoint(
 
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="morphology")
+    result = apply_filters_traced(result, seed, country, method="morphology", language=language)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1563,7 +1580,7 @@ async def parse_adaptive_prefix_endpoint(
 
     result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="adaptive-prefix")
+    result = apply_filters_traced(result, seed, country, method="adaptive-prefix", language=language)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
