@@ -497,6 +497,12 @@ class BatchPostFilter:
                     our_city_lemmas.add(lemma)
                     logger.debug(f"[BPF] our_city_lemma: '{w}' → '{lemma}'")
 
+        # FIX: Если в запросе есть город НАШЕЙ страны — не блокировать другие гео-слова
+        # "одесса черемушки" → "одесса" = UA → "черемушки" не блокируем
+        keyword_has_target_city = any(
+            self._find_in_country(w, country) for w in words + keyword_lemmas
+        )
+
         for item in search_items:
             # ШАГ 0: Пропускаем короткие слова и ignored_words
             if len(item) < 3 or item in self.ignored_words:
@@ -550,6 +556,13 @@ class BatchPostFilter:
                     # Проверка seed_cities (города из сида всегда разрешены)
                     if item_normalized in seed_cities or item in seed_cities:
                         logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (есть в сиде)")
+                        continue
+                    
+                    # FIX: Если в запросе есть город НАШЕЙ страны — не блокировать
+                    # "одесса черемушки" → одесса=UA → черемушки пропускаем
+                    if keyword_has_target_city:
+                        logger.info(f"[GEO_ALLOW] ✓ Ключ содержит город {country.upper()}, "
+                                    f"пропускаем '{item}' ({found_country.upper()})")
                         continue
                     
                     # Проверяем - это РЕАЛЬНЫЙ город или возможный бренд?
