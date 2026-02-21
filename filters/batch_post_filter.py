@@ -543,7 +543,7 @@ class BatchPostFilter:
                         continue
                     
                     # FIX: Это обычное слово языка? "дом", "белая", "гора"
-                    if self._is_common_noun(item_normalized, language) or self._is_common_noun(item, language):
+                    if self._is_common_noun(item, language):
                         logger.info(f"[GEO_ALLOW] ✓ Слово '{item}' — обычное существительное, не город")
                         continue
                     
@@ -588,8 +588,10 @@ class BatchPostFilter:
 
     def _is_common_noun(self, word: str, language: str) -> bool:
         """
-        Проверяет, является ли слово обычным словом языка (не гео-названием).
-        Проверяет ПЕРВЫЙ (самый вероятный) вариант парсинга.
+        Проверяет, является ли слово ОБЫЧНЫМ словом языка (не гео-названием).
+        Строгая проверка: только высокочастотные слова с высоким score.
+        "дом", "белая", "гора" → True
+        "шахты", "златоуст", "борисов" → False
         """
         if not self._has_morph or language not in ['ru', 'uk']:
             return False
@@ -604,13 +606,24 @@ class BatchPostFilter:
             first = parsed[0]
             tag_str = str(first.tag)
             
-            # Если первый вариант — гео-название, это НЕ обычное слово
-            if 'Geox' in tag_str:
+            # Любой маркер собственного имени → НЕ обычное слово
+            for marker in ('Geox', 'Name', 'Surn', 'Patr', 'Orgn'):
+                if marker in tag_str:
+                    return False
+            
+            if not word.islower():
                 return False
             
-            # Если первый вариант — NOUN или ADJF без Geox → обычное слово
-            if ('NOUN' in tag_str or 'ADJF' in tag_str) and word.islower():
-                return True
+            # ADJF — только с Qual (качественное: белая, холодная)
+            # Без Qual = относительное (яблоновский, приморский) → не пропускаем
+            if 'ADJF' in tag_str:
+                return 'Qual' in tag_str and first.score >= 0.4
+            
+            # NOUN — только неодушевлённые (inan) с высоким score
+            # "дом"(inan), "гора"(inan), "центр"(inan) → True
+            # "златоуст"(anim) → False (proper name pattern)
+            if 'NOUN' in tag_str:
+                return 'inan' in tag_str and first.score >= 0.5
         except:
             pass
         
