@@ -271,6 +271,9 @@ class GoogleAutocompleteParser:
 
         # Трассировщик фильтрации
         self.tracer = FilterTracer(enabled=True)
+        
+        # Флаг для отключения relevance_filter через ?filters=
+        self.skip_relevance_filter = False
 
     def is_city_allowed(self, word: str, target_country: str) -> bool:
         """
@@ -792,7 +795,10 @@ class GoogleAutocompleteParser:
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered = await filter_relevant_keywords(list(all_with_anchors), seed, language)
+        if not self.skip_relevance_filter:
+            filtered = await filter_relevant_keywords(list(all_with_anchors), seed, language)
+        else:
+            filtered = list(all_with_anchors)
         
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -868,7 +874,10 @@ class GoogleAutocompleteParser:
         all_with_anchors = keywords | internal_anchors
         filtered_1 = await filter_infix_results(list(all_with_anchors), language)
 
-        filtered_2 = await filter_relevant_keywords(filtered_1, seed, language)
+        if not self.skip_relevance_filter:
+            filtered_2 = await filter_relevant_keywords(filtered_1, seed, language)
+        else:
+            filtered_2 = filtered_1
         
         filtered_set = set(filtered_2)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -984,7 +993,10 @@ class GoogleAutocompleteParser:
             keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        if not self.skip_relevance_filter:
+            filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        else:
+            filtered = sorted(list(all_with_anchors))
         
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -1108,7 +1120,10 @@ class GoogleAutocompleteParser:
                     keywords.add(kw)
         
         all_with_anchors = keywords | internal_anchors
-        filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        if not self.skip_relevance_filter:
+            filtered = await filter_relevant_keywords(sorted(list(all_with_anchors)), seed, language)
+        else:
+            filtered = sorted(list(all_with_anchors))
         
         filtered_set = set(filtered)
         final_keywords = sorted(list(keywords & filtered_set))
@@ -1403,7 +1418,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
-    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf}
+    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "rel": not parser.skip_relevance_filter}
     return result
 
 
@@ -1435,12 +1450,16 @@ async def light_search_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
 ):
     """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
+
+    # Управление relevance_filter (работает внутри parse-методов)
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
 
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
@@ -1465,12 +1484,15 @@ async def deep_search_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры 0-9"),
     parallel_limit: int = Query(10, description="Параллельных запросов", alias="parallel"),
     include_keywords: bool = Query(True, description="Включить список ключей"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
+
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
@@ -1505,12 +1527,15 @@ async def parse_suffix_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
 ):
     """Только SUFFIX метод"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
+
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
 
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
@@ -1535,12 +1560,15 @@ async def parse_infix_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
 ):
     """Только INFIX метод"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
+
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
 
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
@@ -1565,12 +1593,15 @@ async def parse_morphology_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
 ):
     """Только MORPHOLOGY метод"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
+
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
 
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
@@ -1595,12 +1626,15 @@ async def parse_adaptive_prefix_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
 ):
     """ADAPTIVE PREFIX метод (находит PREFIX запросы типа 'киев ремонт пылесосов')"""
 
     if language == "auto":
         language = parser.detect_seed_language(seed)
+
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
 
     correction = await parser.autocorrect_text(seed, language)
     if correction.get("has_errors"):
