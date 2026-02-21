@@ -1315,12 +1315,31 @@ async def root():
 
 
 def apply_filters_traced(result: dict, seed: str, country: str, 
-                          method: str, language: str = "ru", deduplicate: bool = False) -> dict:
+                          method: str, language: str = "ru", deduplicate: bool = False,
+                          enabled_filters: str = "pre,geo,bpf") -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
     Порядок: pre_filter → geo_garbage → BPF → deduplicate
     Заблокированные ключи добавляются в result["anchors"] с указанием фильтра.
+    
+    enabled_filters: через запятую какие фильтры включены.
+        "pre"  = pre_filter
+        "geo"  = geo_garbage_filter  
+        "bpf"  = batch_post_filter
+        "none" = все выключены (сырые данные)
+        "all" или "pre,geo,bpf" = все включены (по умолчанию)
     """
+    # Парсим флаги
+    ef = enabled_filters.lower().strip()
+    if ef == "all":
+        ef = "pre,geo,bpf"
+    parts = [x.strip() for x in ef.split(",")]
+    run_pre = "pre" in parts
+    run_geo = "geo" in parts
+    run_bpf = "bpf" in parts
+    
+    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf}")
+    
     parser.tracer.start_request(seed=seed, country=country, method=method)
     
     if "anchors" not in result:
@@ -1329,41 +1348,42 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     before_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
     
     # PRE-ФИЛЬТР
-    parser.tracer.before_filter("pre_filter", result.get("keywords", []))
-    result = apply_pre_filter(result, seed=seed)
-    parser.tracer.after_filter("pre_filter", result.get("keywords", []))
-    
-    after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
-    for kw in (before_set - after_set):
-        result["anchors"].append(kw)
-    
-    before_set = after_set
+    if run_pre:
+        parser.tracer.before_filter("pre_filter", result.get("keywords", []))
+        result = apply_pre_filter(result, seed=seed)
+        parser.tracer.after_filter("pre_filter", result.get("keywords", []))
+        
+        after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+        for kw in (before_set - after_set):
+            result["anchors"].append(kw)
+        before_set = after_set
     
     # ГЕО-ФИЛЬТР
-    parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
-    result = filter_geo_garbage(result, seed=seed, target_country=country)
-    parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
-    
-    after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
-    for kw in (before_set - after_set):
-        result["anchors"].append(kw)
-    
-    before_set = after_set
+    if run_geo:
+        parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
+        result = filter_geo_garbage(result, seed=seed, target_country=country)
+        parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
+        
+        after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+        for kw in (before_set - after_set):
+            result["anchors"].append(kw)
+        before_set = after_set
     
     # BATCH POST-FILTER
-    parser.tracer.before_filter("batch_post_filter", result.get("keywords", []))
-    bpf_result = parser.post_filter.filter_batch(
-        keywords=result.get("keywords", []),
-        seed=seed,
-        country=country,
-        language=language
-    )
-    result["keywords"] = bpf_result["keywords"]
-    parser.tracer.after_filter("batch_post_filter", result.get("keywords", []))
-    
-    after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
-    for kw in (before_set - after_set):
-        result["anchors"].append(kw)
+    if run_bpf:
+        parser.tracer.before_filter("batch_post_filter", result.get("keywords", []))
+        bpf_result = parser.post_filter.filter_batch(
+            keywords=result.get("keywords", []),
+            seed=seed,
+            country=country,
+            language=language
+        )
+        result["keywords"] = bpf_result["keywords"]
+        parser.tracer.after_filter("batch_post_filter", result.get("keywords", []))
+        
+        after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+        for kw in (before_set - after_set):
+            result["anchors"].append(kw)
     
     # ДЕДУПЛИКАЦИЯ (опционально)
     if deduplicate:
@@ -1383,6 +1403,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
+    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf}
     return result
 
 
@@ -1413,7 +1434,8 @@ async def light_search_endpoint(
     language: str = Query("auto", description="Язык"),
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
+    source: str = Query("google", description="Источник: google/yandex/bing"),
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
 ):
     """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
 
@@ -1426,7 +1448,7 @@ async def light_search_endpoint(
 
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="light-search", language=language)
+    result = apply_filters_traced(result, seed, country, method="light-search", language=language, enabled_filters=filters)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1442,7 +1464,8 @@ async def deep_search_endpoint(
     language: str = Query("auto", description="Язык (auto/ru/uk/en)"),
     use_numbers: bool = Query(False, description="Добавить цифры 0-9"),
     parallel_limit: int = Query(10, description="Параллельных запросов", alias="parallel"),
-    include_keywords: bool = Query(True, description="Включить список ключей")
+    include_keywords: bool = Query(True, description="Включить список ключей"),
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
@@ -1451,7 +1474,7 @@ async def deep_search_endpoint(
 
     result = await parser.parse_deep_search(seed, country, region_id, language, use_numbers, parallel_limit, include_keywords)
     
-    result = apply_filters_traced(result, seed, country, method="deep-search", language=language, deduplicate=True)
+    result = apply_filters_traced(result, seed, country, method="deep-search", language=language, deduplicate=True, enabled_filters=filters)
     
     return result
 
@@ -1481,7 +1504,8 @@ async def parse_suffix_endpoint(
     language: str = Query("auto", description="Язык"),
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
+    source: str = Query("google", description="Источник: google/yandex/bing"),
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
 ):
     """Только SUFFIX метод"""
 
@@ -1494,7 +1518,7 @@ async def parse_suffix_endpoint(
 
     result = await parser.parse_suffix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="suffix", language=language)
+    result = apply_filters_traced(result, seed, country, method="suffix", language=language, enabled_filters=filters)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1510,7 +1534,8 @@ async def parse_infix_endpoint(
     language: str = Query("auto", description="Язык"),
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
+    source: str = Query("google", description="Источник: google/yandex/bing"),
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
 ):
     """Только INFIX метод"""
 
@@ -1523,7 +1548,7 @@ async def parse_infix_endpoint(
 
     result = await parser.parse_infix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="infix", language=language)
+    result = apply_filters_traced(result, seed, country, method="infix", language=language, enabled_filters=filters)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1539,7 +1564,8 @@ async def parse_morphology_endpoint(
     language: str = Query("auto", description="Язык"),
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
+    source: str = Query("google", description="Источник: google/yandex/bing"),
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
 ):
     """Только MORPHOLOGY метод"""
 
@@ -1552,7 +1578,7 @@ async def parse_morphology_endpoint(
 
     result = await parser.parse_morphology(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="morphology", language=language)
+    result = apply_filters_traced(result, seed, country, method="morphology", language=language, enabled_filters=filters)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1568,7 +1594,8 @@ async def parse_adaptive_prefix_endpoint(
     language: str = Query("auto", description="Язык"),
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing")
+    source: str = Query("google", description="Источник: google/yandex/bing"),
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf")
 ):
     """ADAPTIVE PREFIX метод (находит PREFIX запросы типа 'киев ремонт пылесосов')"""
 
@@ -1581,7 +1608,7 @@ async def parse_adaptive_prefix_endpoint(
 
     result = await parser.parse_adaptive_prefix(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="adaptive-prefix", language=language)
+    result = apply_filters_traced(result, seed, country, method="adaptive-prefix", language=language, enabled_filters=filters)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
