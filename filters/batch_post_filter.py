@@ -432,6 +432,16 @@ class BatchPostFilter:
             if w in self.districts:
                 dist_country = self.districts[w]
                 if dist_country != country.lower():
+                    # Проверяем: есть ли в запросе город ЦЕЛЕВОЙ страны?
+                    # "харьков алексеевка" → "харьков" = UA → не блокируем "алексеевка" (RU)
+                    has_target_city = any(
+                        self.all_cities_global.get(other_w) == country.lower()
+                        for other_w in set(words + keyword_lemmas) - {w}
+                    )
+                    if has_target_city:
+                        logger.debug(f"[BPF] ALLOW district '{w}' ({dist_country}) — "
+                                     f"keyword has target city ({country})")
+                        continue
                     return False, f"район '{w}' ({dist_country})", "districts"
         
         for w in words + keyword_lemmas:
@@ -477,6 +487,16 @@ class BatchPostFilter:
         search_items.extend(trigrams)
         search_items.extend([tg.replace(' ', '-') for tg in trigrams])
 
+        # FIX: Собираем леммы слов которые являются городами НАШЕЙ страны
+        # "львов" → UA → лемма "лев" → не блокировать "лев" как город BF
+        our_city_lemmas = set()
+        for w in words:
+            if self._find_in_country(w, country):
+                lemma = self._get_lemma(w, language)
+                if lemma != w:
+                    our_city_lemmas.add(lemma)
+                    logger.debug(f"[BPF] our_city_lemma: '{w}' → '{lemma}'")
+
         for item in search_items:
             # ШАГ 0: Пропускаем короткие слова и ignored_words
             if len(item) < 3 or item in self.ignored_words:
@@ -516,6 +536,16 @@ class BatchPostFilter:
                 
                 # Это город ДРУГОЙ страны (мы уже проверили нашу выше)
                 if found_country != country.lower():
+                    
+                    # FIX: Это лемма нашего города? "лев" ← "львов" (UA)
+                    if item in our_city_lemmas or item_normalized in our_city_lemmas:
+                        logger.info(f"[GEO_ALLOW] ✓ Слово '{item}' — лемма города нашей страны, пропускаем")
+                        continue
+                    
+                    # FIX: Это обычное слово языка? "дом", "белая", "гора"
+                    if self._is_common_noun(item_normalized, language) or self._is_common_noun(item, language):
+                        logger.info(f"[GEO_ALLOW] ✓ Слово '{item}' — обычное существительное, не город")
+                        continue
                     
                     # Проверка seed_cities (города из сида всегда разрешены)
                     if item_normalized in seed_cities or item in seed_cities:
@@ -557,6 +587,10 @@ class BatchPostFilter:
         return True, "", ""
 
     def _is_common_noun(self, word: str, language: str) -> bool:
+        """
+        Проверяет, является ли слово обычным словом языка (не гео-названием).
+        Проверяет ПЕРВЫЙ (самый вероятный) вариант парсинга.
+        """
         if not self._has_morph or language not in ['ru', 'uk']:
             return False
         
@@ -564,19 +598,19 @@ class BatchPostFilter:
         
         try:
             parsed = morph.parse(word)
-            if parsed:
-                for parse_variant in parsed:
-                    tag = parse_variant.tag
-                    
-                    if 'Geox' in tag:
-                        return False
-                    
-                    if 'Name' in tag:
-                        return False
-                
-                first_tag = parsed[0].tag
-                if 'NOUN' in first_tag and word.islower():
-                    return True
+            if not parsed:
+                return False
+            
+            first = parsed[0]
+            tag_str = str(first.tag)
+            
+            # Если первый вариант — гео-название, это НЕ обычное слово
+            if 'Geox' in tag_str:
+                return False
+            
+            # Если первый вариант — NOUN или ADJF без Geox → обычное слово
+            if ('NOUN' in tag_str or 'ADJF' in tag_str) and word.islower():
+                return True
         except:
             pass
         
