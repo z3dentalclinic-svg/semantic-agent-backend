@@ -428,10 +428,38 @@ class BatchPostFilter:
             if check_val in self.forbidden_geo:
                 return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist"
 
+        # FIX: Собираем биграмы которые являются городами НАШЕЙ страны
+        # "белая церковь" → UA, "кривой рог" → UA
+        our_city_bigrams = set()
+        word_bigrams = self._extract_ngrams(words, 2)
+        for bg in word_bigrams:
+            if self._find_in_country(bg, country):
+                our_city_bigrams.add(bg)
+                # Добавляем отдельные слова биграма в защищённый набор
+                for part in bg.split():
+                    our_city_bigrams.add(part)
+
         for w in words:
             if w in self.districts:
                 dist_country = self.districts[w]
                 if dist_country != country.lower():
+                    # FIX 1: Слово входит в составной город НАШЕЙ страны?
+                    # "белая" ∈ "белая церковь"(UA) → не блокировать
+                    if w in our_city_bigrams:
+                        logger.debug(f"[BPF] ALLOW district '{w}' — part of compound city in {country.upper()}")
+                        continue
+                    
+                    # FIX 2: Слово само является городом НАШЕЙ страны?
+                    # "черкассы" = UA city → не блокировать как RU район
+                    if self._find_in_country(w, country):
+                        logger.debug(f"[BPF] ALLOW district '{w}' — is a city in target {country.upper()}")
+                        continue
+                    
+                    # FIX 3: Это обычное слово? ("центр", "рог", "мир")
+                    if self._is_common_noun(w, language):
+                        logger.debug(f"[BPF] ALLOW district '{w}' — common noun")
+                        continue
+                    
                     # Проверяем: есть ли в запросе город ЦЕЛЕВОЙ страны?
                     # "харьков алексеевка" → "харьков" = UA → не блокируем "алексеевка" (RU)
                     has_target_city = any(
@@ -629,8 +657,16 @@ class BatchPostFilter:
             
             # ADJF — только с Qual (качественное: белая, холодная)
             # Без Qual = относительное (яблоновский, приморский) → не пропускаем
+            # ИСКЛЮЧЕНИЕ: высокий score + нет Geox → обычное прилагательное ("русском", "английском")
+            # Geox уже проверен выше и вернул бы False
             if 'ADJF' in tag_str:
-                return 'Qual' in tag_str and first.score >= 0.4
+                if 'Qual' in tag_str and first.score >= 0.4:
+                    return True
+                # Нет Geox (проверено выше) + достаточный score → не географическое
+                # русский(0.667) → True, московский(0.50) → False
+                if first.score >= 0.6:
+                    return True
+                return False
             
             # NOUN — только неодушевлённые (inan) с высоким score
             # "дом"(inan), "гора"(inan), "центр"(inan) → True
