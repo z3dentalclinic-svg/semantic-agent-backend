@@ -606,10 +606,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         
         # Удаляем предлоги
         clean_words = [w for w in words if w not in prepositions and len(w) > 1]
-        # Добавляем дефисные слова
+        # Добавляем дефисные слова: "южно-сахалинск", "санкт-петербург"
         clean_words = clean_words + [h for h in hyphenated if h not in clean_words]
         
-        # НОРМАЛИЗАЦИЯ (ключевой момент!)
+        # Биграмы — только для поиска составных городов ("сан франциско", "нью йорк")
+        # НЕ добавляем в clean_words чтобы не ломать Geox/district/occupied проверки
+        query_bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        
+        # НОРМАЛИЗАЦИЯ — синхронно с clean_words
         clean_words_normalized = [_normalize_token(w) for w in clean_words]
         
         # ═══════════════════════════════════════════════════════════
@@ -653,6 +657,13 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                                 continue
                             cities_in_query.add(check_word)
                             break
+            
+            # Проверяем биграмы: "сан франциско", "нью йорк", "лос анджелес"
+            for bigram in query_bigrams:
+                if bigram in all_geo_entities:
+                    entity_country, entity_type = all_geo_entities[bigram]
+                    if entity_type == 'city':
+                        cities_in_query.add(bigram)
             
             # Если есть хотя бы один чужой город → БЛОК
             if len(cities_in_query) > 0:
