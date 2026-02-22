@@ -592,8 +592,13 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         query_lower = query.lower()
         words = re.findall(r'[а-яёіїєґa-z0-9]+', query_lower)
         
+        # Извлекаем также слова через дефис: "южно-сахалинск", "санкт-петербург"
+        hyphenated = re.findall(r'[а-яёіїєґa-z0-9]+-[а-яёіїєґa-z0-9]+(?:-[а-яёіїєґa-z0-9]+)*', query_lower)
+        
         # Удаляем предлоги
         clean_words = [w for w in words if w not in prepositions and len(w) > 1]
+        # Добавляем дефисные слова
+        clean_words = clean_words + [h for h in hyphenated if h not in clean_words]
         
         # НОРМАЛИЗАЦИЯ (ключевой момент!)
         clean_words_normalized = [_normalize_token(w) for w in clean_words]
