@@ -587,11 +587,32 @@ class BatchPostFilter:
                         continue
                     
                     # FIX: Если в запросе есть город НАШЕЙ страны — не блокировать
-                    # "одесса черемушки" → одесса=UA → черемушки пропускаем
+                    # "одесса черемушки" → одесса=UA, черемушки=UA district → пропускаем
+                    # "харьков алексеевка" → харьков=UA → пропускаем (контекст UA)
+                    # НО: "минск первомайский" → минск=BY, минск не район UA → блок
                     if keyword_has_target_city:
-                        logger.info(f"[GEO_ALLOW] ✓ Ключ содержит город {country.upper()}, "
-                                    f"пропускаем '{item}' ({found_country.upper()})")
-                        continue
+                        # Слово = район нашей страны? → точно пропускаем
+                        # Проверяем ВСЕ варианты написания (ё/е) — любой может быть наш район
+                        item_no_yo = item.replace('ё', 'е')
+                        dist_variants = [
+                            self.districts.get(item),
+                            self.districts.get(item_normalized),
+                            self.districts.get(item_no_yo),
+                        ]
+                        if country.lower() in dist_variants:
+                            logger.info(f"[GEO_ALLOW] ✓ '{item}' = район {country.upper()} + keyword has target city")
+                            continue
+                        # Слово = район в ЛЮБОЙ стране → типичное название микрорайона/посёлка
+                        # "алексеевка" = район в RU, но рядом с "харьков" = наш район
+                        # "минск" = нигде не район → не пропускаем
+                        if any(d is not None for d in dist_variants):
+                            logger.info(f"[GEO_ALLOW] ✓ '{item}' = район (generic name) + keyword has target city")
+                            continue
+                        # Слово НЕ является реальным городом? → пропускаем (бренд/аббревиатура)
+                        if not self._is_real_city_not_brand(item, found_country):
+                            logger.info(f"[GEO_ALLOW] ✓ Ключ содержит город {country.upper()}, "
+                                        f"пропускаем '{item}' ({found_country.upper()}) — не реальный город")
+                            continue
                     
                     # Проверяем - это РЕАЛЬНЫЙ город или возможный бренд?
                     is_real_city = self._is_real_city_not_brand(item, found_country)
