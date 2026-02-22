@@ -59,6 +59,9 @@ CANONICAL_CITY_DISTRICTS: Dict[str, Set[str]] = {}
 # Маппинг: район → canonical_city (обратный lookup)
 DISTRICT_TO_CANONICAL: Dict[str, str] = {}
 
+# Маппинг: country_name (ru/uk/en) → (country_code, 'country')
+COUNTRY_NAMES_MULTILINGUAL: Dict[str, tuple] = {}
+
 try:
     import geonamescache
     _gc = geonamescache.GeonamesCache()
@@ -100,6 +103,29 @@ except ImportError:
     logger.warning("[GEO_DISTRICTS] geonamescache not available, dynamic districts disabled")
 except Exception as e:
     logger.error(f"[GEO_DISTRICTS] Error loading: {e}")
+
+# Загружаем названия стран на ru/uk/en через Babel
+try:
+    from babel import Locale
+    _countries = _gc.get_countries() if _gc else {}
+    
+    # Английские имена
+    for _code, _data in _countries.items():
+        COUNTRY_NAMES_MULTILINGUAL[_data['name'].lower()] = (_code, 'country')
+    
+    # Русские и украинские через Babel
+    for _lang in ['ru', 'uk']:
+        _locale = Locale(_lang)
+        for _code in _countries.keys():
+            _name = _locale.territories.get(_code)
+            if _name and len(_name) > 2:
+                COUNTRY_NAMES_MULTILINGUAL[_name.lower()] = (_code, 'country')
+    
+    logger.info(f"[GEO_DISTRICTS] COUNTRY_NAMES_MULTILINGUAL: {len(COUNTRY_NAMES_MULTILINGUAL)} entries")
+except ImportError:
+    logger.warning("[GEO_DISTRICTS] babel not available, multilingual country names disabled")
+except Exception as e:
+    logger.error(f"[GEO_DISTRICTS] Error loading country names: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -489,7 +515,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     for name, meta in fallback_entities.items():
         all_geo_entities.setdefault(name, meta)
     
-    logger.info(f"[GEO_WHITE_LIST] Total geo entities after fallback: {len(all_geo_entities)}")
+    # 1.3. Названия стран на ru/uk/en (через Babel)
+    for name, meta in COUNTRY_NAMES_MULTILINGUAL.items():
+        all_geo_entities.setdefault(name, meta)
+    
+    logger.info(f"[GEO_WHITE_LIST] Total geo entities after fallback+countries: {len(all_geo_entities)}")
     
     # 1.3. Добавляем города из CITY_DISTRICTS
     for city_name in CITY_DISTRICTS.keys():
@@ -574,10 +604,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         # ═══════════════════════════════════════════════════════════
         
         has_occupied = False
-        for word_norm in clean_words_normalized:
-            if word_norm in OCCUPIED_TERRITORIES:
+        for raw_word, word_norm in zip(clean_words, clean_words_normalized):
+            if raw_word in OCCUPIED_TERRITORIES or word_norm in OCCUPIED_TERRITORIES:
                 has_occupied = True
-                logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{word_norm}'")
+                matched = raw_word if raw_word in OCCUPIED_TERRITORIES else word_norm
+                logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{matched}'")
                 stats['blocked_occupied'] += 1
                 break
         
@@ -597,10 +628,17 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
-                if word_norm in all_geo_entities:
-                    entity_country, entity_type = all_geo_entities[word_norm]
-                    if entity_type == 'city':
-                        cities_in_query.add(word_norm)
+                # Проверяем обе формы — raw и normalized
+                for check_word in [raw_word, word_norm]:
+                    if check_word in all_geo_entities:
+                        entity_country, entity_type = all_geo_entities[check_word]
+                        if entity_type == 'city':
+                            # Защита от ложных срабатываний: короткие обычные слова
+                            # "час" = город Chas (Чехия), но это обычное слово
+                            if len(check_word) <= 3:
+                                continue
+                            cities_in_query.add(check_word)
+                            break
             
             # Если есть хотя бы один чужой город → БЛОК
             if len(cities_in_query) > 0:
@@ -623,28 +661,36 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
-                if word_norm in all_geo_entities:
-                    entity_country, entity_type = all_geo_entities[word_norm]
+                # Проверяем обе формы
+                matched_entity = None
+                for check_word in [raw_word, word_norm]:
+                    if check_word in all_geo_entities:
+                        matched_entity = (check_word, all_geo_entities[check_word])
+                        break
+                
+                if not matched_entity:
+                    continue
                     
-                    # А. Страна?
-                    if entity_type == 'country':
-                        # Любая страна, не упомянутая в seed, считается мусором
-                        if word_norm not in seed_words_normalized:
-                            logger.info(
-                                f"[GEO_WHITE_LIST] ❌ COUNTRY_MENTION: '{query}' mentions country '{word_norm}' ({entity_country})"
-                            )
-                            stats['blocked_foreign_country'] += 1
-                            blocked = True
-                            break
-                    
-                    # Б. Природный объект (гора, река, озеро)?
-                    elif entity_type in ['mountain', 'river', 'lake']:
-                        # Если не в seed → БЛОК
-                        if word_norm not in seed_words_normalized:
-                            logger.info(f"[GEO_WHITE_LIST] ❌ GEO_OBJECT: '{query}' contains {entity_type} '{word_norm}'")
-                            stats['blocked_geo_object'] += 1
-                            blocked = True
-                            break
+                check_word, (entity_country, entity_type) = matched_entity
+                
+                # А. Страна?
+                if entity_type == 'country':
+                    # Любая страна, не упомянутая в seed, считается мусором
+                    if raw_word not in seed_words and word_norm not in seed_words_normalized:
+                        logger.info(
+                            f"[GEO_WHITE_LIST] ❌ COUNTRY_MENTION: '{query}' mentions country '{check_word}' ({entity_country})"
+                        )
+                        stats['blocked_foreign_country'] += 1
+                        blocked = True
+                        break
+                
+                # Б. Природный объект (гора, река, озеро)?
+                elif entity_type in ['mountain', 'river', 'lake']:
+                    if raw_word not in seed_words and word_norm not in seed_words_normalized:
+                        logger.info(f"[GEO_WHITE_LIST] ❌ GEO_OBJECT: '{query}' contains {entity_type} '{check_word}'")
+                        stats['blocked_geo_object'] += 1
+                        blocked = True
+                        break
             
             if blocked:
                 continue
