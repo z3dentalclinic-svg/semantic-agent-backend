@@ -39,9 +39,67 @@ OK:
 
 import re
 import logging
+import json
+import os
 from typing import Dict, Set, List, Tuple
 
 logger = logging.getLogger("GeoGarbageFilter")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ДИНАМИЧЕСКАЯ ЗАГРУЗКА РАЙОНОВ (districts.json + geonamescache)
+# ═══════════════════════════════════════════════════════════════════
+
+# Маппинг: любое_имя_города → canonical (из geonamescache)
+CITY_CANONICAL_MAP: Dict[str, str] = {}
+
+# Маппинг: canonical_city → set районов (из districts.json)
+CANONICAL_CITY_DISTRICTS: Dict[str, Set[str]] = {}
+
+# Маппинг: район → canonical_city (обратный lookup)
+DISTRICT_TO_CANONICAL: Dict[str, str] = {}
+
+try:
+    import geonamescache
+    _gc = geonamescache.GeonamesCache()
+    _cities = _gc.get_cities()
+    
+    # Строим CITY_CANONICAL_MAP: сначала мелкие, потом крупные (крупные перезаписывают)
+    for _city_data in sorted(_cities.values(), key=lambda c: c.get('population', 0)):
+        _canonical = _city_data['name'].lower()
+        CITY_CANONICAL_MAP[_canonical] = _canonical
+        for _alt in _city_data.get('alternatenames', []):
+            if len(_alt) > 1:
+                CITY_CANONICAL_MAP[_alt.lower()] = _canonical
+    
+    logger.info(f"[GEO_DISTRICTS] CITY_CANONICAL_MAP: {len(CITY_CANONICAL_MAP)} entries")
+    
+    # Загружаем districts.json и строим CANONICAL_CITY_DISTRICTS
+    _districts_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "districts.json")
+    if os.path.exists(_districts_path):
+        with open(_districts_path, "r", encoding="utf-8") as _f:
+            _raw_districts = json.load(_f)
+        
+        from collections import defaultdict
+        _temp = defaultdict(set)
+        
+        for _district_name, _info in _raw_districts.items():
+            _city_raw = _info.get('city', '').lower()
+            # Маппим city из districts.json на canonical через geonamescache
+            _canonical_city = CITY_CANONICAL_MAP.get(_city_raw, _city_raw)
+            _temp[_canonical_city].add(_district_name)
+            DISTRICT_TO_CANONICAL[_district_name] = _canonical_city
+        
+        CANONICAL_CITY_DISTRICTS = dict(_temp)
+        logger.info(f"[GEO_DISTRICTS] CANONICAL_CITY_DISTRICTS: {len(CANONICAL_CITY_DISTRICTS)} cities, "
+                    f"{len(DISTRICT_TO_CANONICAL)} districts")
+    else:
+        logger.warning(f"[GEO_DISTRICTS] districts.json not found at {_districts_path}")
+        
+except ImportError:
+    logger.warning("[GEO_DISTRICTS] geonamescache not available, dynamic districts disabled")
+except Exception as e:
+    logger.error(f"[GEO_DISTRICTS] Error loading: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -464,8 +522,17 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     if not seed_city:
         logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city in seed: '{seed}'. All queries pass.")
     
-    # Разрешенные районы
-    allowed_districts = CITY_DISTRICTS.get(seed_city, set()) if seed_city else set()
+    # Разрешенные районы — динамически из districts.json + geonamescache
+    # seed_city "днепр" → canonical "dnipro" → 126 районов из districts.json
+    seed_canonical = CITY_CANONICAL_MAP.get(seed_city, seed_city) if seed_city else None
+    allowed_districts = set()
+    if seed_canonical:
+        # Динамические районы из districts.json
+        allowed_districts = CANONICAL_CITY_DISTRICTS.get(seed_canonical, set())
+        # Плюс хардкодные (fallback, если districts.json неполный)
+        allowed_districts = allowed_districts | CITY_DISTRICTS.get(seed_city, set())
+        logger.info(f"[GEO_WHITE_LIST] seed_city='{seed_city}' → canonical='{seed_canonical}' → "
+                    f"{len(allowed_districts)} allowed districts")
     
     # ═══════════════════════════════════════════════════════════════
     # Шаг 3: WHITE-LIST фильтрация (с нормализацией!)
@@ -525,9 +592,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         if seed_city:
             cities_in_query: Set[str] = set()
             
-            for word_norm in clean_words_normalized:
+            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
                 # КРИТИЧНО: Пропускаем разрешенные районы seed_city
-                if word_norm in allowed_districts:
+                if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
                 if word_norm in all_geo_entities:
@@ -551,9 +618,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         if seed_city:
             blocked = False
             
-            for word_norm in clean_words_normalized:
+            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
                 # КРИТИЧНО: Пропускаем разрешенные районы seed_city
-                if word_norm in allowed_districts:
+                if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
                 if word_norm in all_geo_entities:
@@ -583,30 +650,32 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 4: Чужие районы
-        # Блокируем ТОЛЬКО те районы других городов, которых НЕТ в allowed_districts
+        # ПРОВЕРКА 4: Чужие районы (динамическая через districts.json)
+        # Если слово = район другого города → БЛОК
+        # Проверяем и raw и normalized формы (normalize обрезает окончания)
         # ═══════════════════════════════════════════════════════════
         
-        if seed_city and allowed_districts:
+        if seed_city and seed_canonical:
             has_wrong_district = False
             
-            for city, districts in CITY_DISTRICTS.items():
-                if city == seed_city:
+            # Проверяем пары (raw, normalized) вместе
+            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
+                # Пропускаем разрешенные районы seed_city
+                if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
-                for district in districts:
-                    # КРИТИЧНО: Если этот район тоже есть в нашем городе - пропускаем!
-                    if district in allowed_districts:
-                        continue
-                    
-                    if district in query_lower:
-                        has_wrong_district = True
-                        logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_DISTRICT: '{query}' contains district '{district}' "
-                                  f"from city '{city}', seed_city is '{seed_city}'")
-                        stats['blocked_wrong_district'] += 1
-                        break
-                
-                if has_wrong_district:
+                # Слово — район какого-то города? Проверяем обе формы
+                district_canonical_city = (
+                    DISTRICT_TO_CANONICAL.get(raw_word) or 
+                    DISTRICT_TO_CANONICAL.get(word_norm)
+                )
+                if district_canonical_city and district_canonical_city != seed_canonical:
+                    has_wrong_district = True
+                    matched_form = raw_word if DISTRICT_TO_CANONICAL.get(raw_word) else word_norm
+                    logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_DISTRICT: '{query}' contains district "
+                              f"'{matched_form}' from city '{district_canonical_city}', "
+                              f"seed_city is '{seed_city}' (canonical='{seed_canonical}')")
+                    stats['blocked_wrong_district'] += 1
                     break
             
             if has_wrong_district:
