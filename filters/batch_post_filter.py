@@ -456,13 +456,14 @@ class BatchPostFilter:
                         continue
                     
                     # FIX 3: Это обычное слово? ("центр", "рог")
-                    # Повышенный порог: districts.json — авторитетные данные,
-                    # морфология должна быть уверена что это НЕ гео-слово
+                    # Доверяем только словам из реального словаря (DictionaryAnalyzer),
+                    # НЕ угаданным по суффиксу (FakeDictionary)
                     if self._is_common_noun(w, language):
                         morph = self.morph_ru if language != 'uk' else self.morph_uk
-                        noun_score = morph.parse(w)[0].score
-                        if noun_score >= 0.65:
-                            logger.debug(f"[BPF] ALLOW district '{w}' — common noun (score={noun_score:.2f})")
+                        parsed = morph.parse(w)[0]
+                        is_real_dict = parsed.methods_stack[0][0].__class__.__name__ == 'DictionaryAnalyzer'
+                        if is_real_dict and parsed.score >= 0.65:
+                            logger.debug(f"[BPF] ALLOW district '{w}' — real dictionary word (score={parsed.score:.2f})")
                             continue
                     
                     # Проверяем: есть ли в запросе город ЦЕЛЕВОЙ страны?
