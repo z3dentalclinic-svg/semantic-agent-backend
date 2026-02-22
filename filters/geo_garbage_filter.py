@@ -127,6 +127,14 @@ except ImportError:
 except Exception as e:
     logger.error(f"[GEO_DISTRICTS] Error loading country names: {e}")
 
+# pymorphy3 для Geox проверки (регионы, республики)
+try:
+    import pymorphy3 as _pymorphy3
+    _morph_geox = _pymorphy3.MorphAnalyzer(lang='ru')
+except ImportError:
+    _morph_geox = None
+    logger.warning("[GEO_DISTRICTS] pymorphy3 not available for Geox checks")
+
 
 # ═══════════════════════════════════════════════════════════════════
 # БАЗА ОККУПИРОВАННЫХ ТЕРРИТОРИЙ
@@ -578,6 +586,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         'blocked_geo_object': 0,
         'blocked_wrong_district': 0,
         'blocked_wrong_oblast': 0,
+        'blocked_geox_region': 0,
         'allowed': 0,
     }
     
@@ -752,6 +761,37 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
             if other_cities_oblast:
                 logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_OBLAST: '{query}' mentions oblast with other cities: {other_cities_oblast}")
                 stats['blocked_wrong_oblast'] += 1
+                continue
+        
+        # ═══════════════════════════════════════════════════════════
+        # ПРОВЕРКА 6: Geox через pymorphy3 (регионы, республики, области)
+        # Ловит: чечня, дагестан, бавария, каталония — без хардкода
+        # ═══════════════════════════════════════════════════════════
+        
+        if seed_city and _morph_geox:
+            has_foreign_geox = False
+            
+            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
+                # Пропускаем seed слова и разрешенные районы
+                if raw_word in seed_words or word_norm in seed_words_normalized:
+                    continue
+                if raw_word in allowed_districts or word_norm in allowed_districts:
+                    continue
+                # Пропускаем короткие слова и латиницу
+                if len(raw_word) <= 3 or raw_word.isascii():
+                    continue
+                
+                # Проверяем Geox тег
+                parses = _morph_geox.parse(raw_word)
+                is_geox = any('Geox' in str(p.tag) for p in parses)
+                if is_geox:
+                    has_foreign_geox = True
+                    logger.info(f"[GEO_WHITE_LIST] ❌ GEOX_REGION: '{query}' contains "
+                              f"geo-entity '{raw_word}' (pymorphy3 Geox)")
+                    stats['blocked_geox_region'] += 1
+                    break
+            
+            if has_foreign_geox:
                 continue
         
         # ═══════════════════════════════════════════════════════════
