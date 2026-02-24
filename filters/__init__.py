@@ -17,6 +17,7 @@ from .geo_garbage_filter import filter_geo_garbage, OCCUPIED_TERRITORIES
 from .pre_filter import pre_filter, apply_pre_filter
 from .infix_filter import filter_infix_results
 from .relevance_filter import filter_relevant_keywords
+from .l0_filter import apply_l0_filter
 
 logger = logging.getLogger(__name__)
 
@@ -49,5 +50,5 @@ __all__ = [
     'pre_filter',
     'apply_pre_filter',
     'filter_infix_results',
-    'filter_relevant_keywords'
-]
+    'filter_relevant_keywords',
+    'apply_l0_filter',
