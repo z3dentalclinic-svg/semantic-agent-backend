@@ -80,59 +80,50 @@ def load_geonames_db(country_code: Optional[str] = None) -> Set[str]:
 
 def load_brands_db() -> Set[str]:
     """
-    Загружает базу брендов техники.
+    Загружает базу брендов.
     
-    Включает:
-    - Русские и английские написания
-    - Вариации названий (LG, ЛЖ, элджи)
+    Приоритет:
+    1. brands.json (генерируется fetch_brands.py из Wikidata)
+    2. Встроенный fallback (~100 брендов)
     
     Returns:
         Множество названий брендов в нижнем регистре
     """
-    brands = {
-        # Пылесосы
-        'samsung', 'самсунг',
-        'lg', 'лж', 'элджи',
-        'dyson', 'дайсон',
-        'xiaomi', 'сяоми',
-        'dreame', 'дрим', 'дриме',
-        'philips', 'филипс',
-        'bosch', 'бош',
-        'electrolux', 'электролюкс',
-        'thomas', 'томас',
-        'karcher', 'керхер', 'кёрхер',
-        'miele', 'миле',
-        'rowenta', 'ровента',
-        'tefal', 'тефаль',
-        'zelmer', 'зелмер',
-        'vitek', 'витек',
-        'polaris', 'поларис',
-        'scarlett', 'скарлетт',
-        'redmond', 'редмонд',
-        'gorenje', 'горенье',
-        'delonghi', 'делонги',
-        'panasonic', 'панасоник',
-        'hitachi', 'хитачи',
-        'sharp', 'шарп',
-        'toshiba', 'тошиба',
-        'hoover', 'гувер', 'хувер',
-        'vax', 'вакс',
-        'dirt devil', 'дирт девил',
-        'bissell', 'биссел',
-        'ilife', 'айлайф',
-        'ecovacs', 'эковакс',
-        'roborock', 'роборок',
-        'irobot', 'айробот',
-        'neato', 'неато',
-        'eufy', 'юфи', 'эуфи',
-        
-        # Добавляем популярные модели как отдельные бренды
-        'v15', 'v12', 'v11', 'v10', 'v8',  # Dyson модели
-        's7', 's6', 's5',  # Roborock модели
-        'roomba',  # iRobot
-        '2000', '3000', '4000', '5000',  # Типичные номера моделей
-    }
+    import os
+    import json
     
+    # Пробуем загрузить brands.json
+    for path in [
+        os.path.join(os.path.dirname(__file__), 'brands.json'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'brands.json'),
+        'brands.json',
+    ]:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                brands = set(data.get("brands", []))
+                print(f"✅ brands.json loaded: {len(brands)} brands from {path}")
+                return brands
+            except Exception as e:
+                print(f"⚠️ Error loading brands.json: {e}")
+    
+    # Fallback: встроенный минимальный набор
+    print("⚠️ brands.json not found, using built-in fallback (limited)")
+    brands = {
+        'samsung', 'самсунг', 'lg', 'лж', 'элджи',
+        'dyson', 'дайсон', 'xiaomi', 'сяоми',
+        'philips', 'филипс', 'bosch', 'бош',
+        'electrolux', 'электролюкс', 'thomas', 'томас',
+        'karcher', 'керхер', 'miele', 'миле',
+        'apple', 'эпл', 'sony', 'сони',
+        'panasonic', 'панасоник', 'hitachi', 'хитачи',
+        'toyota', 'тойота', 'bmw', 'бмв',
+        'mercedes', 'мерседес', 'honda', 'хонда',
+        'nike', 'найк', 'adidas', 'адидас',
+        'ikea', 'икеа', 'bork', 'борк',
+        'атлант', 'горенье', 'redmond', 'редмонд',
+    }
     return brands
 
 
