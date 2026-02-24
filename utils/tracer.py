@@ -45,8 +45,8 @@ class FilterTracer:
         "pre_filter",
         "geo_garbage_filter",
         "batch_post_filter",
-        "relevance_filter",
         "deduplicate",
+        "l0_filter",
     ]
 
     def __init__(self, enabled: bool = True):
@@ -160,6 +160,58 @@ class FilterTracer:
                 f"time: {stage['time']:.3f}s"
             )
 
+    def after_l0_filter(self, valid: List[Any], trash: List[Any], grey: List[Any],
+                        l0_trace: List[Dict] = None):
+        """
+        Специальный метод для L0 — три исхода (VALID/TRASH/GREY), не два.
+        
+        Args:
+            valid: ключи прошедшие как VALID
+            trash: ключи заблокированные как TRASH
+            grey: ключи ушедшие в GREY (для perplexity)
+            l0_trace: детальный трейс из l0_filter
+        """
+        if not self.enabled:
+            return
+        
+        filter_name = "l0_filter"
+        if filter_name not in self.stages:
+            logger.warning(f"[TRACER] after_l0_filter без before_filter!")
+            return
+        
+        stage = self.stages[filter_name]
+        valid_set = self._extract_keywords(valid)
+        trash_set = self._extract_keywords(trash)
+        grey_set = self._extract_keywords(grey)
+        
+        stage["after"] = valid_set | grey_set  # "прошедшие" = VALID + GREY
+        stage["blocked"] = trash_set           # "заблокированные" = TRASH
+        stage["grey"] = grey_set               # новое поле для L0
+        stage["valid"] = valid_set             # явно VALID
+        stage["time"] = time.time() - stage.get("_start", time.time())
+        
+        # Записываем reasons из l0_trace
+        if l0_trace:
+            for rec in l0_trace:
+                kw = rec.get("keyword", "").lower().strip()
+                reason = rec.get("reason", "")
+                signals = rec.get("signals", [])
+                label = rec.get("label", "")
+                sig_str = ", ".join(signals) if signals else ""
+                stage["reasons"][kw] = f"[{label}] {sig_str}: {reason}" if sig_str else f"[{label}] {reason}"
+                
+                if label == "TRASH" and kw not in self.keyword_map:
+                    self.keyword_map[kw] = {
+                        "blocked_by": "l0_filter",
+                        "reason": stage["reasons"].get(kw, ""),
+                    }
+        
+        logger.info(
+            f"[TRACER] ◆ l0_filter | VALID: {len(valid_set)} | "
+            f"TRASH: {len(trash_set)} | GREY: {len(grey_set)} | "
+            f"time: {stage['time']:.3f}s"
+        )
+
     def finish_request(self) -> Dict:
         """
         Завершение трассировки. Возвращает полный отчёт.
@@ -224,7 +276,9 @@ class FilterTracer:
                 "input": len(s["before"]),
                 "output": len(s["after"]),
                 "blocked": len(s["blocked"]),
-                "blocked_keywords": sorted(s["blocked"])[:50],  # макс 50 для читабельности
+                "grey": len(s.get("grey", set())),
+                "valid": len(s.get("valid", s["after"])),
+                "blocked_keywords": sorted(s["blocked"])[:50],
                 "time": round(s["time"], 4),
             })
 
