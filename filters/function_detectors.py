@@ -231,16 +231,23 @@ def detect_action(tail: str) -> Tuple[bool, str]:
         'как заменить', 'как собрать', 'как отремонтировать',
     ]
     
-    action_lemmas = {
+    # Самодостаточные леммы — одного слова хватает для VALID
+    # "видео" → VALID, "инструкция" → VALID, "разборка" → VALID
+    action_lemmas_strong = {
         'инструкция', 'руководство', 'мануал',
         'видео', 'видеоинструкция', 'фото',
         'схема', 'чертёж', 'чертеж', 'диаграмма',
         'разборка', 'сборка', 'чистка', 'замена',
         'диагностика', 'профилактика', 'обслуживание',
+        'курс', 'обучение', 'мастер-класс',
+    }
+    
+    # Запчасти — одного слова НЕ хватает, нужен контекст (≥2 слова)
+    # "щетка" → GREY, но "замена щетки" → VALID, "купить щетку" → VALID
+    action_lemmas_parts = {
         'запчасть', 'деталь', 'комплектующие', 'фильтр',
         'щётка', 'щетка', 'шланг', 'мешок', 'пылесборник',
         'мотор', 'двигатель', 'турбина', 'аккумулятор',
-        'курс', 'обучение', 'мастер-класс',
     }
     
     # Паттерн: существительное-действие (разборка, замена фильтра)
@@ -251,17 +258,37 @@ def detect_action(tail: str) -> Tuple[bool, str]:
     }
     
     tail_lower = tail.lower()
+    words = tail_lower.split()
+    is_single_word = len(words) == 1
     
     for pattern in action_patterns:
         if pattern in tail_lower:
             return True, f"Действие (паттерн): '{pattern}'"
     
-    for word in tail_lower.split():
-        lemma = morph.parse(word)[0].normal_form
-        if lemma in action_lemmas:
-            return True, f"Действие (лемма): '{lemma}'"
+    for word in words:
+        parsed = morph.parse(word)[0]
+        lemma = parsed.normal_form
+        
+        # Одиночный инфинитив без объекта — обрывок, не действие
+        # "почистить" → GREY, но "почистить фильтр" → VALID
         if lemma in action_verb_lemmas:
+            if is_single_word:
+                return False, ""
             return True, f"Действие (глагол): '{lemma}'"
+        
+        # Самодостаточные леммы — работают даже одним словом
+        # "видео" → VALID, "инструкция" → VALID
+        if lemma in action_lemmas_strong:
+            if is_single_word and parsed.tag.case == 'ablt':
+                return False, ""
+            return True, f"Действие (лемма): '{lemma}'"
+        
+        # Запчасти — одним словом НЕ VALID, нужен контекст
+        # "щетка" → GREY, "замена щетки" → VALID
+        if lemma in action_lemmas_parts:
+            if is_single_word:
+                return False, ""
+            return True, f"Действие (запчасть): '{lemma}'"
     
     return False, ""
 
