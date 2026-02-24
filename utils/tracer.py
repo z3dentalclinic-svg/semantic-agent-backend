@@ -191,14 +191,29 @@ class FilterTracer:
         stage["time"] = time.time() - stage.get("_start", time.time())
         
         # Записываем reasons из l0_trace
+        # ВАЖНО: сохраняем трейс для ВСЕХ ключей (valid, grey, trash)
+        # чтобы при мега-тесте видеть почему каждый ключ получил свой label
         if l0_trace:
             for rec in l0_trace:
                 kw = rec.get("keyword", "").lower().strip()
                 reason = rec.get("reason", "")
                 signals = rec.get("signals", [])
                 label = rec.get("label", "")
+                confidence = rec.get("confidence", 0.0)
+                decided_by = rec.get("decided_by", "")
+                tail = rec.get("tail", "")
                 sig_str = ", ".join(signals) if signals else ""
                 stage["reasons"][kw] = f"[{label}] {sig_str}: {reason}" if sig_str else f"[{label}] {reason}"
+                
+                # Детальный трейс для каждого ключа (включая VALID)
+                stage.setdefault("l0_details", {})[kw] = {
+                    "label": label,
+                    "tail": tail,
+                    "signals": signals,
+                    "reason": reason,
+                    "confidence": confidence,
+                    "decided_by": decided_by,
+                }
                 
                 if label == "TRASH" and kw not in self.keyword_map:
                     self.keyword_map[kw] = {
@@ -294,6 +309,39 @@ class FilterTracer:
             "blocked_keywords": dict(sorted(self.keyword_map.items())),
             "surviving_keywords": surviving,
         }
+        
+        # Добавляем трейс для VALID ключей — какой фильтр их пропустил и почему
+        valid_trace = {}
+        for kw in surviving:
+            kw_trace = {
+                "passed_filters": [],
+            }
+            # Путь через все фильтры
+            for name in self.FILTER_ORDER:
+                if name not in self.stages:
+                    continue
+                s = self.stages[name]
+                if kw in s.get("before", set()):
+                    kw_trace["passed_filters"].append(name)
+            
+            # L0 детали (если L0 был включён)
+            l0_stage = self.stages.get("l0_filter", {})
+            l0_details = l0_stage.get("l0_details", {}).get(kw)
+            if l0_details:
+                kw_trace["l0"] = l0_details
+            
+            valid_trace[kw] = kw_trace
+        
+        report["valid_keywords"] = valid_trace
+        
+        # Трейс для GREY ключей (L0)
+        grey_trace = {}
+        l0_stage = self.stages.get("l0_filter", {})
+        for kw in sorted(l0_stage.get("grey", set())):
+            l0_details = l0_stage.get("l0_details", {}).get(kw)
+            if l0_details:
+                grey_trace[kw] = l0_details
+        report["grey_keywords"] = grey_trace
 
         # Итоговый лог
         logger.info(
@@ -368,13 +416,30 @@ class FilterTracer:
         
         blocked_info = self.keyword_map.get(kw)
         
-        return {
+        # L0 детали (для любого ключа — valid, grey, trash)
+        l0_stage = self.stages.get("l0_filter", {})
+        l0_details = l0_stage.get("l0_details", {}).get(kw)
+        
+        # Определяем статус с учётом L0 grey
+        if blocked_info:
+            status = "blocked"
+        elif l0_details and l0_details.get("label") == "GREY":
+            status = "grey"
+        else:
+            status = "passed"
+        
+        result = {
             "keyword": kw,
-            "status": "blocked" if blocked_info else "passed",
+            "status": status,
             "blocked_by": blocked_info["blocked_by"] if blocked_info else None,
             "reason": blocked_info.get("reason", "") if blocked_info else "",
             "path": path,
         }
+        
+        if l0_details:
+            result["l0"] = l0_details
+        
+        return result
 
     def format_report_text(self) -> str:
         """Форматирует отчёт в читаемый текст для логов/файлов."""
@@ -410,6 +475,36 @@ class FilterTracer:
                 lines.append(f"  ✗ '{kw}' → {info['blocked_by']}: {info.get('reason', '—')}")
             if len(report["blocked_keywords"]) > 20:
                 lines.append(f"  ... +{len(report['blocked_keywords']) - 20} more")
+        
+        # GREY keywords с L0 деталями
+        grey_kws = report.get("grey_keywords", {})
+        if grey_kws:
+            lines.append(f"")
+            lines.append(f"── Grey keywords ({len(grey_kws)}) ──")
+            for kw, details in list(grey_kws.items())[:20]:
+                tail = details.get("tail", "")
+                sigs = ", ".join(details.get("signals", [])) or "—"
+                lines.append(f"  ⚠ '{kw}' | tail='{tail}' | signals: {sigs}")
+            if len(grey_kws) > 20:
+                lines.append(f"  ... +{len(grey_kws) - 20} more")
+        
+        # VALID keywords с L0 деталями
+        valid_kws = report.get("valid_keywords", {})
+        if valid_kws:
+            lines.append(f"")
+            lines.append(f"── Valid keywords ({len(valid_kws)}) ──")
+            for kw, info in list(valid_kws.items())[:30]:
+                l0 = info.get("l0")
+                if l0:
+                    tail = l0.get("tail", "")
+                    sigs = ", ".join(l0.get("signals", [])) or "—"
+                    decided = l0.get("decided_by", "")
+                    lines.append(f"  ✓ '{kw}' | tail='{tail}' | signals: {sigs} | by: {decided}")
+                else:
+                    filters = ", ".join(info.get("passed_filters", []))
+                    lines.append(f"  ✓ '{kw}' | filters: {filters}")
+            if len(valid_kws) > 30:
+                lines.append(f"  ... +{len(valid_kws) - 30} more")
         
         lines.append(f"═══════════════════════════")
         return "\n".join(lines)
