@@ -20,7 +20,8 @@ from filters import (
     filter_infix_results,
     filter_relevant_keywords,
     filter_geo_garbage,
-    apply_pre_filter  # ← санитарная очистка парсинга (ДО гео-фильтра)
+    apply_pre_filter,  # ← санитарная очистка парсинга (ДО гео-фильтра)
+    apply_l0_filter,   # ← L0 классификатор хвостов (ПОСЛЕ всех фильтров)
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
@@ -144,6 +145,21 @@ async def preflight_handler():
 #         return all_cities_global
 
 ALL_CITIES_GLOBAL = generate_geo_blacklist_full()
+
+# Базы для L0 классификатора — используем то что УЖЕ загружено на сервере
+# GEO_DB: объединяем ALL_CITIES_GLOBAL (города) + DISTRICTS_EXTENDED (районы)
+# Обе базы — dict {name: country_code}, L0 принимает set имён
+GEO_DB = set(ALL_CITIES_GLOBAL.keys()) | set(DISTRICTS_EXTENDED.keys())
+logger.info(f"[L0] GEO_DB: {len(GEO_DB)} записей (cities: {len(ALL_CITIES_GLOBAL)}, districts: {len(DISTRICTS_EXTENDED)})")
+
+# BRAND_DB: грузим отдельно (маленькая, ~100 записей)
+try:
+    from databases import load_brands_db
+    BRAND_DB = load_brands_db()
+    logger.info(f"[L0] BRAND_DB: {len(BRAND_DB)} записей")
+except ImportError:
+    BRAND_DB = set()
+    logger.warning("[L0] databases.py not found, BRAND_DB пуст")
 
 
 def deduplicate_final_results(data: dict) -> dict:
@@ -1334,26 +1350,28 @@ def apply_filters_traced(result: dict, seed: str, country: str,
                           enabled_filters: str = "pre,geo,bpf") -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
-    Порядок: pre_filter → geo_garbage → BPF → deduplicate
+    Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0
     Заблокированные ключи добавляются в result["anchors"] с указанием фильтра.
     
     enabled_filters: через запятую какие фильтры включены.
         "pre"  = pre_filter
         "geo"  = geo_garbage_filter  
         "bpf"  = batch_post_filter
+        "l0"   = L0 tail classifier
         "none" = все выключены (сырые данные)
-        "all" или "pre,geo,bpf" = все включены (по умолчанию)
+        "all" или "pre,geo,bpf,l0" = все включены (по умолчанию)
     """
     # Парсим флаги
     ef = enabled_filters.lower().strip()
     if ef == "all":
-        ef = "pre,geo,bpf"
+        ef = "pre,geo,bpf,l0"
     parts = [x.strip() for x in ef.split(",")]
     run_pre = "pre" in parts
     run_geo = "geo" in parts
     run_bpf = "bpf" in parts
+    run_l0 = "l0" in parts
     
-    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf}")
+    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0}")
     
     parser.tracer.start_request(seed=seed, country=country, method=method)
     
@@ -1406,6 +1424,29 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         result = deduplicate_final_results(result)
         parser.tracer.after_filter("deduplicate", result.get("keywords", []))
     
+    # L0 КЛАССИФИКАТОР (последний в цепочке)
+    if run_l0:
+        parser.tracer.before_filter("l0_filter", result.get("keywords", []))
+        
+        result = apply_l0_filter(
+            result,
+            seed=seed,
+            target_country=country,
+            geo_db=GEO_DB,
+            brand_db=BRAND_DB,
+        )
+        
+        # Трейсер L0 — три исхода
+        l0_trace = result.get("_l0_trace", [])
+        l0_trash = [r["keyword"] for r in l0_trace if r.get("label") == "TRASH"]
+        
+        parser.tracer.after_l0_filter(
+            valid=result.get("keywords", []),
+            trash=l0_trash,
+            grey=result.get("keywords_grey", []),
+            l0_trace=l0_trace,
+        )
+    
     # Дедупликация anchors
     seen = set()
     unique_anchors = []
@@ -1418,7 +1459,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
-    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "rel": not parser.skip_relevance_filter}
+    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "rel": not parser.skip_relevance_filter}
     return result
 
 
