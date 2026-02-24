@@ -10,7 +10,7 @@ TailFunctionClassifier v2 — исправленный классификато�
 
 from typing import Dict, List, Tuple, Set
 import pymorphy3
-from function_detectors import (
+from .function_detectors import (
     detect_geo, detect_brand, detect_commerce, detect_reputation,
     detect_location, detect_action, detect_time,
     detect_fragment, detect_meta,
