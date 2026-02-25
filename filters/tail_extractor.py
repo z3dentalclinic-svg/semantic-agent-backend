@@ -114,7 +114,24 @@ def _extract_fuzzy_ordered(q: str, s: str):
     
     # Собираем хвост: всё что не на позициях seed'а
     seed_idx = set(seed_positions)
-    tail_words = [query_words[i] for i in range(len(query_words)) if i not in seed_idx]
+    
+    # === Browse-артефакт: одиночная буква между seed-позициями ===
+    # "купить гтх в 3060 ti" → "в" между позициями 1 и 3 → артефакт
+    # "купить гтх 3060 в украине" → "в" после позиции 2 → реальный хвост
+    sorted_positions = sorted(seed_positions)
+    browse_artifacts = set()
+    for pi in range(len(sorted_positions) - 1):
+        pos_left = sorted_positions[pi]
+        pos_right = sorted_positions[pi + 1]
+        # Проверяем слова между двумя соседними seed-позициями
+        for mid in range(pos_left + 1, pos_right):
+            word = query_words[mid]
+            # Одиночная буква (не цифра) → browse-артефакт
+            if len(word) == 1 and word.isalpha():
+                browse_artifacts.add(mid)
+    
+    tail_words = [query_words[i] for i in range(len(query_words))
+                  if i not in seed_idx and i not in browse_artifacts]
     
     tail = ' '.join(tail_words).strip()
     return tail if tail else ''
