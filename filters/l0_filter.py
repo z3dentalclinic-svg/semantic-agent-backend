@@ -27,7 +27,7 @@ def apply_l0_filter(
     result: Dict[str, Any],
     seed: str,
     target_country: str = "ua",
-    geo_db: Set[str] = None,
+    geo_db: Dict[str, Set[str]] = None,
     brand_db: Set[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -37,7 +37,7 @@ def apply_l0_filter(
         result: dict с ключами "keywords", "anchors"
         seed: базовый запрос
         target_country: целевая страна
-        geo_db: база городов (set). Если None — пустой set
+        geo_db: база городов Dict[str, Set[str]] (название → {коды_стран})
         brand_db: база брендов (set). Если None — пустой set
     
     Returns:
@@ -50,7 +50,7 @@ def apply_l0_filter(
         return result
     
     if geo_db is None:
-        geo_db = set()
+        geo_db = {}
     if brand_db is None:
         brand_db = set()
     
