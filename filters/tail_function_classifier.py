@@ -106,7 +106,7 @@ class TailFunctionClassifier:
         
         # ===== ПОЗИТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_positive = [
-            ('geo',        lambda: detect_geo(tail, self.geo_db)),
+            ('geo',        lambda: detect_geo(tail, self.geo_db, self.target_country)),
             ('brand',      lambda: detect_brand(tail, self.brand_db)),
             ('commerce',   lambda: detect_commerce(tail)),
             ('reputation', lambda: detect_reputation(tail)),
@@ -371,7 +371,7 @@ def run_tests():
     test_cases = [
         # VALID — позитивные сигналы
         ("",              "VALID", "Пустой хвост (= seed)"),
-        ("киев",          "VALID", "Город"),
+        ("киев",          "VALID", "Город UA"),
         ("samsung",       "VALID", "Бренд"),
         ("цена",          "VALID", "Коммерция"),
         ("отзывы",        "VALID", "Репутация"),
@@ -382,6 +382,12 @@ def run_tests():
         ("работа",        "GREY",  "Нет позитивного детектора → GREY"),
         ("на дому",       "VALID", "Локация (на дому)"),
         ("недорого",      "VALID", "Коммерция (недорого)"),
+        
+        # Country-aware geo — новые тесты
+        ("тир",           "GREY",  "Тир = Ливан, не UA → нет geo → GREY"),
+        ("днс",           "TRASH", "ДНС = marketplace_trash для UA"),
+        ("розетка",       "VALID", "Розетка = marketplace_valid для UA"),
+        ("або",           "GREY",  "Або — нет в UA geo → GREY"),
         
         # TRASH — негативные сигналы
         ("есть",          "TRASH", "Копула без объекта"),
