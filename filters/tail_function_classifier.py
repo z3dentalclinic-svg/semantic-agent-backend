@@ -202,6 +202,8 @@ class TailFunctionClassifier:
             'отзыв', 'рейтинг', 'оценка', 'обзор', 'мнение',
             'рекомендация', 'жалоба', 'форум', 'блог',
             'лучший', 'топ', 'худший', 'сравнение', 'рекомендовать',
+            # Леммы прилагательных (pymorphy нормализует лучший→хороший)
+            'хороший', 'плохой',
         }
         action_lemmas = {
             'инструкция', 'руководство', 'мануал',
@@ -216,30 +218,45 @@ class TailFunctionClassifier:
             'почистить', 'разобрать', 'собрать', 'подключить',
             'установить', 'настроить', 'проверить', 'заменить',
             'показать', 'объяснить',
+            # Прилагательные-действия
+            'пошаговый', 'подробный',
         }
         contacts_lemmas = {
             'адрес', 'телефон', 'контакт', 'карта', 'маршрут',
             'график', 'расписание', 'режим', 'часы', 'работа',
+            # Прилагательные-контакты
+            'контактный',
         }
         location_lemmas = {
             'рядом', 'поблизости', 'ближайший', 'недалеко',
             'район', 'улица', 'дом', 'квартира',
+            # Прилагательные-локации
+            'ближний', 'близкий',
         }
         time_lemmas = {
             'круглосуточно', 'срочно', 'быстро', 'сегодня', 'сейчас',
+            # Прилагательные-время
+            'срочный', 'круглосуточный',
         }
         marketplace_lemmas = {
             'олх', 'olx', 'розетка', 'rozetka', 'пром', 'hotline',
             'алиэкспресс', 'aliexpress', 'амазон', 'amazon',
             'эпицентр',
         }
+        # Прилагательные, которые являются валидными модификаторами для любой ниши
+        valid_adj_lemmas = {
+            'бюджетный', 'бесплатный', 'платный', 'гарантийный',
+            'новый', 'старый', 'профессиональный', 'домашний',
+            'дешёвый', 'дешевый', 'дорогой',
+        }
         
         all_known = (commerce_lemmas | reputation_lemmas | action_lemmas |
-                     contacts_lemmas | location_lemmas | time_lemmas | marketplace_lemmas)
+                     contacts_lemmas | location_lemmas | time_lemmas |
+                     marketplace_lemmas | valid_adj_lemmas)
         
-        # POS которые пропускаем (служебные/модификаторы — не несут тематику)
-        skip_pos = {'PREP', 'CONJ', 'PRCL', 'INTJ', 'ADVB', 'PRED',
-                     'ADJF', 'ADJS', 'COMP', 'PRTS', 'PRTF'}
+        # POS которые пропускаем (только служебные — НЕ прилагательные)
+        # Прилагательные проверяем: "юридический" → сирота, "лучший" → в known
+        skip_pos = {'PREP', 'CONJ', 'PRCL', 'INTJ', 'ADVB', 'PRED', 'COMP'}
         
         orphans = []
         for w in words:
@@ -304,10 +321,17 @@ class TailFunctionClassifier:
             hard_negatives = {'duplicate', 'meta', 'marketplace_trash', 'tech_garbage', 'mixed_alpha'}
             has_hard_negative = bool(set(negative) & hard_negatives)
             
-            if has_db_positive and not has_hard_negative:
+            # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
+            has_incoherent = 'incoherent_tail' in negative
+            
+            if has_db_positive and not has_hard_negative and not has_incoherent:
                 # БД говорит VALID, эвристика говорит TRASH → доверяем БД
                 confidence = 0.75
                 return 'VALID', confidence, pos_score, neg_score
+            
+            # Incoherent → максимум GREY, никогда VALID
+            if has_incoherent and not has_hard_negative:
+                return 'GREY', 0.4, pos_score, neg_score
             
             if has_hard_negative:
                 # Мета-вопрос или дублирование → даже бренд не спасает
