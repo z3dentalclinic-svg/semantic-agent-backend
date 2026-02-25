@@ -9,7 +9,7 @@ function_detectors.py — 11 детекторов функции хвоста.
 """
 
 import pymorphy3
-from typing import Tuple, Set
+from typing import Tuple, Set, Dict
 
 morph = pymorphy3.MorphAnalyzer()
 
@@ -18,18 +18,21 @@ morph = pymorphy3.MorphAnalyzer()
 # ПОЗИТИВНЫЕ ДЕТЕКТОРЫ (функция хвоста определена → VALID)
 # ============================================================
 
-def detect_geo(tail: str, geo_db: Set[str]) -> Tuple[bool, str]:
+def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua") -> Tuple[bool, str]:
     """
     Детектор географии: город, район, страна.
     Использует geonamescache (65k+ городов) + лемматизацию.
     
-    Защита от омонимов: "или" (союз, но город в Китае), "хана" (лемма "хан").
-    - Прямое совпадение: принимаем если слово не служебное (CONJ/PREP/PRCL)
-    - Совпадение по лемме: принимаем только если pymorphy знает слово как Geox
+    COUNTRY-AWARE: geo_db = Dict[str, Set[str]] (название → {коды_стран}).
+    Город считается VALID только если он существует в target_country.
     
-    "киев" → True   "одессе" → True (лемма: одесса, Geox)
-    "или" → False (CONJ)   "хана" → False (лемма хан, нет Geox)
+    "киев" (UA) → True (киев ∈ UA)
+    "тир"  (UA) → False (тир ∈ LB, не в UA)
+    "днс"  (UA) → False (днс нет в geo_db вообще)
+    "или"  (UA) → False (или ∈ GB, не в UA + CONJ)
+    "одессе" (UA) → True (лемма "одесса" ∈ UA)
     """
+    target = target_country.upper()
     # POS которые НИКОГДА не являются городами в контексте поиска
     skip_pos = {'CONJ', 'PREP', 'PRCL', 'INTJ'}
     
@@ -38,28 +41,30 @@ def detect_geo(tail: str, geo_db: Set[str]) -> Tuple[bool, str]:
     for word in words:
         parsed = morph.parse(word)[0]
         
-        # Точное совпадение
+        # Пропускаем служебные слова в любом случае
+        if parsed.tag.POS in skip_pos:
+            continue
+        
+        # Точное совпадение + проверка страны
         if word in geo_db:
-            # Пропускаем служебные слова (или, и, на...)
-            if parsed.tag.POS in skip_pos:
-                continue
-            return True, f"Город: '{word}'"
+            if target in geo_db[word]:
+                return True, f"Город: '{word}' ({target})"
+            # Город существует, но в другой стране → пропускаем (не TRASH, просто нет сигнала)
+            continue
         
         # Лемматизация (киеву → киев, одессе → одесса)
         lemma = parsed.normal_form
         if lemma in geo_db and lemma != word:
-            # Для лемма-совпадений требуем Geox в хотя бы одном разборе
-            # Это блокирует "хана" → "хан" (нет Geox)
-            # Но пропускает "одессе" → "одесса" (есть Geox)
-            has_geox = any('Geox' in str(pp.tag) for pp in morph.parse(word))
-            if has_geox:
-                return True, f"Город (лемма): '{lemma}'"
+            if target in geo_db[lemma]:
+                return True, f"Город (лемма): '{lemma}' ({target})"
+            continue
     
     # Проверяем многословные названия (нью йорк, кривой рог)
     if len(words) >= 2:
         bigram = ' '.join(words[:2])
         if bigram in geo_db:
-            return True, f"Город (биграмм): '{bigram}'"
+            if target in geo_db[bigram]:
+                return True, f"Город (биграмм): '{bigram}' ({target})"
     
     return False, ""
 
@@ -618,7 +623,7 @@ def detect_short_garbage(tail: str) -> Tuple[bool, str]:
     return False, ""
 
 
-def detect_dangling(tail: str, seed: str = "ремонт пылесосов", geo_db: set = None) -> Tuple[bool, str]:
+def detect_dangling(tail: str, seed: str = "ремонт пылесосов", geo_db = None) -> Tuple[bool, str]:
     """
     Детектор висячего модификатора: прилагательное без существительного.
     
@@ -1158,8 +1163,23 @@ _ALL_KNOWN_MARKETPLACES = _GLOBAL_VALID | {
 # Региональные конфиги (ускоритель для основных рынков)
 # Для стран НЕ в этом словаре → detect_trash_marketplace не срабатывает → GREY → perplexity
 _REGIONAL_MARKETPLACES = {
-    # UA намеренно НЕ включена — тестируем через perplexity
-    # После подтверждения работы perplexity — можно добавить как ускоритель
+    'ua': {
+        'valid': {
+            'олх', 'olx', 'розетка', 'rozetka', 'фокстрот', 'foxtrot',
+            'комфи', 'comfy', 'хотлайн', 'hotline', 'цитрус', 'citrus',
+            'эпицентр', 'epicentr', 'алло', 'allo',
+            'prom.ua', 'prom', 'bigl.ua',
+            'эльдорадо', 'eldorado',
+        },
+        'trash': {
+            'авито', 'avito', 'озон', 'ozon', 'wildberries', 'вайлдберриз',
+            'днс', 'dns', 'м видео', 'mvideo', 'яндекс маркет',
+            'сбермегамаркет', 'сбер', 'юла', 'youla',
+            'куфар', 'kufar', 'онлайнер', 'onliner',
+            'шоп бай', 'shop.by',
+            'касторама', 'леруа',
+        },
+    },
     'kz': {
         'valid': {
             'олх', 'olx', 'kaspi', 'каспи', 'forte', 'форте',
