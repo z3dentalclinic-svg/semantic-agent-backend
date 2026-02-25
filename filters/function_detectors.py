@@ -23,20 +23,37 @@ def detect_geo(tail: str, geo_db: Set[str]) -> Tuple[bool, str]:
     Детектор географии: город, район, страна.
     Использует geonamescache (65k+ городов) + лемматизацию.
     
-    "киев" → True   "одессе" → True (лемма: одесса)
-    "абвгд" → False
+    Защита от омонимов: "или" (союз, но город в Китае), "хана" (лемма "хан").
+    - Прямое совпадение: принимаем если слово не служебное (CONJ/PREP/PRCL)
+    - Совпадение по лемме: принимаем только если pymorphy знает слово как Geox
+    
+    "киев" → True   "одессе" → True (лемма: одесса, Geox)
+    "или" → False (CONJ)   "хана" → False (лемма хан, нет Geox)
     """
+    # POS которые НИКОГДА не являются городами в контексте поиска
+    skip_pos = {'CONJ', 'PREP', 'PRCL', 'INTJ'}
+    
     words = tail.lower().split()
     
     for word in words:
+        parsed = morph.parse(word)[0]
+        
         # Точное совпадение
         if word in geo_db:
+            # Пропускаем служебные слова (или, и, на...)
+            if parsed.tag.POS in skip_pos:
+                continue
             return True, f"Город: '{word}'"
         
         # Лемматизация (киеву → киев, одессе → одесса)
-        lemma = morph.parse(word)[0].normal_form
-        if lemma in geo_db:
-            return True, f"Город (лемма): '{lemma}'"
+        lemma = parsed.normal_form
+        if lemma in geo_db and lemma != word:
+            # Для лемма-совпадений требуем Geox в хотя бы одном разборе
+            # Это блокирует "хана" → "хан" (нет Geox)
+            # Но пропускает "одессе" → "одесса" (есть Geox)
+            has_geox = any('Geox' in str(pp.tag) for pp in morph.parse(word))
+            if has_geox:
+                return True, f"Город (лемма): '{lemma}'"
     
     # Проверяем многословные названия (нью йорк, кривой рог)
     if len(words) >= 2:
