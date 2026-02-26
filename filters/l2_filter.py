@@ -427,7 +427,8 @@ def get_l2_classifier(config: Optional[L2Config] = None) -> L2Classifier:
 def apply_l2_filter(
     l0_result: Dict[str, Any],
     seed: str,
-    enable_l2: bool = True
+    enable_l2: bool = True,
+    config: Optional[L2Config] = None
 ) -> Dict[str, Any]:
     """
     Обёртка для применения L2 фильтра к результату L0.
@@ -436,6 +437,7 @@ def apply_l2_filter(
         l0_result: Результат от apply_l0_filter с keywords_grey
         seed: Базовый запрос
         enable_l2: Включить L2 (False = passthrough)
+        config: Кастомный L2Config (пороги из UI). None = дефолтные пороги.
     
     Returns:
         Результат с классифицированными GREY:
@@ -443,6 +445,7 @@ def apply_l2_filter(
         - anchors: TRASH из L0 + TRASH из L2
         - keywords_grey: оставшиеся GREY для L3
         - l2_stats: статистика L2
+        - l2_config: использованные пороги
     
     Note:
         При ошибке L2 возвращает l0_result без изменений (graceful degradation).
@@ -459,7 +462,23 @@ def apply_l2_filter(
         logger.info(f"L2: Processing {grey_count} GREY keywords")
         
         classifier = get_l2_classifier()
+        
+        # Применяем кастомный config если передан
+        if config is not None:
+            classifier.config = config
+            logger.info(f"L2: Using custom config: mode={config.combination_mode}, comb_valid={config.combined_valid_threshold}, comb_trash={config.combined_trash_threshold}")
+        
         result = classifier.classify_l0_result(l0_result, seed)
+        
+        # Добавляем использованные пороги в результат
+        used_config = classifier.config
+        result["l2_config"] = {
+            "combined_valid_threshold": used_config.combined_valid_threshold,
+            "combined_trash_threshold": used_config.combined_trash_threshold,
+            "direct_valid_threshold": used_config.direct_valid_threshold,
+            "direct_trash_threshold": used_config.direct_trash_threshold,
+            "combination_mode": used_config.combination_mode,
+        }
         
         stats = result.get("l2_stats", {})
         logger.info(
