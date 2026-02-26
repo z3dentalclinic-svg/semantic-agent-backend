@@ -22,6 +22,7 @@ from filters import (
     filter_geo_garbage,
     apply_pre_filter,  # ← санитарная очистка парсинга (ДО гео-фильтра)
     apply_l0_filter,   # ← L0 классификатор хвостов (ПОСЛЕ всех фильтров)
+    apply_l2_filter,   # ← L2 семантический классификатор (Dual Cosine)
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
@@ -58,8 +59,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="7.9.0",
-    description="6 методов | 3 sources | Batch Post-Filter | O(1) lookups | v7.9 GEO DB PRIORITY"
+    version="8.0.0",
+    description="6 методов | 3 sources | Batch Post-Filter | L0 + L2 Classifiers | v8.0 DUAL COSINE"
 )
 
 app.add_middleware(
@@ -1354,7 +1355,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
                           enabled_filters: str = "pre,geo,bpf") -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
-    Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0
+    Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0 → L2
     Заблокированные ключи добавляются в result["anchors"] с указанием фильтра.
     
     enabled_filters: через запятую какие фильтры включены.
@@ -1362,20 +1363,22 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         "geo"  = geo_garbage_filter  
         "bpf"  = batch_post_filter
         "l0"   = L0 tail classifier
+        "l2"   = L2 semantic classifier (Dual Cosine)
         "none" = все выключены (сырые данные)
-        "all" или "pre,geo,bpf,l0" = все включены (по умолчанию)
+        "all" или "pre,geo,bpf,l0,l2" = все включены (по умолчанию)
     """
     # Парсим флаги
     ef = enabled_filters.lower().strip()
     if ef == "all":
-        ef = "pre,geo,bpf,l0"
+        ef = "pre,geo,bpf,l0,l2"
     parts = [x.strip() for x in ef.split(",")]
     run_pre = "pre" in parts
     run_geo = "geo" in parts
     run_bpf = "bpf" in parts
     run_l0 = "l0" in parts
+    run_l2 = "l2" in parts
     
-    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0}")
+    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0} l2={run_l2}")
     
     parser.tracer.start_request(seed=seed, country=country, method=method)
     
@@ -1451,6 +1454,36 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             l0_trace=l0_trace,
         )
     
+    # L2 СЕМАНТИЧЕСКИЙ КЛАССИФИКАТОР (после L0, обрабатывает GREY)
+    if run_l2 and result.get("keywords_grey"):
+        parser.tracer.before_filter("l2_filter", result.get("keywords_grey", []))
+        
+        result = apply_l2_filter(
+            result,
+            seed=seed,
+            enable_l2=True,
+        )
+        
+        # Логируем результаты L2
+        l2_stats = result.get("l2_stats", {})
+        l2_trace = result.get("_l2_trace", [])
+        
+        logger.info(
+            f"[L2] VALID: {l2_stats.get('l2_valid', 0)}, "
+            f"TRASH: {l2_stats.get('l2_trash', 0)}, "
+            f"GREY remaining: {l2_stats.get('l2_grey', 0)} "
+            f"({l2_stats.get('reduction_pct', 0)}% reduction)"
+        )
+        
+        # Трейсер L2 — три исхода
+        parser.tracer.after_l2_filter(
+            valid=result.get("keywords", []),
+            trash=[a for a in result.get("anchors", []) if isinstance(a, dict) and a.get("anchor_reason") == "L2_TRASH"],
+            grey=result.get("keywords_grey", []),
+            l2_stats=l2_stats,
+            l2_trace=l2_trace,
+        )
+    
     # Дедупликация anchors
     seen = set()
     unique_anchors = []
@@ -1463,7 +1496,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
-    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "rel": not parser.skip_relevance_filter}
+    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l2": run_l2, "rel": not parser.skip_relevance_filter}
     return result
 
 
