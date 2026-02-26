@@ -1350,9 +1350,29 @@ async def root():
     return FileResponse('static/index.html')
 
 
+def _build_l2_config(comb_valid, comb_trash, dir_valid, dir_trash, mode):
+    """Собирает L2 config из query параметров (None = использовать дефолт)."""
+    from filters.l2_filter import L2Config
+    
+    config = L2Config()
+    
+    if comb_valid is not None:
+        config.combined_valid_threshold = comb_valid
+    if comb_trash is not None:
+        config.combined_trash_threshold = comb_trash
+    if dir_valid is not None:
+        config.direct_valid_threshold = dir_valid
+    if dir_trash is not None:
+        config.direct_trash_threshold = dir_trash
+    if mode is not None and mode in ("conservative", "weighted", "any_trash"):
+        config.combination_mode = mode
+    
+    return config
+
+
 def apply_filters_traced(result: dict, seed: str, country: str, 
                           method: str, language: str = "ru", deduplicate: bool = False,
-                          enabled_filters: str = "pre,geo,bpf") -> dict:
+                          enabled_filters: str = "pre,geo,bpf", l2_config = None) -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
     Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0 → L2
@@ -1462,6 +1482,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             result,
             seed=seed,
             enable_l2=True,
+            config=l2_config,
         )
         
         # Логируем результаты L2
@@ -1488,11 +1509,16 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     seen = set()
     unique_anchors = []
     for a in result["anchors"]:
-        key = a.lower().strip() if isinstance(a, str) else ""
+        if isinstance(a, str):
+            key = a.lower().strip()
+        elif isinstance(a, dict):
+            key = (a.get("keyword") or a.get("query") or "").lower().strip()
+        else:
+            key = ""
         if key and key not in seen:
             seen.add(key)
             unique_anchors.append(a)
-    result["anchors"] = sorted(unique_anchors)
+    result["anchors"] = unique_anchors  # НЕ сортируем — dict'ы не сортируются
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
@@ -1528,7 +1554,13 @@ async def light_search_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры"),
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel,l0,l2"),
+    # L2 пороги (опционально, из UI)
+    l2_comb_valid: float = Query(None, description="L2: Combined VALID threshold"),
+    l2_comb_trash: float = Query(None, description="L2: Combined TRASH threshold"),
+    l2_dir_valid: float = Query(None, description="L2: Direct VALID threshold"),
+    l2_dir_trash: float = Query(None, description="L2: Direct TRASH threshold"),
+    l2_mode: str = Query(None, description="L2 mode: conservative/weighted/any_trash"),
 ):
     """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
 
@@ -1545,7 +1577,10 @@ async def light_search_endpoint(
 
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
-    result = apply_filters_traced(result, seed, country, method="light-search", language=language, enabled_filters=filters)
+    # Собираем L2 config из параметров
+    l2_config = _build_l2_config(l2_comb_valid, l2_comb_trash, l2_dir_valid, l2_dir_trash, l2_mode)
+    
+    result = apply_filters_traced(result, seed, country, method="light-search", language=language, enabled_filters=filters, l2_config=l2_config)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1562,7 +1597,13 @@ async def deep_search_endpoint(
     use_numbers: bool = Query(False, description="Добавить цифры 0-9"),
     parallel_limit: int = Query(10, description="Параллельных запросов", alias="parallel"),
     include_keywords: bool = Query(True, description="Включить список ключей"),
-    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel")
+    filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel,l0,l2"),
+    # L2 пороги (опционально, из UI)
+    l2_comb_valid: float = Query(None, description="L2: Combined VALID threshold"),
+    l2_comb_trash: float = Query(None, description="L2: Combined TRASH threshold"),
+    l2_dir_valid: float = Query(None, description="L2: Direct VALID threshold"),
+    l2_dir_trash: float = Query(None, description="L2: Direct TRASH threshold"),
+    l2_mode: str = Query(None, description="L2 mode: conservative/weighted/any_trash"),
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
@@ -1577,7 +1618,10 @@ async def deep_search_endpoint(
     # Используем исправленный seed для фильтров (parse_deep_search корректирует через Yandex Speller)
     filter_seed = result.get("corrected_seed") or seed
     
-    result = apply_filters_traced(result, filter_seed, country, method="deep-search", language=language, deduplicate=True, enabled_filters=filters)
+    # Собираем L2 config из параметров
+    l2_config = _build_l2_config(l2_comb_valid, l2_comb_trash, l2_dir_valid, l2_dir_trash, l2_mode)
+    
+    result = apply_filters_traced(result, filter_seed, country, method="deep-search", language=language, deduplicate=True, enabled_filters=filters, l2_config=l2_config)
     
     return result
 
