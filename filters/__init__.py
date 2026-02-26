@@ -6,7 +6,8 @@ Contains all filtering logic:
 - pre_filter: Sanitary parsing cleanup (duplicates, echoes, repeats)
 - infix_filter: Infix results filtering
 - relevance_filter: Relevance keyword filtering
-- entity_logic: Morphology and NER filtering (DEPRECATED)
+- l0_filter: Layer 0 structural classifier (26 detectors)
+- l2_filter: Layer 2 semantic classifier (Dual Cosine embeddings)
 """
 import json
 import os
@@ -18,6 +19,7 @@ from .pre_filter import pre_filter, apply_pre_filter
 from .infix_filter import filter_infix_results
 from .relevance_filter import filter_relevant_keywords
 from .l0_filter import apply_l0_filter
+from .l2_filter import L2Classifier, apply_l2_filter
 
 logger = logging.getLogger(__name__)
 
@@ -52,4 +54,6 @@ __all__ = [
     'filter_infix_results',
     'filter_relevant_keywords',
     'apply_l0_filter',
+    'L2Classifier',
+    'apply_l2_filter',
 ]
