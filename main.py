@@ -147,9 +147,13 @@ async def preflight_handler():
 ALL_CITIES_GLOBAL = generate_geo_blacklist_full()
 
 # Базы для L0 классификатора — используем то что УЖЕ загружено на сервере
-# GEO_DB: объединяем ALL_CITIES_GLOBAL (города) + DISTRICTS_EXTENDED (районы)
-# Обе базы — dict {name: country_code}, L0 принимает set имён
-GEO_DB = set(ALL_CITIES_GLOBAL.keys()) | set(DISTRICTS_EXTENDED.keys())
+# GEO_DB: Dict[str, Set[str]] — город → множество ISO-кодов стран
+# detect_geo() проверяет geo_db[word] чтобы узнать в какой стране город
+GEO_DB = {}
+for city_name, country_code in ALL_CITIES_GLOBAL.items():
+    GEO_DB.setdefault(city_name, set()).add(country_code.upper())
+for district_name, country_code in DISTRICTS_EXTENDED.items():
+    GEO_DB.setdefault(district_name, set()).add(country_code.upper())
 logger.info(f"[L0] GEO_DB: {len(GEO_DB)} записей (cities: {len(ALL_CITIES_GLOBAL)}, districts: {len(DISTRICTS_EXTENDED)})")
 
 # BRAND_DB: грузим отдельно (маленькая, ~100 записей)
