@@ -25,3 +25,7 @@ slovnet>=0.6.0
 geonamescache>=3.0.0
 # Multilingual country names для Geo-Garbage Filter
 babel
+
+# L2 Perplexity Classifier (Dual Cosine)
+fastembed>=0.7.0
+onnxruntime>=1.17.0
