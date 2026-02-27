@@ -380,8 +380,18 @@ def detect_fragment(tail: str) -> Tuple[bool, str]:
     # "плюс"(Plus), "лайт"(Lite) — pymorphy видит PREP/PRCL, но это модели товаров.
     # Универсально для любой темы.
     product_suffixes = {'про', 'макс', 'мини', 'плюс', 'лайт', 'ультра'}
+    
+    # === ФИКС: pymorphy ошибочно тегирует некоторые NOUN как CONJ ===
+    # "минус" → pymorphy: CONJ, но в контексте "где плюс где минус" это NOUN
+    # "плюс" → уже в product_suffixes
+    # Не блокируем эти слова как fragment, они семантически NOUN
+    misclassified_as_conj = {'минус'}  # pymorphy баг: CONJ вместо NOUN
+    
     if last_parsed.tag.POS in ('PREP', 'CONJ', 'PRCL') and last_word not in product_suffixes:
-        return True, f"Обрывок: '{last_word}' ({last_parsed.tag.POS}) на конце"
+        if last_word in misclassified_as_conj:
+            pass  # Не блокируем — это ложное срабатывание pymorphy
+        else:
+            return True, f"Обрывок: '{last_word}' ({last_parsed.tag.POS}) на конце"
     
     # Правило 2: Одиночная копула / бытийный глагол без объекта
     copula_forms = {'есть', 'быть', 'бывает', 'бывают', 'бывать',
@@ -602,7 +612,7 @@ def detect_short_garbage(tail: str) -> Tuple[bool, str]:
     Ловит короткие бессмысленные токены: "жт", "хр", "щ".
     
     Правило: одиночный токен ≤2 символа, POS неизвестен или INTJ (междометие).
-    Исключения: числа, аббревиатуры (тб, гб), латиница.
+    Исключения: числа, аббревиатуры (тб, гб), латиница, известные сокращения.
     """
     if not tail:
         return False, ""
@@ -611,7 +621,7 @@ def detect_short_garbage(tail: str) -> Tuple[bool, str]:
     if len(words) != 1:
         return False, ""
     
-    word = words[0]
+    word = words[0].lower()
     
     if len(word) > 2:
         return False, ""
@@ -622,6 +632,21 @@ def detect_short_garbage(tail: str) -> Tuple[bool, str]:
     
     # Латиница — может быть аббревиатура (gb, tb, hp)
     if word.isascii() and word.isalpha():
+        return False, ""
+    
+    # === ФИКС: Известные сокращения (коммерческий интент) ===
+    # "бу" = "б/у" = бывший в употреблении — валидный коммерческий модификатор
+    # Cross-niche: "аккумулятор бу", "телефон бу", "авто бу" — везде покупательский
+    known_abbreviations = {
+        'бу',   # б/у = бывший в употреблении
+        'б',    # сокращение (б/у, б.у.)
+        'шт',   # штуки
+        'уа',   # UA = Украина
+        'рф',   # РФ = Россия
+        'сш',   # США
+        'ес',   # ЕС = Европейский союз
+    }
+    if word in known_abbreviations:
         return False, ""
     
     parsed = morph.parse(word)[0]
@@ -721,10 +746,30 @@ def detect_duplicate_words(tail: str) -> Tuple[bool, str]:
     
     "ремонт ремонт" → True    "пылесосов пылесос" → True (лемма)
     "samsung samsung" → True
+    
+    ИСКЛЮЧЕНИЕ: interrogative patterns — "где плюс где минус"
+    Паттерн "где X где Y" — валидный вопрос о расположении (полярность батареи и т.д.)
     """
     words = tail.lower().split()
     if len(words) < 2:
         return False, ""
+    
+    # === ФИКС: Interrogative patterns ===
+    # "где плюс где минус" — валидный вопрос, не дубликат
+    # Паттерн: вопросительное слово повторяется с разными объектами между
+    interrogative_words = {'где', 'как', 'куда', 'когда', 'какой', 'какая', 'какое', 'сколько'}
+    
+    # Находим позиции вопросительных слов
+    interrogative_positions = [i for i, w in enumerate(words) if w in interrogative_words]
+    
+    # Если вопросительное слово встречается 2+ раза и между ними есть другие слова
+    if len(interrogative_positions) >= 2:
+        # Проверяем что между повторами есть контент
+        first_pos = interrogative_positions[0]
+        second_pos = interrogative_positions[1]
+        if second_pos - first_pos >= 2:  # Минимум 1 слово между "где ... где"
+            # Это interrogative pattern — НЕ блокируем
+            return False, ""
     
     # Проверка точных дубликатов
     if len(words) != len(set(words)):
@@ -807,6 +852,14 @@ def detect_broken_grammar(tail: str) -> Tuple[bool, str]:
     
     "после ремонт" → True (после требует род.п., а "ремонт" в им.п.)
     "после ремонта" → False (правильное управление)
+    
+    ОСЛАБЛЕНИЕ ДЛЯ SEARCH QUERIES:
+    Поисковые запросы часто не соблюдают грамматику:
+    "аккумулятор для скутер" — человек просто набирает слова, не склоняя.
+    
+    Не блокируем если:
+    1. Хвост = только "предлог + существительное в nomn" (типичный search pattern)
+    2. Существительное — конкретный объект (не абстрактное слово)
     """
     words = tail.lower().split()
     if len(words) < 2:
@@ -845,6 +898,27 @@ def detect_broken_grammar(tail: str) -> Tuple[bool, str]:
             return False, ""
         
         second_parses = morph.parse(second_word)
+        
+        # === ФИКС: Ослабление для search queries ===
+        # Паттерн "PREP + NOUN(nomn)" в 2-словном хвосте — типичный search query
+        # "для скутер", "на мотоцикл", "от генератор" — человек не склоняет
+        # НЕ блокируем если это выглядит как search query
+        if len(words) == 2:
+            second_best = second_parses[0]
+            # Если слово — конкретное существительное в именительном падеже
+            if second_best.tag.POS == 'NOUN' and second_best.tag.case == 'nomn':
+                # Проверяем: это конкретный объект, не абстракция?
+                # Абстракции ("ремонт", "смысл") скорее будут ошибкой парсинга
+                # Конкретные объекты ("скутер", "мотоцикл") — search query
+                # Простая эвристика: одушевлённость или 5+ символов = конкретный объект
+                is_concrete = (
+                    second_best.tag.animacy == 'inan' or
+                    len(second_word) >= 5 or
+                    'anim' in str(second_best.tag)
+                )
+                if is_concrete:
+                    # Это скорее search query, не блокируем
+                    return False, ""
         
         # Ни один парс не даёт требуемый падеж → грамматика сломана
         has_valid_case = False
@@ -1096,144 +1170,6 @@ def detect_contacts(tail: str) -> Tuple[bool, str]:
     
     return False, ""
 
-
-def detect_marketplace(tail: str, target_country: str = "ua") -> Tuple[bool, str]:
-    """
-    Детектор площадок/маркетплейсов — VALID для целевого региона.
-    
-    1. Если страна в конфиге → проверяет по списку VALID площадок
-    2. Если площадка известная но нет в конфиге → всё равно позитивный сигнал
-       (коммерческий интент, человек ищет где купить)
-    """
-    tail_lower = tail.lower().strip()
-    
-    # Сначала проверяем конфиг для известных стран (ускоритель)
-    country_valid = _REGIONAL_MARKETPLACES.get(target_country.lower(), {}).get('valid', set())
-    
-    for check in [tail_lower] + tail_lower.split():
-        if check in country_valid or check in _GLOBAL_VALID:
-            return True, f"Площадка ({target_country.upper()}): '{check}'"
-    
-    # Если страна не в конфиге — проверяем глобальный список известных площадок
-    # Это даёт позитивный сигнал "человек ищет где купить"
-    if not country_valid:
-        for check in [tail_lower] + tail_lower.split():
-            if check in _ALL_KNOWN_MARKETPLACES:
-                return True, f"Площадка (известная): '{check}'"
-    
-    return False, ""
-
-
-def detect_trash_marketplace(tail: str, target_country: str = "ua") -> Tuple[bool, str]:
-    """
-    НЕГАТИВНЫЙ детектор: площадки заведомо чужих регионов → TRASH.
-    
-    Работает ТОЛЬКО для стран с конфигом (UA/KZ/RU/BY).
-    Для остальных стран → не срабатывает, уходит в GREY → perplexity решает.
-    """
-    country_trash = _REGIONAL_MARKETPLACES.get(target_country.lower(), {}).get('trash', set())
-    
-    if not country_trash:
-        return False, ""  # Нет конфига → не блокируем, пусть решает perplexity
-    
-    tail_lower = tail.lower().strip()
-    
-    for check in [tail_lower] + tail_lower.split():
-        if check in country_trash:
-            return True, f"Площадка (чужая для {target_country.upper()}): '{check}'"
-    
-    # Биграмы: "м видео", "5 элемент", "яндекс маркет"
-    words = tail_lower.split()
-    for i in range(len(words) - 1):
-        bigram = f"{words[i]} {words[i+1]}"
-        if bigram in country_trash:
-            return True, f"Площадка (чужая для {target_country.upper()}): '{bigram}'"
-    
-    return False, ""
-
-
-# ============================================================
-# КОНФИГ ПЛОЩАДОК
-# ============================================================
-
-# Глобальные (работают везде)
-_GLOBAL_VALID = {
-    'amazon', 'ebay', 'aliexpress', 'алиэкспресс',
-}
-
-# Все известные площадки (для стран без конфига → позитивный сигнал)
-_ALL_KNOWN_MARKETPLACES = _GLOBAL_VALID | {
-    'олх', 'olx', 'розетка', 'rozetka', 'фокстрот', 'foxtrot',
-    'комфи', 'comfy', 'хотлайн', 'hotline', 'цитрус', 'citrus',
-    'эпицентр', 'epicentr', 'эльдорадо', 'eldorado', 'алло', 'allo',
-    'prom.ua', 'prom', 'bigl.ua',
-    'авито', 'avito', 'озон', 'ozon', 'wildberries', 'вайлдберриз',
-    'днс', 'dns', 'м видео', 'mvideo', 'яндекс маркет',
-    'куфар', 'kufar', 'онлайнер', 'onliner',
-    'kaspi', 'каспи', 'технодом', 'technodom', 'сулпак', 'sulpak',
-    'tesco', 'argos', 'currys', 'john lewis',
-    'mediamarkt', 'saturn', 'fnac', 'darty',
-}
-
-# Региональные конфиги (ускоритель для основных рынков)
-# Для стран НЕ в этом словаре → detect_trash_marketplace не срабатывает → GREY → perplexity
-_REGIONAL_MARKETPLACES = {
-    'ua': {
-        'valid': {
-            'олх', 'olx', 'розетка', 'rozetka', 'фокстрот', 'foxtrot',
-            'комфи', 'comfy', 'хотлайн', 'hotline', 'цитрус', 'citrus',
-            'эпицентр', 'epicentr', 'алло', 'allo',
-            'prom.ua', 'prom', 'bigl.ua',
-            'эльдорадо', 'eldorado',
-        },
-        'trash': {
-            'авито', 'avito', 'озон', 'ozon', 'wildberries', 'вайлдберриз',
-            'днс', 'dns', 'м видео', 'mvideo', 'яндекс маркет',
-            'сбермегамаркет', 'сбер', 'юла', 'youla',
-            'куфар', 'kufar', 'онлайнер', 'onliner',
-            'шоп бай', 'shop.by',
-            'касторама', 'леруа',
-        },
-    },
-    'kz': {
-        'valid': {
-            'олх', 'olx', 'kaspi', 'каспи', 'forte', 'форте',
-            'колёса', 'kolesa', 'крыша', 'krisha',
-            'flip.kz', 'technodom', 'технодом', 'sulpak', 'сулпак',
-            'мечта', 'mechta', 'белый ветер', 'авито', 'avito',
-        },
-        'trash': {
-            'розетка', 'rozetka', 'фокстрот', 'foxtrot',
-            'комфи', 'comfy', 'хотлайн', 'hotline',
-            'куфар', 'kufar', 'онлайнер', 'onliner',
-            'шоп бай', 'shop.by',
-        },
-    },
-    'ru': {
-        'valid': {
-            'авито', 'avito', 'озон', 'ozon', 'wildberries', 'вайлдберриз',
-            'днс', 'dns', 'мтс', 'mts', 'яндекс', 'yandex',
-            'м видео', 'mvideo', 'сбермегамаркет', 'сбер',
-            'касторама', 'леруа', 'юла', 'youla',
-        },
-        'trash': {
-            'олх', 'olx', 'розетка', 'rozetka', 'фокстрот', 'foxtrot',
-            'комфи', 'comfy', 'хотлайн', 'hotline',
-            'куфар', 'kufar', 'онлайнер', 'onliner',
-            'шоп бай', 'shop.by',
-        },
-    },
-    'by': {
-        'valid': {
-            'куфар', 'kufar', 'онлайнер', 'onliner', 'шоп бай', 'shop.by',
-            '5 элемент', 'а1', 'a1', 'электросила', 'юнит',
-        },
-        'trash': {
-            'олх', 'olx', 'розетка', 'rozetka', 'фокстрот', 'foxtrot',
-            'комфи', 'comfy', 'хотлайн', 'hotline',
-        },
-    },
-}
 
 
 # ============================================================
