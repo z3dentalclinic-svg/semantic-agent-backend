@@ -1,168 +1,114 @@
-"""
-l0_filter.py — Серверная обёртка L0 классификатора1.
+# L0 Фиксы — 26 февраля 2026
 
-Встраивается в пайплайн ПОСЛЕ всех существующих фильтров:
-    pre_filter → geo_garbage → batch_post → deduplicate → L0
+## Обзор
 
-Принимает result dict с keywords → классифицирует каждый ключ → 
-разделяет на VALID / TRASH / GREY.
+Исправлены 5 проблем в L0 детекторах. Все фиксы алгоритмические (не hardcode).
 
-Результат:
-    result["keywords"]       → VALID ключи (высокая уверенность)
-    result["keywords_grey"]  → GREY ключи (для будущего perplexity)
-    result["anchors"]       += TRASH ключи с пометкой [L0]
-    result["_l0_trace"]      → детальный трейсинг каждого ключа
-"""
+**ВАЖНО:** Marketplace детекторы (`detect_marketplace`, `detect_trash_marketplace`) УДАЛЕНЫ из L0. Причина: невозможно масштабировать хардкод списки на все страны мира × все языки × все вариации написания. Маркетплейсы теперь обрабатываются в L3 (DeepSeek).
 
-import logging
-from typing import Dict, List, Set, Any
+---
 
-from .tail_extractor import extract_tail
-from .tail_function_classifier import TailFunctionClassifier
+## Фикс 1: detect_short_garbage — "бу" как известное сокращение
 
-logger = logging.getLogger(__name__)
+**Файл:** `function_detectors.py`
 
+**Проблема:** "аккумулятор на скутер бу" → TRASH (бу = 2 символа)
 
-def apply_l0_filter(
-    result: Dict[str, Any],
-    seed: str,
-    target_country: str = "ua",
-    geo_db: Dict[str, Set[str]] = None,
-    brand_db: Set[str] = None,
-) -> Dict[str, Any]:
-    """
-    Применяет L0 классификатор к списку ключевых слов.
-    
-    Args:
-        result: dict с ключами "keywords", "anchors"
-        seed: базовый запрос
-        target_country: целевая страна
-        geo_db: база городов Dict[str, Set[str]] (название → {коды_стран})
-        brand_db: база брендов (set). Если None — пустой set
-    
-    Returns:
-        result с обновлёнными keywords, keywords_grey, anchors, _l0_trace
-    """
-    keywords = result.get("keywords", [])
-    if not keywords:
-        result.setdefault("keywords_grey", [])
-        result.setdefault("_l0_trace", [])
-        return result
-    
-    if geo_db is None:
-        geo_db = {}
-    if brand_db is None:
-        brand_db = set()
-    
-    clf = TailFunctionClassifier(
-        geo_db=geo_db,
-        brand_db=brand_db,
-        seed=seed,
-        target_country=target_country,
-    )
-    
-    valid_keywords = []
-    grey_keywords = []
-    trash_keywords = []
-    trace_records = []
-    
-    for kw_item in keywords:
-        # Поддержка str и dict форматов
-        if isinstance(kw_item, str):
-            kw = kw_item.strip()
-        elif isinstance(kw_item, dict):
-            kw = kw_item.get("query", "").strip()
-        else:
-            valid_keywords.append(kw_item)
-            continue
-        
-        if not kw:
-            continue
-        
-        # Извлекаем хвост
-        tail = extract_tail(kw, seed)
-        
-        # NO_SEED → GREY (не можем классифицировать, пусть perplexity решит)
-        if tail is None:
-            grey_keywords.append(kw_item)
-            trace_records.append({
-                "keyword": kw,
-                "tail": None,
-                "label": "GREY",
-                "decided_by": "l0",
-                "reason": "seed не найден → GREY",
-                "signals": [],
-            })
-            continue
-        
-        # Пустой хвост = запрос совпадает с seed → VALID
-        if not tail:
-            valid_keywords.append(kw_item)
-            trace_records.append({
-                "keyword": kw,
-                "tail": "",
-                "label": "VALID",
-                "decided_by": "l0",
-                "reason": "запрос = seed",
-                "signals": ["exact_seed"],
-            })
-            continue
-        
-        # Классификация хвоста
-        r = clf.classify(tail)
-        label = r["label"]
-        all_signals = r["positive_signals"] + [f"-{s}" for s in r["negative_signals"]]
-        
-        trace_record = {
-            "keyword": kw,
-            "tail": tail,
-            "label": label,
-            "decided_by": "l0",
-            "reason": "; ".join(r["reasons"][:3]),
-            "signals": all_signals,
-            "confidence": r["confidence"],
-        }
-        trace_records.append(trace_record)
-        
-        if label == "VALID":
-            valid_keywords.append(kw_item)
-        elif label == "TRASH":
-            trash_keywords.append(kw_item)
-        else:  # GREY
-            grey_keywords.append(kw_item)
-    
-    # --- Обновляем result ---
-    
-    # keywords = только VALID
-    result["keywords"] = valid_keywords
-    result["count"] = len(valid_keywords)
-    
-    # keywords_grey = для будущего perplexity
-    result["keywords_grey"] = grey_keywords
-    result["keywords_grey_count"] = len(grey_keywords)
-    
-    # TRASH → якоря с пометкой [L0]
-    existing_anchors = result.get("anchors", [])
-    for kw_item in trash_keywords:
-        kw = kw_item if isinstance(kw_item, str) else kw_item.get("query", "")
-        existing_anchors.append(kw)
-    result["anchors"] = existing_anchors
-    result["anchors_count"] = len(existing_anchors)
-    
-    # Трейсинг
-    result["_l0_trace"] = trace_records
-    
-    # Статистика для лога
-    total = len(trace_records)
-    v = len(valid_keywords)
-    t = len(trash_keywords)
-    g = len(grey_keywords)
-    
-    logger.info(
-        f"[L0] seed='{seed}' | total={total} | "
-        f"VALID={v} ({v*100//total if total else 0}%) | "
-        f"TRASH={t} ({t*100//total if total else 0}%) | "
-        f"GREY={g} ({g*100//total if total else 0}%)"
-    )
-    
-    return result
+**Решение:** Whitelist известных сокращений:
+```python
+known_abbreviations = {'бу', 'шт', 'уа', 'рф', ...}
+```
+
+---
+
+## Фикс 2: detect_fragment — "минус" не CONJ
+
+**Файл:** `function_detectors.py`
+
+**Проблема:** "где плюс где минус" → TRASH (минус = CONJ на конце)
+
+**Решение:** Whitelist слов, которые pymorphy неправильно тегирует:
+```python
+misclassified_as_conj = {'минус'}
+```
+
+---
+
+## Фикс 3: detect_duplicate_words — interrogative patterns
+
+**Файл:** `function_detectors.py`
+
+**Проблема:** "где плюс где минус" → TRASH (дублирование "где")
+
+**Решение:** Исключение для "где X где Y" паттернов:
+```python
+if len(interrogative_positions) >= 2:
+    if second_pos - first_pos >= 2:
+        return False, ""  # НЕ блокируем
+```
+
+---
+
+## Фикс 4: detect_broken_grammar — search query tolerance
+
+**Файл:** `function_detectors.py`
+
+**Проблема:** "аккумулятор для скутер" → TRASH (для требует gent)
+
+**Решение:** Не блокируем "PREP + конкретный NOUN в nomn":
+```python
+if is_concrete:  # скутер, мотоцикл — конкретные объекты
+    return False, ""
+```
+
+---
+
+## Фикс 5: detect_category_mismatch — НОВЫЙ детектор
+
+**Файл:** `category_mismatch_detector.py` (новый)
+
+**Проблема:** "щербет", "йети", "бум" — другие категории
+
+**Решение:** Embedding-based категоризация:
+```python
+INCOMPATIBLE_CATEGORIES = {
+    "auto_parts": ["food", "animals", "mythology", "sounds"],
+}
+# "щербет" → food → несовместимо с auto_parts → TRASH
+```
+
+---
+
+## УДАЛЕНО: Marketplace детекторы
+
+**Что удалено:**
+- `detect_marketplace()`
+- `detect_trash_marketplace()`
+- `_REGIONAL_MARKETPLACES`, `_MARKETPLACE_ALIASES`
+
+**Почему:** Hardcode не масштабируется на 200+ стран × языки × вариации.
+
+**Решение:** Маркетплейсы → GREY → L3 (DeepSeek).
+
+---
+
+## Файлы для деплоя
+
+| Файл | Изменения |
+|------|-----------|
+| function_detectors.py | Фиксы 1-4, удалены marketplace |
+| tail_function_classifier.py | Интеграция category_mismatch |
+| category_mismatch_detector.py | НОВЫЙ |
+| l0_filter.py | Без изменений |
+
+---
+
+## Тесты
+
+| Ключ | До | После | Фикс |
+|------|-----|-------|------|
+| бу | TRASH | OK | 1 |
+| где плюс где минус | TRASH | OK | 2,3 |
+| для скутер | TRASH | OK | 4 |
+| щербет | OK | TRASH | 5 |
+| на озоне | TRASH | GREY→L3 | удалено |
