@@ -25,6 +25,8 @@ from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 import numpy as np
 
+from .shared_model import get_embedding_model
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,16 +106,11 @@ class L2Classifier:
     
     @property
     def embedder(self):
-        """Lazy load fastembed model."""
+        """Lazy load fastembed model via shared singleton."""
         if self._embedder is None:
-            try:
-                from fastembed import TextEmbedding
-                logger.info(f"Loading embedding model: {self.config.embedding_model}")
-                self._embedder = TextEmbedding(model_name=self.config.embedding_model)
-                logger.info("Embedding model loaded")
-            except Exception as e:
-                logger.error(f"Failed to load embedding model: {e}")
-                raise RuntimeError(f"L2 classifier unavailable: {e}")
+            self._embedder = get_embedding_model()
+            if self._embedder is None:
+                raise RuntimeError("L2 classifier unavailable: embedding model failed to load")
         return self._embedder
     
     @property
