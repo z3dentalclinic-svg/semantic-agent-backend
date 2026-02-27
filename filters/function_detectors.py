@@ -1265,3 +1265,136 @@ def detect_standalone_number(tail: str, seed: str = "") -> Tuple[bool, str]:
         return True, f"Голое число: '{word}' без контекста"
     
     return False, ""
+
+
+# ============================================================
+# НОВЫЕ НЕГАТИВНЫЕ ДЕТЕКТОРЫ (мягкие — понижают вес, не убивают)
+# ============================================================
+
+def detect_truncated_geo(tail: str, geo_db: dict = None) -> Tuple[bool, str]:
+    """
+    Детектор обрезанного составного города.
+    
+    "ханты" → первая часть "ханты-мансийск" → TRASH
+    "санкт" → первая часть "санкт-петербург" → TRASH
+    "южно" → первая часть "южно-сахалинск" → TRASH
+    
+    Алгоритм: проверяем geo_db — есть ли составной город,
+    начинающийся с этого слова. Если слово само НЕ город,
+    но является началом составного города → обрезанное название.
+    
+    Cross-niche: работает для любого seed, любой страны.
+    Хардкода ноль — всё из geo_db.
+    """
+    if not tail or not geo_db:
+        return False, ""
+    
+    words = tail.lower().split()
+    if len(words) != 1:
+        return False, ""
+    
+    word = words[0]
+    
+    # Если слово само является полноценным городом — не обрезанное
+    if word in geo_db:
+        return False, ""
+    
+    # Лемма — тоже полноценный город?
+    lemma = morph.parse(word)[0].normal_form
+    if lemma in geo_db:
+        return False, ""
+    
+    # Ищем составные города, начинающиеся с этого слова
+    # Составные = содержат дефис или пробел
+    # Проверяем: word == первая часть до дефиса/пробела
+    for city_name in geo_db:
+        if '-' in city_name:
+            first_part = city_name.split('-')[0]
+            if first_part == word or first_part == lemma:
+                return True, f"Обрезанный город: '{word}' → '{city_name}'"
+        elif ' ' in city_name:
+            first_part = city_name.split(' ')[0]
+            if first_part == word or first_part == lemma:
+                return True, f"Обрезанный город: '{word}' → '{city_name}'"
+    
+    return False, ""
+
+
+def detect_orphan_genitive(tail: str, seed: str = "") -> Tuple[bool, str]:
+    """
+    Мягкий детектор: одиночный генитив после seed в генитиве.
+    
+    seed="ремонт пылесосов", tail="аппаратов"
+    → "пылесосов" = NOUN gent plur, "аппаратов" = NOUN gent plur
+    → Параллельные генитивы → негативный сигнал
+    
+    НЕ TRASH — мягкий негативный сигнал (может быть "фильтров").
+    Понижает вес в арбитраже, финальное решение за L3.
+    
+    Cross-niche: "купить айфон телефонов", "аккумулятор скутер моторов"
+    """
+    if not tail or not seed:
+        return False, ""
+    
+    words = tail.lower().split()
+    if len(words) != 1:
+        return False, ""
+    
+    word = words[0]
+    parsed = morph.parse(word)[0]
+    
+    # Хвост = существительное в генитиве?
+    if parsed.tag.POS != 'NOUN' or parsed.tag.case != 'gent':
+        return False, ""
+    
+    # Последнее существительное seed тоже в генитиве?
+    seed_words = seed.lower().split()
+    for sw in reversed(seed_words):
+        sp = morph.parse(sw)[0]
+        if sp.tag.POS == 'NOUN':
+            if sp.tag.case == 'gent':
+                return True, f"Генитив-сирота: '{word}' (gent) после seed '{sw}' (gent)"
+            # Нашли существительное, но оно не в gent → не ловим
+            return False, ""
+    
+    return False, ""
+
+
+def detect_single_infinitive(tail: str, seed: str = "") -> Tuple[bool, str]:
+    """
+    Мягкий детектор: одиночный инфинитив без объекта.
+    
+    "почистить" → INFN, одно слово, seed без глагола → повисает
+    
+    НЕ ловим если:
+    - detect_verb_modifier уже поймал (seed с глаголом + наречие)
+    - Хвост > 1 слова ("почистить фильтр" — это detect_action)
+    
+    Мягкий негативный сигнал — может быть валидным интентом,
+    но структурно неполный.
+    
+    Cross-niche: "аккумулятор скутер заменить", "окна заклеить"
+    """
+    if not tail or not seed:
+        return False, ""
+    
+    words = tail.lower().split()
+    if len(words) != 1:
+        return False, ""
+    
+    word = words[0]
+    parsed = morph.parse(word)[0]
+    
+    # Только инфинитив
+    if parsed.tag.POS != 'INFN':
+        return False, ""
+    
+    # Если seed содержит глагол — хвост может быть модификатором,
+    # detect_verb_modifier это уже обрабатывает → не дублируем
+    seed_words = seed.lower().split()
+    for sw in seed_words:
+        sp = morph.parse(sw)[0]
+        if sp.tag.POS in ('INFN', 'VERB'):
+            return False, ""
+    
+    return True, f"Голый инфинитив: '{word}' без объекта (seed без глагола)"
