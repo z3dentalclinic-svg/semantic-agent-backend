@@ -308,13 +308,28 @@ class L2Classifier:
         Обработать результат L0, классифицировать GREY.
         
         Args:
-            l0_result: Результат от L0 с keywords_grey
+            l0_result: Результат от L0 с keywords_grey и _l0_trace
             seed: Базовый запрос
         
         Returns:
             Обновлённый результат с L2 классификацией
+        
+        Note:
+            Если L0 пометил GREY с негативными сигналами (orphan_genitive,
+            single_infinitive и т.д.), L2 НЕ может промоутить в VALID.
+            Максимум GREY → уходит в L3 для семантического решения.
         """
         grey_keywords = l0_result.get("keywords_grey", [])
+        
+        # === Собираем L0 негативные сигналы для каждого keyword ===
+        l0_trace = l0_result.get("_l0_trace", [])
+        l0_negative_signals: Dict[str, List[str]] = {}
+        for trace in l0_trace:
+            kw = trace.get("keyword", "")
+            signals = trace.get("signals", [])
+            neg = [s.lstrip('-') for s in signals if s.startswith('-')]
+            if neg:
+                l0_negative_signals[kw] = neg
         
         # Извлекаем хвосты
         tails = []
@@ -336,6 +351,31 @@ class L2Classifier:
         
         # Классифицируем
         classified = self.classify_tails(seed, tails, return_debug=True)
+        
+        # === Понижаем VALID → GREY если L0 имел негативные сигналы ===
+        # L0 структурно нашёл проблему → cosine similarity не может переспорить
+        downgraded = []
+        still_valid = []
+        
+        for item in classified["valid"]:
+            tail = item["tail"]
+            kw = tail_to_kw.get(tail)
+            # Ищем keyword для проверки L0 сигналов
+            keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
+            
+            l0_neg = l0_negative_signals.get(keyword, [])
+            if l0_neg:
+                # L0 нашёл структурную проблему — L2 не может промоутить
+                item_debug = item.get("debug", {})
+                item_debug["l2_original"] = "VALID"
+                item_debug["downgraded_by"] = f"L0 signals: {', '.join(l0_neg)}"
+                downgraded.append(item)
+                logger.debug(f"L2 downgrade: '{tail}' VALID→GREY (L0: {l0_neg})")
+            else:
+                still_valid.append(item)
+        
+        classified["valid"] = still_valid
+        classified["grey"] = classified["grey"] + downgraded
         
         # Собираем результат
         result = l0_result.copy()
@@ -383,6 +423,7 @@ class L2Classifier:
             "l2_valid": len(classified["valid"]),
             "l2_trash": len(classified["trash"]),
             "l2_grey": len(classified["grey"]),
+            "l2_downgraded": len(downgraded),
             "reduction_pct": round(
                 (1 - len(classified["grey"]) / len(tails)) * 100, 1
             ) if tails else 0
