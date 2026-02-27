@@ -19,10 +19,19 @@ from .function_detectors import (
     detect_seed_echo, detect_broken_grammar,
     detect_number_hijack, detect_short_garbage,
     # Новые детекторы
-    detect_contacts, detect_marketplace, detect_trash_marketplace,
+    detect_contacts,
     detect_technical_garbage, detect_mixed_alphabet, detect_standalone_number,
     detect_verb_modifier, detect_conjunctive_extension,
 )
+
+# Category mismatch detector (использует embeddings, ленивая загрузка)
+try:
+    from .category_mismatch_detector import detect_category_mismatch
+    CATEGORY_MISMATCH_AVAILABLE = True
+except ImportError:
+    CATEGORY_MISMATCH_AVAILABLE = False
+    def detect_category_mismatch(seed, tail):
+        return (False, "")
 
 morph = pymorphy3.MorphAnalyzer()
 
@@ -41,7 +50,6 @@ SIGNAL_WEIGHTS = {
     'time':       0.8,    # "круглосуточно", "срочно" — универсальный сигнал
     'type_spec':  0.85,   # согласование с seed — надёжный лингвистический сигнал
     'contacts':   0.85,   # "телефон", "адрес" — конкретный интент
-    'marketplace_valid': 0.9,  # площадка UA — сильный сигнал
     'verb_modifier': 0.85,  # наречие при глаголе seed — лингвистически надёжный
     'conjunctive': 0.8,    # "и подарков" — расширение запроса
     
@@ -56,11 +64,11 @@ SIGNAL_WEIGHTS = {
     'broken_grammar':  0.8,    # сломанное управление предлога
     'number_hijack':   0.85,   # генитив-паразит на числе из seed
     'short_garbage':   0.9,    # бессмысленные 1-2 символьные токены
-    'marketplace_trash': 0.95, # площадка РФ/РБ — очень надёжный сигнал
     'tech_garbage':    0.95,   # email/URL/телефон — почти 100% мусор
     'mixed_alpha':     0.9,    # смешанные алфавиты
     'standalone_num':  0.7,    # голое число — может ошибиться (модели)
     'incoherent_tail': 0.85,   # многословный хвост с "чужими" словами
+    'category_mismatch': 0.9,  # категория tail несовместима с seed (еда vs запчасти)
 }
 
 
@@ -115,7 +123,6 @@ class TailFunctionClassifier:
             ('time',       lambda: detect_time(tail)),
             ('type_spec',  lambda: detect_type_specifier(tail, self.seed)),
             ('contacts',   lambda: detect_contacts(tail)),
-            ('marketplace_valid', lambda: detect_marketplace(tail, self.target_country)),
             ('verb_modifier', lambda: detect_verb_modifier(tail, self.seed)),
             ('conjunctive', lambda: detect_conjunctive_extension(tail, self.seed)),
         ]
@@ -138,10 +145,11 @@ class TailFunctionClassifier:
             ('broken_grammar',  lambda: detect_broken_grammar(tail)),
             ('number_hijack',   lambda: detect_number_hijack(tail, self.seed)),
             ('short_garbage',   lambda: detect_short_garbage(tail)),
-            ('marketplace_trash', lambda: detect_trash_marketplace(tail, self.target_country)),
             ('tech_garbage',    lambda: detect_technical_garbage(tail)),
             ('mixed_alpha',     lambda: detect_mixed_alphabet(tail)),
             ('standalone_num',  lambda: detect_standalone_number(tail, self.seed)),
+            # Детектор несовместимых категорий (использует embeddings)
+            ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
         ]
         
         for signal_name, detector in detectors_negative:
@@ -314,11 +322,11 @@ class TailFunctionClassifier:
         if has_positive and has_negative:
             # Приоритет БД-сигналов: если geo или brand подтверждён,
             # а негатив — только эвристика, доверяем БД
-            db_signals = {'geo', 'brand', 'marketplace_valid', 'verb_modifier', 'conjunctive'}
+            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive'}
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
-            hard_negatives = {'duplicate', 'meta', 'marketplace_trash', 'tech_garbage', 'mixed_alpha'}
+            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha', 'category_mismatch'}
             has_hard_negative = bool(set(negative) & hard_negatives)
             
             # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
@@ -385,8 +393,6 @@ def run_tests():
         
         # Country-aware geo — новые тесты
         ("тир",           "GREY",  "Тир = Ливан, не UA → нет geo → GREY"),
-        ("днс",           "TRASH", "ДНС = marketplace_trash для UA"),
-        ("розетка",       "VALID", "Розетка = marketplace_valid для UA"),
         ("або",           "GREY",  "Або — нет в UA geo → GREY"),
         
         # TRASH — негативные сигналы
