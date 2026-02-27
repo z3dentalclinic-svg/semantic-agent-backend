@@ -22,6 +22,8 @@ from .function_detectors import (
     detect_contacts,
     detect_technical_garbage, detect_mixed_alphabet, detect_standalone_number,
     detect_verb_modifier, detect_conjunctive_extension,
+    # Новые мягкие детекторы
+    detect_truncated_geo, detect_orphan_genitive, detect_single_infinitive,
 )
 
 # Category mismatch detector (использует embeddings, ленивая загрузка)
@@ -69,6 +71,9 @@ SIGNAL_WEIGHTS = {
     'standalone_num':  0.7,    # голое число — может ошибиться (модели)
     'incoherent_tail': 0.85,   # многословный хвост с "чужими" словами
     'category_mismatch': 0.9,  # категория tail несовместима с seed (еда vs запчасти)
+    'truncated_geo':     0.85,  # обрезанный составной город — довольно надёжно
+    'orphan_genitive':   0.5,   # мягкий — может быть валидным ("фильтров")
+    'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
 }
 
 
@@ -150,6 +155,10 @@ class TailFunctionClassifier:
             ('standalone_num',  lambda: detect_standalone_number(tail, self.seed)),
             # Детектор несовместимых категорий (использует embeddings)
             ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
+            # Новые мягкие детекторы
+            ('truncated_geo',     lambda: detect_truncated_geo(tail, self.geo_db)),
+            ('orphan_genitive',   lambda: detect_orphan_genitive(tail, self.seed)),
+            ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed)),
         ]
         
         for signal_name, detector in detectors_negative:
@@ -161,11 +170,23 @@ class TailFunctionClassifier:
         # ===== ПРОВЕРКА КОГЕРЕНТНОСТИ ХВОСТА =====
         # Если детектор поймал одно слово в многословном хвосте,
         # а остальные контентные слова — "чужие", понижаем до GREY
+        #
+        # ИСКЛЮЧЕНИЕ: если позитивный сигнал пришёл от ПАТТЕРНА (multi-word match)
+        # и хвост короткий (≤2 слов), паттерн покрывает весь хвост →
+        # coherence check не нужен, он просто разломает паттерн на слова.
+        # Пример: "своими руками" → detect_action ловит паттерн,
+        # но coherence видит "руками" как orphan.
         if positive_signals:
-            is_coherent, orphans = self._check_coherence(tail)
-            if not is_coherent:
-                negative_signals.append('incoherent_tail')
-                reasons.append(f"⚠️ Некогерентный хвост: слова {orphans} не относятся к поисковым паттернам")
+            tail_word_count = len(tail.lower().split())
+            has_pattern_match = any('паттерн' in r for r in reasons)
+            
+            if tail_word_count <= 2 and has_pattern_match:
+                pass  # Паттерн покрывает весь хвост — coherence не нужен
+            else:
+                is_coherent, orphans = self._check_coherence(tail)
+                if not is_coherent:
+                    negative_signals.append('incoherent_tail')
+                    reasons.append(f"⚠️ Некогерентный хвост: слова {orphans} не относятся к поисковым паттернам")
         
         # ===== АРБИТРАЖ С ВЕСАМИ =====
         label, confidence, pos_score, neg_score = self._arbitrate(
@@ -315,6 +336,11 @@ class TailFunctionClassifier:
         
         # --- Случай 2: Только негативные ---
         if has_negative and not has_positive:
+            # Мягкие негативные сигналы (orphan_genitive, single_infinitive)
+            # не должны давать TRASH — только понижать до GREY
+            # Жёсткий TRASH только при neg_score >= 0.6
+            if neg_score < 0.6:
+                return 'GREY', 0.4, pos_score, neg_score
             confidence = min(0.85 + neg_score * 0.05, 0.99)
             return 'TRASH', confidence, pos_score, neg_score
         
