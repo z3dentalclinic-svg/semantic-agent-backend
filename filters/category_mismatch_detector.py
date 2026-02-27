@@ -4,14 +4,15 @@ Category Mismatch Detector для L0.
 Определяет несовместимость категории tail со seed через embeddings.
 Например: seed="аккумулятор на скутер", tail="щербет" → еда ≠ запчасть → TRASH
 
-Использует модель L2 (fastembed) для embeddings.
-Ленивая инициализация — модель загружается только при первом вызове.
+Использует SHARED модель (shared_model.py) — та же что и L2.
 """
 
 import logging
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import numpy as np
+
+from .shared_model import get_embedding_model
 
 logger = logging.getLogger(__name__)
 
@@ -83,38 +84,35 @@ class CategoryMismatchDetector:
     def __init__(self):
         if self._initialized:
             return
-        self.model = None
         self.config = CategoryConfig()
         self._anchor_embeddings: Dict[str, np.ndarray] = {}
         self._seed_category_cache: Dict[str, str] = {}
         self._initialized = True
-        self._model_loaded = False
+        self._anchors_computed = False
     
-    def _load_model(self):
-        """Ленивая загрузка модели."""
-        if self._model_loaded:
-            return True
-        try:
-            from fastembed import TextEmbedding
-            logger.info("CategoryMismatchDetector: Loading embedding model...")
-            self.model = TextEmbedding("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-            self._model_loaded = True
-            logger.info("CategoryMismatchDetector: Model loaded")
-            return True
-        except Exception as e:
-            logger.warning(f"CategoryMismatchDetector: Failed to load model: {e}")
-            return False
+    def _get_model(self):
+        """Получить shared модель."""
+        return get_embedding_model()
     
     def _compute_anchor_embeddings(self):
         """Вычислить embeddings для anchor категорий."""
-        if self._anchor_embeddings or not self._load_model():
+        if self._anchors_computed:
             return
+        
+        model = self._get_model()
+        if model is None:
+            return
+        
+        logger.info("CategoryMismatchDetector: Computing anchor embeddings...")
         
         for category, anchors in CATEGORY_ANCHORS.items():
             anchor_text = " ".join(anchors)
-            embeddings = list(self.model.embed([anchor_text]))
+            embeddings = list(model.embed([anchor_text]))
             if embeddings:
                 self._anchor_embeddings[category] = embeddings[0]
+        
+        self._anchors_computed = True
+        logger.info(f"CategoryMismatchDetector: Initialized {len(self._anchor_embeddings)} categories")
     
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         norm_a = np.linalg.norm(a)
@@ -127,10 +125,11 @@ class CategoryMismatchDetector:
         """Определить категорию слова."""
         self._compute_anchor_embeddings()
         
-        if not self._anchor_embeddings or self.model is None:
+        model = self._get_model()
+        if not self._anchor_embeddings or model is None:
             return ("unknown", 0.0)
         
-        word_embeddings = list(self.model.embed([word]))
+        word_embeddings = list(model.embed([word]))
         if not word_embeddings:
             return ("unknown", 0.0)
         
@@ -151,8 +150,9 @@ class CategoryMismatchDetector:
     
     def detect_mismatch(self, seed: str, tail: str) -> Tuple[bool, str]:
         """Проверить несовместимость категории tail с seed."""
-        if not self._model_loaded and not self._load_model():
-            return (False, "")
+        model = self._get_model()
+        if model is None:
+            return (False, "")  # Модель недоступна — не блокируем
         
         self._compute_anchor_embeddings()
         if not self._anchor_embeddings:
