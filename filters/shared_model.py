@@ -4,8 +4,6 @@ Shared Embedding Models — singletons для L2 и CategoryMismatch.
 Модели:
 1. MiniLM (основная) — multilingual embeddings для KNN, CategoryMismatch
 2. rubert-tiny2 MLM (опциональная) — fill-mask для substitution test
-
-Загружаются ОДИН раз, переиспользуются всеми модулями.
 """
 
 import logging
@@ -57,17 +55,10 @@ _rubert_mlm = None
 _rubert_loading = False
 _rubert_attempted = False
 
-# Путь к предварительно экспортированному ONNX (build script)
-RUBERT_LOCAL_PATH = "./models/rubert-tiny2-onnx"
-
 
 def get_rubert_mlm():
     """
     Получить singleton rubert-tiny2 для fill-mask scoring.
-    
-    Грузит из локальной папки (ONNX, экспортирован при build).
-    torch НЕ нужен в runtime — только onnxruntime.
-    
     Возвращает dict {"model": ..., "tokenizer": ...} или None.
     """
     global _rubert_mlm, _rubert_loading, _rubert_attempted
@@ -90,26 +81,20 @@ def get_rubert_mlm():
     _rubert_attempted = True
     
     try:
-        import os
-        from optimum.onnxruntime import ORTModelForMaskedLM
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
         
-        if not os.path.exists(RUBERT_LOCAL_PATH):
-            logger.warning(
-                f"[SharedModel] rubert ONNX not found at {RUBERT_LOCAL_PATH}. "
-                "Run build script to export. Substitution test disabled."
-            )
-            return None
+        model_name = "cointegrated/rubert-tiny2"
+        logger.info(f"[SharedModel] Loading rubert MLM: {model_name}...")
         
-        logger.info(f"[SharedModel] Loading rubert MLM from {RUBERT_LOCAL_PATH}...")
-        model = ORTModelForMaskedLM.from_pretrained(RUBERT_LOCAL_PATH)
-        tokenizer = AutoTokenizer.from_pretrained(RUBERT_LOCAL_PATH)
+        model = AutoModelForMaskedLM.from_pretrained(model_name)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         _rubert_mlm = {"model": model, "tokenizer": tokenizer}
-        logger.info("[SharedModel] rubert MLM loaded successfully (~40MB)")
+        logger.info("[SharedModel] rubert MLM loaded successfully")
         
     except ImportError as e:
-        logger.warning(f"[SharedModel] rubert requires optimum: {e}")
+        logger.warning(f"[SharedModel] rubert requires transformers + torch: {e}")
     except Exception as e:
         logger.error(f"[SharedModel] Failed to load rubert MLM: {e}")
     finally:
