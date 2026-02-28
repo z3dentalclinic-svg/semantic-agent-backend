@@ -29,3 +29,7 @@ babel
 # L2 Perplexity Classifier (Dual Cosine)
 fastembed>=0.7.0
 onnxruntime>=1.17.0
+
+# L2 rubert-tiny2 MLM (substitution test)
+# torch ставится и удаляется в build.sh (только для ONNX экспорта)
+optimum[onnxruntime]>=1.17.0
