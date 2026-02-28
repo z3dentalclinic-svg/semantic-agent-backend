@@ -210,18 +210,29 @@ class L2Classifier:
         l0_trace = l0_result.get("_l0_trace", [])
         l0_signals = self._parse_l0_signals(l0_trace)
         
-        # === Извлекаем хвосты ===
+        # === Build keyword→tail lookup from L0 trace ===
+        # L0 trace содержит правильно извлечённые хвосты.
+        # keywords_grey может содержать строки (полные запросы),
+        # поэтому lookup через _l0_trace критичен.
+        l0_tail_lookup = {}
+        for rec in l0_trace:
+            kw_lower = rec.get("keyword", "").lower().strip()
+            tail = rec.get("tail", "")
+            if kw_lower and tail:
+                l0_tail_lookup[kw_lower] = tail
+        
+        # === Извлекаем хвосты GREY ===
         grey_tails = []
         tail_to_kw = {}
         kw_to_tail = {}
         
         for kw in grey_keywords:
             if isinstance(kw, dict):
-                tail = kw.get("tail") or kw.get("keyword", "")
-                keyword = kw.get("keyword", tail)
+                keyword = kw.get("keyword", kw.get("query", ""))
+                tail = kw.get("tail") or l0_tail_lookup.get(keyword.lower().strip(), keyword)
             else:
-                tail = str(kw)
-                keyword = tail
+                keyword = str(kw)
+                tail = l0_tail_lookup.get(keyword.lower().strip(), keyword)
             
             if tail:
                 grey_tails.append(tail)
@@ -232,9 +243,11 @@ class L2Classifier:
         valid_tails = []
         for kw in l0_valid_keywords:
             if isinstance(kw, dict):
-                tail = kw.get("tail") or kw.get("keyword", "")
+                keyword = kw.get("keyword", kw.get("query", ""))
+                tail = kw.get("tail") or l0_tail_lookup.get(keyword.lower().strip(), keyword)
             else:
-                tail = str(kw)
+                keyword = str(kw)
+                tail = l0_tail_lookup.get(keyword.lower().strip(), keyword)
             if tail:
                 valid_tails.append(tail)
         
