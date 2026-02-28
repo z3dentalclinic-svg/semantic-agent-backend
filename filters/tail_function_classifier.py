@@ -70,7 +70,7 @@ SIGNAL_WEIGHTS = {
     'mixed_alpha':     0.9,    # смешанные алфавиты
     'standalone_num':  0.7,    # голое число — может ошибиться (модели)
     'incoherent_tail': 0.85,   # многословный хвост с "чужими" словами
-    'category_mismatch': 0.9,  # категория tail несовместима с seed (еда vs запчасти)
+    'category_mismatch': 0.5,  # мягкий — embeddings ненадёжно классифицируют категории
     'truncated_geo':     0.85,  # обрезанный составной город — довольно надёжно
     'orphan_genitive':   0.5,   # мягкий — может быть валидным ("фильтров")
     'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
@@ -352,7 +352,7 @@ class TailFunctionClassifier:
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
-            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha', 'category_mismatch'}
+            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha'}
             has_hard_negative = bool(set(negative) & hard_negatives)
             
             # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
