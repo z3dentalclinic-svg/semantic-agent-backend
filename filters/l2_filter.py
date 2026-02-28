@@ -315,7 +315,7 @@ class L2Classifier:
         if valid_tails:
             try:
                 knn_scores = self._compute_knn_scores(
-                    grey_tails, valid_tails, k=cfg.knn_k
+                    grey_tails, valid_tails, k=self.config.knn_k
                 )
             except Exception as e:
                 logger.warning(f"L2: KNN failed: {e}")
