@@ -1,28 +1,45 @@
 """
-L2 Filter — Semantic Classifier (Dual Cosine)
+L2 Filter — Tri-Signal Classifier (PMI + Centroid + L0 signals)
 
-Слой 2 фильтрации: обрабатывает GREY хвосты из L0 через embeddings.
+Слой 2 фильтрации: обрабатывает GREY хвосты из L0.
 
-Два сигнала:
-1. Combined: cosine(embed(seed), embed(seed + tail))
-   - Высокий = tail хорошо дополняет seed
-   
-2. Direct: cosine(embed(seed), embed(tail))
-   - Средний/высокий = tail семантически связан с seed
+Три сигнала:
+1. PMI (Pointwise Mutual Information) — частотность слов хвоста в батче.
+   Слова из валидных хвостов встречаются чаще. "Купить", "гелевый", "50 кубов"
+   появляются в десятках ключей. "Жиклеры", "жало" — единичные.
 
-Модель: paraphrase-multilingual-MiniLM-L12-v2 (~470MB ONNX через fastembed)
+2. Centroid distance — cosine distance хвоста до центроида L0 VALID кластера.
+   Центроид = средний вектор всех L0 VALID хвостов.
+   "Литиевый" близок к центроиду (рядом с "гелевый", "цена").
+   "Жиклеры" далеко.
+
+3. L0 negative signals — структурные red flags от L0.
+   orphan_genitive, single_infinitive, incoherent_tail и т.д.
+   Учитываем ТОЛЬКО если нет позитивных сигналов ("pure negative").
+   Если есть и pos и neg — сигналы гасятся, считаем нейтрально.
+
+Решение:
+- PMI ≥ порог И нет L0 pure-neg → VALID
+- PMI ≥ порог НО L0 pure-neg → конфликт → GREY (→ L3)
+- PMI < порог, centroid ≥ порог, нет L0 pure-neg → VALID  
+- L0 pure-neg + centroid < порог → TRASH
+- PMI low + centroid low → TRASH
+- Остальное → GREY (→ L3 LLM)
 
 Результат:
 - VALID → добавляется к keywords
 - TRASH → добавляется к anchors  
-- GREY → остаётся для L3 (DeepSeek API)
+- GREY → остаётся для L3 (DeepSeek API, ≤5% от входа)
 """
 
 import os
 import json
+import math
 import logging
 from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from collections import Counter
+
 import numpy as np
 
 from .shared_model import get_embedding_model
@@ -34,50 +51,23 @@ logger = logging.getLogger(__name__)
 class L2Config:
     """Конфигурация L2 классификатора."""
     
-    # Модель fastembed
-    # Варианты: 
-    #   "intfloat/multilingual-e5-large" (~560MB, лучше качество)
-    #   "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (~470MB)
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     
-    # Пороги для Cosine Combined (seed vs seed+tail)
-    # Высокий = tail хорошо дополняет seed
-    combined_valid_threshold: float = 0.92   # выше → VALID
-    combined_trash_threshold: float = 0.75   # ниже → TRASH
+    # PMI порог: выше → автоматически VALID (если нет L0 pure-neg)
+    pmi_valid_threshold: float = 2.5
     
-    # Пороги для Cosine Direct (seed vs tail)
-    # Средний = tail семантически связан с seed
-    direct_valid_threshold: float = 0.50    # выше → VALID
-    direct_trash_threshold: float = 0.25    # ниже → TRASH
+    # Centroid distance порог: выше → VALID (для PMI < pmi_valid)
+    centroid_valid_threshold: float = 0.55
+    # Centroid distance: ниже → TRASH (при L0 pure-neg или PMI low)
+    centroid_trash_threshold: float = 0.40
     
-    # Веса для combined scoring
-    combined_weight: float = 0.6
-    direct_weight: float = 0.4
-    
-    # Итоговые пороги (weighted sum)
-    final_valid_threshold: float = 0.70
-    final_trash_threshold: float = 0.45
-    
-    # Режим: "weighted" | "conservative" | "any_trash"
-    # weighted: взвешенная сумма двух сигналов
-    # conservative: оба сигнала должны согласиться
-    # any_trash: если хоть один сигнал = TRASH → TRASH
-    combination_mode: str = "conservative"
-    
-    # Кэш
     cache_file: str = "l2_cache.json"
 
 
 class L2Classifier:
     """
-    Слой 2: Dual Cosine классификатор через fastembed.
-    
-    Два сигнала:
-    1. Combined: cosine(embed(seed), embed(seed + tail))
-    2. Direct: cosine(embed(seed), embed(tail))
-    
-    Принимает GREY хвосты от L0, возвращает VALID/GREY/TRASH.
-    GREY остаётся для L3 (DeepSeek API).
+    Слой 2: Tri-Signal классификатор.
+    PMI + Centroid Distance + L0 Signals.
     """
     
     def __init__(self, config: Optional[L2Config] = None):
@@ -87,7 +77,6 @@ class L2Classifier:
         self._load_cache()
     
     def _load_cache(self):
-        """Загрузить кэш из файла."""
         if os.path.exists(self.config.cache_file):
             try:
                 with open(self.config.cache_file, 'r', encoding='utf-8') as f:
@@ -97,7 +86,6 @@ class L2Classifier:
                 logger.warning(f"Failed to load cache: {e}")
     
     def _save_cache(self):
-        """Сохранить кэш в файл."""
         try:
             with open(self.config.cache_file, 'w', encoding='utf-8') as f:
                 json.dump(self._cache, f, ensure_ascii=False)
@@ -110,194 +98,95 @@ class L2Classifier:
         if self._embedder is None:
             self._embedder = get_embedding_model()
             if self._embedder is None:
-                raise RuntimeError("L2 classifier unavailable: embedding model failed to load")
+                raise RuntimeError("L2: embedding model failed to load")
         return self._embedder
     
     @property
     def is_available(self) -> bool:
-        """Проверить доступность L2 классификатора."""
         try:
             _ = self.embedder
             return True
         except Exception:
             return False
     
+    # =========================================================
+    # SIGNAL 1: PMI (Batch Word Frequency)
+    # =========================================================
+    
+    def _compute_word_df(self, all_tails: List[str]) -> Counter:
+        """
+        Document frequency: в скольких хвостах встречается каждое слово.
+        """
+        word_df = Counter()
+        for tail in all_tails:
+            for w in set(tail.lower().split()):
+                word_df[w] += 1
+        return word_df
+    
+    def _pmi_score(self, tail: str, word_df: Counter) -> float:
+        """
+        PMI score = средний log2(df+1) контентных слов хвоста.
+        
+        Высокий = domain-relevant слова. Низкий = редкие/подозрительные.
+        """
+        words = tail.lower().split()
+        content = [w for w in words if len(w) > 2 or w.isdigit()]
+        if not content:
+            content = words
+        if not content:
+            return 0.0
+        return sum(math.log2(word_df.get(w, 0) + 1) for w in content) / len(content)
+    
+    # =========================================================
+    # SIGNAL 2: Centroid Distance
+    # =========================================================
+    
     def _normalize(self, v: np.ndarray) -> np.ndarray:
-        """L2 normalize vector."""
         norm = np.linalg.norm(v)
         return v / norm if norm > 0 else v
     
-    def _compute_scores(self, seed: str, tails: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Вычислить два cosine scores для каждого tail.
-        
-        Returns:
-            (combined_scores, direct_scores)
-        """
-        # Для paraphrase-multilingual prefix не нужен
-        # (E5 модели требуют "query: ", но MiniLM — нет)
-        seed_text = seed
-        combined_texts = [f"{seed} {tail}" for tail in tails]
-        tail_texts = tails
-        
-        # Собираем все тексты для батч-эмбеддинга
-        all_texts = [seed_text] + combined_texts + tail_texts
-        
-        # fastembed возвращает generator, конвертируем в list
-        embeddings = list(self.embedder.embed(all_texts))
-        embeddings = np.array(embeddings)
-        
-        # Разбираем результаты
-        seed_emb = self._normalize(embeddings[0])
-        combined_embs = embeddings[1:len(tails)+1]
-        tail_embs = embeddings[len(tails)+1:]
-        
-        # Нормализуем
-        combined_embs = np.array([self._normalize(e) for e in combined_embs])
-        tail_embs = np.array([self._normalize(e) for e in tail_embs])
-        
-        # Cosine similarities (dot product нормализованных векторов)
-        combined_scores = np.dot(combined_embs, seed_emb)
-        direct_scores = np.dot(tail_embs, seed_emb)
-        
-        return combined_scores, direct_scores
+    def _compute_centroid(self, valid_tails: List[str]) -> Optional[np.ndarray]:
+        """Центроид = нормализованный средний вектор L0 VALID хвостов."""
+        if not valid_tails:
+            return None
+        embs = np.array(list(self.embedder.embed(valid_tails)))
+        embs = np.array([self._normalize(e) for e in embs])
+        centroid = np.mean(embs, axis=0)
+        return self._normalize(centroid)
     
-    def _classify_single(
-        self,
-        combined_score: float,
-        direct_score: float
-    ) -> Tuple[str, dict]:
-        """
-        Классифицировать один хвост по двум сигналам.
-        
-        Returns:
-            (label, debug_info)
-        """
-        cfg = self.config
-        debug = {
-            "combined": round(combined_score, 4),
-            "direct": round(direct_score, 4)
-        }
-        
-        # Определяем голоса каждого сигнала
-        combined_vote = (
-            "VALID" if combined_score >= cfg.combined_valid_threshold
-            else "TRASH" if combined_score < cfg.combined_trash_threshold
-            else "GREY"
-        )
-        direct_vote = (
-            "VALID" if direct_score >= cfg.direct_valid_threshold
-            else "TRASH" if direct_score < cfg.direct_trash_threshold
-            else "GREY"
-        )
-        
-        debug["combined_vote"] = combined_vote
-        debug["direct_vote"] = direct_vote
-        
-        if cfg.combination_mode == "conservative":
-            # Оба сигнала должны согласиться
-            if combined_vote == direct_vote:
-                return combined_vote, debug
-            else:
-                return "GREY", debug
-        
-        elif cfg.combination_mode == "any_trash":
-            # Агрессивная фильтрация: если хоть один = TRASH → TRASH
-            if combined_vote == "TRASH" or direct_vote == "TRASH":
-                return "TRASH", debug
-            elif combined_vote == "VALID" and direct_vote == "VALID":
-                return "VALID", debug
-            else:
-                return "GREY", debug
-        
-        else:  # weighted
-            # Взвешенная сумма
-            weighted = (
-                cfg.combined_weight * combined_score +
-                cfg.direct_weight * direct_score
-            )
-            debug["weighted"] = round(weighted, 4)
-            
-            if weighted >= cfg.final_valid_threshold:
-                return "VALID", debug
-            elif weighted < cfg.final_trash_threshold:
-                return "TRASH", debug
-            return "GREY", debug
+    def _centroid_distances(self, tails: List[str], centroid: np.ndarray) -> np.ndarray:
+        """Cosine distance каждого хвоста до центроида."""
+        if centroid is None:
+            return np.full(len(tails), 0.5)
+        embs = np.array(list(self.embedder.embed(tails)))
+        embs = np.array([self._normalize(e) for e in embs])
+        return np.dot(embs, centroid)
     
-    def classify_tails(
-        self,
-        seed: str,
-        tails: List[str],
-        return_debug: bool = False
-    ) -> Dict[str, List]:
+    # =========================================================
+    # SIGNAL 3: L0 Signals
+    # =========================================================
+    
+    def _parse_l0_signals(self, l0_trace: List[dict]) -> Dict[str, dict]:
         """
-        Классифицировать список хвостов.
-        
-        Args:
-            seed: Базовый запрос
-            tails: Список хвостов для классификации
-            return_debug: Включить debug info для калибровки
-        
-        Returns:
-            {
-                "valid": [{"tail": ..., "debug": ...}, ...],
-                "grey": [...],
-                "trash": [...]
+        Парсим L0 trace → для каждого keyword:
+        positive, negative, pure_neg (neg без pos).
+        """
+        result = {}
+        for trace in l0_trace:
+            kw = trace.get("keyword", "")
+            signals = trace.get("signals", [])
+            neg = [s.lstrip('-') for s in signals if s.startswith('-')]
+            pos = [s for s in signals if not s.startswith('-')]
+            result[kw] = {
+                "positive": pos,
+                "negative": neg,
+                "pure_neg": bool(neg) and not bool(pos),
             }
-        """
-        if not tails:
-            return {"valid": [], "grey": [], "trash": []}
-        
-        # Проверяем кэш
-        uncached_tails = []
-        uncached_indices = []
-        results = [None] * len(tails)
-        
-        for i, tail in enumerate(tails):
-            cache_key = f"{seed}||{tail}".lower()
-            if cache_key in self._cache:
-                cached = self._cache[cache_key]
-                results[i] = (cached["label"], cached.get("debug", {}))
-            else:
-                uncached_tails.append(tail)
-                uncached_indices.append(i)
-        
-        cache_hits = len(tails) - len(uncached_tails)
-        if cache_hits:
-            logger.info(f"Cache: {cache_hits} hits, {len(uncached_tails)} misses")
-        
-        # Вычисляем для некэшированных
-        if uncached_tails:
-            combined_scores, direct_scores = self._compute_scores(seed, uncached_tails)
-            
-            # Классифицируем
-            for i, (tail, comb, direct) in enumerate(zip(uncached_tails, combined_scores, direct_scores)):
-                label, debug = self._classify_single(float(comb), float(direct))
-                idx = uncached_indices[i]
-                results[idx] = (label, debug)
-                
-                # Кэшируем
-                cache_key = f"{seed}||{tail}".lower()
-                self._cache[cache_key] = {"label": label, "debug": debug}
-            
-            self._save_cache()
-        
-        # Группируем результаты
-        output = {"valid": [], "grey": [], "trash": []}
-        
-        for tail, (label, debug) in zip(tails, results):
-            entry = {"tail": tail}
-            if return_debug:
-                entry["debug"] = debug
-            output[label.lower()].append(entry)
-        
-        logger.info(
-            f"L2 Results: {len(output['valid'])} VALID, "
-            f"{len(output['grey'])} GREY, "
-            f"{len(output['trash'])} TRASH"
-        )
-        
-        return output
+        return result
+    
+    # =========================================================
+    # MAIN: Classify L0 result
+    # =========================================================
     
     def classify_l0_result(
         self,
@@ -305,97 +194,138 @@ class L2Classifier:
         seed: str
     ) -> Dict[str, Any]:
         """
-        Обработать результат L0, классифицировать GREY.
-        
-        Args:
-            l0_result: Результат от L0 с keywords_grey и _l0_trace
-            seed: Базовый запрос
-        
-        Returns:
-            Обновлённый результат с L2 классификацией
-        
-        Note:
-            Если L0 пометил GREY с негативными сигналами (orphan_genitive,
-            single_infinitive и т.д.), L2 НЕ может промоутить в VALID.
-            Максимум GREY → уходит в L3 для семантического решения.
+        Обработать результат L0, классифицировать GREY через три сигнала.
         """
         grey_keywords = l0_result.get("keywords_grey", [])
+        l0_valid_keywords = l0_result.get("keywords", [])
         
-        # === Собираем L0 сигналы для каждого keyword ===
+        if not grey_keywords:
+            logger.info("L2: No GREY to process")
+            return l0_result
+        
+        # === Parse L0 signals ===
         l0_trace = l0_result.get("_l0_trace", [])
-        l0_negative_signals: Dict[str, List[str]] = {}
-        l0_positive_signals: Dict[str, List[str]] = {}
-        for trace in l0_trace:
-            kw = trace.get("keyword", "")
-            signals = trace.get("signals", [])
-            neg = [s.lstrip('-') for s in signals if s.startswith('-')]
-            pos = [s for s in signals if not s.startswith('-')]
-            if neg:
-                l0_negative_signals[kw] = neg
-            if pos:
-                l0_positive_signals[kw] = pos
+        l0_signals = self._parse_l0_signals(l0_trace)
         
-        # Извлекаем хвосты
-        tails = []
+        # === Извлекаем хвосты ===
+        grey_tails = []
         tail_to_kw = {}
+        kw_to_tail = {}
         
         for kw in grey_keywords:
             if isinstance(kw, dict):
                 tail = kw.get("tail") or kw.get("keyword", "")
+                keyword = kw.get("keyword", tail)
             else:
                 tail = str(kw)
+                keyword = tail
             
             if tail:
-                tails.append(tail)
+                grey_tails.append(tail)
                 tail_to_kw[tail] = kw
+                kw_to_tail[keyword] = tail
         
-        if not tails:
-            logger.info("No GREY tails to classify")
-            return l0_result
+        # L0 VALID хвосты для centroid + PMI
+        valid_tails = []
+        for kw in l0_valid_keywords:
+            if isinstance(kw, dict):
+                tail = kw.get("tail") or kw.get("keyword", "")
+            else:
+                tail = str(kw)
+            if tail:
+                valid_tails.append(tail)
         
-        # Классифицируем
-        classified = self.classify_tails(seed, tails, return_debug=True)
+        logger.info(
+            f"L2: {len(grey_tails)} GREY, "
+            f"centroid from {len(valid_tails)} L0 VALID"
+        )
         
-        # === Понижаем VALID → GREY ===
-        # Два правила:
-        # 1. L0 имел негативные сигналы → L2 не может переспорить
-        # 2. L0 не дал НИ ОДНОГО позитивного сигнала → cosine недостаточен
-        #    для промоута, нужно семантическое подтверждение от L3
-        downgraded = []
-        still_valid = []
+        # === SIGNAL 1: PMI ===
+        all_tails_for_df = valid_tails + grey_tails
+        word_df = self._compute_word_df(all_tails_for_df)
+        pmi_scores = {tail: self._pmi_score(tail, word_df) for tail in grey_tails}
         
-        for item in classified["valid"]:
-            tail = item["tail"]
+        # === SIGNAL 2: Centroid Distance ===
+        centroid_scores = {}
+        if valid_tails:
+            try:
+                centroid = self._compute_centroid(valid_tails)
+                distances = self._centroid_distances(grey_tails, centroid)
+                centroid_scores = {
+                    tail: float(dist) 
+                    for tail, dist in zip(grey_tails, distances)
+                }
+            except Exception as e:
+                logger.warning(f"L2: Centroid failed: {e}")
+                centroid_scores = {tail: 0.5 for tail in grey_tails}
+        else:
+            logger.warning("L2: No L0 VALID for centroid, using PMI only")
+            centroid_scores = {tail: 0.5 for tail in grey_tails}
+        
+        # === TRI-SIGNAL DECISION ===
+        cfg = self.config
+        classified = {"valid": [], "grey": [], "trash": []}
+        
+        for tail in grey_tails:
             kw = tail_to_kw.get(tail)
             keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
             
-            l0_neg = l0_negative_signals.get(keyword, [])
-            l0_pos = l0_positive_signals.get(keyword, [])
+            pmi = pmi_scores.get(tail, 0)
+            cdist = centroid_scores.get(tail, 0.5)
+            l0_sig = l0_signals.get(keyword, {
+                "positive": [], "negative": [], "pure_neg": False
+            })
+            pure_neg = l0_sig["pure_neg"]
             
-            if l0_neg:
-                # Правило 1: L0 нашёл структурную проблему
-                item_debug = item.get("debug", {})
-                item_debug["l2_original"] = "VALID"
-                item_debug["downgraded_by"] = f"L0 negative: {', '.join(l0_neg)}"
-                downgraded.append(item)
-                logger.debug(f"L2 downgrade: '{tail}' VALID→GREY (L0 neg: {l0_neg})")
-            elif not l0_pos:
-                # Правило 2: L0 не нашёл ничего хорошего — cosine не хватит
-                item_debug = item.get("debug", {})
-                item_debug["l2_original"] = "VALID"
-                item_debug["downgraded_by"] = "no L0 positive signals"
-                downgraded.append(item)
-                logger.debug(f"L2 downgrade: '{tail}' VALID→GREY (no L0 positives)")
+            debug = {
+                "pmi": round(pmi, 3),
+                "centroid_dist": round(cdist, 4),
+                "l0_pos": l0_sig["positive"],
+                "l0_neg": l0_sig["negative"],
+                "pure_neg": pure_neg,
+            }
+            
+            # --- Decision rules ---
+            label = "GREY"
+            reason = ""
+            
+            # R1: High PMI + no pure negative → VALID
+            if pmi >= cfg.pmi_valid_threshold and not pure_neg:
+                label = "VALID"
+                reason = f"PMI {pmi:.2f} >= {cfg.pmi_valid_threshold}"
+            
+            # R2: High PMI + pure negative → conflict → GREY (→ LLM)
+            elif pmi >= cfg.pmi_valid_threshold and pure_neg:
+                label = "GREY"
+                reason = f"Conflict: PMI {pmi:.2f} high, L0 pure-neg"
+            
+            # R3: Low PMI, high centroid, no pure neg → VALID
+            elif cdist >= cfg.centroid_valid_threshold and not pure_neg:
+                label = "VALID"
+                reason = f"Centroid {cdist:.3f} >= {cfg.centroid_valid_threshold}"
+            
+            # R4: Pure neg + low centroid → TRASH
+            elif pure_neg and cdist < cfg.centroid_trash_threshold:
+                label = "TRASH"
+                reason = f"Pure-neg + centroid {cdist:.3f} < {cfg.centroid_trash_threshold}"
+            
+            # R5: Low PMI + low centroid → TRASH
+            elif pmi < cfg.pmi_valid_threshold and cdist < cfg.centroid_trash_threshold:
+                label = "TRASH"
+                reason = f"PMI {pmi:.2f} low + centroid {cdist:.3f} low"
+            
+            # R6: Everything else → GREY (→ LLM)
             else:
-                still_valid.append(item)
+                label = "GREY"
+                reason = f"Uncertain: PMI {pmi:.2f}, centroid {cdist:.3f}"
+            
+            debug["decision"] = reason
+            classified[label.lower()].append({"tail": tail, "debug": debug})
         
-        classified["valid"] = still_valid
-        classified["grey"] = classified["grey"] + downgraded
-        
-        # Собираем результат
+        # === Assemble result ===
         result = l0_result.copy()
         
-        # VALID из L0 + VALID из L2
+        # VALID: L0 + L2
         l2_valid = [
             tail_to_kw[item["tail"]]
             for item in classified["valid"]
@@ -403,7 +333,7 @@ class L2Classifier:
         ]
         result["keywords"] = l0_result.get("keywords", []) + l2_valid
         
-        # TRASH из L0 + TRASH из L2
+        # TRASH: L0 + L2
         l2_trash = []
         for item in classified["trash"]:
             tail = item["tail"]
@@ -415,16 +345,14 @@ class L2Classifier:
                     kw["l2_debug"] = item.get("debug", {})
                 else:
                     kw = {
-                        "keyword": kw,
-                        "tail": tail,
+                        "keyword": kw, "tail": tail,
                         "anchor_reason": "L2_TRASH",
                         "l2_debug": item.get("debug", {})
                     }
                 l2_trash.append(kw)
-        
         result["anchors"] = l0_result.get("anchors", []) + l2_trash
         
-        # GREY остаётся для L3
+        # GREY → L3
         l2_grey = [
             tail_to_kw[item["tail"]]
             for item in classified["grey"]
@@ -432,45 +360,52 @@ class L2Classifier:
         ]
         result["keywords_grey"] = l2_grey
         
-        # Статистика
+        # Stats
         result["l2_stats"] = {
-            "input_grey": len(tails),
+            "input_grey": len(grey_tails),
+            "l0_valid_for_centroid": len(valid_tails),
             "l2_valid": len(classified["valid"]),
             "l2_trash": len(classified["trash"]),
             "l2_grey": len(classified["grey"]),
-            "l2_downgraded": len(downgraded),
             "reduction_pct": round(
-                (1 - len(classified["grey"]) / len(tails)) * 100, 1
-            ) if tails else 0
+                (1 - len(classified["grey"]) / len(grey_tails)) * 100, 1
+            ) if grey_tails else 0
         }
         
-        # Детальный трейс L2 для каждого ключа
+        # Detailed trace
         l2_trace = []
-        for category, label in [("valid", "VALID"), ("trash", "TRASH"), ("grey", "GREY")]:
+        for category, lbl in [("valid", "VALID"), ("trash", "TRASH"), ("grey", "GREY")]:
             for item in classified[category]:
                 tail = item["tail"]
                 debug = item.get("debug", {})
                 kw = tail_to_kw.get(tail)
                 keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
                 l2_trace.append({
-                    "keyword": keyword,
-                    "tail": tail,
-                    "label": label,
-                    "combined_score": debug.get("combined", 0),
-                    "direct_score": debug.get("direct", 0),
-                    "combined_vote": debug.get("combined_vote", ""),
-                    "direct_vote": debug.get("direct_vote", ""),
+                    "keyword": keyword, "tail": tail, "label": lbl,
+                    "pmi": debug.get("pmi", 0),
+                    "centroid_dist": debug.get("centroid_dist", 0),
+                    "l0_pos": debug.get("l0_pos", []),
+                    "l0_neg": debug.get("l0_neg", []),
+                    "decision": debug.get("decision", ""),
                 })
         result["_l2_trace"] = l2_trace
+        
+        stats = result["l2_stats"]
+        logger.info(
+            f"L2: {stats['l2_valid']} VALID, "
+            f"{stats['l2_trash']} TRASH, "
+            f"{stats['l2_grey']} GREY→L3 "
+            f"({stats['reduction_pct']}% reduction)"
+        )
         
         return result
 
 
-# === Singleton instance для использования в main.py ===
+# === Singleton ===
 _l2_instance: Optional[L2Classifier] = None
 
+
 def get_l2_classifier(config: Optional[L2Config] = None) -> L2Classifier:
-    """Получить singleton instance L2 классификатора."""
     global _l2_instance
     if _l2_instance is None:
         _l2_instance = L2Classifier(config)
@@ -483,230 +418,28 @@ def apply_l2_filter(
     enable_l2: bool = True,
     config: Optional[L2Config] = None
 ) -> Dict[str, Any]:
-    """
-    Обёртка для применения L2 фильтра к результату L0.
-    
-    Args:
-        l0_result: Результат от apply_l0_filter с keywords_grey
-        seed: Базовый запрос
-        enable_l2: Включить L2 (False = passthrough)
-        config: Кастомный L2Config (пороги из UI). None = дефолтные пороги.
-    
-    Returns:
-        Результат с классифицированными GREY:
-        - keywords: VALID из L0 + VALID из L2
-        - anchors: TRASH из L0 + TRASH из L2
-        - keywords_grey: оставшиеся GREY для L3
-        - l2_stats: статистика L2
-        - l2_config: использованные пороги
-    
-    Note:
-        При ошибке L2 возвращает l0_result без изменений (graceful degradation).
-    """
+    """Обёртка для применения L2 фильтра к результату L0."""
     if not enable_l2:
         return l0_result
     
     grey_count = len(l0_result.get("keywords_grey", []))
     if grey_count == 0:
-        logger.info("L2: No GREY to process, skipping")
         return l0_result
     
     try:
-        logger.info(f"L2: Processing {grey_count} GREY keywords")
-        
         classifier = get_l2_classifier()
-        
-        # Применяем кастомный config если передан
         if config is not None:
             classifier.config = config
-            logger.info(f"L2: Using custom config: mode={config.combination_mode}, comb_valid={config.combined_valid_threshold}, comb_trash={config.combined_trash_threshold}")
         
         result = classifier.classify_l0_result(l0_result, seed)
-        
-        # Добавляем использованные пороги в результат
-        used_config = classifier.config
         result["l2_config"] = {
-            "combined_valid_threshold": used_config.combined_valid_threshold,
-            "combined_trash_threshold": used_config.combined_trash_threshold,
-            "direct_valid_threshold": used_config.direct_valid_threshold,
-            "direct_trash_threshold": used_config.direct_trash_threshold,
-            "combination_mode": used_config.combination_mode,
+            "pmi_valid_threshold": classifier.config.pmi_valid_threshold,
+            "centroid_valid_threshold": classifier.config.centroid_valid_threshold,
+            "centroid_trash_threshold": classifier.config.centroid_trash_threshold,
         }
-        
-        stats = result.get("l2_stats", {})
-        logger.info(
-            f"L2: {stats.get('l2_valid', 0)} VALID, "
-            f"{stats.get('l2_trash', 0)} TRASH, "
-            f"{stats.get('l2_grey', 0)} GREY remaining "
-            f"({stats.get('reduction_pct', 0)}% reduction)"
-        )
-        
         return result
     
     except Exception as e:
-        logger.error(f"L2: Failed to classify, returning L0 result unchanged: {e}")
+        logger.error(f"L2: Failed: {e}")
         l0_result["l2_error"] = str(e)
         return l0_result
-
-
-# === CLI для тестирования и калибровки ===
-
-def test_classifier():
-    """Тест на примерах из контекста."""
-    
-    classifier = L2Classifier()
-    
-    seed = "аккумулятор на скутер"
-    
-    # Тестовые хвосты разных категорий
-    test_tails = [
-        # Ожидаем VALID (характеристики, модели, действия)
-        "гелевый",
-        "12 вольт",
-        "литиевый",
-        "купить",
-        "цена",
-        "honda dio",
-        "ямаха",
-        
-        # Ожидаем TRASH (мусор, нерелевантное)
-        "щербет",
-        "жало",
-        "навигатор",
-        "макита",  # cross-domain brand
-        
-        # Спорные (GREY → L3)
-        "чертеж",
-        "жалобы",
-        "из чего состоит",
-        "нужны ли права",
-    ]
-    
-    print(f"\nSeed: {seed}")
-    print(f"Testing {len(test_tails)} tails...\n")
-    
-    results = classifier.classify_tails(seed, test_tails, return_debug=True)
-    
-    print("=== VALID ===")
-    for item in results["valid"]:
-        d = item["debug"]
-        print(f"  {item['tail']:20} | comb={d['combined']:.3f} ({d.get('combined_vote','')}) direct={d['direct']:.3f} ({d.get('direct_vote','')})")
-    
-    print("\n=== GREY ===")
-    for item in results["grey"]:
-        d = item["debug"]
-        print(f"  {item['tail']:20} | comb={d['combined']:.3f} ({d.get('combined_vote','')}) direct={d['direct']:.3f} ({d.get('direct_vote','')})")
-    
-    print("\n=== TRASH ===")
-    for item in results["trash"]:
-        d = item["debug"]
-        print(f"  {item['tail']:20} | comb={d['combined']:.3f} ({d.get('combined_vote','')}) direct={d['direct']:.3f} ({d.get('direct_vote','')})")
-
-
-def calibrate_thresholds(
-    seed: str,
-    labeled_data: List[Tuple[str, str]]  # [(tail, expected_label), ...]
-):
-    """
-    Калибровка порогов на размеченных данных.
-    
-    Выводит распределение scores для каждого класса
-    чтобы подобрать оптимальные пороги.
-    """
-    classifier = L2Classifier()
-    
-    tails = [t for t, _ in labeled_data]
-    labels = {t: l for t, l in labeled_data}
-    
-    results = classifier.classify_tails(seed, tails, return_debug=True)
-    
-    # Собираем scores по ожидаемым классам
-    scores_by_expected = {"VALID": [], "GREY": [], "TRASH": []}
-    
-    all_items = results["valid"] + results["grey"] + results["trash"]
-    
-    for item in all_items:
-        tail = item["tail"]
-        expected = labels.get(tail, "UNKNOWN")
-        if expected in scores_by_expected:
-            scores_by_expected[expected].append({
-                "tail": tail,
-                "combined": item["debug"]["combined"],
-                "direct": item["debug"]["direct"],
-                "predicted": item["debug"].get("combined_vote", "")
-            })
-    
-    print(f"\n{'='*60}")
-    print(f"Calibration for seed: {seed}")
-    print(f"{'='*60}\n")
-    
-    for label in ["VALID", "TRASH", "GREY"]:
-        items = scores_by_expected[label]
-        if not items:
-            continue
-        
-        combined = [x["combined"] for x in items]
-        direct = [x["direct"] for x in items]
-        
-        print(f"{label} ({len(items)} samples):")
-        print(f"  Combined: min={min(combined):.3f} max={max(combined):.3f} mean={np.mean(combined):.3f}")
-        print(f"  Direct:   min={min(direct):.3f} max={max(direct):.3f} mean={np.mean(direct):.3f}")
-        
-        for item in items:
-            status = "✓" if item["predicted"] == label else "✗"
-            print(f"    {status} {item['tail']:20} comb={item['combined']:.3f} direct={item['direct']:.3f}")
-        print()
-
-
-def raw_scores(seed: str, tails: List[str]):
-    """
-    Вывести сырые scores без классификации.
-    Полезно для начальной калибровки порогов.
-    """
-    classifier = L2Classifier()
-    
-    combined_scores, direct_scores = classifier._compute_scores(seed, tails)
-    
-    print(f"\n{'='*60}")
-    print(f"Raw scores for seed: {seed}")
-    print(f"{'='*60}\n")
-    print(f"{'Tail':25} | {'Combined':>10} | {'Direct':>10}")
-    print("-" * 50)
-    
-    for tail, comb, direct in zip(tails, combined_scores, direct_scores):
-        print(f"{tail:25} | {comb:10.4f} | {direct:10.4f}")
-
-
-if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "calibrate":
-        # Пример калибровки
-        labeled = [
-            ("гелевый", "VALID"),
-            ("12 вольт", "VALID"),
-            ("ямаха", "VALID"),
-            ("купить", "VALID"),
-            ("литиевый", "VALID"),
-            ("honda dio", "VALID"),
-            ("щербет", "TRASH"),
-            ("макита", "TRASH"),
-            ("навигатор", "TRASH"),
-            ("жало", "TRASH"),
-            ("чертеж", "GREY"),
-            ("жалобы", "GREY"),
-            ("из чего состоит", "GREY"),
-        ]
-        calibrate_thresholds("аккумулятор на скутер", labeled)
-    
-    elif len(sys.argv) > 1 and sys.argv[1] == "raw":
-        # Сырые scores
-        tails = [
-            "гелевый", "12 вольт", "ямаха", "купить",
-            "щербет", "макита", "навигатор",
-            "чертеж", "жалобы", "из чего состоит"
-        ]
-        raw_scores("аккумулятор на скутер", tails)
-    
-    else:
-        test_classifier()
