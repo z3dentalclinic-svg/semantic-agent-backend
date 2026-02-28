@@ -328,12 +328,24 @@ class L2Classifier:
         # === Assemble result ===
         result = l0_result.copy()
         
-        # VALID: L0 + L2
-        l2_valid = [
-            tail_to_kw[item["tail"]]
-            for item in classified["valid"]
-            if item["tail"] in tail_to_kw
-        ]
+        # VALID: L0 + L2 (записываем l2 debug в каждый keyword)
+        l2_valid = []
+        for item in classified["valid"]:
+            tail = item["tail"]
+            if tail in tail_to_kw:
+                kw = tail_to_kw[tail]
+                if isinstance(kw, dict):
+                    kw = kw.copy()
+                debug = item.get("debug", {})
+                # l2 info в формате для output JSON
+                if isinstance(kw, dict):
+                    kw["l2"] = {
+                        "label": "VALID",
+                        "pmi": debug.get("pmi", 0),
+                        "centroid_dist": debug.get("centroid_dist", 0),
+                        "decision": debug.get("decision", ""),
+                    }
+                l2_valid.append(kw)
         result["keywords"] = l0_result.get("keywords", []) + l2_valid
         
         # TRASH: L0 + L2
@@ -355,12 +367,23 @@ class L2Classifier:
                 l2_trash.append(kw)
         result["anchors"] = l0_result.get("anchors", []) + l2_trash
         
-        # GREY → L3
-        l2_grey = [
-            tail_to_kw[item["tail"]]
-            for item in classified["grey"]
-            if item["tail"] in tail_to_kw
-        ]
+        # GREY → L3 (с l2 debug)
+        l2_grey = []
+        for item in classified["grey"]:
+            tail = item["tail"]
+            if tail in tail_to_kw:
+                kw = tail_to_kw[tail]
+                if isinstance(kw, dict):
+                    kw = kw.copy()
+                debug = item.get("debug", {})
+                if isinstance(kw, dict):
+                    kw["l2"] = {
+                        "label": "GREY",
+                        "pmi": debug.get("pmi", 0),
+                        "centroid_dist": debug.get("centroid_dist", 0),
+                        "decision": debug.get("decision", ""),
+                    }
+                l2_grey.append(kw)
         result["keywords_grey"] = l2_grey
         
         # Stats
@@ -375,7 +398,7 @@ class L2Classifier:
             ) if grey_tails else 0
         }
         
-        # Detailed trace
+        # Detailed trace (без underscore — чтобы не стрипилось)
         l2_trace = []
         for category, lbl in [("valid", "VALID"), ("trash", "TRASH"), ("grey", "GREY")]:
             for item in classified[category]:
@@ -391,7 +414,30 @@ class L2Classifier:
                     "l0_neg": debug.get("l0_neg", []),
                     "decision": debug.get("decision", ""),
                 })
-        result["_l2_trace"] = l2_trace
+        result["l2_trace"] = l2_trace
+        
+        # === Diagnostic dump ===
+        try:
+            diag_path = os.path.join(os.path.dirname(self.config.cache_file) or '.', 'l2_diagnostic.json')
+            diag = {
+                "config": {
+                    "pmi_valid_threshold": cfg.pmi_valid_threshold,
+                    "centroid_valid_threshold": cfg.centroid_valid_threshold,
+                    "centroid_trash_threshold": cfg.centroid_trash_threshold,
+                },
+                "stats": result["l2_stats"],
+                "centroid_dist_distribution": {
+                    "min": round(min(centroid_scores.values()), 4) if centroid_scores else 0,
+                    "max": round(max(centroid_scores.values()), 4) if centroid_scores else 0,
+                    "mean": round(sum(centroid_scores.values()) / len(centroid_scores), 4) if centroid_scores else 0,
+                },
+                "trace": l2_trace,
+            }
+            with open(diag_path, 'w', encoding='utf-8') as f:
+                json.dump(diag, f, ensure_ascii=False, indent=2)
+            logger.info(f"L2: Diagnostic dump → {diag_path}")
+        except Exception as e:
+            logger.warning(f"L2: Failed to write diagnostic: {e}")
         
         stats = result["l2_stats"]
         logger.info(
