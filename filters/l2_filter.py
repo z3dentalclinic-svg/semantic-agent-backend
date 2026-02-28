@@ -1,34 +1,35 @@
 """
-L2 Filter — Tri-Signal Classifier (PMI + Centroid + L0 signals)
+L2 Filter — Dual-Signal Classifier (PMI + KNN + L0 signals)
 
 Слой 2 фильтрации: обрабатывает GREY хвосты из L0.
 
-Три сигнала:
+Сигналы:
 1. PMI (Pointwise Mutual Information) — частотность слов хвоста в батче.
    Слова из валидных хвостов встречаются чаще. "Купить", "гелевый", "50 кубов"
    появляются в десятках ключей. "Жиклеры", "жало" — единичные.
 
-2. Centroid distance — cosine distance хвоста до центроида L0 VALID кластера.
-   Центроид = средний вектор всех L0 VALID хвостов.
-   "Литиевый" близок к центроиду (рядом с "гелевый", "цена").
-   "Жиклеры" далеко.
+2. KNN similarity — top-k mean cosine к L0 VALID хвостам.
+   "Похож ли хвост на что-то КОНКРЕТНОЕ из валидных?"
+   "гелевый" → top-3 mean к "литиевый","электрический","тяговый" ≈ 0.7+ → VALID.
+   "глушитель" → top-3 mean ≈ 0.25 → TRASH.
+   
+   [ЗАКОММЕНТИРОВАНО] Centroid distance — код остался, можно раскомментировать.
 
 3. L0 negative signals — структурные red flags от L0.
    orphan_genitive, single_infinitive, incoherent_tail и т.д.
    Учитываем ТОЛЬКО если нет позитивных сигналов ("pure negative").
-   Если есть и pos и neg — сигналы гасятся, считаем нейтрально.
 
 Решение:
 - PMI ≥ порог И нет L0 pure-neg → VALID
 - PMI ≥ порог НО L0 pure-neg → конфликт → GREY (→ L3)
-- PMI < порог, centroid ≥ порог, нет L0 pure-neg → VALID  
-- L0 pure-neg + centroid < порог → TRASH
-- PMI low + centroid low → TRASH
+- PMI < порог, KNN ≥ порог, нет L0 pure-neg → VALID
+- L0 pure-neg + KNN < порог → TRASH
+- PMI low + KNN low → TRASH
 - Остальное → GREY (→ L3 LLM)
 
 Результат:
 - VALID → добавляется к keywords
-- TRASH → добавляется к anchors  
+- TRASH → добавляется к anchors
 - GREY → остаётся для L3 (DeepSeek API, ≤5% от входа)
 """
 
@@ -56,18 +57,24 @@ class L2Config:
     # PMI порог: выше → автоматически VALID (если нет L0 pure-neg)
     pmi_valid_threshold: float = 2.5
     
-    # Centroid distance порог: выше → VALID (для PMI < pmi_valid)
-    centroid_valid_threshold: float = 0.65
-    # Centroid distance: ниже → TRASH (при L0 pure-neg или PMI low)
-    centroid_trash_threshold: float = 0.50
+    # KNN: top-k mean cosine similarity к L0 VALID хвостам
+    knn_k: int = 3
+    # KNN score: выше → VALID (для PMI < pmi_valid)
+    knn_valid_threshold: float = 0.70
+    # KNN score: ниже → TRASH
+    knn_trash_threshold: float = 0.35
+    
+    # --- CENTROID (закомментировано, раскомментировать для сравнения) ---
+    # centroid_valid_threshold: float = 0.65
+    # centroid_trash_threshold: float = 0.50
     
     cache_file: str = "l2_cache.json"
 
 
 class L2Classifier:
     """
-    Слой 2: Tri-Signal классификатор.
-    PMI + Centroid Distance + L0 Signals.
+    Слой 2: PMI + KNN классификатор.
+    PMI + KNN Similarity + L0 Signals.
     """
     
     def __init__(self, config: Optional[L2Config] = None):
@@ -128,7 +135,7 @@ class L2Classifier:
         PMI score = MIN log2(df+1) контентных слов хвоста.
         
         Используем min, не mean: если хоть одно слово редкое — PMI низкий.
-        "щетки купить" = min(2.0, 6.4) = 2.0 → centroid zone.
+        "щетки купить" = min(2.0, 6.4) = 2.0 → KNN zone.
         "купить гелевый" = min(6.4, 4.4) = 4.4 → VALID.
         """
         words = tail.lower().split()
@@ -141,29 +148,71 @@ class L2Classifier:
         return min(scores)
     
     # =========================================================
-    # SIGNAL 2: Centroid Distance
+    # SIGNAL 2: KNN Similarity (top-k mean cosine к VALID)
     # =========================================================
     
     def _normalize(self, v: np.ndarray) -> np.ndarray:
         norm = np.linalg.norm(v)
         return v / norm if norm > 0 else v
     
-    def _compute_centroid(self, valid_tails: List[str]) -> Optional[np.ndarray]:
-        """Центроид = нормализованный средний вектор L0 VALID хвостов."""
-        if not valid_tails:
-            return None
-        embs = np.array(list(self.embedder.embed(valid_tails)))
-        embs = np.array([self._normalize(e) for e in embs])
-        centroid = np.mean(embs, axis=0)
-        return self._normalize(centroid)
+    def _compute_knn_scores(
+        self, 
+        grey_tails: List[str], 
+        valid_tails: List[str], 
+        k: int = 3
+    ) -> Dict[str, float]:
+        """
+        Для каждого GREY хвоста: top-k mean cosine similarity к VALID хвостам.
+        
+        KNN спрашивает: "похож ли на что-то КОНКРЕТНОЕ?"
+        В отличие от centroid ("похож ли на СРЕДНЕЕ?").
+        
+        k=3: берём 3 ближайших VALID, считаем среднее.
+        Робастнее чем single max (одна случайная высокая cosine не делает VALID).
+        """
+        if not valid_tails or not grey_tails:
+            return {tail: 0.0 for tail in grey_tails}
+        
+        # Embed all at once for efficiency
+        valid_embs = np.array(list(self.embedder.embed(valid_tails)))
+        valid_embs = np.array([self._normalize(e) for e in valid_embs])
+        
+        grey_embs = np.array(list(self.embedder.embed(grey_tails)))
+        grey_embs = np.array([self._normalize(e) for e in grey_embs])
+        
+        # Cosine similarity matrix: (n_grey, n_valid)
+        sim_matrix = np.dot(grey_embs, valid_embs.T)
+        
+        # Top-k mean for each grey tail
+        actual_k = min(k, len(valid_tails))
+        scores = {}
+        for i, tail in enumerate(grey_tails):
+            top_k = np.sort(sim_matrix[i])[-actual_k:]  # top-k highest
+            scores[tail] = float(np.mean(top_k))
+        
+        return scores
     
-    def _centroid_distances(self, tails: List[str], centroid: np.ndarray) -> np.ndarray:
-        """Cosine distance каждого хвоста до центроида."""
-        if centroid is None:
-            return np.full(len(tails), 0.5)
-        embs = np.array(list(self.embedder.embed(tails)))
-        embs = np.array([self._normalize(e) for e in embs])
-        return np.dot(embs, centroid)
+    # =========================================================
+    # SIGNAL 2 (LEGACY): Centroid Distance — ЗАКОММЕНТИРОВАНО
+    # Раскомментировать для сравнения с KNN.
+    # =========================================================
+    
+    # def _compute_centroid(self, valid_tails: List[str]) -> Optional[np.ndarray]:
+    #     """Центроид = нормализованный средний вектор L0 VALID хвостов."""
+    #     if not valid_tails:
+    #         return None
+    #     embs = np.array(list(self.embedder.embed(valid_tails)))
+    #     embs = np.array([self._normalize(e) for e in embs])
+    #     centroid = np.mean(embs, axis=0)
+    #     return self._normalize(centroid)
+    #
+    # def _centroid_distances(self, tails: List[str], centroid: np.ndarray) -> np.ndarray:
+    #     """Cosine distance каждого хвоста до центроида."""
+    #     if centroid is None:
+    #         return np.full(len(tails), 0.5)
+    #     embs = np.array(list(self.embedder.embed(tails)))
+    #     embs = np.array([self._normalize(e) for e in embs])
+    #     return np.dot(embs, centroid)
     
     # =========================================================
     # SIGNAL 3: L0 Signals
@@ -239,7 +288,7 @@ class L2Classifier:
                 tail_to_kw[tail] = kw
                 kw_to_tail[keyword] = tail
         
-        # L0 VALID хвосты для centroid + PMI
+        # L0 VALID хвосты для KNN + PMI
         valid_tails = []
         for kw in l0_valid_keywords:
             if isinstance(kw, dict):
@@ -253,7 +302,7 @@ class L2Classifier:
         
         logger.info(
             f"L2: {len(grey_tails)} GREY, "
-            f"centroid from {len(valid_tails)} L0 VALID"
+            f"KNN from {len(valid_tails)} L0 VALID"
         )
         
         # === SIGNAL 1: PMI ===
@@ -261,22 +310,35 @@ class L2Classifier:
         word_df = self._compute_word_df(all_tails_for_df)
         pmi_scores = {tail: self._pmi_score(tail, word_df) for tail in grey_tails}
         
-        # === SIGNAL 2: Centroid Distance ===
-        centroid_scores = {}
+        # === SIGNAL 2: KNN Similarity ===
+        knn_scores = {}
         if valid_tails:
             try:
-                centroid = self._compute_centroid(valid_tails)
-                distances = self._centroid_distances(grey_tails, centroid)
-                centroid_scores = {
-                    tail: float(dist) 
-                    for tail, dist in zip(grey_tails, distances)
-                }
+                knn_scores = self._compute_knn_scores(
+                    grey_tails, valid_tails, k=cfg.knn_k
+                )
             except Exception as e:
-                logger.warning(f"L2: Centroid failed: {e}")
-                centroid_scores = {tail: 0.5 for tail in grey_tails}
+                logger.warning(f"L2: KNN failed: {e}")
+                knn_scores = {tail: 0.0 for tail in grey_tails}
         else:
-            logger.warning("L2: No L0 VALID for centroid, using PMI only")
-            centroid_scores = {tail: 0.5 for tail in grey_tails}
+            logger.warning("L2: No L0 VALID for KNN, using PMI only")
+            knn_scores = {tail: 0.0 for tail in grey_tails}
+        
+        # --- CENTROID (закомментировано) ---
+        # centroid_scores = {}
+        # if valid_tails:
+        #     try:
+        #         centroid = self._compute_centroid(valid_tails)
+        #         distances = self._centroid_distances(grey_tails, centroid)
+        #         centroid_scores = {
+        #             tail: float(dist) 
+        #             for tail, dist in zip(grey_tails, distances)
+        #         }
+        #     except Exception as e:
+        #         logger.warning(f"L2: Centroid failed: {e}")
+        #         centroid_scores = {tail: 0.5 for tail in grey_tails}
+        # else:
+        #     centroid_scores = {tail: 0.5 for tail in grey_tails}
         
         # === TRI-SIGNAL DECISION ===
         cfg = self.config
@@ -287,7 +349,7 @@ class L2Classifier:
             keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
             
             pmi = pmi_scores.get(tail, 0)
-            cdist = centroid_scores.get(tail, 0.5)
+            knn = knn_scores.get(tail, 0.0)
             l0_sig = l0_signals.get(keyword, {
                 "positive": [], "negative": [], "pure_neg": False
             })
@@ -295,7 +357,7 @@ class L2Classifier:
             
             debug = {
                 "pmi": round(pmi, 3),
-                "centroid_dist": round(cdist, 4),
+                "knn_score": round(knn, 4),
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
                 "pure_neg": pure_neg,
@@ -315,25 +377,25 @@ class L2Classifier:
                 label = "GREY"
                 reason = f"Conflict: PMI {pmi:.2f} high, L0 pure-neg"
             
-            # R3: Low PMI, high centroid, no pure neg → VALID
-            elif cdist >= cfg.centroid_valid_threshold and not pure_neg:
+            # R3: Low PMI, high KNN, no pure neg → VALID
+            elif knn >= cfg.knn_valid_threshold and not pure_neg:
                 label = "VALID"
-                reason = f"Centroid {cdist:.3f} >= {cfg.centroid_valid_threshold}"
+                reason = f"KNN {knn:.3f} >= {cfg.knn_valid_threshold}"
             
-            # R4: Pure neg + low centroid → TRASH
-            elif pure_neg and cdist < cfg.centroid_trash_threshold:
+            # R4: Pure neg + low KNN → TRASH
+            elif pure_neg and knn < cfg.knn_trash_threshold:
                 label = "TRASH"
-                reason = f"Pure-neg + centroid {cdist:.3f} < {cfg.centroid_trash_threshold}"
+                reason = f"Pure-neg + KNN {knn:.3f} < {cfg.knn_trash_threshold}"
             
-            # R5: Low PMI + low centroid → TRASH
-            elif pmi < cfg.pmi_valid_threshold and cdist < cfg.centroid_trash_threshold:
+            # R5: Low PMI + low KNN → TRASH
+            elif pmi < cfg.pmi_valid_threshold and knn < cfg.knn_trash_threshold:
                 label = "TRASH"
-                reason = f"PMI {pmi:.2f} low + centroid {cdist:.3f} low"
+                reason = f"PMI {pmi:.2f} low + KNN {knn:.3f} low"
             
             # R6: Everything else → GREY (→ LLM)
             else:
                 label = "GREY"
-                reason = f"Uncertain: PMI {pmi:.2f}, centroid {cdist:.3f}"
+                reason = f"Uncertain: PMI {pmi:.2f}, KNN {knn:.3f}"
             
             debug["decision"] = reason
             classified[label.lower()].append({"tail": tail, "debug": debug})
@@ -355,7 +417,7 @@ class L2Classifier:
                     kw["l2"] = {
                         "label": "VALID",
                         "pmi": debug.get("pmi", 0),
-                        "centroid_dist": debug.get("centroid_dist", 0),
+                        "knn_score": debug.get("knn_score", 0),
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
@@ -393,7 +455,7 @@ class L2Classifier:
                     kw["l2"] = {
                         "label": "GREY",
                         "pmi": debug.get("pmi", 0),
-                        "centroid_dist": debug.get("centroid_dist", 0),
+                        "knn_score": debug.get("knn_score", 0),
                         "decision": debug.get("decision", ""),
                     }
                 l2_grey.append(kw)
@@ -402,7 +464,7 @@ class L2Classifier:
         # Stats
         result["l2_stats"] = {
             "input_grey": len(grey_tails),
-            "l0_valid_for_centroid": len(valid_tails),
+            "l0_valid_for_knn": len(valid_tails),
             "l2_valid": len(classified["valid"]),
             "l2_trash": len(classified["trash"]),
             "l2_grey": len(classified["grey"]),
@@ -422,7 +484,7 @@ class L2Classifier:
                 l2_trace.append({
                     "keyword": keyword, "tail": tail, "label": lbl,
                     "pmi": debug.get("pmi", 0),
-                    "centroid_dist": debug.get("centroid_dist", 0),
+                    "knn_score": debug.get("knn_score", 0),
                     "l0_pos": debug.get("l0_pos", []),
                     "l0_neg": debug.get("l0_neg", []),
                     "decision": debug.get("decision", ""),
@@ -435,14 +497,15 @@ class L2Classifier:
             diag = {
                 "config": {
                     "pmi_valid_threshold": cfg.pmi_valid_threshold,
-                    "centroid_valid_threshold": cfg.centroid_valid_threshold,
-                    "centroid_trash_threshold": cfg.centroid_trash_threshold,
+                    "knn_k": cfg.knn_k,
+                    "knn_valid_threshold": cfg.knn_valid_threshold,
+                    "knn_trash_threshold": cfg.knn_trash_threshold,
                 },
                 "stats": result["l2_stats"],
-                "centroid_dist_distribution": {
-                    "min": round(min(centroid_scores.values()), 4) if centroid_scores else 0,
-                    "max": round(max(centroid_scores.values()), 4) if centroid_scores else 0,
-                    "mean": round(sum(centroid_scores.values()) / len(centroid_scores), 4) if centroid_scores else 0,
+                "knn_score_distribution": {
+                    "min": round(min(knn_scores.values()), 4) if knn_scores else 0,
+                    "max": round(max(knn_scores.values()), 4) if knn_scores else 0,
+                    "mean": round(sum(knn_scores.values()) / len(knn_scores), 4) if knn_scores else 0,
                 },
                 "trace": l2_trace,
             }
@@ -496,8 +559,9 @@ def apply_l2_filter(
         result = classifier.classify_l0_result(l0_result, seed)
         result["l2_config"] = {
             "pmi_valid_threshold": classifier.config.pmi_valid_threshold,
-            "centroid_valid_threshold": classifier.config.centroid_valid_threshold,
-            "centroid_trash_threshold": classifier.config.centroid_trash_threshold,
+            "knn_k": classifier.config.knn_k,
+            "knn_valid_threshold": classifier.config.knn_valid_threshold,
+            "knn_trash_threshold": classifier.config.knn_trash_threshold,
         }
         return result
     
