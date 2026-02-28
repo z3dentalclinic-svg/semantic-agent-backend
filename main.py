@@ -22,7 +22,7 @@ from filters import (
     filter_geo_garbage,
     apply_pre_filter,  # ← санитарная очистка парсинга (ДО гео-фильтра)
     apply_l0_filter,   # ← L0 классификатор хвостов (ПОСЛЕ всех фильтров)
-    apply_l2_filter,   # ← L2 семантический классификатор (Dual Cosine)
+    apply_l2_filter,   # ← L2 Tri-Signal классификатор (PMI + Centroid + L0 signals)
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
@@ -1350,22 +1350,18 @@ async def root():
     return FileResponse('static/index.html')
 
 
-def _build_l2_config(comb_valid, comb_trash, dir_valid, dir_trash, mode):
+def _build_l2_config(pmi_valid=None, centroid_valid=None, centroid_trash=None):
     """Собирает L2 config из query параметров (None = использовать дефолт)."""
     from filters.l2_filter import L2Config
     
     config = L2Config()
     
-    if comb_valid is not None:
-        config.combined_valid_threshold = comb_valid
-    if comb_trash is not None:
-        config.combined_trash_threshold = comb_trash
-    if dir_valid is not None:
-        config.direct_valid_threshold = dir_valid
-    if dir_trash is not None:
-        config.direct_trash_threshold = dir_trash
-    if mode is not None and mode in ("conservative", "weighted", "any_trash"):
-        config.combination_mode = mode
+    if pmi_valid is not None:
+        config.pmi_valid_threshold = pmi_valid
+    if centroid_valid is not None:
+        config.centroid_valid_threshold = centroid_valid
+    if centroid_trash is not None:
+        config.centroid_trash_threshold = centroid_trash
     
     return config
 
@@ -1383,7 +1379,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         "geo"  = geo_garbage_filter  
         "bpf"  = batch_post_filter
         "l0"   = L0 tail classifier
-        "l2"   = L2 semantic classifier (Dual Cosine)
+        "l2"   = L2 Tri-Signal classifier (PMI + Centroid + L0 signals)
         "none" = все выключены (сырые данные)
         "all" или "pre,geo,bpf,l0,l2" = все включены (по умолчанию)
     """
@@ -1545,6 +1541,19 @@ async def toggle_tracer(enabled: bool = Query(True, description="Включит�
     return {"tracer_enabled": enabled}
 
 
+@app.get("/debug/l2-diag")
+async def l2_diagnostic():
+    """Возвращает L2 diagnostic dump (centroid distances, PMI, decisions)."""
+    import json as _json
+    try:
+        with open("l2_diagnostic.json", "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except FileNotFoundError:
+        return {"error": "l2_diagnostic.json not found — run a search with L2 enabled first"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/light-search")
 async def light_search_endpoint(
     seed: str = Query(..., description="Базовый запрос"),
@@ -1555,12 +1564,10 @@ async def light_search_endpoint(
     parallel_limit: int = Query(10, description="Параллельных запросов"),
     source: str = Query("google", description="Источник: google/yandex/bing"),
     filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel,l0,l2"),
-    # L2 пороги (опционально, из UI)
-    l2_comb_valid: float = Query(None, description="L2: Combined VALID threshold"),
-    l2_comb_trash: float = Query(None, description="L2: Combined TRASH threshold"),
-    l2_dir_valid: float = Query(None, description="L2: Direct VALID threshold"),
-    l2_dir_trash: float = Query(None, description="L2: Direct TRASH threshold"),
-    l2_mode: str = Query(None, description="L2 mode: conservative/weighted/any_trash"),
+    # L2 пороги (Tri-Signal)
+    l2_pmi_valid: float = Query(None, description="L2: PMI VALID threshold"),
+    l2_centroid_valid: float = Query(None, description="L2: Centroid VALID threshold"),
+    l2_centroid_trash: float = Query(None, description="L2: Centroid TRASH threshold"),
 ):
     """LIGHT SEARCH: быстрый поиск (SUFFIX + INFIX)"""
 
@@ -1578,7 +1585,7 @@ async def light_search_endpoint(
     result = await parser.parse_light_search(seed, country, language, use_numbers, parallel_limit, source, region_id)
     
     # Собираем L2 config из параметров
-    l2_config = _build_l2_config(l2_comb_valid, l2_comb_trash, l2_dir_valid, l2_dir_trash, l2_mode)
+    l2_config = _build_l2_config(l2_pmi_valid, l2_centroid_valid, l2_centroid_trash)
     
     result = apply_filters_traced(result, seed, country, method="light-search", language=language, enabled_filters=filters, l2_config=l2_config)
 
@@ -1598,12 +1605,10 @@ async def deep_search_endpoint(
     parallel_limit: int = Query(10, description="Параллельных запросов", alias="parallel"),
     include_keywords: bool = Query(True, description="Включить список ключей"),
     filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel,l0,l2"),
-    # L2 пороги (опционально, из UI)
-    l2_comb_valid: float = Query(None, description="L2: Combined VALID threshold"),
-    l2_comb_trash: float = Query(None, description="L2: Combined TRASH threshold"),
-    l2_dir_valid: float = Query(None, description="L2: Direct VALID threshold"),
-    l2_dir_trash: float = Query(None, description="L2: Direct TRASH threshold"),
-    l2_mode: str = Query(None, description="L2 mode: conservative/weighted/any_trash"),
+    # L2 пороги (Tri-Signal)
+    l2_pmi_valid: float = Query(None, description="L2: PMI VALID threshold"),
+    l2_centroid_valid: float = Query(None, description="L2: Centroid VALID threshold"),
+    l2_centroid_trash: float = Query(None, description="L2: Centroid TRASH threshold"),
 ):
     """DEEP SEARCH: глубокий поиск (все 4 метода ИЗ ВСЕХ 3 ИСТОЧНИКОВ)"""
 
@@ -1619,7 +1624,7 @@ async def deep_search_endpoint(
     filter_seed = result.get("corrected_seed") or seed
     
     # Собираем L2 config из параметров
-    l2_config = _build_l2_config(l2_comb_valid, l2_comb_trash, l2_dir_valid, l2_dir_trash, l2_mode)
+    l2_config = _build_l2_config(l2_pmi_valid, l2_centroid_valid, l2_centroid_trash)
     
     result = apply_filters_traced(result, filter_seed, country, method="deep-search", language=language, deduplicate=True, enabled_filters=filters, l2_config=l2_config)
     
