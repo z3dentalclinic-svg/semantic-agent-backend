@@ -94,20 +94,28 @@ def _extract_fuzzy_ordered(q: str, s: str):
             # Если seed-слово кириллическое а query-слово латинское (или наоборот)
             # в позиции где seed-слово ДОЛЖНО быть → считаем матч.
             # "айфон" (кир) ↔ "iphone" (лат) — разный скрипт, та же позиция.
-            sw_is_cyr = any('\u0400' <= c <= '\u04ff' for c in sw)
-            sw_is_lat = any('a' <= c <= 'z' for c in sw)
+            #
+            # ОГРАНИЧЕНИЕ: служебные слова (PREP, CONJ, PRCL) НЕ матчатся
+            # через cross-script. "на" ≠ "segway", "и" ≠ "gt3".
+            # Cross-script мост — только для контентных слов (бренды, модели).
+            sw_parse = morph.parse(sw)[0]
+            sw_is_function = sw_parse.tag.POS in ('PREP', 'CONJ', 'PRCL', 'INTJ')
             
-            for i in range(search_from, len(query_words)):
-                qw = query_words[i]
-                qw_is_cyr = any('\u0400' <= c <= '\u04ff' for c in qw)
-                qw_is_lat = any('a' <= c <= 'z' for c in qw)
+            if not sw_is_function:
+                sw_is_cyr = any('\u0400' <= c <= '\u04ff' for c in sw)
+                sw_is_lat = any('a' <= c <= 'z' for c in sw)
                 
-                # Скрипты РАЗНЫЕ → кросс-скриптовая замена
-                if (sw_is_cyr and qw_is_lat) or (sw_is_lat and qw_is_cyr):
-                    seed_positions.append(i)
-                    search_from = i + 1
-                    found = True
-                    break
+                for i in range(search_from, len(query_words)):
+                    qw = query_words[i]
+                    qw_is_cyr = any('\u0400' <= c <= '\u04ff' for c in qw)
+                    qw_is_lat = any('a' <= c <= 'z' for c in qw)
+                    
+                    # Скрипты РАЗНЫЕ → кросс-скриптовая замена
+                    if (sw_is_cyr and qw_is_lat) or (sw_is_lat and qw_is_cyr):
+                        seed_positions.append(i)
+                        search_from = i + 1
+                        found = True
+                        break
             
             if not found:
                 return None  # слово seed'а отсутствует → seed не найден
@@ -193,9 +201,13 @@ def _unordered_match(query_words, query_lemmas, seed_words, seed_lemmas):
                 break
     
     # Проход 2: кросс-скрипт для НЕнайденных seed-слов
+    # ОГРАНИЧЕНИЕ: служебные слова (PREP, CONJ, PRCL) не матчатся cross-script
     for si, (sw, sl) in enumerate(zip(seed_words, seed_lemmas)):
         if si in matched_seed_idx:
             continue
+        sw_parse = morph.parse(sw)[0]
+        if sw_parse.tag.POS in ('PREP', 'CONJ', 'PRCL', 'INTJ'):
+            continue  # служебное слово — не матчим cross-script
         for qi in range(len(query_words)):
             if qi in used_positions:
                 continue
@@ -260,6 +272,17 @@ def _extract_partial_match(q: str, s: str):
         
         if positions is not None and len(positions) >= 2:
             tail_words = [query_words[i] for i in range(len(query_words)) if i not in positions]
+            
+            # === Фикс: предлог-замена ===
+            # Если пропустили PREP из seed ("на") и tail начинается с PREP ("для", "в")
+            # → это замена предлога, а не хвост.
+            # "аккумулятор для скутер 12 вольт" → skip "на" → tail ["для", "12", "вольт"]
+            # "для" заменяет "на" → strip → tail ["12", "вольт"]
+            if skip_pos == 'PREP' and tail_words:
+                first_tail_parse = morph.parse(tail_words[0])[0]
+                if first_tail_parse.tag.POS == 'PREP':
+                    tail_words = tail_words[1:]
+            
             tail = ' '.join(tail_words).strip()
             return tail if tail else ''
     
