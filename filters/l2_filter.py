@@ -42,17 +42,17 @@ from dataclasses import dataclass
 from collections import Counter
 
 import numpy as np
-import pymorphy2
+import pymorphy3
 
 from .shared_model import get_embedding_model
 
-# Singleton morph analyzer (0 MB extra — pymorphy2 already in L0)
+# Singleton morph analyzer (0 MB extra — pymorphy3 already in L0)
 _morph_analyzer = None
 
 def _get_morph():
     global _morph_analyzer
     if _morph_analyzer is None:
-        _morph_analyzer = pymorphy2.MorphAnalyzer()
+        _morph_analyzer = pymorphy3.MorphAnalyzer()
     return _morph_analyzer
 
 logger = logging.getLogger(__name__)
