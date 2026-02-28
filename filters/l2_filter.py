@@ -42,8 +42,18 @@ from dataclasses import dataclass
 from collections import Counter
 
 import numpy as np
+import pymorphy2
 
 from .shared_model import get_embedding_model
+
+# Singleton morph analyzer (0 MB extra — pymorphy2 already in L0)
+_morph_analyzer = None
+
+def _get_morph():
+    global _morph_analyzer
+    if _morph_analyzer is None:
+        _morph_analyzer = pymorphy2.MorphAnalyzer()
+    return _morph_analyzer
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +228,108 @@ class L2Classifier:
     # SIGNAL 3: L0 Signals
     # =========================================================
     
+    # =========================================================
+    # SIGNAL 4: Морфологическая совместимость (seed head ↔ tail)
+    # =========================================================
+    #
+    # Ключевая идея: "гелевый" — ADJ, согласуется с "аккумулятор" (муж.род, ед.число)
+    # → это МОДИФИКАТОР seed'а → VALID.
+    # "глушитель" — NOUN, не согласуется как определение → не модификатор.
+    #
+    # Это POSITIVE-ONLY сигнал:
+    #   morph_score ≥ 0.7 → VALID (прилагательное/числительное, согласованное с seed)
+    #   morph_score < 0.7 → НЕ информативно (глаголы, бренды тоже валидны)
+    #
+    # 0 MB extra — pymorphy2 уже в L0, singleton analyzer.
+    
+    def _extract_seed_head(self, seed: str) -> tuple:
+        """
+        Извлекаем головное существительное из seed.
+        
+        "аккумулятор на скутер" → ("аккумулятор", gender=masc, number=sing)
+        "шины для bmw" → ("шины", gender=femn, number=plur)
+        "кондиционер в квартиру" → ("кондиционер", gender=masc, number=sing)
+        
+        Берём ПЕРВОЕ существительное — оно обычно главное в PPC seed'ах.
+        """
+        morph = _get_morph()
+        for word in seed.lower().split():
+            parses = morph.parse(word)
+            if not parses:
+                continue
+            p = parses[0]
+            if 'NOUN' in p.tag:
+                return (p.normal_form, p.tag.gender, p.tag.number)
+        return (None, None, None)
+    
+    def _morph_compatibility_score(self, tail: str, seed_gender, seed_number) -> tuple:
+        """
+        Морфологическая совместимость хвоста с head noun seed'а.
+        
+        Returns: (score: float, detail: str)
+        
+        score ≥ 0.7: хвост содержит согласованный модификатор → VALID signal
+        score < 0.7: не информативно (не значит TRASH)
+        
+        Проверяем ПЕРВЫЕ 1-2 слова хвоста:
+        - ADJ согласованное с seed → 1.0 ("гелевый" + аккумулятор[masc])
+        - ADJ не согласованное → 0.3 ("гелевая" + аккумулятор[masc] — род не тот)
+        - NUMR / цифра → 0.8 (спецификация)
+        - PRTF (причастие) согласованное → 0.9 ("тяговый", "заряженный")
+        - Всё остальное → 0.0 (NOUN, VERB, бренды — нейтрально)
+        """
+        if seed_gender is None:
+            return (0.0, "no_seed_head")
+        
+        morph = _get_morph()
+        words = tail.lower().split()[:2]  # первые 1-2 слова
+        
+        best_score = 0.0
+        best_detail = "no_adj"
+        
+        for word in words:
+            if not word or len(word) < 2:
+                continue
+                
+            # Цифры/спецификации
+            if word[0].isdigit():
+                if best_score < 0.8:
+                    best_score = 0.8
+                    best_detail = f"numeric:{word}"
+                continue
+            
+            parses = morph.parse(word)
+            if not parses:
+                continue
+            p = parses[0]
+            
+            # Прилагательное (полное или краткое)
+            if 'ADJF' in p.tag or 'ADJS' in p.tag or 'PRTF' in p.tag:
+                gender_match = (p.tag.gender == seed_gender) if p.tag.gender else False
+                number_match = (p.tag.number == seed_number) if p.tag.number else False
+                
+                # Множественное число: род не различается
+                if seed_number == 'plur' and p.tag.number == 'plur':
+                    gender_match = True
+                
+                if gender_match and number_match:
+                    score = 1.0 if ('ADJF' in p.tag or 'ADJS' in p.tag) else 0.9
+                    detail = f"adj_agree:{word}({p.tag.gender},{p.tag.number})"
+                    if score > best_score:
+                        best_score = score
+                        best_detail = detail
+                elif gender_match or number_match:
+                    # Частичное совпадение
+                    if best_score < 0.5:
+                        best_score = 0.5
+                        best_detail = f"adj_partial:{word}({p.tag.gender},{p.tag.number})"
+                else:
+                    if best_score < 0.3:
+                        best_score = 0.3
+                        best_detail = f"adj_no_agree:{word}({p.tag.gender},{p.tag.number})"
+        
+        return (best_score, best_detail)
+    
     def _parse_l0_signals(self, l0_trace: List[dict]) -> Dict[str, dict]:
         """
         Парсим L0 trace → для каждого keyword:
@@ -326,19 +438,23 @@ class L2Classifier:
         
         # --- CENTROID (закомментировано) ---
         # centroid_scores = {}
-        # if valid_tails:
-        #     try:
-        #         centroid = self._compute_centroid(valid_tails)
-        #         distances = self._centroid_distances(grey_tails, centroid)
-        #         centroid_scores = {
-        #             tail: float(dist) 
-        #             for tail, dist in zip(grey_tails, distances)
-        #         }
-        #     except Exception as e:
-        #         logger.warning(f"L2: Centroid failed: {e}")
-        #         centroid_scores = {tail: 0.5 for tail in grey_tails}
-        # else:
-        #     centroid_scores = {tail: 0.5 for tail in grey_tails}
+        # ...
+        
+        # === SIGNAL 4: Morph Compatibility ===
+        seed_head, seed_gender, seed_number = self._extract_seed_head(seed)
+        morph_scores = {}
+        morph_details = {}
+        if seed_head:
+            logger.info(f"L2: Seed head noun: '{seed_head}' ({seed_gender}, {seed_number})")
+            for tail in grey_tails:
+                score, detail = self._morph_compatibility_score(tail, seed_gender, seed_number)
+                morph_scores[tail] = score
+                morph_details[tail] = detail
+        else:
+            logger.warning(f"L2: No head noun in seed '{seed}', morph disabled")
+            for tail in grey_tails:
+                morph_scores[tail] = 0.0
+                morph_details[tail] = "no_seed_head"
         
         # === TRI-SIGNAL DECISION ===
         cfg = self.config
@@ -350,6 +466,8 @@ class L2Classifier:
             
             pmi = pmi_scores.get(tail, 0)
             knn = knn_scores.get(tail, 0.0)
+            morph = morph_scores.get(tail, 0.0)
+            morph_detail = morph_details.get(tail, "")
             l0_sig = l0_signals.get(keyword, {
                 "positive": [], "negative": [], "pure_neg": False
             })
@@ -358,6 +476,8 @@ class L2Classifier:
             debug = {
                 "pmi": round(pmi, 3),
                 "knn_score": round(knn, 4),
+                "morph_score": round(morph, 2),
+                "morph_detail": morph_detail,
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
                 "pure_neg": pure_neg,
@@ -376,6 +496,13 @@ class L2Classifier:
             elif pmi >= cfg.pmi_valid_threshold and pure_neg:
                 label = "GREY"
                 reason = f"Conflict: PMI {pmi:.2f} high, L0 pure-neg"
+            
+            # R2.5: Morph agreement (ADJ agrees with seed head) → VALID
+            # "гелевый" + аккумулятор[masc] → согласуется → VALID
+            # Positive-only: morph < 0.7 НЕ значит TRASH
+            elif morph >= 0.7 and not pure_neg:
+                label = "VALID"
+                reason = f"Morph {morph:.1f} ({morph_detail})"
             
             # R3: Low PMI, high KNN, no pure neg → VALID
             elif knn >= cfg.knn_valid_threshold and not pure_neg:
@@ -418,6 +545,8 @@ class L2Classifier:
                         "label": "VALID",
                         "pmi": debug.get("pmi", 0),
                         "knn_score": debug.get("knn_score", 0),
+                        "morph_score": debug.get("morph_score", 0),
+                        "morph_detail": debug.get("morph_detail", ""),
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
@@ -456,6 +585,8 @@ class L2Classifier:
                         "label": "GREY",
                         "pmi": debug.get("pmi", 0),
                         "knn_score": debug.get("knn_score", 0),
+                        "morph_score": debug.get("morph_score", 0),
+                        "morph_detail": debug.get("morph_detail", ""),
                         "decision": debug.get("decision", ""),
                     }
                 l2_grey.append(kw)
@@ -485,6 +616,8 @@ class L2Classifier:
                     "keyword": keyword, "tail": tail, "label": lbl,
                     "pmi": debug.get("pmi", 0),
                     "knn_score": debug.get("knn_score", 0),
+                    "morph_score": debug.get("morph_score", 0),
+                    "morph_detail": debug.get("morph_detail", ""),
                     "l0_pos": debug.get("l0_pos", []),
                     "l0_neg": debug.get("l0_neg", []),
                     "decision": debug.get("decision", ""),
@@ -500,12 +633,22 @@ class L2Classifier:
                     "knn_k": cfg.knn_k,
                     "knn_valid_threshold": cfg.knn_valid_threshold,
                     "knn_trash_threshold": cfg.knn_trash_threshold,
+                    "morph_valid_threshold": 0.7,
+                    "seed_head": seed_head,
+                    "seed_gender": str(seed_gender),
+                    "seed_number": str(seed_number),
                 },
                 "stats": result["l2_stats"],
                 "knn_score_distribution": {
                     "min": round(min(knn_scores.values()), 4) if knn_scores else 0,
                     "max": round(max(knn_scores.values()), 4) if knn_scores else 0,
                     "mean": round(sum(knn_scores.values()) / len(knn_scores), 4) if knn_scores else 0,
+                },
+                "morph_score_distribution": {
+                    "min": round(min(morph_scores.values()), 2) if morph_scores else 0,
+                    "max": round(max(morph_scores.values()), 2) if morph_scores else 0,
+                    "scores_gte_07": sum(1 for v in morph_scores.values() if v >= 0.7),
+                    "scores_eq_0": sum(1 for v in morph_scores.values() if v == 0.0),
                 },
                 "trace": l2_trace,
             }
