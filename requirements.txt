@@ -21,7 +21,7 @@ nltk==3.9.2
 natasha>=1.6.0
 razdel>=0.5.0
 slovnet>=0.6.0
-# GEO Database для Pre-filter (v5.2.8) - ОБНОВЛЕНО ДЛЯ ПОЛНОЙ БАЗЫ ГОРОДОВ!
+# GEO Database для Pre-filter (v5.2.8)
 geonamescache>=3.0.0
 # Multilingual country names для Geo-Garbage Filter
 babel
@@ -31,5 +31,5 @@ fastembed>=0.7.0
 onnxruntime>=1.17.0
 
 # L2 rubert-tiny2 MLM (substitution test)
-torch --index-url https://download.pytorch.org/whl/cpu
+torch
 transformers>=4.30.0
