@@ -321,15 +321,19 @@ class L2Classifier:
         """
         grey_keywords = l0_result.get("keywords_grey", [])
         
-        # === Собираем L0 негативные сигналы для каждого keyword ===
+        # === Собираем L0 сигналы для каждого keyword ===
         l0_trace = l0_result.get("_l0_trace", [])
         l0_negative_signals: Dict[str, List[str]] = {}
+        l0_positive_signals: Dict[str, List[str]] = {}
         for trace in l0_trace:
             kw = trace.get("keyword", "")
             signals = trace.get("signals", [])
             neg = [s.lstrip('-') for s in signals if s.startswith('-')]
+            pos = [s for s in signals if not s.startswith('-')]
             if neg:
                 l0_negative_signals[kw] = neg
+            if pos:
+                l0_positive_signals[kw] = pos
         
         # Извлекаем хвосты
         tails = []
@@ -352,25 +356,36 @@ class L2Classifier:
         # Классифицируем
         classified = self.classify_tails(seed, tails, return_debug=True)
         
-        # === Понижаем VALID → GREY если L0 имел негативные сигналы ===
-        # L0 структурно нашёл проблему → cosine similarity не может переспорить
+        # === Понижаем VALID → GREY ===
+        # Два правила:
+        # 1. L0 имел негативные сигналы → L2 не может переспорить
+        # 2. L0 не дал НИ ОДНОГО позитивного сигнала → cosine недостаточен
+        #    для промоута, нужно семантическое подтверждение от L3
         downgraded = []
         still_valid = []
         
         for item in classified["valid"]:
             tail = item["tail"]
             kw = tail_to_kw.get(tail)
-            # Ищем keyword для проверки L0 сигналов
             keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
             
             l0_neg = l0_negative_signals.get(keyword, [])
+            l0_pos = l0_positive_signals.get(keyword, [])
+            
             if l0_neg:
-                # L0 нашёл структурную проблему — L2 не может промоутить
+                # Правило 1: L0 нашёл структурную проблему
                 item_debug = item.get("debug", {})
                 item_debug["l2_original"] = "VALID"
-                item_debug["downgraded_by"] = f"L0 signals: {', '.join(l0_neg)}"
+                item_debug["downgraded_by"] = f"L0 negative: {', '.join(l0_neg)}"
                 downgraded.append(item)
-                logger.debug(f"L2 downgrade: '{tail}' VALID→GREY (L0: {l0_neg})")
+                logger.debug(f"L2 downgrade: '{tail}' VALID→GREY (L0 neg: {l0_neg})")
+            elif not l0_pos:
+                # Правило 2: L0 не нашёл ничего хорошего — cosine не хватит
+                item_debug = item.get("debug", {})
+                item_debug["l2_original"] = "VALID"
+                item_debug["downgraded_by"] = "no L0 positive signals"
+                downgraded.append(item)
+                logger.debug(f"L2 downgrade: '{tail}' VALID→GREY (no L0 positives)")
             else:
                 still_valid.append(item)
         
