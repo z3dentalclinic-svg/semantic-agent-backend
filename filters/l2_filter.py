@@ -44,7 +44,7 @@ from collections import Counter
 import numpy as np
 import pymorphy3
 
-from .shared_model import get_embedding_model
+from .shared_model import get_embedding_model, get_rubert_model
 
 # Singleton morph analyzer (0 MB extra — pymorphy3 already in L0)
 _morph_analyzer = None
@@ -117,6 +117,13 @@ class L2Classifier:
             if self._embedder is None:
                 raise RuntimeError("L2: embedding model failed to load")
         return self._embedder
+    
+    @property
+    def rubert(self):
+        """Lazy load rubert-tiny model. Returns None if not available."""
+        if not hasattr(self, '_rubert'):
+            self._rubert = get_rubert_model()
+        return self._rubert
     
     @property
     def is_available(self) -> bool:
@@ -330,6 +337,60 @@ class L2Classifier:
         
         return (best_score, best_detail)
     
+    # =========================================================
+    # SIGNAL 5: Template Cosine (seed+tail фразовая совместимость)
+    # =========================================================
+    #
+    # Другая ось чем KNN: вместо "похож ли tail на VALID tails?"
+    # спрашиваем "образует ли seed+tail ОСМЫСЛЕННУЮ ФРАЗУ?"
+    #
+    # embed("аккумулятор гелевый") vs embed("аккумулятор на скутер") → high cosine
+    # embed("аккумулятор глушитель") vs embed("аккумулятор на скутер") → lower cosine
+    #
+    # Используем rubert-tiny (русскоязычная модель) если доступна,
+    # иначе fallback на MiniLM.
+    
+    def _compute_template_cosine(
+        self,
+        grey_tails: List[str],
+        seed: str,
+        seed_head: str
+    ) -> Dict[str, float]:
+        """
+        Template cosine: насколько "{seed_head} {tail}" похоже на "{seed}"?
+        
+        Если tail — естественный модификатор seed, то фраза "аккумулятор гелевый"
+        семантически близка к "аккумулятор на скутер".
+        Если tail — чужой объект, "аккумулятор глушитель" — далеко.
+        
+        Returns: {tail: cosine_score}
+        """
+        if not grey_tails or not seed_head:
+            return {tail: 0.0 for tail in grey_tails}
+        
+        # Выбираем модель: rubert (русский) > MiniLM (fallback)
+        model = self.rubert or self.embedder
+        model_name = "rubert" if self.rubert else "miniLM"
+        logger.info(f"L2: Template cosine using {model_name}")
+        
+        # Строим шаблоны: "{seed_head} {tail}" для каждого tail
+        templates = [f"{seed_head} {tail}" for tail in grey_tails]
+        
+        # Embed всё за один batch
+        all_texts = [seed] + templates
+        all_embs = np.array(list(model.embed(all_texts)))
+        all_embs = np.array([self._normalize(e) for e in all_embs])
+        
+        seed_emb = all_embs[0]  # embedding seed'а
+        template_embs = all_embs[1:]  # embeddings шаблонов
+        
+        # Cosine similarity каждого шаблона к seed
+        scores = {}
+        for i, tail in enumerate(grey_tails):
+            scores[tail] = float(np.dot(template_embs[i], seed_emb))
+        
+        return scores
+    
     def _parse_l0_signals(self, l0_trace: List[dict]) -> Dict[str, dict]:
         """
         Парсим L0 trace → для каждого keyword:
@@ -456,7 +517,17 @@ class L2Classifier:
                 morph_scores[tail] = 0.0
                 morph_details[tail] = "no_seed_head"
         
-        # === TRI-SIGNAL DECISION ===
+        # === SIGNAL 5: Template Cosine ===
+        template_scores = {}
+        try:
+            template_scores = self._compute_template_cosine(
+                grey_tails, seed, seed_head or seed.split()[0]
+            )
+        except Exception as e:
+            logger.warning(f"L2: Template cosine failed: {e}")
+            template_scores = {tail: 0.0 for tail in grey_tails}
+        
+        # === MULTI-SIGNAL DECISION ===
         cfg = self.config
         classified = {"valid": [], "grey": [], "trash": []}
         
@@ -468,6 +539,7 @@ class L2Classifier:
             knn = knn_scores.get(tail, 0.0)
             morph = morph_scores.get(tail, 0.0)
             morph_detail = morph_details.get(tail, "")
+            tmpl = template_scores.get(tail, 0.0)
             l0_sig = l0_signals.get(keyword, {
                 "positive": [], "negative": [], "pure_neg": False
             })
@@ -478,6 +550,7 @@ class L2Classifier:
                 "knn_score": round(knn, 4),
                 "morph_score": round(morph, 2),
                 "morph_detail": morph_detail,
+                "template_cosine": round(tmpl, 4),
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
                 "pure_neg": pure_neg,
@@ -504,10 +577,11 @@ class L2Classifier:
                 label = "VALID"
                 reason = f"Morph {morph:.1f} ({morph_detail})"
             
-            # R3: Low PMI, high KNN, no pure neg → VALID
-            elif knn >= cfg.knn_valid_threshold and not pure_neg:
-                label = "VALID"
-                reason = f"KNN {knn:.3f} >= {cfg.knn_valid_threshold}"
+            # R3: KNN VALID — ОТКЛЮЧЕНО (false positives: глушитель 0.84, жигули 0.89)
+            # Template cosine пока diagnostic-only, порог установим после анализа
+            # elif knn >= cfg.knn_valid_threshold and not pure_neg:
+            #     label = "VALID"
+            #     reason = f"KNN {knn:.3f} >= {cfg.knn_valid_threshold}"
             
             # R4: Pure neg + low KNN → TRASH
             elif pure_neg and knn < cfg.knn_trash_threshold:
@@ -547,6 +621,7 @@ class L2Classifier:
                         "knn_score": debug.get("knn_score", 0),
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
+                        "template_cosine": debug.get("template_cosine", 0),
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
@@ -587,6 +662,7 @@ class L2Classifier:
                         "knn_score": debug.get("knn_score", 0),
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
+                        "template_cosine": debug.get("template_cosine", 0),
                         "decision": debug.get("decision", ""),
                     }
                 l2_grey.append(kw)
@@ -618,6 +694,7 @@ class L2Classifier:
                     "knn_score": debug.get("knn_score", 0),
                     "morph_score": debug.get("morph_score", 0),
                     "morph_detail": debug.get("morph_detail", ""),
+                    "template_cosine": debug.get("template_cosine", 0),
                     "l0_pos": debug.get("l0_pos", []),
                     "l0_neg": debug.get("l0_neg", []),
                     "decision": debug.get("decision", ""),
@@ -649,6 +726,12 @@ class L2Classifier:
                     "max": round(max(morph_scores.values()), 2) if morph_scores else 0,
                     "scores_gte_07": sum(1 for v in morph_scores.values() if v >= 0.7),
                     "scores_eq_0": sum(1 for v in morph_scores.values() if v == 0.0),
+                },
+                "template_cosine_distribution": {
+                    "min": round(min(template_scores.values()), 4) if template_scores else 0,
+                    "max": round(max(template_scores.values()), 4) if template_scores else 0,
+                    "mean": round(sum(template_scores.values()) / len(template_scores), 4) if template_scores else 0,
+                    "model": "rubert" if self.rubert else "miniLM",
                 },
                 "trace": l2_trace,
             }
