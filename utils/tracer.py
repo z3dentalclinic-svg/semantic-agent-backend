@@ -8,7 +8,7 @@ tracer.py — Модуль трассировки фильтрации ключ�
   3. BatchPostFilter      (гео-конфликты внутри parse-методов)
   4. deduplicate          (дубликаты)
   5. l0_filter            (структурный классификатор хвостов)
-  6. l2_filter            (семантический классификатор, Dual Cosine)
+  6. l2_filter            (Tri-Signal: PMI + Centroid Distance + L0 signals)
 
 Использование:
   from utils.tracer import FilterTracer
@@ -24,8 +24,9 @@ tracer.py — Модуль трассировки фильтрации ключ�
   # Для L0 (три исхода):
   tracer.after_l0_filter(valid, trash, grey, l0_trace)
   
-  # Для L2 (три исхода):
-  tracer.after_l2_filter(valid, trash, grey, l2_stats)
+  # Для L2 (три исхода, tri-signal трейс):
+  tracer.after_l2_filter(valid, trash, grey, l2_stats, l2_trace)
+  # l2_trace: [{keyword, tail, label, pmi, centroid_dist, l0_pos, l0_neg, decision}]
   
   # В конце:
   summary = tracer.finish_request()
@@ -240,12 +241,8 @@ class FilterTracer:
         """
         Специальный метод для L2 — три исхода (VALID/TRASH/GREY).
         
-        Args:
-            valid: ключи прошедшие как VALID (L0 VALID + L2 VALID)
-            trash: ключи заблокированные L2 как TRASH
-            grey: ключи оставшиеся GREY для L3
-            l2_stats: статистика из L2 classifier
-            l2_trace: детальный трейс из L2 [{keyword, tail, label, combined_score, direct_score, ...}]
+        Tri-Signal L2 trace fields:
+            keyword, tail, label, pmi, centroid_dist, l0_pos, l0_neg, decision
         """
         if not self.enabled:
             return
@@ -267,34 +264,36 @@ class FilterTracer:
         stage["time"] = time.time() - stage.get("_start", time.time())
         stage["l2_stats"] = l2_stats or {}
         
-        # Сохраняем детальный трейс L2
+        # Сохраняем детальный трейс L2 (Tri-Signal)
         if l2_trace:
             stage["l2_details"] = {}
             for rec in l2_trace:
                 kw = rec.get("keyword", "").lower().strip()
                 label = rec.get("label", "")
-                combined = rec.get("combined_score", 0)
-                direct = rec.get("direct_score", 0)
-                combined_vote = rec.get("combined_vote", "")
-                direct_vote = rec.get("direct_vote", "")
+                pmi = rec.get("pmi", 0)
+                cdist = rec.get("centroid_dist", 0)
+                decision = rec.get("decision", "")
+                l0_pos = rec.get("l0_pos", [])
+                l0_neg = rec.get("l0_neg", [])
                 
                 stage["l2_details"][kw] = {
                     "label": label,
                     "tail": rec.get("tail", ""),
-                    "combined_score": combined,
-                    "direct_score": direct,
-                    "combined_vote": combined_vote,
-                    "direct_vote": direct_vote,
+                    "pmi": pmi,
+                    "centroid_dist": cdist,
+                    "decision": decision,
+                    "l0_pos": l0_pos,
+                    "l0_neg": l0_neg,
                 }
                 
                 # Формируем reason для keyword_map
-                reason = f"comb={combined:.3f}({combined_vote}) direct={direct:.3f}({direct_vote})"
+                reason = f"pmi={pmi:.2f} cdist={cdist:.3f} → {decision}"
                 stage["reasons"][kw] = f"[{label}] {reason}"
         
         # Записываем в keyword_map для L2 TRASH
         for kw in trash_set:
             if kw not in self.keyword_map:
-                reason = stage.get("reasons", {}).get(kw, "L2_TRASH (low semantic relevance)")
+                reason = stage.get("reasons", {}).get(kw, "L2_TRASH")
                 self.keyword_map[kw] = {
                     "blocked_by": "l2_filter",
                     "reason": reason,
@@ -612,9 +611,18 @@ class FilterTracer:
                 tail = l0.get("tail", "")
                 sigs = ", ".join(l0.get("signals", [])) or "—"
                 
-                # L2 детали
+                # L2 детали (tri-signal)
                 l2 = details.get("l2", {})
-                if l2:
+                if l2 and "pmi" in l2:
+                    pmi_val = l2.get("pmi", 0)
+                    cdist = l2.get("centroid_dist", 0)
+                    decision = l2.get("decision", "")
+                    lines.append(
+                        f"  ⚠ '{kw}' | tail='{tail}' | L0: {sigs} | "
+                        f"L2: pmi={pmi_val:.2f} cdist={cdist:.3f} → {decision}"
+                    )
+                elif l2 and "combined_score" in l2:
+                    # Fallback: старый формат
                     comb = l2.get("combined_score", 0)
                     direct = l2.get("direct_score", 0)
                     lines.append(f"  ⚠ '{kw}' | tail='{tail}' | L0: {sigs} | L2: comb={comb:.3f} direct={direct:.3f}")
@@ -627,14 +635,15 @@ class FilterTracer:
         l2_stats = report.get("l2_stats", {})
         if l2_stats:
             lines.append(f"")
-            lines.append(f"── L2 Semantic Classifier ──")
+            lines.append(f"── L2 Tri-Signal Classifier ──")
             lines.append(
                 f"  Input GREY: {l2_stats.get('input_grey', 0)} | "
                 f"→ VALID: {l2_stats.get('l2_valid', 0)} | "
                 f"TRASH: {l2_stats.get('l2_trash', 0)} | "
-                f"GREY: {l2_stats.get('l2_grey', 0)}"
+                f"GREY→L3: {l2_stats.get('l2_grey', 0)}"
             )
             lines.append(f"  Reduction: {l2_stats.get('reduction_pct', 0)}%")
+            lines.append(f"  Centroid from: {l2_stats.get('l0_valid_for_centroid', 0)} L0 VALID tails")
         
         # VALID keywords с L0/L2 деталями
         valid_kws = report.get("valid_keywords", {})
@@ -645,8 +654,19 @@ class FilterTracer:
                 l0 = info.get("l0")
                 l2 = info.get("l2")
                 
-                if l0 and l2:
-                    # Прошёл и L0 и L2
+                if l0 and l2 and "pmi" in l2:
+                    # Tri-signal L2
+                    tail = l0.get("tail", "")
+                    sigs = ", ".join(l0.get("signals", [])) or "—"
+                    pmi_val = l2.get("pmi", 0)
+                    cdist = l2.get("centroid_dist", 0)
+                    decision = l2.get("decision", "")
+                    lines.append(
+                        f"  ✓ '{kw}' | tail='{tail}' | L0: {sigs} | "
+                        f"L2: pmi={pmi_val:.2f} cdist={cdist:.3f} → {decision}"
+                    )
+                elif l0 and l2 and "combined_score" in l2:
+                    # Старый формат L2
                     tail = l0.get("tail", "")
                     sigs = ", ".join(l0.get("signals", [])) or "—"
                     comb = l2.get("combined_score", 0)
@@ -658,8 +678,13 @@ class FilterTracer:
                     sigs = ", ".join(l0.get("signals", [])) or "—"
                     decided = l0.get("decided_by", "")
                     lines.append(f"  ✓ '{kw}' | tail='{tail}' | L0: {sigs} | by: {decided}")
+                elif l2 and "pmi" in l2:
+                    # Только tri-signal L2
+                    pmi_val = l2.get("pmi", 0)
+                    cdist = l2.get("centroid_dist", 0)
+                    decision = l2.get("decision", "")
+                    lines.append(f"  ✓ '{kw}' | L2: pmi={pmi_val:.2f} cdist={cdist:.3f} → {decision}")
                 elif l2:
-                    # Только L2 (был GREY в L0, стал VALID в L2)
                     comb = l2.get("combined_score", 0)
                     direct = l2.get("direct_score", 0)
                     lines.append(f"  ✓ '{kw}' | L2: comb={comb:.3f} direct={direct:.3f}")
