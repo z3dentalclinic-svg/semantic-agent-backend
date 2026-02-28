@@ -1295,6 +1295,10 @@ def detect_truncated_geo(tail: str, geo_db: dict = None) -> Tuple[bool, str]:
     
     word = words[0]
     
+    # Числа не могут быть обрезанными городами ("12" ≠ "12 de octubre")
+    if word.isdigit():
+        return False, ""
+    
     # Если слово само является полноценным городом — не обрезанное
     if word in geo_db:
         return False, ""
