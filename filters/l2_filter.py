@@ -57,9 +57,9 @@ class L2Config:
     pmi_valid_threshold: float = 2.5
     
     # Centroid distance порог: выше → VALID (для PMI < pmi_valid)
-    centroid_valid_threshold: float = 0.55
+    centroid_valid_threshold: float = 0.65
     # Centroid distance: ниже → TRASH (при L0 pure-neg или PMI low)
-    centroid_trash_threshold: float = 0.40
+    centroid_trash_threshold: float = 0.50
     
     cache_file: str = "l2_cache.json"
 
@@ -125,9 +125,11 @@ class L2Classifier:
     
     def _pmi_score(self, tail: str, word_df: Counter) -> float:
         """
-        PMI score = средний log2(df+1) контентных слов хвоста.
+        PMI score = MIN log2(df+1) контентных слов хвоста.
         
-        Высокий = domain-relevant слова. Низкий = редкие/подозрительные.
+        Используем min, не mean: если хоть одно слово редкое — PMI низкий.
+        "щетки купить" = min(2.0, 6.4) = 2.0 → centroid zone.
+        "купить гелевый" = min(6.4, 4.4) = 4.4 → VALID.
         """
         words = tail.lower().split()
         content = [w for w in words if len(w) > 2 or w.isdigit()]
@@ -135,7 +137,8 @@ class L2Classifier:
             content = words
         if not content:
             return 0.0
-        return sum(math.log2(word_df.get(w, 0) + 1) for w in content) / len(content)
+        scores = [math.log2(word_df.get(w, 0) + 1) for w in content]
+        return min(scores)
     
     # =========================================================
     # SIGNAL 2: Centroid Distance
