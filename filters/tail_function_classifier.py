@@ -143,7 +143,7 @@ class TailFunctionClassifier:
         
         # ===== НЕГАТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_negative = [
-            ('fragment',        lambda: detect_fragment(tail)),
+            ('fragment',        lambda: detect_fragment(tail, self.seed)),
             ('meta',            lambda: detect_meta(tail, self.seed)),
             ('dangling',        lambda: detect_dangling(tail, self.seed, self.geo_db)),
             ('duplicate',       lambda: detect_duplicate_words(tail)),
