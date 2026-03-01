@@ -1554,6 +1554,60 @@ async def l2_diagnostic():
         return {"error": str(e)}
 
 
+@app.get("/debug/l0-trace")
+async def l0_trace_endpoint(
+    label: str = Query("all", description="Фильтр: all / valid / trash / grey / no_seed"),
+    tail: str = Query(None, description="Поиск по tail (подстрока)"),
+    keyword: str = Query(None, description="Поиск по keyword (подстрока)"),
+):
+    """
+    Возвращает L0 diagnostic trace — tail extraction + detector signals для каждого ключа.
+    
+    Примеры:
+        /debug/l0-trace                     — все ключи
+        /debug/l0-trace?label=trash         — только TRASH
+        /debug/l0-trace?tail=бу             — ключи с tail содержащим "бу"
+        /debug/l0-trace?keyword=авито       — ключи с keyword содержащим "авито"
+        /debug/l0-trace?label=no_seed       — ключи где seed не найден
+    """
+    import json as _json
+    try:
+        with open("l0_diagnostic.json", "r", encoding="utf-8") as f:
+            diag = _json.load(f)
+    except FileNotFoundError:
+        return {"error": "l0_diagnostic.json not found — run a search with L0 enabled first"}
+    except Exception as e:
+        return {"error": str(e)}
+    
+    traces = diag.get("trace", [])
+    
+    # Фильтрация по label
+    if label != "all":
+        if label == "no_seed":
+            traces = [t for t in traces if t.get("tail") is None]
+        else:
+            traces = [t for t in traces if t.get("label", "").lower() == label.lower()]
+    
+    # Фильтрация по tail подстроке
+    if tail:
+        tail_lower = tail.lower()
+        traces = [t for t in traces if t.get("tail") and tail_lower in t["tail"].lower()]
+    
+    # Фильтрация по keyword подстроке
+    if keyword:
+        kw_lower = keyword.lower()
+        traces = [t for t in traces if kw_lower in t.get("keyword", "").lower()]
+    
+    return {
+        "seed": diag.get("seed"),
+        "target_country": diag.get("target_country"),
+        "stats": diag.get("stats"),
+        "filter": {"label": label, "tail": tail, "keyword": keyword},
+        "filtered_count": len(traces),
+        "trace": traces,
+    }
+
+
 @app.get("/api/light-search")
 async def light_search_endpoint(
     seed: str = Query(..., description="Базовый запрос"),
