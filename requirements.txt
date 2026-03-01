@@ -30,8 +30,5 @@ babel
 fastembed>=0.7.0
 onnxruntime>=1.17.0
 
-# L2 rubert-tiny2 MLM — torch ставится через Build Command (CPU-only)
-transformers>=4.30.0
-
 # Debug
 psutil>=5.9.0
