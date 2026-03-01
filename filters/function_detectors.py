@@ -1067,13 +1067,16 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
     
     Алгоритмический, через POS-теги pymorphy3. Ноль хардкода.
     
-    seed="как принимать нимесил":
-      "лучше" → COMP + seed имеет INFN "принимать" → модификатор → VALID
-      "можно" → PRED + seed имеет INFN → модификатор → VALID  
-      "правильно" → ADVB + seed имеет INFN → модификатор → VALID
+    Фильтрация по семантическому классу наречия:
+    - PRED (можно, нужно) → всегда модификатор → OK
+    - COMP (лучше, больше) → всегда модификатор → OK
+    - ADVB на -о/-е (правильно, долго, часто) → способ действия → OK
+    - ADVB без -о (домой, навалом, онлайн) → направление/канал → reject
     
-    seed="ремонт пылесосов":
-      "лучше" → COMP, но seed НЕ имеет глагола → НЕ модификатор → False
+    Лингвистический принцип: продуктивные наречия способа действия
+    в русском языке образуются от прилагательных суффиксом -о/-е.
+    Направительные (домой, туда), инструментальные (навалом),
+    канальные (онлайн) не имеют этого суффикса.
     """
     if not tail or not seed:
         return False, ""
@@ -1096,15 +1099,24 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
     if len(tail_words) > 2:
         return False, ""
     
-    # POS-теги которые модифицируют глагол
-    verb_modifier_pos = {'ADVB', 'COMP', 'PRED'}
-    
     all_modifiers = True
     for tw in tail_words:
         tp = morph.parse(tw)[0]
-        if tp.tag.POS not in verb_modifier_pos:
-            all_modifiers = False
-            break
+        pos = tp.tag.POS
+        
+        # PRED (можно, нужно) и COMP (лучше) — всегда модификаторы
+        if pos in ('PRED', 'COMP'):
+            continue
+        
+        # ADVB — только если образовано от прилагательного (суффикс -о/-е)
+        # "правильно", "долго", "часто" → OK
+        # "домой", "навалом", "онлайн" → reject
+        if pos == 'ADVB' and (tw.endswith('о') or tw.endswith('е')):
+            continue
+        
+        # Всё остальное — не модификатор
+        all_modifiers = False
+        break
     
     if all_modifiers:
         pos_tags = [morph.parse(w)[0].tag.POS for w in tail_words]
