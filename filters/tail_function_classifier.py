@@ -24,6 +24,7 @@ from .function_detectors import (
     detect_verb_modifier, detect_conjunctive_extension,
     # Новые мягкие детекторы
     detect_truncated_geo, detect_orphan_genitive, detect_single_infinitive,
+    detect_foreign_geo,
 )
 
 # Category mismatch detector (использует embeddings, ленивая загрузка)
@@ -72,6 +73,7 @@ SIGNAL_WEIGHTS = {
     'incoherent_tail': 0.85,   # многословный хвост с "чужими" словами
     'category_mismatch': 0.5,  # мягкий — embeddings ненадёжно классифицируют категории
     'truncated_geo':     0.85,  # обрезанный составной город — довольно надёжно
+    'foreign_geo':       0.95,  # город/страна из чужого региона — очень надёжно (geo_db)
     'orphan_genitive':   0.5,   # мягкий — может быть валидным ("фильтров")
     'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
 }
@@ -157,6 +159,7 @@ class TailFunctionClassifier:
             ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
             # Новые мягкие детекторы
             ('truncated_geo',     lambda: detect_truncated_geo(tail, self.geo_db)),
+            ('foreign_geo',       lambda: detect_foreign_geo(tail, self.geo_db, self.target_country)),
             ('orphan_genitive',   lambda: detect_orphan_genitive(tail, self.seed)),
             ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed)),
         ]
@@ -364,7 +367,7 @@ class TailFunctionClassifier:
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
-            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha'}
+            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha', 'foreign_geo'}
             has_hard_negative = bool(set(negative) & hard_negatives)
             
             # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
