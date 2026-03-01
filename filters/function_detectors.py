@@ -1348,6 +1348,106 @@ def detect_truncated_geo(tail: str, geo_db: dict = None) -> Tuple[bool, str]:
     return False, ""
 
 
+# Страны мира: название → ISO код (кириллица + латиница)
+# Конечный, стабильный список — не hardcode ниши, а базовая география
+_COUNTRIES = {
+    # СНГ + ближнее зарубежье
+    'россия': 'RU', 'рф': 'RU', 'беларусь': 'BY', 'белоруссия': 'BY',
+    'казахстан': 'KZ', 'узбекистан': 'UZ', 'кыргызстан': 'KG',
+    'таджикистан': 'TJ', 'туркменистан': 'TM', 'азербайджан': 'AZ',
+    'армения': 'AM', 'грузия': 'GE', 'молдова': 'MD', 'молдавия': 'MD',
+    'украина': 'UA',
+    # Европа
+    'польша': 'PL', 'германия': 'DE', 'франция': 'FR', 'италия': 'IT',
+    'испания': 'ES', 'португалия': 'PT', 'чехия': 'CZ', 'словакия': 'SK',
+    'венгрия': 'HU', 'румыния': 'RO', 'болгария': 'BG', 'хорватия': 'HR',
+    'сербия': 'RS', 'словения': 'SI', 'австрия': 'AT', 'швейцария': 'CH',
+    'нидерланды': 'NL', 'голландия': 'NL', 'бельгия': 'BE',
+    'швеция': 'SE', 'норвегия': 'NO', 'дания': 'DK', 'финляндия': 'FI',
+    'литва': 'LT', 'латвия': 'LV', 'эстония': 'EE',
+    'греция': 'GR', 'турция': 'TR', 'кипр': 'CY',
+    'ирландия': 'IE', 'исландия': 'IS',
+    'великобритания': 'GB', 'англия': 'GB', 'шотландия': 'GB',
+    # Азия
+    'китай': 'CN', 'япония': 'JP', 'корея': 'KR', 'индия': 'IN',
+    'таиланд': 'TH', 'вьетнам': 'VN', 'индонезия': 'ID',
+    'малайзия': 'MY', 'сингапур': 'SG', 'филиппины': 'PH',
+    # Америка
+    'сша': 'US', 'америка': 'US', 'канада': 'CA', 'мексика': 'MX',
+    'бразилия': 'BR', 'аргентина': 'AR',
+    # Ближний Восток
+    'израиль': 'IL', 'иран': 'IR', 'ирак': 'IQ',
+    'египет': 'EG', 'марокко': 'MA',
+    'оаэ': 'AE', 'эмираты': 'AE', 'саудовская аравия': 'SA',
+    # Океания
+    'австралия': 'AU', 'новая зеландия': 'NZ',
+    # Латиница
+    'russia': 'RU', 'belarus': 'BY', 'ukraine': 'UA',
+    'poland': 'PL', 'germany': 'DE', 'france': 'FR', 'italy': 'IT',
+    'spain': 'ES', 'czech': 'CZ', 'switzerland': 'CH',
+    'usa': 'US', 'uk': 'GB', 'china': 'CN', 'japan': 'JP',
+    'turkey': 'TR', 'israel': 'IL', 'canada': 'CA',
+}
+
+
+def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua") -> Tuple[bool, str]:
+    """
+    Негативный детектор: чужая география в хвосте.
+    
+    Ловит:
+    1. Города из ДРУГОЙ страны (через geo_db)
+    2. Страны, отличные от target_country (через _COUNTRIES)
+    
+    "барановичах" → inflect(nomn) → "барановичи" = BY ≠ UA → negative
+    "в италии" → лемма "италия" = IT ≠ UA → negative
+    "киев" → UA = target → NOT negative (позитивный geo ловит)
+    
+    Cross-niche: работает для любого seed. Ноль хардкода ниши.
+    """
+    if not geo_db:
+        return False, ""
+    
+    target = target_country.upper()
+    skip_pos = {'CONJ', 'PREP', 'PRCL', 'INTJ'}
+    
+    words = tail.lower().split()
+    
+    for word in words:
+        parsed = morph.parse(word)[0]
+        
+        if parsed.tag.POS in skip_pos:
+            continue
+        
+        lemma = parsed.normal_form
+        
+        # Собираем все формы для проверки: слово, лемма, номинатив
+        check_forms = {word, lemma}
+        # Приводим к номинативу (барановичах → барановичи, киеву → киев)
+        nomn_form = parsed.inflect({'nomn'})
+        if nomn_form:
+            check_forms.add(nomn_form.word)
+        
+        # Проверка 1: чужой город (geo_db)
+        for check_word in check_forms:
+            if check_word in geo_db:
+                countries = geo_db[check_word]
+                if target not in countries:
+                    foreign = ', '.join(sorted(countries))
+                    return True, f"Чужой город: '{check_word}' ({foreign}, не {target})"
+                # Город из target_country — не negative
+                break
+        
+        # Проверка 2: чужая страна (_COUNTRIES)
+        for check_word in check_forms:
+            if check_word in _COUNTRIES:
+                country_code = _COUNTRIES[check_word]
+                if country_code != target:
+                    return True, f"Чужая страна: '{check_word}' ({country_code}, не {target})"
+                break
+    
+    return False, ""
+
+
 def detect_orphan_genitive(tail: str, seed: str = "") -> Tuple[bool, str]:
     """
     Мягкий детектор: одиночный генитив после seed в генитиве.
