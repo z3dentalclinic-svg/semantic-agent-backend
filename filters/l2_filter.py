@@ -44,7 +44,7 @@ from collections import Counter
 import numpy as np
 import pymorphy3
 
-from .shared_model import get_embedding_model, get_rubert_mlm
+from .shared_model import get_embedding_model
 
 # Singleton morph analyzer (0 MB extra — pymorphy3 already in L0)
 _morph_analyzer = None
@@ -117,13 +117,6 @@ class L2Classifier:
             if self._embedder is None:
                 raise RuntimeError("L2: embedding model failed to load")
         return self._embedder
-    
-    @property
-    def rubert_mlm(self):
-        """Lazy load rubert-tiny2 MLM model. Returns dict or None."""
-        if not hasattr(self, '_rubert_mlm'):
-            self._rubert_mlm = get_rubert_mlm()
-        return self._rubert_mlm
     
     @property
     def is_available(self) -> bool:
@@ -337,106 +330,6 @@ class L2Classifier:
         
         return (best_score, best_detail)
     
-    # =========================================================
-    # SIGNAL 5: MLM Substitution Test (rubert-tiny2 fill-mask)
-    # =========================================================
-    #
-    # НОВАЯ ОСЬ: не "похожи ли embeddings?" а "может ли tail быть модификатором seed?"
-    #
-    # Шаблон: "{seed_head} [MASK]" → P("гелевый") vs P("глушитель")
-    # "аккумулятор [MASK]" → rubert предсказывает что дальше:
-    #   P("гелевый") = высокая → VALID (языковая модель ожидает это слово)
-    #   P("глушитель") = низкая → TRASH (модель не ожидает это после "аккумулятор")
-    #
-    # Это ФУНКЦИОНАЛЬНАЯ совместимость, не семантическая близость.
-    # rubert-tiny2 обучен на русских текстах и знает что "аккумулятор бывает гелевый"
-    # но не "аккумулятор бывает глушитель".
-    
-    def _compute_substitution_scores(
-        self,
-        grey_tails: List[str],
-        seed_head: str
-    ) -> Dict[str, float]:
-        """
-        MLM substitution test: P(tail_word | "{seed_head} [MASK]").
-        
-        Для каждого grey tail:
-        1. Берём ПЕРВОЕ слово tail
-        2. Формируем "{seed_head} [MASK]"
-        3. Считаем log-probability первого слова tail на позиции [MASK]
-        4. Нормализуем в 0..1
-        
-        Returns: {tail: score}
-        Высокий score = tail ожидаемый модификатор seed.
-        """
-        mlm = self.rubert_mlm
-        if mlm is None:
-            logger.info("L2: rubert MLM not available, skipping substitution test")
-            return {}
-        
-        model = mlm["model"]
-        tokenizer = mlm["tokenizer"]
-        
-        if not grey_tails or not seed_head:
-            return {}
-        
-        import torch
-        
-        # Шаблон: "seed_head [MASK]"
-        mask_token = tokenizer.mask_token
-        template = f"{seed_head} {mask_token}"
-        
-        # Tokenize template
-        inputs = tokenizer(template, return_tensors="pt")
-        
-        # Find [MASK] position
-        mask_token_id = tokenizer.mask_token_id
-        input_ids = inputs["input_ids"][0]
-        mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=True)[0]
-        
-        if len(mask_positions) == 0:
-            logger.warning(f"L2: No [MASK] found in template '{template}'")
-            return {}
-        
-        mask_pos = mask_positions[0].item()
-        
-        # Run model → logits
-        with torch.no_grad():
-            outputs = model(**inputs)
-        
-        logits = outputs.logits[0]  # shape: (seq_len, vocab_size)
-        mask_logits = logits[mask_pos]  # shape: (vocab_size,)
-        
-        # Log-softmax для вероятностей
-        log_probs = torch.nn.functional.log_softmax(mask_logits, dim=0)
-        
-        scores = {}
-        for tail in grey_tails:
-            # Берём первое слово хвоста
-            first_word = tail.lower().split()[0] if tail.strip() else tail
-            
-            # Токенизируем первое слово, берём первый subword token
-            word_tokens = tokenizer.encode(first_word, add_special_tokens=False)
-            if not word_tokens:
-                scores[tail] = 0.0
-                continue
-            
-            first_token_id = word_tokens[0]
-            
-            # Log-probability этого токена на позиции [MASK]
-            log_prob = log_probs[first_token_id].item()
-            
-            # Нормализуем: log_prob от -15 (маловероятно) до -2 (вероятно) → 0..1
-            normalized = max(0.0, min(1.0, (log_prob + 15.0) / 13.0))
-            scores[tail] = normalized
-        
-        logger.info(
-            f"L2: Substitution scores computed for {len(scores)} tails "
-            f"(min={min(scores.values()):.3f}, max={max(scores.values()):.3f})"
-        )
-        
-        return scores
-    
     def _parse_l0_signals(self, l0_trace: List[dict]) -> Dict[str, dict]:
         """
         Парсим L0 trace → для каждого keyword:
@@ -634,17 +527,7 @@ class L2Classifier:
                 morph_scores[tail] = 0.0
                 morph_details[tail] = "no_seed_head"
         
-        # === SIGNAL 5: MLM Substitution Test ===
-        subst_scores = {}
-        try:
-            subst_scores = self._compute_substitution_scores(
-                grey_tails, seed_head or seed.split()[0]
-            )
-        except Exception as e:
-            logger.warning(f"L2: Substitution test failed: {e}")
-            subst_scores = {}
-        
-        # === SIGNAL 6: Word Overlap with Reference ===
+        # === SIGNAL 5: Word Overlap with Reference ===
         ref_words = self._extract_reference_words(valid_tails, seed_head)
         word_overlap = self._compute_word_overlap(grey_tails, ref_words)
         logger.info(f"L2: Reference words ({len(ref_words)}): {sorted(ref_words)[:20]}...")
@@ -661,7 +544,6 @@ class L2Classifier:
             knn = knn_scores.get(tail, 0.0)
             morph = morph_scores.get(tail, 0.0)
             morph_detail = morph_details.get(tail, "")
-            subst = subst_scores.get(tail, -1.0)  # -1 = not computed
             l0_sig = l0_signals.get(keyword, {
                 "positive": [], "negative": [], "pure_neg": False
             })
@@ -673,7 +555,6 @@ class L2Classifier:
                 "knn_score": round(knn, 4),
                 "morph_score": round(morph, 2),
                 "morph_detail": morph_detail,
-                "subst_score": round(subst, 4) if subst >= 0 else None,
                 "ref_overlap": overlap,
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
@@ -753,7 +634,6 @@ class L2Classifier:
                         "knn_score": debug.get("knn_score", 0),
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
-                        "subst_score": debug.get("subst_score"),
                         "ref_overlap": debug.get("ref_overlap", []),
                         "decision": debug.get("decision", ""),
                     }
@@ -795,7 +675,6 @@ class L2Classifier:
                         "knn_score": debug.get("knn_score", 0),
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
-                        "subst_score": debug.get("subst_score"),
                         "ref_overlap": debug.get("ref_overlap", []),
                         "decision": debug.get("decision", ""),
                     }
@@ -828,7 +707,6 @@ class L2Classifier:
                     "knn_score": debug.get("knn_score", 0),
                     "morph_score": debug.get("morph_score", 0),
                     "morph_detail": debug.get("morph_detail", ""),
-                    "subst_score": debug.get("subst_score"),
                         "ref_overlap": debug.get("ref_overlap", []),
                     "l0_pos": debug.get("l0_pos", []),
                     "l0_neg": debug.get("l0_neg", []),
@@ -861,13 +739,6 @@ class L2Classifier:
                     "max": round(max(morph_scores.values()), 2) if morph_scores else 0,
                     "scores_gte_07": sum(1 for v in morph_scores.values() if v >= 0.7),
                     "scores_eq_0": sum(1 for v in morph_scores.values() if v == 0.0),
-                },
-                "subst_score_distribution": {
-                    "min": round(min(subst_scores.values()), 4) if subst_scores else None,
-                    "max": round(max(subst_scores.values()), 4) if subst_scores else None,
-                    "mean": round(sum(subst_scores.values()) / len(subst_scores), 4) if subst_scores else None,
-                    "model": "rubert-tiny2" if self.rubert_mlm else "unavailable",
-                    "count": len(subst_scores),
                 },
                 "word_overlap": {
                     "reference_words": sorted(ref_words),
