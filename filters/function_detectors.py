@@ -268,7 +268,16 @@ def detect_time(tail: str) -> Tuple[bool, str]:
             return True, f"Время (паттерн): '{pattern}'"
     
     for word in tail_lower.split():
-        lemma = morph.parse(word)[0].normal_form
+        parsed = morph.parse(word)[0]
+        lemma = parsed.normal_form
+        pos = parsed.tag.POS
+        
+        # Прилагательные без существительного — не time сигнал
+        # "быстрые" (ADJF) → reject, "быстро" (ADVB) → OK
+        # "срочный" (ADJF) → reject, "срочно" (ADVB) → OK
+        if pos in ('ADJF', 'ADJS', 'PRTF', 'PRTS'):
+            continue
+        
         if lemma in time_lemmas or word in time_lemmas:
             return True, f"Время (лемма): '{lemma}'"
     
