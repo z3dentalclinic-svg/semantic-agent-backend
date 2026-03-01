@@ -582,13 +582,11 @@ class L2Classifier:
                 label = "VALID"
                 reason = f"Morph {morph:.1f} ({morph_detail})"
             
-            # R2.7: Word overlap с reference → VALID
-            # tail содержит слово из L0 VALID (бренды, модели, тех. термины)
-            # "ямаха джог 36" содержит "ямаха","джог" из reference → VALID
-            # "глушитель" не содержит ничего из reference → stays GREY
-            elif overlap and not pure_neg:
-                label = "VALID"
-                reason = f"RefOverlap: {','.join(overlap)}"
+            # R2.7: Word overlap с reference — ОТКЛЮЧЕНО (даёт FP через intent-слова)
+            # Overlap считается и логируется в диагностику, но не влияет на решение.
+            # elif overlap and not pure_neg:
+            #     label = "VALID"
+            #     reason = f"RefOverlap: {','.join(overlap)}"
             
             # R3: KNN VALID — ОТКЛЮЧЕНО (false positives: глушитель 0.84, жигули 0.89)
             # Template cosine пока diagnostic-only, порог установим после анализа
