@@ -1398,9 +1398,9 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
     1. Города из ДРУГОЙ страны (через geo_db)
     2. Страны, отличные от target_country (через _COUNTRIES)
     
-    "барановичах" → inflect(nomn) → "барановичи" = BY ≠ UA → negative
-    "в италии" → лемма "италия" = IT ≠ UA → negative
-    "киев" → UA = target → NOT negative (позитивный geo ловит)
+    НЕ ловит:
+    - Паттерн "из X в Y" (обе страны в хвосте) → международный сервис
+      "из украины в италию" → своя + чужая → cross-border → пропускаем
     
     Cross-niche: работает для любого seed. Ноль хардкода ниши.
     """
@@ -1412,6 +1412,33 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
     
     words = tail.lower().split()
     
+    # === Предпроверка: есть ли target_country в хвосте? ===
+    # Если да → паттерн "из [своей] в [чужую]" → cross-border intent → не блокируем
+    has_target_country = False
+    for word in words:
+        parsed = morph.parse(word)[0]
+        if parsed.tag.POS in skip_pos:
+            continue
+        lemma = parsed.normal_form
+        nomn_form = parsed.inflect({'nomn'})
+        check_forms = {word, lemma}
+        if nomn_form:
+            check_forms.add(nomn_form.word)
+        for cf in check_forms:
+            if cf in _COUNTRIES and _COUNTRIES[cf] == target:
+                has_target_country = True
+                break
+            if cf in geo_db and target in geo_db[cf]:
+                has_target_country = True
+                break
+        if has_target_country:
+            break
+    
+    if has_target_country:
+        # "из украины в италию" → обе страны → cross-border → не блокируем
+        return False, ""
+    
+    # === Основная проверка ===
     for word in words:
         parsed = morph.parse(word)[0]
         
