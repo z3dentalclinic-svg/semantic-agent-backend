@@ -279,63 +279,37 @@ class L2Classifier:
         - PRTF (причастие) согласованное → 0.9 ("тяговый", "заряженный")
         - Всё остальное → 0.0 (NOUN, VERB, бренды — нейтрально)
         
-        NOUN-ADJ guard (оба направления):
-        - NOUN + ADJ: "жиклер холостого" → adj про жиклер, не seed → skip
-        - ADJ + NOUN(не seed): "желтого цвета" → adj про цвет, не seed → skip
-        - ADJ alone: "гелевый" → модифицирует seed → score
-        - "литий ионный" → NOUN+ADJ → skip (L3 вернёт)
+        NOUN-ADJ guard отключён: pymorphy парсит бренды/модели как NOUN
+        ("дио", "такт", "штиль" → NOUN), что убивает 120+ валидных хвостов.
+        FP типа "жиклер холостого хода", "желтого цвета" → задача L3.
         """
         if seed_gender is None:
             return (0.0, "no_seed_head")
         
         morph = _get_morph()
         words = tail.lower().split()[:2]  # первые 1-2 слова
-        seed_head_lower = seed_head.lower() if seed_head else ""
-        
-        # Двухпроходная логика: сначала парсим все, потом проверяем контекст
-        parsed = []
-        for word in words:
-            if not word or len(word) < 2:
-                parsed.append((word, None, None))
-                continue
-            if word[0].isdigit():
-                parsed.append((word, 'NUM', None))
-                continue
-            parses = morph.parse(word)
-            if not parses:
-                parsed.append((word, None, None))
-                continue
-            p = parses[0]
-            parsed.append((word, p.tag.POS, p))
-        
-        # Проверяем: есть ли non-seed NOUN среди первых 2 слов?
-        has_nonseed_noun = False
-        for word, pos, p in parsed:
-            if pos == 'NOUN' and p and p.normal_form != seed_head_lower:
-                has_nonseed_noun = True
-                break
         
         best_score = 0.0
         best_detail = "no_adj"
         
-        for i, (word, pos, p) in enumerate(parsed):
+        for word in words:
+            if not word or len(word) < 2:
+                continue
+                
             # Цифры/спецификации
-            if pos == 'NUM':
+            if word[0].isdigit():
                 if best_score < 0.8:
                     best_score = 0.8
                     best_detail = f"numeric:{word}"
                 continue
             
-            if p is None:
+            parses = morph.parse(word)
+            if not parses:
                 continue
+            p = parses[0]
             
             # Прилагательное (полное или краткое)
             if 'ADJF' in p.tag or 'ADJS' in p.tag or 'PRTF' in p.tag:
-                # NOUN-ADJ guard: если рядом есть non-seed NOUN, adj модифицирует его
-                if has_nonseed_noun:
-                    best_detail = f"adj_with_noun:{word}({p.tag.gender},{p.tag.number})"
-                    continue
-                
                 gender_match = (p.tag.gender == seed_gender) if p.tag.gender else False
                 number_match = (p.tag.number == seed_number) if p.tag.number else False
                 
