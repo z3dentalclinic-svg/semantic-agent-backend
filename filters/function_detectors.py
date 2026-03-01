@@ -372,20 +372,36 @@ def detect_action(tail: str) -> Tuple[bool, str]:
 # НЕГАТИВНЫЕ ДЕТЕКТОРЫ (дефект формы → TRASH)
 # ============================================================
 
-def detect_fragment(tail: str) -> Tuple[bool, str]:
+def detect_fragment(tail: str, seed: str = "") -> Tuple[bool, str]:
     """
     Детектор обрывка: хвост заканчивается на служебное слово,
     или состоит из одной копулы/частицы.
     
     "и" → True    "для" → True    "есть" → True
     "рядом" → False (наречие, не служебное)
+    
+    SEED-AWARE: если seed содержит глагол, одиночное "когда"/"сколько"
+    в tail = временной модификатор глагола, не обрывок.
     """
     words = tail.lower().split()
     if not words:
         return False, ""
     
+    # Проверяем: есть ли глагол в seed?
+    seed_has_verb = False
+    if seed:
+        for sw in seed.lower().split():
+            sp = morph.parse(sw)[0]
+            if sp.tag.POS in ('INFN', 'VERB'):
+                seed_has_verb = True
+                break
+    
     last_word = words[-1]
     last_parsed = morph.parse(last_word)[0]
+    
+    # Вопросительные/временные слова которые могут модифицировать глагол seed
+    # "когда" при seed "как принимать" → "когда принимать" → NOT обрывок
+    verb_modifier_questions = {'когда', 'сколько', 'коли', 'скільки'}
     
     # Правило 1: Заканчивается на предлог, союз, частицу
     # Исключение: продуктовые суффиксы — "про"(Pro), "макс"(Max), "мини"(Mini), 
@@ -402,6 +418,8 @@ def detect_fragment(tail: str) -> Tuple[bool, str]:
     if last_parsed.tag.POS in ('PREP', 'CONJ', 'PRCL') and last_word not in product_suffixes:
         if last_word in misclassified_as_conj:
             pass  # Не блокируем — это ложное срабатывание pymorphy
+        elif seed_has_verb and last_word in verb_modifier_questions:
+            pass  # "когда"/"сколько" при seed с глаголом = модификатор, не обрывок
         else:
             return True, f"Обрывок: '{last_word}' ({last_parsed.tag.POS}) на конце"
     
