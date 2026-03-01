@@ -263,7 +263,7 @@ class L2Classifier:
                 return (p.normal_form, p.tag.gender, p.tag.number)
         return (None, None, None)
     
-    def _morph_compatibility_score(self, tail: str, seed_gender, seed_number) -> tuple:
+    def _morph_compatibility_score(self, tail: str, seed_gender, seed_number, seed_head=None) -> tuple:
         """
         Морфологическая совместимость хвоста с head noun seed'а.
         
@@ -278,34 +278,64 @@ class L2Classifier:
         - NUMR / цифра → 0.8 (спецификация)
         - PRTF (причастие) согласованное → 0.9 ("тяговый", "заряженный")
         - Всё остальное → 0.0 (NOUN, VERB, бренды — нейтрально)
+        
+        NOUN-ADJ guard (оба направления):
+        - NOUN + ADJ: "жиклер холостого" → adj про жиклер, не seed → skip
+        - ADJ + NOUN(не seed): "желтого цвета" → adj про цвет, не seed → skip
+        - ADJ alone: "гелевый" → модифицирует seed → score
+        - "литий ионный" → NOUN+ADJ → skip (L3 вернёт)
         """
         if seed_gender is None:
             return (0.0, "no_seed_head")
         
         morph = _get_morph()
         words = tail.lower().split()[:2]  # первые 1-2 слова
+        seed_head_lower = seed_head.lower() if seed_head else ""
+        
+        # Двухпроходная логика: сначала парсим все, потом проверяем контекст
+        parsed = []
+        for word in words:
+            if not word or len(word) < 2:
+                parsed.append((word, None, None))
+                continue
+            if word[0].isdigit():
+                parsed.append((word, 'NUM', None))
+                continue
+            parses = morph.parse(word)
+            if not parses:
+                parsed.append((word, None, None))
+                continue
+            p = parses[0]
+            parsed.append((word, p.tag.POS, p))
+        
+        # Проверяем: есть ли non-seed NOUN среди первых 2 слов?
+        has_nonseed_noun = False
+        for word, pos, p in parsed:
+            if pos == 'NOUN' and p and p.normal_form != seed_head_lower:
+                has_nonseed_noun = True
+                break
         
         best_score = 0.0
         best_detail = "no_adj"
         
-        for word in words:
-            if not word or len(word) < 2:
-                continue
-                
+        for i, (word, pos, p) in enumerate(parsed):
             # Цифры/спецификации
-            if word[0].isdigit():
+            if pos == 'NUM':
                 if best_score < 0.8:
                     best_score = 0.8
                     best_detail = f"numeric:{word}"
                 continue
             
-            parses = morph.parse(word)
-            if not parses:
+            if p is None:
                 continue
-            p = parses[0]
             
             # Прилагательное (полное или краткое)
             if 'ADJF' in p.tag or 'ADJS' in p.tag or 'PRTF' in p.tag:
+                # NOUN-ADJ guard: если рядом есть non-seed NOUN, adj модифицирует его
+                if has_nonseed_noun:
+                    best_detail = f"adj_with_noun:{word}({p.tag.gender},{p.tag.number})"
+                    continue
+                
                 gender_match = (p.tag.gender == seed_gender) if p.tag.gender else False
                 number_match = (p.tag.number == seed_number) if p.tag.number else False
                 
@@ -320,7 +350,6 @@ class L2Classifier:
                         best_score = score
                         best_detail = detail
                 elif gender_match or number_match:
-                    # Частичное совпадение
                     if best_score < 0.5:
                         best_score = 0.5
                         best_detail = f"adj_partial:{word}({p.tag.gender},{p.tag.number})"
@@ -540,7 +569,7 @@ class L2Classifier:
         if seed_head:
             logger.info(f"L2: Seed head noun: '{seed_head}' ({seed_gender}, {seed_number})")
             for tail in grey_tails:
-                score, detail = self._morph_compatibility_score(tail, seed_gender, seed_number)
+                score, detail = self._morph_compatibility_score(tail, seed_gender, seed_number, seed_head)
                 morph_scores[tail] = score
                 morph_details[tail] = detail
         else:
