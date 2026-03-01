@@ -56,9 +56,19 @@ def pre_filter(query: str, seed: str) -> tuple:
     
     # 5. Слово из seed встречается в запросе чаще чем в seed:
     #    "днепр ремонт пылесосов днепр район" → "днепр" 2x в query, 1x в seed → мусор
+    #    Исключаем предлоги/союзы — они естественно повторяются:
+    #    "купить аккумулятор на скутер на wildberries" → "на" 2x OK
+    _FUNC_WORDS = frozenset({
+        'в', 'на', 'с', 'к', 'у', 'о', 'за', 'из', 'от', 'до', 'по', 'при',
+        'для', 'без', 'под', 'над', 'про', 'через', 'между',
+        'и', 'а', 'но', 'или', 'ни', 'не', 'да', 'же', 'ли', 'бы',
+        'in', 'on', 'at', 'to', 'for', 'of', 'with', 'and', 'or', 'the', 'a',
+    })
     seed_word_counts = Counter(s.split())
     query_word_counts = Counter(q.split())
     for word, seed_count in seed_word_counts.items():
+        if word in _FUNC_WORDS:
+            continue
         if query_word_counts.get(word, 0) > seed_count:
             return True, f"повтор seed-слова: '{word}' ({query_word_counts[word]}x в query, {seed_count}x в seed)"
     
@@ -166,6 +176,24 @@ if __name__ == "__main__":
     
     for query, expected_trash in tests2:
         is_trash, reason = pre_filter(query, seed2)
+        ok = is_trash == expected_trash
+        status = "✅" if ok else "❌"
+        print(f"{status} \"{query}\" → {'TRASH' if is_trash else 'OK'}  {reason or ''}")
+    
+    # Тест с предлогом в seed
+    seed3 = "аккумулятор на скутер"
+    tests3 = [
+        ("купить аккумулятор на скутер на wildberries", False),  # "на" = предлог, OK
+        ("купить аккумулятор на скутер на озоне", False),        # "на" = предлог, OK
+        ("аккумулятор на скутер аккумулятор", True),             # "аккумулятор" 2x
+        ("аккумулятор на скутер скутер", True),                  # "скутер" 2x
+    ]
+    
+    print(f"\nТЕСТ pre_filter (seed: {seed3})")
+    print("=" * 50)
+    
+    for query, expected_trash in tests3:
+        is_trash, reason = pre_filter(query, seed3)
         ok = is_trash == expected_trash
         status = "✅" if ok else "❌"
         print(f"{status} \"{query}\" → {'TRASH' if is_trash else 'OK'}  {reason or ''}")
