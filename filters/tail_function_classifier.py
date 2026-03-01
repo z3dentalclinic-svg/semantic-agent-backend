@@ -301,12 +301,23 @@ class TailFunctionClassifier:
             if pos in skip_pos:
                 prev_pos = pos
                 continue
-            # Слово после предлога = часть предложной фразы → не orphan
-            # "цена в украине" → "в"=PREP, "украине" → prepositional phrase → OK
-            # Cross-niche: "обзор на английском", "доставка по киеву"
+            # Слово после предлога — пропускаем только если это гео
+            # "цена в украине" → "украине" = гео → OK
+            # "расценка в смете" → "смете" ≠ гео → orphan
             if prev_pos == 'PREP':
-                prev_pos = pos
-                continue
+                nomn_form = parsed.inflect({'nomn'})
+                check_forms = {w, lemma}
+                if nomn_form:
+                    check_forms.add(nomn_form.word)
+                is_geo = any(cf in self.geo_db for cf in check_forms)
+                if not is_geo:
+                    # Проверяем страны
+                    from .function_detectors import _COUNTRIES
+                    is_geo = any(cf in _COUNTRIES for cf in check_forms)
+                if is_geo:
+                    prev_pos = pos
+                    continue
+                # Не гео — проверяем как обычное слово (fall through)
             # Известная лемма
             if lemma in all_known or w in all_known:
                 prev_pos = pos
