@@ -523,19 +523,11 @@ class L2Classifier:
         word_df = self._compute_word_df(all_tails_for_df)
         pmi_scores = {tail: self._pmi_score(tail, word_df) for tail in grey_tails}
         
-        # === SIGNAL 2: KNN Similarity ===
-        knn_scores = {}
-        if valid_tails:
-            try:
-                knn_scores = self._compute_knn_scores(
-                    grey_tails, valid_tails, k=self.config.knn_k
-                )
-            except Exception as e:
-                logger.warning(f"L2: KNN failed: {e}")
-                knn_scores = {tail: 0.0 for tail in grey_tails}
-        else:
-            logger.warning("L2: No L0 VALID for KNN, using PMI only")
-            knn_scores = {tail: 0.0 for tail in grey_tails}
+        # === SIGNAL 2: KNN Similarity — ОТКЛЮЧЕНО ===
+        # MiniLM не различает функциональную совместимость.
+        # KNN VALID (R3) отключён давно. KNN TRASH (R4/R5) ловит ~7 хвостов,
+        # L3 обработает их без потерь. Экономим compute time на embed 270+ хвостов.
+        knn_scores = {tail: 0.0 for tail in grey_tails}
         
         # --- CENTROID (закомментировано) ---
         # centroid_scores = {}
@@ -610,11 +602,11 @@ class L2Classifier:
             # R2.5: Morph agreement (ADJ agrees with seed head) → VALID
             # "гелевый" + аккумулятор[masc] → согласуется → VALID
             # Positive-only: morph < 0.7 НЕ значит TRASH
-            # KNN guard: morph alone не достаточно, нужна минимальная семантическая близость
-            # (отсекает гео-adj "левый берег", "правый берег" для seed "ремонт")
-            elif morph >= 0.7 and knn >= 0.5 and not pure_neg:
+            # KNN guard НЕ работает: "литий ионный" = morph 1.0, KNN 0.378 (валидный, но KNN низкий)
+            # "женский" = morph 1.0, KNN 0.752 (FP, но KNN высокий). Диапазоны пересекаются.
+            elif morph >= 0.7 and not pure_neg:
                 label = "VALID"
-                reason = f"Morph {morph:.1f} ({morph_detail}) + KNN {knn:.3f}"
+                reason = f"Morph {morph:.1f} ({morph_detail})"
             
             # R2.8: Digit-letter spec token → VALID
             # "12v", "7ah", "ytz7s", "50кубов" — спецификация = коммерческий запрос
@@ -635,15 +627,15 @@ class L2Classifier:
             #     label = "VALID"
             #     reason = f"KNN {knn:.3f} >= {cfg.knn_valid_threshold}"
             
-            # R4: Pure neg + low KNN → TRASH
-            elif pure_neg and knn < cfg.knn_trash_threshold:
-                label = "TRASH"
-                reason = f"Pure-neg + KNN {knn:.3f} < {cfg.knn_trash_threshold}"
+            # R4: Pure neg + low KNN → TRASH — ОТКЛЮЧЕНО (KNN отключён)
+            # elif pure_neg and knn < cfg.knn_trash_threshold:
+            #     label = "TRASH"
+            #     reason = f"Pure-neg + KNN {knn:.3f} < {cfg.knn_trash_threshold}"
             
-            # R5: Low PMI + low KNN → TRASH
-            elif pmi < cfg.pmi_valid_threshold and knn < cfg.knn_trash_threshold:
-                label = "TRASH"
-                reason = f"PMI {pmi:.2f} low + KNN {knn:.3f} low"
+            # R5: Low PMI + low KNN → TRASH — ОТКЛЮЧЕНО (KNN отключён)
+            # elif pmi < cfg.pmi_valid_threshold and knn < cfg.knn_trash_threshold:
+            #     label = "TRASH"
+            #     reason = f"PMI {pmi:.2f} low + KNN {knn:.3f} low"
             
             # R6: Everything else → GREY (→ LLM)
             else:
