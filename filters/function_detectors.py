@@ -14,6 +14,26 @@ from typing import Tuple, Set, Dict
 morph = pymorphy3.MorphAnalyzer()
 
 
+def _seed_has_verb(seed: str) -> bool:
+    """
+    Проверяет наличие глагола в seed.
+    
+    Guard: word_is_known() — неизвестные слова (бренды, транслитерация)
+    НЕ считаются глаголами, даже если pymorphy угадывает VERB.
+    
+    "как принимать нимесил" → True  (принимать = INFN, known)
+    "нимесил таблетки"     → False (нимесил = VERB guess, NOT known)
+    "ремонт пылесосов"     → False (нет глаголов)
+    """
+    if not seed:
+        return False
+    for sw in seed.lower().split():
+        sp = morph.parse(sw)[0]
+        if sp.tag.POS in ('INFN', 'VERB') and morph.word_is_known(sw):
+            return True
+    return False
+
+
 # ============================================================
 # ПОЗИТИВНЫЕ ДЕТЕКТОРЫ (функция хвоста определена → VALID)
 # ============================================================
@@ -388,13 +408,7 @@ def detect_fragment(tail: str, seed: str = "") -> Tuple[bool, str]:
         return False, ""
     
     # Проверяем: есть ли глагол в seed?
-    seed_has_verb = False
-    if seed:
-        for sw in seed.lower().split():
-            sp = morph.parse(sw)[0]
-            if sp.tag.POS in ('INFN', 'VERB'):
-                seed_has_verb = True
-                break
+    seed_has_verb = _seed_has_verb(seed)
     
     last_word = words[-1]
     last_parsed = morph.parse(last_word)[0]
@@ -515,13 +529,7 @@ def detect_meta(tail: str, seed: str = "") -> Tuple[bool, str]:
     words = tail_lower.split()
     
     # Проверяем: есть ли глагол в seed?
-    seed_has_verb = False
-    if seed:
-        for sw in seed.lower().split():
-            sp = morph.parse(sw)[0]
-            if sp.tag.POS in ('INFN', 'VERB'):
-                seed_has_verb = True
-                break
+    seed_has_verb = _seed_has_verb(seed)
     
     # Паттерн 1: Мета-фразы целиком
     meta_patterns = [
@@ -1135,15 +1143,7 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
     tail_words = tail.lower().split()
     
     # Проверяем: есть ли глагол в seed?
-    seed_words = seed.lower().split()
-    seed_has_verb = False
-    for sw in seed_words:
-        sp = morph.parse(sw)[0]
-        if sp.tag.POS in ('INFN', 'VERB'):
-            seed_has_verb = True
-            break
-    
-    if not seed_has_verb:
+    if not _seed_has_verb(seed):
         return False, ""
     
     # Хвост = 1-2 слова, все — модификаторы глагола?
@@ -1214,6 +1214,97 @@ def detect_conjunctive_extension(tail: str, seed: str = "") -> Tuple[bool, str]:
             for bp in morph.parse(bw):
                 if bp.tag.POS in content_pos:
                     return True, f"Конъюнктивное расширение: '{tail}' (содержание + связка к seed)"
+    
+    return False, ""
+
+
+def detect_prepositional_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
+    """
+    Детектор обстоятельственного модификатора: PREP + NOUN(правильный падеж) + seed с глаголом.
+    
+    Зеркало detect_broken_grammar: тот ловит НЕПРАВИЛЬНЫЙ падеж → TRASH,
+    этот ловит ПРАВИЛЬНЫЙ падеж → VALID.
+    
+    "при болях" → при(PREP) + болях(NOUN,loct) → VALID (условие)
+    "после еды" → после(PREP) + еды(NOUN,gent) → VALID (время)
+    "для детей" → для(PREP) + детей(NOUN,gent) → VALID (цель)
+    
+    Требует: seed с глаголом (word_is_known guard через _seed_has_verb).
+    
+    Cross-niche: "принимать при болях", "использовать при перегреве",
+    "менять после 50000 км", "хранить без упаковки"
+    """
+    if not tail or not seed:
+        return False, ""
+    
+    tail_words = tail.lower().split()
+    if not tail_words:
+        return False, ""
+    
+    # 1. Seed должен содержать глагол
+    if not _seed_has_verb(seed):
+        return False, ""
+    
+    # 2. Tail должен начинаться с предлога
+    first_word = tail_words[0]
+    first_parsed = morph.parse(first_word)[0]
+    
+    if first_parsed.tag.POS != 'PREP':
+        return False, ""
+    
+    # 3. Правила управления предлогов (единый dict с detect_broken_grammar)
+    prep_cases = {
+        'после': {'gent', 'gen2'},
+        'до': {'gent', 'gen2'},
+        'без': {'gent', 'gen2'},
+        'для': {'gent', 'gen2'},
+        'от': {'gent', 'gen2'},
+        'из': {'gent', 'gen2'},
+        'у': {'gent', 'gen2'},
+        'около': {'gent', 'gen2'},
+        'вместо': {'gent', 'gen2'},
+        'кроме': {'gent', 'gen2'},
+        'при': {'loct', 'loc2'},
+        'на': {'loct', 'loc2', 'accs'},
+        'в': {'loct', 'loc2', 'accs'},
+        'о': {'loct', 'loc2'},
+        'по': {'datv'},
+        'к': {'datv'},
+        'перед': {'ablt'},
+        'с': {'ablt', 'gent'},
+        'за': {'ablt', 'accs'},
+        'над': {'ablt'},
+        'под': {'ablt', 'accs'},
+        'между': {'ablt'},
+        'через': {'accs'},
+    }
+    
+    if first_word not in prep_cases:
+        return False, ""
+    
+    required_cases = prep_cases[first_word]
+    
+    # 4. Найти NOUN после предлога (пропуская ADJ, NUM, PRCL, вложенные PREP)
+    for tw in tail_words[1:]:
+        tp = morph.parse(tw)[0]
+        
+        if tp.tag.POS in ('ADJF', 'ADJS', 'PRTF', 'PRTS', 'NUMR', 'PRCL'):
+            continue
+        
+        if tw.isdigit():
+            continue
+            
+        if tp.tag.POS == 'NOUN':
+            all_parses = morph.parse(tw)
+            for p in all_parses:
+                if p.tag.case in required_cases:
+                    return True, f"Обстоятельственный модификатор: '{first_word} ... {tw}' ({p.tag.case}) при seed с глаголом"
+            return False, ""
+        
+        if tp.tag.POS == 'PREP':
+            continue
+        
+        break
     
     return False, ""
 
