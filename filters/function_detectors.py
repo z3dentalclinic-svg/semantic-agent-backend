@@ -481,15 +481,29 @@ def detect_fragment(tail: str) -> Tuple[bool, str]:
     return False, ""
 
 
-def detect_meta(tail: str) -> Tuple[bool, str]:
+def detect_meta(tail: str, seed: str = "") -> Tuple[bool, str]:
     """
     Детектор мета-вопроса: вопрос О САМОМ ПОНЯТИИ, а не уточнение поиска.
     
     "зачем" → True           "что означает" → True
     "как разобрать" → False   (это действие, не мета)
+    
+    SEED-AWARE: если seed содержит глагол, "можно ли" и "когда" в tail
+    модифицируют этот глагол, а не задают мета-вопрос.
+    "можно ли жаропонижающее" при seed "как принимать нимесил" → NOT мета
+    "когда" при seed "как принимать нимесил" → NOT мета
     """
     tail_lower = tail.lower().strip()
     words = tail_lower.split()
+    
+    # Проверяем: есть ли глагол в seed?
+    seed_has_verb = False
+    if seed:
+        for sw in seed.lower().split():
+            sp = morph.parse(sw)[0]
+            if sp.tag.POS in ('INFN', 'VERB'):
+                seed_has_verb = True
+                break
     
     # Паттерн 1: Мета-фразы целиком
     meta_patterns = [
@@ -526,7 +540,11 @@ def detect_meta(tail: str) -> Tuple[bool, str]:
                 if after_parsed.tag.POS in ('INFN', 'VERB'):
                     # "можно ли заряжать" — валидный вопрос, НЕ мета
                     continue
-            # "можно ли" без продолжения или без глагола — мета
+            # Глагол в seed'е: "можно ли [принимать]" — глагол из seed, не tail
+            # "можно ли жаропонижающее" при seed "как принимать" → не мета
+            if seed_has_verb:
+                continue
+            # "можно ли" без глагола нигде — мета
             return True, f"Мета-вопрос: '{pattern}'"
     
     for pattern in meta_patterns:
@@ -537,6 +555,12 @@ def detect_meta(tail: str) -> Tuple[bool, str]:
     bare_question_words = {'зачем', 'почему', 'что', 'как', 'когда',
                             'навіщо', 'чому', 'що', 'як', 'коли'}
     if len(words) == 1 and words[0] in bare_question_words:
+        # Если seed имеет глагол, временные/модальные вопросы модифицируют его
+        # "когда" при seed "как принимать нимесил" → "когда принимать" → NOT мета
+        # "сколько" при seed "как принимать" → "сколько принимать" → NOT мета
+        verb_modifier_questions = {'когда', 'сколько', 'коли', 'скільки'}
+        if seed_has_verb and words[0] in verb_modifier_questions:
+            return False, ""
         # Исключение: "как" может быть частью "как разобрать" — но тут одиночное
         return True, f"Мета-вопрос: голое '{words[0]}'"
     
@@ -1475,23 +1499,33 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
         if nomn_form:
             check_forms.add(nomn_form.word)
         
-        # Проверка 1: чужой город (geo_db)
-        for check_word in check_forms:
-            if check_word in geo_db:
-                countries = geo_db[check_word]
-                if target not in countries:
-                    foreign = ', '.join(sorted(countries))
-                    return True, f"Чужой город: '{check_word}' ({foreign}, не {target})"
-                # Город из target_country — не negative
-                break
+        # === GUARD: проверяем geo_db только если pymorphy считает слово географическим ===
+        # "болях" → все парсы без Geox → common word → skip geo_db
+        # "барановичах" → 2й парс имеет Geox → реальный город → check geo_db
+        # Это предотвращает FP типа "боли" = город в Китае
+        all_parses = morph.parse(word)
+        has_geox = any('Geox' in str(p.tag) for p in all_parses)
         
-        # Проверка 2: чужая страна (_COUNTRIES)
-        for check_word in check_forms:
-            if check_word in _COUNTRIES:
-                country_code = _COUNTRIES[check_word]
-                if country_code != target:
-                    return True, f"Чужая страна: '{check_word}' ({country_code}, не {target})"
-                break
+        # Проверка 1: чужой город (geo_db) — только для географических слов
+        if has_geox:
+            for check_word in check_forms:
+                if check_word in geo_db:
+                    countries = geo_db[check_word]
+                    if target not in countries:
+                        foreign = ', '.join(sorted(countries))
+                        return True, f"Чужой город: '{check_word}' ({foreign}, не {target})"
+                    # Город из target_country — не negative
+                    break
+        
+        # Проверка 2: чужая страна (_COUNTRIES) — тоже только для Geox/Sgtm
+        # Страны всегда имеют Geox в pymorphy (Италия, Чехия, etc.)
+        if has_geox:
+            for check_word in check_forms:
+                if check_word in _COUNTRIES:
+                    country_code = _COUNTRIES[check_word]
+                    if country_code != target:
+                        return True, f"Чужая страна: '{check_word}' ({country_code}, не {target})"
+                    break
     
     return False, ""
 
