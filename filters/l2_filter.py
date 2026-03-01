@@ -36,6 +36,7 @@ L2 Filter — Dual-Signal Classifier (PMI + KNN + L0 signals)
 import os
 import json
 import math
+import re
 import logging
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
@@ -420,6 +421,35 @@ class L2Classifier:
         return overlap
     
     # =========================================================
+    # SIGNAL 7: Digit-Letter Specification Pattern
+    # =========================================================
+    #
+    # Универсальный паттерн: токен смешивает цифры и буквы = спецификация.
+    # Cross-niche: 12v, 7ah (аккум), 225/45r17 (шины), 16gb (телефоны),
+    # ytz7s, ctx5l (модели батарей), 50кубов (скутеры).
+    #
+    # Проверяем ВСЕ слова хвоста (не только первые 2 как morph).
+    # Positive-only: нет паттерна ≠ TRASH.
+    
+    _SPEC_PATTERN = re.compile(r'\d+[a-zа-яё]+|[a-zа-яё]+\d+', re.IGNORECASE)
+    
+    def _has_spec_token(self, tail: str) -> tuple:
+        """
+        Проверяет наличие digit-letter токенов в хвосте.
+        
+        Returns: (has_spec: bool, matched_token: str)
+        
+        "12v 7ah" → (True, "12v")
+        "ytz7s" → (True, "ytz7s")
+        "купить гелевый" → (False, "")
+        """
+        for token in tail.lower().split():
+            clean = token.strip('.,;:!?/\\()[]{}"\'-')
+            if clean and self._SPEC_PATTERN.search(clean):
+                return (True, clean)
+        return (False, "")
+    
+    # =========================================================
     # MAIN: Classify L0 result
     # =========================================================
     
@@ -549,6 +579,7 @@ class L2Classifier:
             })
             pure_neg = l0_sig["pure_neg"]
             overlap = word_overlap.get(tail, [])
+            has_spec, spec_token = self._has_spec_token(tail)
             
             debug = {
                 "pmi": round(pmi, 3),
@@ -556,6 +587,7 @@ class L2Classifier:
                 "morph_score": round(morph, 2),
                 "morph_detail": morph_detail,
                 "ref_overlap": overlap,
+                "spec_token": spec_token,
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
                 "pure_neg": pure_neg,
@@ -581,6 +613,13 @@ class L2Classifier:
             elif morph >= 0.7 and not pure_neg:
                 label = "VALID"
                 reason = f"Morph {morph:.1f} ({morph_detail})"
+            
+            # R2.8: Digit-letter spec token → VALID
+            # "12v", "7ah", "ytz7s", "50кубов" — спецификация = коммерческий запрос
+            # Cross-niche: любой токен смешивающий цифры и буквы
+            elif has_spec and not pure_neg:
+                label = "VALID"
+                reason = f"SpecToken: {spec_token}"
             
             # R2.7: Word overlap с reference — ОТКЛЮЧЕНО (даёт FP через intent-слова)
             # Overlap считается и логируется в диагностику, но не влияет на решение.
@@ -633,6 +672,7 @@ class L2Classifier:
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
                         "ref_overlap": debug.get("ref_overlap", []),
+                        "spec_token": debug.get("spec_token", ""),
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
@@ -674,6 +714,7 @@ class L2Classifier:
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
                         "ref_overlap": debug.get("ref_overlap", []),
+                        "spec_token": debug.get("spec_token", ""),
                         "decision": debug.get("decision", ""),
                     }
                 l2_grey.append(kw)
@@ -706,6 +747,7 @@ class L2Classifier:
                     "morph_score": debug.get("morph_score", 0),
                     "morph_detail": debug.get("morph_detail", ""),
                         "ref_overlap": debug.get("ref_overlap", []),
+                    "spec_token": debug.get("spec_token", ""),
                     "l0_pos": debug.get("l0_pos", []),
                     "l0_neg": debug.get("l0_neg", []),
                     "decision": debug.get("decision", ""),
