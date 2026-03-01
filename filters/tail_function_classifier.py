@@ -22,6 +22,7 @@ from .function_detectors import (
     detect_contacts,
     detect_technical_garbage, detect_mixed_alphabet, detect_standalone_number,
     detect_verb_modifier, detect_conjunctive_extension,
+    detect_prepositional_modifier,
     # Новые мягкие детекторы
     detect_truncated_geo, detect_orphan_genitive, detect_single_infinitive,
     detect_foreign_geo,
@@ -55,6 +56,7 @@ SIGNAL_WEIGHTS = {
     'contacts':   0.85,   # "телефон", "адрес" — конкретный интент
     'verb_modifier': 0.85,  # наречие при глаголе seed — лингвистически надёжный
     'conjunctive': 0.8,    # "и подарков" — расширение запроса
+    'prep_modifier': 0.85,  # "при болях", "после еды" — лингвистически надёжный (PREP+case)
     
     # Негативные — ЭВРИСТИКИ (могут ошибаться)
     'fragment':        0.8,
@@ -133,6 +135,7 @@ class TailFunctionClassifier:
             ('contacts',   lambda: detect_contacts(tail)),
             ('verb_modifier', lambda: detect_verb_modifier(tail, self.seed)),
             ('conjunctive', lambda: detect_conjunctive_extension(tail, self.seed)),
+            ('prep_modifier', lambda: detect_prepositional_modifier(tail, self.seed)),
         ]
         
         for signal_name, detector in detectors_positive:
@@ -217,9 +220,12 @@ class TailFunctionClassifier:
         if positive_signals:
             tail_word_count = len(tail.lower().split())
             has_pattern_match = any('паттерн' in r for r in reasons)
+            has_prep_modifier = 'prep_modifier' in positive_signals
             
             if tail_word_count <= 2 and has_pattern_match:
                 pass  # Паттерн покрывает весь хвост — coherence не нужен
+            elif has_prep_modifier:
+                pass  # Предложная группа покрывает весь хвост — coherence не нужен
             else:
                 is_coherent, orphans = self._check_coherence(tail)
                 if not is_coherent:
@@ -409,7 +415,7 @@ class TailFunctionClassifier:
         if has_positive and has_negative:
             # Приоритет БД-сигналов: если geo или brand подтверждён,
             # а негатив — только эвристика, доверяем БД
-            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive'}
+            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive', 'prep_modifier'}
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
