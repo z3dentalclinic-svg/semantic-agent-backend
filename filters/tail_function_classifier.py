@@ -288,6 +288,7 @@ class TailFunctionClassifier:
         skip_pos = {'PREP', 'CONJ', 'PRCL', 'INTJ', 'ADVB', 'PRED', 'COMP'}
         
         orphans = []
+        prev_pos = None
         for w in words:
             parsed = morph.parse(w)[0]
             pos = parsed.tag.POS
@@ -295,17 +296,28 @@ class TailFunctionClassifier:
             
             # Служебные и модификаторы — пропускаем
             if pos in skip_pos:
+                prev_pos = pos
+                continue
+            # Слово после предлога = часть предложной фразы → не orphan
+            # "цена в украине" → "в"=PREP, "украине" → prepositional phrase → OK
+            # Cross-niche: "обзор на английском", "доставка по киеву"
+            if prev_pos == 'PREP':
+                prev_pos = pos
                 continue
             # Известная лемма
             if lemma in all_known or w in all_known:
+                prev_pos = pos
                 continue
             # Гео или бренд
             if w in self.geo_db or lemma in self.geo_db:
+                prev_pos = pos
                 continue
             if w in self.brand_db or lemma in self.brand_db:
+                prev_pos = pos
                 continue
             
             orphans.append(w)
+            prev_pos = pos
         
         return len(orphans) == 0, orphans
     
