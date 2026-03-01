@@ -6,7 +6,6 @@ pre_filter.py — санитарная очистка парсинга.
 """
 
 import re
-from collections import Counter
 
 
 def normalize(text: str) -> str:
@@ -31,6 +30,15 @@ def pre_filter(query: str, seed: str) -> tuple:
     if q.count(s) >= 2:
         return True, "дубль seed целиком"
     
+    # 1b. Слово из seed повторяется чаще чем в seed (ловит перестановки)
+    # "нимесил нимесил как принимать" → "нимесил" 2x в query, 1x в seed → мусор
+    from collections import Counter
+    q_counts = Counter(q.split())
+    s_counts = Counter(s.split())
+    for word, q_freq in q_counts.items():
+        if word in s_counts and q_freq > s_counts[word]:
+            return True, f"дубль слова seed: '{word}' ({q_freq}x в query, {s_counts[word]}x в seed)"
+    
     # 2. Извлекаем хвост
     if s not in q:
         return False, None
@@ -54,30 +62,12 @@ def pre_filter(query: str, seed: str) -> tuple:
     if all(w in seed_words for w in tail_words):
         return True, f"хвост целиком из слов seed: '{tail}'"
     
-    # 5. Слово из seed встречается в запросе чаще чем в seed:
-    #    "днепр ремонт пылесосов днепр район" → "днепр" 2x в query, 1x в seed → мусор
-    #    Исключаем предлоги/союзы — они естественно повторяются:
-    #    "купить аккумулятор на скутер на wildberries" → "на" 2x OK
-    _FUNC_WORDS = frozenset({
-        'в', 'на', 'с', 'к', 'у', 'о', 'за', 'из', 'от', 'до', 'по', 'при',
-        'для', 'без', 'под', 'над', 'про', 'через', 'между',
-        'и', 'а', 'но', 'или', 'ни', 'не', 'да', 'же', 'ли', 'бы',
-        'in', 'on', 'at', 'to', 'for', 'of', 'with', 'and', 'or', 'the', 'a',
-    })
-    seed_word_counts = Counter(s.split())
-    query_word_counts = Counter(q.split())
-    for word, seed_count in seed_word_counts.items():
-        if word in _FUNC_WORDS:
-            continue
-        if query_word_counts.get(word, 0) > seed_count:
-            return True, f"повтор seed-слова: '{word}' ({query_word_counts[word]}x в query, {seed_count}x в seed)"
-    
-    # 6. Подряд одинаковые слова: "цветов цветов"
+    # 5. Подряд одинаковые слова: "цветов цветов"
     for i in range(len(tail_words) - 1):
         if tail_words[i] == tail_words[i + 1]:
             return True, f"повтор подряд: '{tail_words[i]}'"
     
-    # 7. Одиночный символ: "ремонт пылесосов а"
+    # 6. Одиночный символ: "ремонт пылесосов а"
     if len(tail) == 1 and not tail.isdigit():
         return True, f"одиночный символ: '{tail}'"
     
@@ -148,7 +138,7 @@ if __name__ == "__main__":
         ("ремонт пылесосов samsung", False),
     ]
     
-    print("ТЕСТ pre_filter (seed: ремонт пылесосов)")
+    print("ТЕСТ pre_filter")
     print("=" * 50)
     
     for query, expected_trash in tests:
@@ -158,42 +148,6 @@ if __name__ == "__main__":
             print(f"⏭️  \"{query}\" → skip (другой seed)")
             continue
         
-        ok = is_trash == expected_trash
-        status = "✅" if ok else "❌"
-        print(f"{status} \"{query}\" → {'TRASH' if is_trash else 'OK'}  {reason or ''}")
-    
-    # Тест с гео-seed
-    seed2 = "ремонт пылесосов днепр"
-    tests2 = [
-        ("днепр ремонт пылесосов днепр район", True),     # "днепр" 2x
-        ("ремонт пылесосов днепр район", False),            # "днепр" 1x = OK
-        ("ремонт пылесосов днепр левый берег", False),      # все слова 1x
-        ("ремонт ремонт пылесосов днепр", True),            # "ремонт" 2x
-    ]
-    
-    print(f"\nТЕСТ pre_filter (seed: {seed2})")
-    print("=" * 50)
-    
-    for query, expected_trash in tests2:
-        is_trash, reason = pre_filter(query, seed2)
-        ok = is_trash == expected_trash
-        status = "✅" if ok else "❌"
-        print(f"{status} \"{query}\" → {'TRASH' if is_trash else 'OK'}  {reason or ''}")
-    
-    # Тест с предлогом в seed
-    seed3 = "аккумулятор на скутер"
-    tests3 = [
-        ("купить аккумулятор на скутер на wildberries", False),  # "на" = предлог, OK
-        ("купить аккумулятор на скутер на озоне", False),        # "на" = предлог, OK
-        ("аккумулятор на скутер аккумулятор", True),             # "аккумулятор" 2x
-        ("аккумулятор на скутер скутер", True),                  # "скутер" 2x
-    ]
-    
-    print(f"\nТЕСТ pre_filter (seed: {seed3})")
-    print("=" * 50)
-    
-    for query, expected_trash in tests3:
-        is_trash, reason = pre_filter(query, seed3)
         ok = is_trash == expected_trash
         status = "✅" if ok else "❌"
         print(f"{status} \"{query}\" → {'TRASH' if is_trash else 'OK'}  {reason or ''}")
