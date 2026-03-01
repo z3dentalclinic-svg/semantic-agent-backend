@@ -152,6 +152,26 @@ def apply_l0_filter(
     # Трейсинг
     result["_l0_trace"] = trace_records
     
+    # Сохраняем диагностику в файл (аналогично l2_diagnostic.json)
+    try:
+        import json as _json
+        diag = {
+            "seed": seed,
+            "target_country": target_country,
+            "stats": {
+                "total": len(trace_records),
+                "valid": len(valid_keywords),
+                "trash": len(trash_keywords),
+                "grey": len(grey_keywords),
+                "no_seed": sum(1 for r in trace_records if r.get("tail") is None),
+            },
+            "trace": trace_records,
+        }
+        with open("l0_diagnostic.json", "w", encoding="utf-8") as f:
+            _json.dump(diag, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"[L0] Failed to save diagnostic: {e}")
+    
     # Статистика для лога
     total = len(trace_records)
     v = len(valid_keywords)
