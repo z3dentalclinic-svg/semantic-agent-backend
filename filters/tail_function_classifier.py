@@ -76,6 +76,7 @@ SIGNAL_WEIGHTS = {
     'foreign_geo':       0.95,  # город/страна из чужого региона — очень надёжно (geo_db)
     'orphan_genitive':   0.5,   # мягкий — может быть валидным ("фильтров")
     'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
+    'intent_mismatch':   0.9,   # информационный seed + коммерческий tail — надёжный конфликт
 }
 
 
@@ -169,6 +170,32 @@ class TailFunctionClassifier:
             if detected:
                 negative_signals.append(signal_name)
                 reasons.append(f"❌ {reason}")
+        
+        # ===== ПРОВЕРКА КОНФЛИКТА ИНТЕНТОВ =====
+        # Если seed информационный (вопросительное слово), а tail коммерческий →
+        # несовместимые интенты. "как принимать нимесил цена" = мусор.
+        # Cross-niche: "где починить пылесос цена", "почему ломается стиральная цена"
+        if positive_signals:
+            interrogative_words = {
+                'как', 'где', 'куда', 'откуда', 'почему', 'зачем',
+                'когда', 'сколько', 'чем', 'чего', 'кто', 'кого',
+                'что', 'какой', 'какая', 'какое', 'какие',
+                'можно', 'нужно', 'стоит',  # модальные в начале seed
+            }
+            seed_words_lower = self.seed.lower().split()
+            seed_is_interrogative = bool(
+                seed_words_lower and seed_words_lower[0] in interrogative_words
+            )
+            
+            if seed_is_interrogative:
+                # Commerce в хвосте информационного seed = конфликт интентов
+                commerce_in_tail = 'commerce' in positive_signals
+                # Гео в хвосте информационного seed = тоже подозрительно
+                # НО: "где починить пылесов киев" — гео валидно для "где"
+                # Поэтому гео не трогаем, только commerce
+                if commerce_in_tail:
+                    negative_signals.append('intent_mismatch')
+                    reasons.append(f"⚠️ Конфликт интентов: seed информационный ('{seed_words_lower[0]}'), tail коммерческий")
         
         # ===== ПРОВЕРКА КОГЕРЕНТНОСТИ ХВОСТА =====
         # Если детектор поймал одно слово в многословном хвосте,
@@ -378,7 +405,7 @@ class TailFunctionClassifier:
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
-            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha', 'foreign_geo'}
+            hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha', 'foreign_geo', 'intent_mismatch'}
             has_hard_negative = bool(set(negative) & hard_negatives)
             
             # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
