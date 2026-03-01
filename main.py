@@ -1779,3 +1779,37 @@ async def parse_adaptive_prefix_endpoint(
         result["corrections"] = correction.get("corrections", [])
 
     return apply_smart_fix(result, seed, language)
+
+
+# === Memory Audit Endpoint ===
+@app.get("/debug/memory-audit")
+def memory_audit():
+    import sys, psutil, os
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info()
+    
+    # Все загруженные модули и их размеры
+    big_modules = {}
+    for name, mod in sorted(sys.modules.items()):
+        if hasattr(mod, '__file__') and mod.__file__:
+            try:
+                size = os.path.getsize(mod.__file__)
+                top = name.split('.')[0]
+                big_modules[top] = big_modules.get(top, 0) + size
+            except:
+                pass
+    
+    top_modules = sorted(big_modules.items(), key=lambda x: -x[1])[:20]
+    
+    return {
+        "ram_mb": round(mem.rss / 1024 / 1024, 1),
+        "ram_percent": round(process.memory_percent(), 1),
+        "system_total_mb": round(psutil.virtual_memory().total / 1024 / 1024, 1),
+        "system_available_mb": round(psutil.virtual_memory().available / 1024 / 1024, 1),
+        "loaded_modules_top20": {name: f"{size/1024/1024:.1f}MB" for name, size in top_modules},
+        "torch_loaded": "torch" in sys.modules,
+        "transformers_loaded": "transformers" in sys.modules,
+        "fastembed_loaded": "fastembed" in sys.modules,
+        "natasha_loaded": "natasha" in sys.modules,
+        "google_ads_loaded": "google.ads" in sys.modules,
+    }
