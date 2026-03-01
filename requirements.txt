@@ -30,6 +30,6 @@ babel
 fastembed>=0.7.0
 onnxruntime>=1.17.0
 
-# L2 rubert-tiny2 MLM (substitution test)
-torch
+# L2 rubert-tiny2 MLM (substitution test) — CPU only
+torch --index-url https://download.pytorch.org/whl/cpu
 transformers>=4.30.0
