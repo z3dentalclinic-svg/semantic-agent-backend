@@ -45,3 +45,11 @@ def get_embedding_model():
 
 def is_model_loaded() -> bool:
     return _model is not None
+
+
+# Заглушка — rubert убран, но другие файлы могут импортировать
+def get_rubert_mlm():
+    return None
+
+def is_rubert_loaded() -> bool:
+    return False
