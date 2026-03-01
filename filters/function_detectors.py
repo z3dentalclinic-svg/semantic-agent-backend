@@ -655,6 +655,7 @@ def detect_short_garbage(tail: str) -> Tuple[bool, str]:
         'хт',   # XT
         'гт',   # GT
         'се',   # SE (iPhone SE)
+        'еу',   # EU = Европейский Союз (транслитерация)
     }
     if word in known_abbreviations:
         return False, ""
@@ -908,6 +909,13 @@ def detect_broken_grammar(tail: str) -> Tuple[bool, str]:
             return False, ""
         
         second_parses = morph.parse(second_word)
+        
+        # === ФИКС: Неизвестные слова (бренды, транслитерация) ===
+        # pymorphy не знает "авито", "озон", "алиэкспресс" → POS=None, case=None
+        # Это НЕ сломанная грамматика, это просто незнакомое слово
+        second_best = second_parses[0]
+        if second_best.tag.POS is None:
+            return False, ""
         
         # === ФИКС: Ослабление для search queries ===
         # Паттерн "PREP + NOUN(nomn)" в 2-словном хвосте — типичный search query
@@ -1307,6 +1315,12 @@ def detect_truncated_geo(tail: str, geo_db: dict = None) -> Tuple[bool, str]:
     
     # Числа не могут быть обрезанными городами ("12" ≠ "12 de octubre")
     if word.isdigit():
+        return False, ""
+    
+    # Минимальная длина: 1-2 символа слишком коротки для надёжного матча
+    # "ти" → "ти-хуа"? Абсурд. "за" → "за калуською"? Абсурд.
+    # Реальные кейсы: "ханты" (5), "санкт" (5), "южно" (4) — все 3+
+    if len(word) < 3:
         return False, ""
     
     # Если слово само является полноценным городом — не обрезанное
