@@ -456,6 +456,77 @@ class L2Classifier:
         return result
     
     # =========================================================
+    # SIGNAL 6: Word Overlap с Reference (L0 VALID)
+    # =========================================================
+    #
+    # Извлекаем все значимые слова из L0 VALID хвостов.
+    # Если GREY tail содержит хотя бы одно такое слово → VALID.
+    #
+    # Примеры: reference содержит "хонда дио", "ямаха джог", "сузуки"
+    # → "ямаха джог 36" содержит "ямаха" → VALID
+    # → "глушитель" не содержит ни одного → GREY
+    #
+    # Cross-niche: работает на любой нише, используя данные самого батча.
+    
+    _STOP_WORDS = frozenset({
+        'и', 'или', 'на', 'в', 'для', 'с', 'по', 'от', 'из', 'к', 'у',
+        'а', 'но', 'не', 'ни', 'да', 'же', 'ли', 'бы', 'то', 'что',
+        'как', 'где', 'кто', 'чем', 'при', 'до', 'без', 'под', 'над',
+        'за', 'про', 'через', 'это', 'его', 'её', 'их', 'мой', 'наш',
+        'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+        'and', 'or', 'is', 'are', 'was', 'be',
+        'купить', 'цена', 'стоит', 'можно', 'нужно', 'лучше',
+        'какой', 'сколько', 'новый', 'своими', 'руками',
+    })
+    
+    def _extract_reference_words(
+        self,
+        valid_tails: List[str],
+        seed_head: Optional[str] = None
+    ) -> set:
+        """
+        Извлечь уникальные значимые слова из L0 VALID хвостов.
+        """
+        ref_words = set()
+        for tail in valid_tails:
+            tokens = tail.lower().split()
+            for token in tokens:
+                clean = token.strip('.,;:!?/\\()[]{}"\'-')
+                if not clean or len(clean) < 2:
+                    continue
+                if clean in self._STOP_WORDS:
+                    continue
+                if clean.isdigit():
+                    continue
+                if seed_head and clean == seed_head.lower():
+                    continue
+                ref_words.add(clean)
+        return ref_words
+    
+    def _compute_word_overlap(
+        self,
+        grey_tails: List[str],
+        ref_words: set
+    ) -> Dict[str, List[str]]:
+        """
+        Для каждого GREY tail: какие reference-слова в нём есть?
+        Returns: {tail: [matched_words]}
+        """
+        if not ref_words:
+            return {tail: [] for tail in grey_tails}
+        
+        overlap = {}
+        for tail in grey_tails:
+            tokens = set()
+            for token in tail.lower().split():
+                clean = token.strip('.,;:!?/\\()[]{}"\'-')
+                if clean and len(clean) >= 2:
+                    tokens.add(clean)
+            matched = sorted(tokens & ref_words)
+            overlap[tail] = matched
+        return overlap
+    
+    # =========================================================
     # MAIN: Classify L0 result
     # =========================================================
     
@@ -573,6 +644,11 @@ class L2Classifier:
             logger.warning(f"L2: Substitution test failed: {e}")
             subst_scores = {}
         
+        # === SIGNAL 6: Word Overlap with Reference ===
+        ref_words = self._extract_reference_words(valid_tails, seed_head)
+        word_overlap = self._compute_word_overlap(grey_tails, ref_words)
+        logger.info(f"L2: Reference words ({len(ref_words)}): {sorted(ref_words)[:20]}...")
+        
         # === MULTI-SIGNAL DECISION ===
         cfg = self.config
         classified = {"valid": [], "grey": [], "trash": []}
@@ -590,6 +666,7 @@ class L2Classifier:
                 "positive": [], "negative": [], "pure_neg": False
             })
             pure_neg = l0_sig["pure_neg"]
+            overlap = word_overlap.get(tail, [])
             
             debug = {
                 "pmi": round(pmi, 3),
@@ -597,6 +674,7 @@ class L2Classifier:
                 "morph_score": round(morph, 2),
                 "morph_detail": morph_detail,
                 "subst_score": round(subst, 4) if subst >= 0 else None,
+                "ref_overlap": overlap,
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
                 "pure_neg": pure_neg,
@@ -622,6 +700,14 @@ class L2Classifier:
             elif morph >= 0.7 and not pure_neg:
                 label = "VALID"
                 reason = f"Morph {morph:.1f} ({morph_detail})"
+            
+            # R2.7: Word overlap с reference → VALID
+            # tail содержит слово из L0 VALID (бренды, модели, тех. термины)
+            # "ямаха джог 36" содержит "ямаха","джог" из reference → VALID
+            # "глушитель" не содержит ничего из reference → stays GREY
+            elif overlap and not pure_neg:
+                label = "VALID"
+                reason = f"RefOverlap: {','.join(overlap)}"
             
             # R3: KNN VALID — ОТКЛЮЧЕНО (false positives: глушитель 0.84, жигули 0.89)
             # Template cosine пока diagnostic-only, порог установим после анализа
@@ -668,6 +754,7 @@ class L2Classifier:
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
                         "subst_score": debug.get("subst_score"),
+                        "ref_overlap": debug.get("ref_overlap", []),
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
@@ -709,6 +796,7 @@ class L2Classifier:
                         "morph_score": debug.get("morph_score", 0),
                         "morph_detail": debug.get("morph_detail", ""),
                         "subst_score": debug.get("subst_score"),
+                        "ref_overlap": debug.get("ref_overlap", []),
                         "decision": debug.get("decision", ""),
                     }
                 l2_grey.append(kw)
@@ -741,6 +829,7 @@ class L2Classifier:
                     "morph_score": debug.get("morph_score", 0),
                     "morph_detail": debug.get("morph_detail", ""),
                     "subst_score": debug.get("subst_score"),
+                        "ref_overlap": debug.get("ref_overlap", []),
                     "l0_pos": debug.get("l0_pos", []),
                     "l0_neg": debug.get("l0_neg", []),
                     "decision": debug.get("decision", ""),
@@ -779,6 +868,12 @@ class L2Classifier:
                     "mean": round(sum(subst_scores.values()) / len(subst_scores), 4) if subst_scores else None,
                     "model": "rubert-tiny2" if self.rubert_mlm else "unavailable",
                     "count": len(subst_scores),
+                },
+                "word_overlap": {
+                    "reference_words": sorted(ref_words),
+                    "reference_word_count": len(ref_words),
+                    "tails_with_overlap": sum(1 for v in word_overlap.values() if v),
+                    "tails_without_overlap": sum(1 for v in word_overlap.values() if not v),
                 },
                 "trace": l2_trace,
             }
