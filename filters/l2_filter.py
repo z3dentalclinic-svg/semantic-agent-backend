@@ -610,9 +610,11 @@ class L2Classifier:
             # R2.5: Morph agreement (ADJ agrees with seed head) → VALID
             # "гелевый" + аккумулятор[masc] → согласуется → VALID
             # Positive-only: morph < 0.7 НЕ значит TRASH
-            elif morph >= 0.7 and not pure_neg:
+            # KNN guard: morph alone не достаточно, нужна минимальная семантическая близость
+            # (отсекает гео-adj "левый берег", "правый берег" для seed "ремонт")
+            elif morph >= 0.7 and knn >= 0.5 and not pure_neg:
                 label = "VALID"
-                reason = f"Morph {morph:.1f} ({morph_detail})"
+                reason = f"Morph {morph:.1f} ({morph_detail}) + KNN {knn:.3f}"
             
             # R2.8: Digit-letter spec token → VALID
             # "12v", "7ah", "ytz7s", "50кубов" — спецификация = коммерческий запрос
