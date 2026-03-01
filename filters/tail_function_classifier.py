@@ -172,30 +172,38 @@ class TailFunctionClassifier:
                 reasons.append(f"❌ {reason}")
         
         # ===== ПРОВЕРКА КОНФЛИКТА ИНТЕНТОВ =====
-        # Если seed информационный (вопросительное слово), а tail коммерческий →
-        # несовместимые интенты. "как принимать нимесил цена" = мусор.
-        # Cross-niche: "где починить пылесос цена", "почему ломается стиральная цена"
+        # Два типа конфликтов:
+        # 1. Информационный seed + коммерческий tail: "как принимать нимесил цена"
+        # 2. Гео-несовместимый seed + гео tail: "как принимать нимесил киев"
+        #    НО: "где починить пылесос киев" → гео валидно (вопрос о месте)
         if positive_signals:
-            interrogative_words = {
-                'как', 'где', 'куда', 'откуда', 'почему', 'зачем',
-                'когда', 'сколько', 'чем', 'чего', 'кто', 'кого',
-                'что', 'какой', 'какая', 'какое', 'какие',
-                'можно', 'нужно', 'стоит',  # модальные в начале seed
+            # Гео-совместимые вопросы: ответ — МЕСТО → гео в tail валидно
+            geo_compatible_interrogatives = {'где', 'куда', 'откуда'}
+            # Гео-несовместимые: ответ — СПОСОБ/ПРИЧИНА → гео в tail мусор
+            geo_incompatible_interrogatives = {
+                'как', 'почему', 'зачем', 'когда', 'что', 'кто', 'чем',
+                'чего', 'какой', 'какая', 'какое', 'какие',
             }
-            seed_words_lower = self.seed.lower().split()
-            seed_is_interrogative = bool(
-                seed_words_lower and seed_words_lower[0] in interrogative_words
+            # Commerce несовместимы с ЛЮБЫМ вопросительным seed
+            commerce_incompatible = (
+                geo_compatible_interrogatives | geo_incompatible_interrogatives |
+                {'можно', 'нужно', 'стоит', 'сколько'}
             )
             
-            if seed_is_interrogative:
-                # Commerce в хвосте информационного seed = конфликт интентов
-                commerce_in_tail = 'commerce' in positive_signals
-                # Гео в хвосте информационного seed = тоже подозрительно
-                # НО: "где починить пылесов киев" — гео валидно для "где"
-                # Поэтому гео не трогаем, только commerce
-                if commerce_in_tail:
-                    negative_signals.append('intent_mismatch')
-                    reasons.append(f"⚠️ Конфликт интентов: seed информационный ('{seed_words_lower[0]}'), tail коммерческий")
+            seed_words_lower = self.seed.lower().split()
+            seed_first_word = seed_words_lower[0] if seed_words_lower else ''
+            
+            # Commerce в хвосте информационного seed = конфликт
+            if seed_first_word in commerce_incompatible and 'commerce' in positive_signals:
+                negative_signals.append('intent_mismatch')
+                reasons.append(f"⚠️ Конфликт интентов: seed информационный ('{seed_first_word}'), tail коммерческий")
+            
+            # Гео в хвосте гео-несовместимого seed = конфликт
+            # "как принимать нимесил киев" → мусор
+            # "где починить пылесос киев" → валидно (вопрос о месте)
+            if seed_first_word in geo_incompatible_interrogatives and 'geo' in positive_signals:
+                negative_signals.append('intent_mismatch')
+                reasons.append(f"⚠️ Конфликт интентов: seed '{seed_first_word}' (не о месте), tail содержит гео")
         
         # ===== ПРОВЕРКА КОГЕРЕНТНОСТИ ХВОСТА =====
         # Если детектор поймал одно слово в многословном хвосте,
