@@ -544,6 +544,15 @@ class BatchPostFilter:
                     logger.info(f"[GEO_SKIP] Слово '{item}' в ignored_words")
                 continue
             
+            # ШАГ 0.5: Geox guard — пропускаем слова, которые точно НЕ города
+            # "боли" → NOUN без Geox → skip (не город Боли в Китае)
+            # "или" → CONJ → skip (не город Или в GB)
+            # Только для одиночных слов (биграмы/триграмы проверяем как есть)
+            if ' ' not in item and '-' not in item:
+                if self._should_skip_geo_check(item, language):
+                    logger.debug(f"[GEO_SKIP] Geox guard: '{item}' — не географическое слово")
+                    continue
+            
             item_normalized = self._get_lemma(item, language)
             
             # ═══════════════════════════════════════════════════════════
@@ -700,6 +709,45 @@ class BatchPostFilter:
             # "златоуст"(anim) → False (proper name pattern)
             if 'NOUN' in tag_str:
                 return 'inan' in tag_str and first.score >= 0.5
+        except:
+            pass
+        
+        return False
+
+    def _should_skip_geo_check(self, word: str, language: str) -> bool:
+        """
+        Geox guard для BatchPostFilter: пропускает слова, которые точно НЕ города.
+        
+        Алгоритмический, без хардкода. Тот же принцип что L0 foreign_geo:
+        если pymorphy знает слово и ни один парс не имеет Geox → не город.
+        
+        "боли"  → known, no Geox → True (skip)   [CN city FP]
+        "или"   → CONJ           → True (skip)   [GB city FP]  
+        "после" → PREP           → True (skip)
+        "киев"  → known, has Geox → False (check)
+        "рига"  → known, has Geox → False (check)
+        """
+        if not self._has_morph:
+            return False
+        
+        morph = self.morph_ru if language != 'uk' else self.morph_uk
+        
+        try:
+            parses = morph.parse(word)
+            if not parses:
+                return False
+            
+            best = parses[0]
+            
+            # 1. Служебные POS — никогда не города
+            if best.tag.POS in ('CONJ', 'PREP', 'PRCL', 'INTJ'):
+                return True
+            
+            # 2. Geox guard: слово известно pymorphy, но ни один парс не географический
+            if morph.word_is_known(word):
+                has_geox = any('Geox' in str(p.tag) for p in parses)
+                if not has_geox:
+                    return True
         except:
             pass
         
