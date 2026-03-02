@@ -1162,7 +1162,13 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
         # ADVB — только если образовано от прилагательного (суффикс -о/-е)
         # "правильно", "долго", "часто" → OK
         # "домой", "навалом", "онлайн" → reject
+        # PRCL guard: "только", "именно", "примерно" — pymorphy видит ADVB,
+        # но имеют альт. парс PRCL → ограничительные частицы, не способ действия
         if pos == 'ADVB' and (tw.endswith('о') or tw.endswith('е')):
+            has_prcl = any(p.tag.POS == 'PRCL' for p in morph.parse(tw))
+            if has_prcl:
+                all_modifiers = False
+                break
             continue
         
         # Всё остальное — не модификатор
