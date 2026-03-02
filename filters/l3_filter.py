@@ -5,7 +5,7 @@ l3_filter.py — Слой 3: DeepSeek LLM классификатор для ос
 
 Что делает:
     1. Берёт keywords_grey из result dict (после L0 → L2)
-    2. Отправляет батчами на DeepSeek API
+    2. Отправляет ПАРАЛЛЕЛЬНО батчами на DeepSeek API
     3. VALID → добавляет в keywords
     4. TRASH → добавляет в anchors (с anchor_reason="L3_TRASH")
     5. ERROR → оставляет в keywords_grey (fallback)
@@ -15,8 +15,11 @@ l3_filter.py — Слой 3: DeepSeek LLM классификатор для ос
     + l3_stats (для UI)
     + _l3_trace (для tracer)
 
+Параллельность:
+    Все батчи отправляются одновременно через ThreadPoolExecutor.
+    3 батча по 50 ключей → ~3 секунды вместо ~9 последовательно.
+
 Стоимость: ~$0.001 за батч 50 ключей (DeepSeek-chat).
-Скорость: ~2-5 секунд на батч.
 
 Требования:
     pip install requests
@@ -26,8 +29,9 @@ l3_filter.py — Слой 3: DeepSeek LLM классификатор для ос
 import os
 import time
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,7 @@ class L3Config:
     timeout: int = 60
     temperature: float = 0.0
     max_retries: int = 2
-    pause_between_batches: float = 1.0
+    max_parallel: int = 5   # максимум параллельных запросов
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -135,7 +139,6 @@ def _parse_response(response: str, expected_count: int) -> List[str]:
             f"[L3] Expected {expected_count} labels, got {len(labels)}. "
             f"Response: {response[:200]}"
         )
-        # Дополняем ERROR если не хватает
         while len(labels) < expected_count:
             labels.append('ERROR')
         labels = labels[:expected_count]
@@ -148,6 +151,50 @@ def _extract_keyword_string(kw) -> str:
     if isinstance(kw, dict):
         return kw.get("keyword", kw.get("query", ""))
     return str(kw)
+
+
+def _process_batch(
+    batch_idx: int,
+    batch: List[str],
+    seed: str,
+    config: L3Config,
+    total_batches: int,
+) -> Tuple[int, List[str], float]:
+    """
+    Обрабатывает один батч. Вызывается в потоке ThreadPoolExecutor.
+    
+    Returns: (batch_idx, labels, api_time)
+    """
+    batch_num = batch_idx + 1
+    user_prompt = _build_user_prompt(seed, batch)
+
+    for attempt in range(config.max_retries + 1):
+        try:
+            t0 = time.time()
+            response = _call_deepseek(config, SYSTEM_PROMPT, user_prompt)
+            elapsed = time.time() - t0
+
+            labels = _parse_response(response, len(batch))
+
+            valid_count = labels.count('VALID')
+            trash_count = labels.count('TRASH')
+            logger.info(
+                f"[L3] Batch {batch_num}/{total_batches} — "
+                f"VALID: {valid_count}, TRASH: {trash_count} ({elapsed:.1f}s)"
+            )
+            return (batch_idx, labels, elapsed)
+
+        except Exception as e:
+            if attempt < config.max_retries:
+                logger.warning(
+                    f"[L3] Batch {batch_num} attempt {attempt+1} failed: {e}. Retrying..."
+                )
+                time.sleep(2)
+            else:
+                logger.error(
+                    f"[L3] Batch {batch_num} FAILED after {config.max_retries+1} attempts: {e}"
+                )
+                return (batch_idx, ['ERROR'] * len(batch), 0.0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -163,7 +210,7 @@ def apply_l3_filter(
     """
     Применяет L3 фильтр к результату после L0 → L2.
 
-    Берёт keywords_grey, отправляет на DeepSeek API,
+    Берёт keywords_grey, отправляет ПАРАЛЛЕЛЬНО на DeepSeek API,
     распределяет: VALID → keywords, TRASH → anchors, ERROR → keywords_grey.
 
     Args:
@@ -201,51 +248,43 @@ def apply_l3_filter(
         kw_strings.append(_extract_keyword_string(kw))
         kw_objects.append(kw)
 
-    logger.info(f"[L3] Processing {len(kw_strings)} GREY keywords via {cfg.model}")
+    # Нарезаем на батчи
+    batches = []
+    for i in range(0, len(kw_strings), cfg.batch_size):
+        batches.append(kw_strings[i:i + cfg.batch_size])
 
-    # ── Батчевая обработка ──
-    all_labels = []
-    total_batches = (len(kw_strings) + cfg.batch_size - 1) // cfg.batch_size
+    total_batches = len(batches)
+    workers = min(cfg.max_parallel, total_batches)
+
+    logger.info(
+        f"[L3] Processing {len(kw_strings)} GREY keywords via {cfg.model} "
+        f"({total_batches} batches, {workers} parallel)"
+    )
+
+    # ── Параллельная обработка батчей ──
+    batch_results: Dict[int, List[str]] = {}
     api_time = 0.0
+    t_wall_start = time.time()
 
-    for batch_idx in range(0, len(kw_strings), cfg.batch_size):
-        batch = kw_strings[batch_idx:batch_idx + cfg.batch_size]
-        batch_num = batch_idx // cfg.batch_size + 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _process_batch, idx, batch, seed, cfg, total_batches
+            ): idx
+            for idx, batch in enumerate(batches)
+        }
 
-        user_prompt = _build_user_prompt(seed, batch)
+        for future in as_completed(futures):
+            batch_idx, labels, elapsed = future.result()
+            batch_results[batch_idx] = labels
+            api_time += elapsed
 
-        for attempt in range(cfg.max_retries + 1):
-            try:
-                t0 = time.time()
-                response = _call_deepseek(cfg, SYSTEM_PROMPT, user_prompt)
-                api_time += time.time() - t0
+    wall_time = round(time.time() - t_wall_start, 2)
 
-                labels = _parse_response(response, len(batch))
-                all_labels.extend(labels)
-
-                valid_count = labels.count('VALID')
-                trash_count = labels.count('TRASH')
-                logger.info(
-                    f"[L3] Batch {batch_num}/{total_batches} — "
-                    f"VALID: {valid_count}, TRASH: {trash_count}"
-                )
-                break
-
-            except Exception as e:
-                if attempt < cfg.max_retries:
-                    logger.warning(
-                        f"[L3] Batch {batch_num} attempt {attempt+1} failed: {e}. Retrying..."
-                    )
-                    time.sleep(2)
-                else:
-                    logger.error(
-                        f"[L3] Batch {batch_num} FAILED after {cfg.max_retries+1} attempts: {e}"
-                    )
-                    all_labels.extend(['ERROR'] * len(batch))
-
-        # Пауза между батчами
-        if batch_idx + cfg.batch_size < len(kw_strings):
-            time.sleep(cfg.pause_between_batches)
+    # Собираем labels в правильном порядке
+    all_labels = []
+    for idx in range(total_batches):
+        all_labels.extend(batch_results[idx])
 
     # ── Собираем результат ──
     out = result.copy()
@@ -314,8 +353,10 @@ def apply_l3_filter(
         "l3_valid": len(l3_valid),
         "l3_trash": len(l3_trash),
         "l3_error": len(l3_error),
-        "api_time": round(api_time, 2),
+        "api_time": round(api_time, 2),   # суммарное время всех батчей
+        "wall_time": wall_time,            # реальное время (параллельно)
         "batches": total_batches,
+        "parallel": workers,
         "model": cfg.model,
     }
 
@@ -324,7 +365,8 @@ def apply_l3_filter(
 
     logger.info(
         f"[L3] Done: {len(l3_valid)} VALID, {len(l3_trash)} TRASH, "
-        f"{len(l3_error)} ERROR | API time: {api_time:.1f}s"
+        f"{len(l3_error)} ERROR | wall: {wall_time}s "
+        f"({total_batches} batches × {workers} parallel)"
     )
 
     return out
