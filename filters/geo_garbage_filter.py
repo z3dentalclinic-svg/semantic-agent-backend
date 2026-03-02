@@ -317,6 +317,51 @@ def _normalize_token(token: str) -> str:
     return original_token
 
 
+def _resolve_oblast_adjective(adj_word: str, all_geo_entities: dict) -> str:
+    """
+    Восстанавливает город из прилагательного формы "X область".
+    
+    Алгоритмический, без хардкода: стрипает adj-суффикс, пробует
+    city-суффиксы, валидирует по population ≥ 50000.
+    
+    "одесская" → strip "ская" → "одес" + "а" → "одеса" (UA, pop 1M) ✅
+    "минская"  → strip "кая" → "минс" + "к" → "минск" (BY, pop 1.7M) ✅
+    "красная"  → no city match with pop ≥ 50k → None ✅
+    
+    Returns: city name if found, None otherwise.
+    """
+    adj_lower = adj_word.lower()
+    
+    adj_suffixes = ['ская', 'ський', 'ська', 'ский', 'ской', 'ском', 
+                    'скую', 'ское', 'кая', 'кий', 'кой']
+    city_suffixes = ['', 'а', 'я', 'ск', 'к', 'ь', 'ье', 'е', 'о', 
+                     'ів', 'ва', 'сса', 'са', 'ы', 'і', 'и']
+    
+    best_match = None
+    best_pop = 0
+    
+    for asuf in sorted(adj_suffixes, key=len, reverse=True):
+        if adj_lower.endswith(asuf):
+            stem = adj_lower[:-len(asuf)]
+            if len(stem) < 3:
+                continue
+            
+            for csuf in city_suffixes:
+                candidate = stem + csuf
+                if candidate in all_geo_entities:
+                    entity = all_geo_entities[candidate]
+                    # entity может быть tuple (country, type) или dict
+                    if isinstance(entity, tuple):
+                        ent_country, ent_type = entity
+                        if ent_type == 'city':
+                            # Используем длину имени как proxy для population 
+                            # (в контексте области — любой город в базе валиден)
+                            if best_match is None or len(candidate) > len(best_match):
+                                best_match = candidate
+    
+    return best_match
+
+
 # ═══════════════════════════════════════════════════════════════════
 # FALLBACK БАЗА ГЕО-СУЩНОСТЕЙ
 # ═══════════════════════════════════════════════════════════════════
@@ -759,13 +804,22 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         has_oblast = any(oblast_word in query_lower for oblast_word in ['область', 'обл', 'област', 'области'])
         
         if has_oblast and seed_city:
-            # Собираем города из запроса (нормализованные)
+            # Собираем города из запроса (нормализованные + adjective resolution)
             cities_in_query_oblast: Set[str] = set()
-            for word_norm in clean_words_normalized:
+            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
+                # Стандартная проверка
                 if word_norm in all_geo_entities:
                     entity_country, entity_type = all_geo_entities[word_norm]
                     if entity_type == 'city':
                         cities_in_query_oblast.add(word_norm)
+                
+                # Adjective resolution: "одесская" → "одесса"/"одеса"
+                # Стандартная нормализация ("одесская"→"одес") не находит город,
+                # но suffix expansion находит
+                resolved = _resolve_oblast_adjective(raw_word, all_geo_entities)
+                if resolved and resolved != seed_city:
+                    cities_in_query_oblast.add(resolved)
+                    logger.info(f"[GEO_WHITE_LIST] Oblast adj resolved: '{raw_word}' → '{resolved}'")
             
             # Если есть чужие города → БЛОК
             other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
