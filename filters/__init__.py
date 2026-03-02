@@ -8,6 +8,7 @@ Contains all filtering logic:
 - relevance_filter: Relevance keyword filtering
 - l0_filter: Layer 0 structural classifier (26 detectors)
 - l2_filter: Layer 2 semantic classifier (Dual Cosine embeddings)
+- l3_filter: Layer 3 DeepSeek LLM classifier (remaining GREY)
 """
 import json
 import os
@@ -20,6 +21,7 @@ from .infix_filter import filter_infix_results
 from .relevance_filter import filter_relevant_keywords
 from .l0_filter import apply_l0_filter
 from .l2_filter import L2Classifier, apply_l2_filter
+from .l3_filter import apply_l3_filter, L3Config
 
 logger = logging.getLogger(__name__)
 
@@ -56,4 +58,6 @@ __all__ = [
     'apply_l0_filter',
     'L2Classifier',
     'apply_l2_filter',
+    'apply_l3_filter',
+    'L3Config',
 ]
