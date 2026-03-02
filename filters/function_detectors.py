@@ -1204,16 +1204,26 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
         # Расширенный паттерн: modifier + object_refinement
         # "правильно в гранулах" = ADVB + PREP + NOUN(inan)
         # Первое слово — модификатор, остальное — уточнение объекта (форма выпуска и т.д.)
-        if len(tail_words) <= 4:
-            first_p = morph.parse(tail_words[0])[0]
-            first_is_modifier = (
-                first_p.tag.POS in ('PRED', 'COMP', 'INFN') or
-                (first_p.tag.POS == 'ADVB' and (tail_words[0].endswith('о') or tail_words[0].endswith('е'))
-                 and not any(p.tag.POS == 'PRCL' for p in morph.parse(tail_words[0])))
-            )
-            if first_is_modifier:
-                # Остаток = PREP + NOUN(inan, no Geox) или NOUN(inan, no Geox)
-                rest = tail_words[1:]
+        if len(tail_words) <= 5:
+            # Пропускаем все ведущие модификаторы (ADVB/-о, PRED, COMP, INFN)
+            modifier_end = 0
+            for tw in tail_words:
+                tw_p = morph.parse(tw)[0]
+                is_mod = (
+                    tw_p.tag.POS in ('PRED', 'COMP', 'INFN') or
+                    (tw_p.tag.POS == 'ADVB' and (tw.endswith('о') or tw.endswith('е'))
+                     and not any(p.tag.POS == 'PRCL' for p in morph.parse(tw)))
+                    # "ли"/"же" — вопросительные частицы, пропускаем ТОЛЬКО после модификатора
+                    or (tw in ('ли', 'же', 'ведь') and modifier_end >= 1)
+                )
+                if is_mod:
+                    modifier_end += 1
+                else:
+                    break
+            
+            if modifier_end >= 1 and modifier_end < len(tail_words):
+                # Остаток после модификаторов
+                rest = tail_words[modifier_end:]
                 rest_start = morph.parse(rest[0])[0]
                 
                 # Пропускаем PREP если есть
@@ -1237,6 +1247,16 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
                     
                     if is_inan and not has_geox:
                         return True, f"Модификатор + уточнение объекта: '{tail_words[0]}' + '{target_word}' (inan, no Geox)"
+                
+                # Субстантивированное прилагательное: "жаропонижающее", "обезболивающее"
+                # Все ADJ, последний — neut,sing → выступает как NOUN(inan)
+                elif noun_idx == len(noun_words) and noun_idx >= 1:
+                    last_adj = noun_words[-1]
+                    last_p = morph.parse(last_adj)[0]
+                    if (last_p.tag.POS in ('ADJF', 'PRTF') and 
+                        last_p.tag.gender == 'neut' and 
+                        last_p.tag.case in ('nomn', 'accs')):
+                        return True, f"Модификатор + субстантив: '{tail_words[0]}' + '{last_adj}' (ADJ как NOUN)"
         
         return False, ""
     
@@ -1287,6 +1307,19 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
             has_geox = any('Geox' in str(p.tag) for p in second_parses)
             if is_inan and not has_geox:
                 return True, f"Модификатор + уточнение объекта: '{tail_words[0]}' + '{tail_words[1]}' (inan, no Geox)"
+    
+    # Уточнение типа продукта: ADJF + NOUN(inan, no Geox) при seed с глаголом
+    # "шипучие таблетки" = ADJF + NOUN(inan) → форма выпуска
+    # Cross-niche: "литиевый аккумулятор", "дисковый тормоз", "напольный кондиционер"
+    # Guard: ADJF + NOUN(Geox) = "московский район" → не пройдёт
+    if len(tail_words) == 2:
+        p0 = morph.parse(tail_words[0])[0]
+        p1_parses = morph.parse(tail_words[1])
+        p1 = p1_parses[0]
+        if p0.tag.POS in ('ADJF', 'PRTF') and p1.tag.POS == 'NOUN' and 'inan' in p1.tag:
+            has_geox = any('Geox' in str(p.tag) for p in p1_parses)
+            if not has_geox:
+                return True, f"Уточнение типа: '{tail_words[0]}' + '{tail_words[1]}' (ADJ+NOUN inan)"
     
     return False, ""
 
