@@ -279,6 +279,7 @@ def detect_time(tail: str) -> Tuple[bool, str]:
     time_patterns = [
         '24/7', '24 часа', 'без выходных',
         'в праздники', 'на праздник',
+        'на ночь', 'на утро',
     ]
     
     tail_lower = tail.lower()
@@ -1259,6 +1260,12 @@ def detect_prepositional_modifier(tail: str, seed: str = "") -> Tuple[bool, str]
         return False, ""
     
     # 3. Правила управления предлогов (единый dict с detect_broken_grammar)
+    # ТОЛЬКО обстоятельственные предлоги — работают с ЛЮБЫМ глаголом.
+    # Аргументные (к, о, у, над) зависят от конкретного глагола → пропускаем.
+    # Многозначные (на, в) дают слишком много FP:
+    #   "на лицо", "на организм", "на озоне" — мусор; "на ночь" — валид (→ detect_time)
+    #   "в таблетках" — GREY, нормально для L2
+    #   "в домашних условиях" — уже ловится detect_action
     prep_cases = {
         'после': {'gent', 'gen2'},
         'до': {'gent', 'gen2'},
@@ -1266,20 +1273,14 @@ def detect_prepositional_modifier(tail: str, seed: str = "") -> Tuple[bool, str]
         'для': {'gent', 'gen2'},
         'от': {'gent', 'gen2'},
         'из': {'gent', 'gen2'},
-        'у': {'gent', 'gen2'},
         'около': {'gent', 'gen2'},
         'вместо': {'gent', 'gen2'},
         'кроме': {'gent', 'gen2'},
         'при': {'loct', 'loc2'},
-        'на': {'loct', 'loc2', 'accs'},
-        'в': {'loct', 'loc2', 'accs'},
-        'о': {'loct', 'loc2'},
         'по': {'datv'},
-        'к': {'datv'},
         'перед': {'ablt'},
         'с': {'ablt', 'gent'},
         'за': {'ablt', 'accs'},
-        'над': {'ablt'},
         'под': {'ablt', 'accs'},
         'между': {'ablt'},
         'через': {'accs'},
