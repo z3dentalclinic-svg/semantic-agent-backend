@@ -435,6 +435,8 @@ def detect_fragment(tail: str, seed: str = "") -> Tuple[bool, str]:
             pass  # Не блокируем — это ложное срабатывание pymorphy
         elif seed_has_verb and last_word in verb_modifier_questions:
             pass  # "когда"/"сколько" при seed с глаголом = модификатор, не обрывок
+        elif last_parsed.tag.POS == 'PREP' and len(words) >= 2 and words[-2] in ('или', 'и', 'либо', 'чи'):
+            pass  # Эллипсис: "до еды или после" = "до еды или после [еды]"
         else:
             return True, f"Обрывок: '{last_word}' ({last_parsed.tag.POS}) на конце"
     
@@ -1191,8 +1193,51 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
     if not _seed_has_verb(seed):
         return False, ""
     
+    # Одиночное вопросительное слово-модификатор глагола
+    # "когда принимать" = вопрос о времени, "сколько принимать" = вопрос о количестве
+    verb_question_modifiers = {'когда', 'сколько', 'коли', 'скільки'}
+    if len(tail_words) == 1 and tail_words[0] in verb_question_modifiers:
+        return True, f"Вопросительный модификатор глагола: '{tail_words[0]}' при seed с глаголом"
+    
     # Хвост = 1-2 слова, все — модификаторы глагола?
     if len(tail_words) > 2:
+        # Расширенный паттерн: modifier + object_refinement
+        # "правильно в гранулах" = ADVB + PREP + NOUN(inan)
+        # Первое слово — модификатор, остальное — уточнение объекта (форма выпуска и т.д.)
+        if len(tail_words) <= 4:
+            first_p = morph.parse(tail_words[0])[0]
+            first_is_modifier = (
+                first_p.tag.POS in ('PRED', 'COMP', 'INFN') or
+                (first_p.tag.POS == 'ADVB' and (tail_words[0].endswith('о') or tail_words[0].endswith('е'))
+                 and not any(p.tag.POS == 'PRCL' for p in morph.parse(tail_words[0])))
+            )
+            if first_is_modifier:
+                # Остаток = PREP + NOUN(inan, no Geox) или NOUN(inan, no Geox)
+                rest = tail_words[1:]
+                rest_start = morph.parse(rest[0])[0]
+                
+                # Пропускаем PREP если есть
+                noun_words = rest[1:] if rest_start.tag.POS == 'PREP' and len(rest) > 1 else rest
+                
+                # Пропускаем ADJ перед NOUN
+                noun_idx = 0
+                for nw in noun_words:
+                    np_ = morph.parse(nw)[0]
+                    if np_.tag.POS in ('ADJF', 'ADJS', 'PRTF', 'PRTS'):
+                        noun_idx += 1
+                    else:
+                        break
+                
+                if noun_idx < len(noun_words):
+                    target_word = noun_words[noun_idx]
+                    target_parses = morph.parse(target_word)
+                    tp = target_parses[0]
+                    is_inan = tp.tag.POS == 'NOUN' and 'inan' in tp.tag
+                    has_geox = any('Geox' in str(p.tag) for p in target_parses)
+                    
+                    if is_inan and not has_geox:
+                        return True, f"Модификатор + уточнение объекта: '{tail_words[0]}' + '{target_word}' (inan, no Geox)"
+        
         return False, ""
     
     all_modifiers = True
@@ -1201,7 +1246,9 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
         pos = tp.tag.POS
         
         # PRED (можно, нужно) и COMP (лучше) — всегда модификаторы
-        if pos in ('PRED', 'COMP'):
+        # INFN (разводить, пить) — параллельный глагол при seed с глаголом
+        # "правильно разводить" = ADVB + INFN → оба модифицируют действие
+        if pos in ('PRED', 'COMP', 'INFN'):
             continue
         
         # ADVB — только если образовано от прилагательного (суффикс -о/-е)
@@ -1223,6 +1270,23 @@ def detect_verb_modifier(tail: str, seed: str = "") -> Tuple[bool, str]:
     if all_modifiers:
         pos_tags = [morph.parse(w)[0].tag.POS for w in tail_words]
         return True, f"Модификатор глагола: '{tail}' ({', '.join(pos_tags)}) при seed с глаголом"
+    
+    # 2 слова: modifier + NOUN(inan, no Geox) = модификатор + уточнение объекта
+    # "нужно порошок" = PRED + NOUN(inan), "правильно лекарство" = ADVB + NOUN(inan)
+    if len(tail_words) == 2:
+        first_p = morph.parse(tail_words[0])[0]
+        first_is_modifier = (
+            first_p.tag.POS in ('PRED', 'COMP', 'INFN') or
+            (first_p.tag.POS == 'ADVB' and (tail_words[0].endswith('о') or tail_words[0].endswith('е'))
+             and not any(p.tag.POS == 'PRCL' for p in morph.parse(tail_words[0])))
+        )
+        if first_is_modifier:
+            second_parses = morph.parse(tail_words[1])
+            sp = second_parses[0]
+            is_inan = sp.tag.POS == 'NOUN' and 'inan' in sp.tag
+            has_geox = any('Geox' in str(p.tag) for p in second_parses)
+            if is_inan and not has_geox:
+                return True, f"Модификатор + уточнение объекта: '{tail_words[0]}' + '{tail_words[1]}' (inan, no Geox)"
     
     return False, ""
 
@@ -1305,7 +1369,7 @@ def detect_prepositional_modifier(tail: str, seed: str = "") -> Tuple[bool, str]
     
     # 3. Правила управления предлогов (единый dict с detect_broken_grammar)
     # ТОЛЬКО обстоятельственные предлоги — работают с ЛЮБЫМ глаголом.
-    # Аргументные (к, о, у, над) зависят от конкретного глагола → пропускаем.
+    # Аргументные (к, о, у, над, из) зависят от конкретного глагола → пропускаем.
     # Многозначные (на, в) дают слишком много FP:
     #   "на лицо", "на организм", "на озоне" — мусор; "на ночь" — валид (→ detect_time)
     #   "в таблетках" — GREY, нормально для L2
@@ -1316,7 +1380,6 @@ def detect_prepositional_modifier(tail: str, seed: str = "") -> Tuple[bool, str]
         'без': {'gent', 'gen2'},
         'для': {'gent', 'gen2'},
         'от': {'gent', 'gen2'},
-        'из': {'gent', 'gen2'},
         'около': {'gent', 'gen2'},
         'вместо': {'gent', 'gen2'},
         'кроме': {'gent', 'gen2'},
