@@ -842,6 +842,50 @@ def detect_duplicate_words(tail: str) -> Tuple[bool, str]:
             # Это interrogative pattern — НЕ блокируем
             return False, ""
     
+    # === ФИКС: Альтернативные конструкции ===
+    # "до еды или после еды" — повтор "еды" через "или"/"и" = валидная альтернатива
+    # "с едой или без еды" — повтор леммы через "или" = валидная альтернатива
+    # Алгоритм: если между позициями повторяющегося слова есть "или"/"и" → не дубликат
+    conjunctions = {'или', 'и', 'либо', 'чи'}  # чи = укр. "или"
+    conjunction_positions = {i for i, w in enumerate(words) if w in conjunctions}
+    
+    if conjunction_positions:
+        # Собираем позиции каждого повторяющегося слова
+        from collections import defaultdict
+        word_positions = defaultdict(list)
+        for i, w in enumerate(words):
+            word_positions[w].append(i)
+        
+        # Есть ли дубликат с союзом между его вхождениями?
+        has_dup_across_conjunction = False
+        for w, positions in word_positions.items():
+            if len(positions) >= 2 and w not in conjunctions:
+                for ci in conjunction_positions:
+                    if positions[0] < ci < positions[-1]:
+                        has_dup_across_conjunction = True
+                        break
+            if has_dup_across_conjunction:
+                break
+        
+        # Те же проверки для лемм
+        if not has_dup_across_conjunction:
+            lemma_positions = defaultdict(list)
+            for i, w in enumerate(words):
+                lemma = morph.parse(w)[0].normal_form
+                lemma_positions[lemma].append(i)
+            
+            for lemma, positions in lemma_positions.items():
+                if len(positions) >= 2 and lemma not in conjunctions:
+                    for ci in conjunction_positions:
+                        if positions[0] < ci < positions[-1]:
+                            has_dup_across_conjunction = True
+                            break
+                if has_dup_across_conjunction:
+                    break
+        
+        if has_dup_across_conjunction:
+            return False, ""
+    
     # Проверка точных дубликатов
     if len(words) != len(set(words)):
         dupes = [w for w in words if words.count(w) > 1]
