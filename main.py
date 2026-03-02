@@ -6,6 +6,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from typing import List, Dict
+import os
 import httpx
 import asyncio
 import time
@@ -23,6 +24,8 @@ from filters import (
     apply_pre_filter,  # ← санитарная очистка парсинга (ДО гео-фильтра)
     apply_l0_filter,   # ← L0 классификатор хвостов (ПОСЛЕ всех фильтров)
     apply_l2_filter,   # ← L2 Tri-Signal классификатор (PMI + Centroid + L0 signals)
+    apply_l3_filter,   # ← L3 DeepSeek LLM классификатор (финальная GREY)
+    L3Config,          # ← конфигурация L3
 )
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
@@ -59,8 +62,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="8.0.0",
-    description="6 методов | 3 sources | Batch Post-Filter | L0 + L2 Classifiers | v8.0 DUAL COSINE"
+    version="9.0.0",
+    description="6 методов | 3 sources | Batch Post-Filter | L0 + L2 + L3 Classifiers | v9.0 DeepSeek L3"
 )
 
 app.add_middleware(
@@ -165,6 +168,9 @@ try:
 except ImportError:
     BRAND_DB = set()
     logger.warning("[L0] databases.py not found, BRAND_DB пуст")
+
+# DeepSeek API key для L3
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 
 def deduplicate_final_results(data: dict) -> dict:
@@ -1366,12 +1372,19 @@ def _build_l2_config(pmi_valid=None, centroid_valid=None, centroid_trash=None):
     return config
 
 
+def _build_l3_config(api_key=None):
+    """Собирает L3 config."""
+    config = L3Config()
+    config.api_key = api_key or DEEPSEEK_API_KEY
+    return config
+
+
 def apply_filters_traced(result: dict, seed: str, country: str, 
                           method: str, language: str = "ru", deduplicate: bool = False,
-                          enabled_filters: str = "pre,geo,bpf", l2_config = None) -> dict:
+                          enabled_filters: str = "pre,geo,bpf", l2_config = None, l3_config = None) -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
-    Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0 → L2
+    Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0 → L2 → L3
     Заблокированные ключи добавляются в result["anchors"] с указанием фильтра.
     
     enabled_filters: через запятую какие фильтры включены.
@@ -1380,21 +1393,23 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         "bpf"  = batch_post_filter
         "l0"   = L0 tail classifier
         "l2"   = L2 Tri-Signal classifier (PMI + Centroid + L0 signals)
+        "l3"   = L3 DeepSeek LLM classifier (remaining GREY)
         "none" = все выключены (сырые данные)
-        "all" или "pre,geo,bpf,l0,l2" = все включены (по умолчанию)
+        "all" или "pre,geo,bpf,l0,l2,l3" = все включены (по умолчанию)
     """
     # Парсим флаги
     ef = enabled_filters.lower().strip()
     if ef == "all":
-        ef = "pre,geo,bpf,l0,l2"
+        ef = "pre,geo,bpf,l0,l2,l3"
     parts = [x.strip() for x in ef.split(",")]
     run_pre = "pre" in parts
     run_geo = "geo" in parts
     run_bpf = "bpf" in parts
     run_l0 = "l0" in parts
     run_l2 = "l2" in parts
+    run_l3 = "l3" in parts
     
-    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0} l2={run_l2}")
+    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0} l2={run_l2} l3={run_l3}")
     
     parser.tracer.start_request(seed=seed, country=country, method=method)
     
@@ -1501,6 +1516,43 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             l2_trace=l2_trace,
         )
     
+    # L3 DEEPSEEK LLM КЛАССИФИКАТОР (после L2, обрабатывает оставшиеся GREY)
+    if run_l3 and result.get("keywords_grey"):
+        parser.tracer.before_filter("l3_filter", result.get("keywords_grey", []))
+        
+        cfg = l3_config or _build_l3_config()
+        
+        result = apply_l3_filter(
+            result,
+            seed=seed,
+            enable_l3=True,
+            config=cfg,
+        )
+        
+        # Логируем результаты L3
+        l3_stats = result.get("l3_stats", {})
+        l3_trace = result.get("_l3_trace", [])
+        
+        logger.info(
+            f"[L3] VALID: {l3_stats.get('l3_valid', 0)}, "
+            f"TRASH: {l3_stats.get('l3_trash', 0)}, "
+            f"ERROR: {l3_stats.get('l3_error', 0)} "
+            f"(API: {l3_stats.get('api_time', 0)}s)"
+        )
+        
+        # Трейсер L3
+        l3_valid_kws = [t["keyword"] for t in l3_trace if t.get("label") == "VALID"]
+        l3_trash_kws = [t["keyword"] for t in l3_trace if t.get("label") == "TRASH"]
+        l3_error_kws = [t["keyword"] for t in l3_trace if t.get("label") == "ERROR"]
+        
+        parser.tracer.after_l3_filter(
+            valid=l3_valid_kws,
+            trash=l3_trash_kws,
+            error=l3_error_kws,
+            l3_stats=l3_stats,
+            l3_trace=l3_trace,
+        )
+    
     # Дедупликация anchors
     seen = set()
     unique_anchors = []
@@ -1518,7 +1570,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
-    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l2": run_l2, "rel": not parser.skip_relevance_filter}
+    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l2": run_l2, "l3": run_l3, "rel": not parser.skip_relevance_filter}
     return result
 
 
@@ -1640,8 +1692,9 @@ async def light_search_endpoint(
     
     # Собираем L2 config из параметров
     l2_config = _build_l2_config(l2_pmi_valid, l2_centroid_valid, l2_centroid_trash)
+    l3_config = _build_l3_config()
     
-    result = apply_filters_traced(result, seed, country, method="light-search", language=language, enabled_filters=filters, l2_config=l2_config)
+    result = apply_filters_traced(result, seed, country, method="light-search", language=language, enabled_filters=filters, l2_config=l2_config, l3_config=l3_config)
 
     if correction.get("has_errors"):
         result["original_seed"] = correction["original"]
@@ -1679,8 +1732,9 @@ async def deep_search_endpoint(
     
     # Собираем L2 config из параметров
     l2_config = _build_l2_config(l2_pmi_valid, l2_centroid_valid, l2_centroid_trash)
+    l3_config = _build_l3_config()
     
-    result = apply_filters_traced(result, filter_seed, country, method="deep-search", language=language, deduplicate=True, enabled_filters=filters, l2_config=l2_config)
+    result = apply_filters_traced(result, filter_seed, country, method="deep-search", language=language, deduplicate=True, enabled_filters=filters, l2_config=l2_config, l3_config=l3_config)
     
     return result
 
