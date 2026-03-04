@@ -62,7 +62,7 @@ class SuffixParseResult:
     """Full result of suffix parsing"""
     seed: str
     analysis: Dict
-    all_keywords: List[str] = field(default_factory=list)
+    all_keywords: List[Dict] = field(default_factory=list)  # [{keyword, source_suffix, source_type, source_priority, source_query}]
     total_queries: int = 0
     successful_queries: int = 0
     empty_queries: int = 0
@@ -138,7 +138,7 @@ class SuffixParser:
 
         # Step 3: Send to autocomplete in parallel
         semaphore = asyncio.Semaphore(parallel_limit)
-        all_keywords = set()
+        keyword_origins = {}  # keyword → {suffix_label, suffix_type, priority, query_sent}
         trace_entries: List[SuffixTraceEntry] = []
 
         # Add blocked to trace
@@ -174,7 +174,17 @@ class SuffixParser:
                 trace_entries.append(entry)
 
                 if results:
-                    all_keywords.update(results)
+                    for kw in results:
+                        kw_lower = kw.lower().strip()
+                        if kw_lower not in keyword_origins:
+                            # First suffix to find this keyword gets credit
+                            keyword_origins[kw_lower] = {
+                                "keyword": kw,
+                                "source_suffix": sq.suffix_label,
+                                "source_type": sq.suffix_type,
+                                "source_priority": sq.priority,
+                                "source_query": sq.query,
+                            }
 
         async with httpx.AsyncClient() as client:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
@@ -216,7 +226,7 @@ class SuffixParser:
         return SuffixParseResult(
             seed=seed,
             analysis=analysis_summary,
-            all_keywords=sorted(list(all_keywords)),
+            all_keywords=sorted(keyword_origins.values(), key=lambda x: x["keyword"]),
             total_queries=len(queries_to_send),
             successful_queries=ok_count,
             empty_queries=empty_count,
