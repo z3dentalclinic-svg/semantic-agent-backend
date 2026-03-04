@@ -35,6 +35,10 @@ SUFFIXES_RU = {
     "A": [
         {"val": "*", "label": "wildcard"},
         {"val": " *", "label": "double_space"},  # deep trigger
+        {"val": "_*", "label": "underscore"},     # compound terms
+        {"val": "- *", "label": "hyphen"},        # specs/models
+        {"val": ".*", "label": "dot"},            # file extensions, abbreviations
+        {"val": "? *", "label": "question_mark"}, # conversational long-tail
     ],
 
     # Type B: Prepositions — contextual
@@ -410,9 +414,10 @@ class SuffixGenerator:
                     markers=[m for m in active_markers],
                 ))
 
-        # Double-space suffix always gets +1 (but max 2)
+        # Experimental mechanics always get priority 2 (deep dig)
+        experimental_labels = {"double_space", "underscore", "hyphen", "dot", "question_mark"}
         for r in results:
-            if r.suffix_label == "double_space" and r.priority == 1:
+            if r.suffix_label in experimental_labels and r.priority == 1:
                 r.priority = 2
 
         return analysis, results
