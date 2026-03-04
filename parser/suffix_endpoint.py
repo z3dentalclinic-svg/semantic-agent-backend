@@ -53,6 +53,7 @@ def register_suffix_endpoint(app: FastAPI):
             {
                 "keyword": kw["keyword"],
                 "source_suffix": kw["source_suffix"],
+                "source_val": kw.get("source_val", ""),
                 "source_type": kw["source_type"],
                 "source_priority": kw["source_priority"],
                 "source_query": kw["source_query"],
