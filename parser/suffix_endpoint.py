@@ -31,7 +31,7 @@ def register_suffix_endpoint(app: FastAPI):
         parallel: int = Query(5, description="Параллельных запросов"),
         source: str = Query("google", description="Источник"),
         echelon: int = Query(0, description="0=все, 1=только P1, 2=только P2"),
-        include_numbers: bool = Query(False, description="Числовые суффиксы 0-9"),
+        include_numbers: bool = Query(True, description="Числовые суффиксы 0-9"),
         filters: str = Query("none", description="Фильтры (для совместимости)"),
     ):
         """
@@ -49,10 +49,21 @@ def register_suffix_endpoint(app: FastAPI):
         )
 
         # Format response compatible with existing HTML displayResults
+        keywords_with_source = [
+            {
+                "keyword": kw["keyword"],
+                "source_suffix": kw["source_suffix"],
+                "source_type": kw["source_type"],
+                "source_priority": kw["source_priority"],
+                "source_query": kw["source_query"],
+            }
+            for kw in result.all_keywords
+        ]
+
         return {
             "method": "suffix-map",
             "seed": seed,
-            "keywords": [{"keyword": kw} for kw in result.all_keywords],
+            "keywords": keywords_with_source,
             "keywords_grey": [],
             "anchors": [],
             "total": len(result.all_keywords),
