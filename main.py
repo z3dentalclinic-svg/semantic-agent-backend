@@ -31,6 +31,7 @@ from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
 from utils.normalizer import normalize_keywords
 from utils.tracer import FilterTracer
+from parser.suffix_endpoint import register_suffix_endpoint  # ← Suffix Map парсер v1.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,8 +63,8 @@ import pymorphy3
 
 app = FastAPI(
     title="FGS Parser API",
-    version="9.0.0",
-    description="6 методов | 3 sources | Batch Post-Filter | L0 + L2 + L3 Classifiers | v9.0 DeepSeek L3"
+    version="10.0.0",
+    description="7 методов | 3 sources | Batch Post-Filter | L0 + L2 + L3 Classifiers | Suffix Map v1.0"
 )
 
 app.add_middleware(
@@ -77,6 +78,9 @@ app.add_middleware(
 @app.options("/{rest_of_path:path}")
 async def preflight_handler():
     return {}
+
+# ═══ SUFFIX MAP PARSER v1.0 ═══
+register_suffix_endpoint(app)
 
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
