@@ -181,6 +181,7 @@ class SuffixParser:
                             keyword_origins[kw_lower] = {
                                 "keyword": kw,
                                 "source_suffix": sq.suffix_label,
+                                "source_val": sq.suffix_val,
                                 "source_type": sq.suffix_type,
                                 "source_priority": sq.priority,
                                 "source_query": sq.query,
