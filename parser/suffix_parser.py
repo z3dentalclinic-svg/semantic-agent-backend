@@ -280,12 +280,12 @@ class SuffixParser:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
             await asyncio.gather(*tasks)
 
-            # Extra: if cp=0 (or other explicit non-negative), send ONE bare-seed request
+            # Extra: if cp=0 (or other explicit non-negative), send TWO bare-seed requests
             # IMPORTANT: cp=0 only works with client=chrome (firefox ignores it)
             if cursor_position is not None and cursor_position >= 0:
-                # Debug: also fetch raw response to log what Google returns
                 logger = logging.getLogger(__name__)
                 
+                # Request 1: standard cp=0 (cursor at start of seed)
                 raw_url = "https://www.google.com/complete/search"
                 raw_params = {
                     "q": seed, "client": "chrome", "hl": language, "gl": country,
@@ -316,9 +316,41 @@ class SuffixParser:
                     status="ok" if cp_results else "empty",
                 )
                 trace_entries.append(entry)
-
                 if cp_results:
                     all_keywords.update(cp_results)
+
+                # Request 2: space + seed with cp=0 (Gemini theory: prefix discovery)
+                space_seed = " " + seed
+                raw_params2 = {
+                    "q": space_seed, "client": "chrome", "hl": language, "gl": country,
+                    "cp": 0, "ie": "utf-8", "oe": "utf-8"
+                }
+                try:
+                    raw_resp2 = await client.get(raw_url, params=raw_params2, headers=raw_headers, timeout=10.0)
+                    logger.info(f"[CP=0+SPACE] Raw response: {raw_resp2.text[:500]}")
+                except Exception as e:
+                    logger.info(f"[CP=0+SPACE] Raw request failed: {e}")
+
+                t0 = time.time()
+                cp_results2 = await self.fetch_suggestions(
+                    space_seed, country, language, client, "chrome", 0
+                )
+                elapsed2 = (time.time() - t0) * 1000
+
+                entry2 = SuffixTraceEntry(
+                    suffix_val=f"sp+cp=0",
+                    suffix_label=f"space_prefix_cp0",
+                    suffix_type="A",
+                    priority=1,
+                    query_sent=f"[space]{seed} [cp=0]",
+                    results_count=len(cp_results2),
+                    results=cp_results2,
+                    time_ms=round(elapsed2, 1),
+                    status="ok" if cp_results2 else "empty",
+                )
+                trace_entries.append(entry2)
+                if cp_results2:
+                    all_keywords.update(cp_results2)
 
         total_time = (time.time() - total_start) * 1000
 
