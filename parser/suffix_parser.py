@@ -14,6 +14,7 @@ import time
 import random
 import json
 import re
+import logging
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -132,13 +133,21 @@ class SuffixParser:
                     if isinstance(data, list) and len(data) > 1:
                         raw = data[1]
                         if isinstance(raw, list):
-                            # Flatten: could be ["s1", "s2"] or [["s1",0,[512]], ["s2",0,[512]]]
+                            # Handles all known formats:
+                            # firefox:  ["s1", "s2"]
+                            # chrome:   [["s1",0,[512]], ["s2",0,[512]]]  
+                            # chrome cp=0: [{"suggestion":"s1","relevance":...}, ...]
                             result = []
                             for item in raw:
                                 if isinstance(item, str):
                                     result.append(self._clean_suggestion(item))
                                 elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
                                     result.append(self._clean_suggestion(item[0]))
+                                elif isinstance(item, dict):
+                                    # Chrome with cp=0 may return dicts
+                                    s = item.get("suggestion") or item.get("value") or item.get("text", "")
+                                    if s:
+                                        result.append(self._clean_suggestion(str(s)))
                             return result
                         return []
                 except Exception:
@@ -158,6 +167,10 @@ class SuffixParser:
                                         result.append(self._clean_suggestion(item))
                                     elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
                                         result.append(self._clean_suggestion(item[0]))
+                                    elif isinstance(item, dict):
+                                        s = item.get("suggestion") or item.get("value") or item.get("text", "")
+                                        if s:
+                                            result.append(self._clean_suggestion(str(s)))
                                 return result
                     except Exception:
                         pass
@@ -178,6 +191,10 @@ class SuffixParser:
                                         result.append(self._clean_suggestion(item))
                                     elif isinstance(item, list) and len(item) > 0:
                                         result.append(self._clean_suggestion(str(item[0])))
+                                    elif isinstance(item, dict):
+                                        s = item.get("suggestion") or item.get("value") or item.get("text", "")
+                                        if s:
+                                            result.append(self._clean_suggestion(str(s)))
                                 return result
                     except Exception:
                         pass
@@ -266,6 +283,21 @@ class SuffixParser:
             # Extra: if cp=0 (or other explicit non-negative), send ONE bare-seed request
             # IMPORTANT: cp=0 only works with client=chrome (firefox ignores it)
             if cursor_position is not None and cursor_position >= 0:
+                # Debug: also fetch raw response to log what Google returns
+                logger = logging.getLogger(__name__)
+                
+                raw_url = "https://www.google.com/complete/search"
+                raw_params = {
+                    "q": seed, "client": "chrome", "hl": language, "gl": country,
+                    "cp": cursor_position, "ie": "utf-8", "oe": "utf-8"
+                }
+                raw_headers = {"User-Agent": random.choice(USER_AGENTS)}
+                try:
+                    raw_resp = await client.get(raw_url, params=raw_params, headers=raw_headers, timeout=10.0)
+                    logger.info(f"[CP={cursor_position}] Raw response: {raw_resp.text[:500]}")
+                except Exception as e:
+                    logger.info(f"[CP={cursor_position}] Raw request failed: {e}")
+
                 t0 = time.time()
                 cp_results = await self.fetch_suggestions(
                     seed, country, language, client, "chrome", cursor_position
