@@ -34,6 +34,7 @@ def register_suffix_endpoint(app: FastAPI):
         include_numbers: bool = Query(False, description="Числовые суффиксы 0-9"),
         filters: str = Query("none", description="Фильтры (для совместимости)"),
         google_client: str = Query("firefox", description="Autocomplete client: firefox/chrome/chrome-omni/safari/psy-ab/gws-wiz"),
+        cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
     ):
         """
         SUFFIX MAP: Smart suffix expansion with priority matrix + tracer.
@@ -48,6 +49,7 @@ def register_suffix_endpoint(app: FastAPI):
             include_numbers=include_numbers,
             echelon=echelon,
             google_client=google_client,
+            cursor_position=cp,
         )
 
         # Format response compatible with existing HTML displayResults
@@ -55,6 +57,7 @@ def register_suffix_endpoint(app: FastAPI):
             "method": "suffix-map",
             "seed": seed,
             "google_client": google_client,
+            "cursor_position": cp,
             "keywords": [{"keyword": kw} for kw in result.all_keywords],
             "keywords_grey": [],
             "anchors": [],
