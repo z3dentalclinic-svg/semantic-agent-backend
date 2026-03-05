@@ -280,77 +280,82 @@ class SuffixParser:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
             await asyncio.gather(*tasks)
 
-            # Extra: if cp=0 (or other explicit non-negative), send TWO bare-seed requests
-            # IMPORTANT: cp=0 only works with client=chrome (firefox ignores it)
+            # ═══ PREFIX EXPERIMENTS ═══
+            # All untested prefix/cp theories in one block
             if cursor_position is not None and cursor_position >= 0:
                 logger = logging.getLogger(__name__)
-                
-                # Request 1: standard cp=0 (cursor at start of seed)
                 raw_url = "https://www.google.com/complete/search"
-                raw_params = {
-                    "q": seed, "client": "chrome", "hl": language, "gl": country,
-                    "cp": cursor_position, "ie": "utf-8", "oe": "utf-8"
-                }
-                raw_headers = {"User-Agent": random.choice(USER_AGENTS)}
-                try:
-                    raw_resp = await client.get(raw_url, params=raw_params, headers=raw_headers, timeout=10.0)
-                    logger.info(f"[CP={cursor_position}] Raw response: {raw_resp.text[:500]}")
-                except Exception as e:
-                    logger.info(f"[CP={cursor_position}] Raw request failed: {e}")
+                suggest_url = "https://suggestqueries.google.com/complete/search"
+                hdrs = {"User-Agent": random.choice(USER_AGENTS)}
 
-                t0 = time.time()
-                cp_results = await self.fetch_suggestions(
-                    seed, country, language, client, "chrome", cursor_position
-                )
-                elapsed = (time.time() - t0) * 1000
+                # Helper to run one experiment
+                async def run_experiment(label, url, q_text, params_extra, use_client="chrome"):
+                    params_exp = {
+                        "q": q_text, "client": use_client,
+                        "hl": language, "gl": country,
+                        "ie": "utf-8", "oe": "utf-8",
+                    }
+                    params_exp.update(params_extra)
+                    try:
+                        resp = await client.get(url, params=params_exp, headers=hdrs, timeout=10.0)
+                        logger.info(f"[{label}] URL: {resp.url}")
+                        logger.info(f"[{label}] Raw: {resp.text[:500]}")
+                        # Parse response
+                        results = []
+                        data = resp.json()
+                        if isinstance(data, list) and len(data) > 1:
+                            raw = data[1]
+                            if isinstance(raw, list):
+                                for item in raw:
+                                    if isinstance(item, str):
+                                        results.append(self._clean_suggestion(item))
+                                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
+                                        results.append(self._clean_suggestion(item[0]))
+                                    elif isinstance(item, dict):
+                                        s = item.get("suggestion") or item.get("value") or item.get("text", "")
+                                        if s:
+                                            results.append(self._clean_suggestion(str(s)))
+                        return results
+                    except Exception as e:
+                        logger.info(f"[{label}] Error: {e}")
+                        return []
 
-                entry = SuffixTraceEntry(
-                    suffix_val=f"cp={cursor_position}",
-                    suffix_label=f"cursor_cp{cursor_position}",
-                    suffix_type="A",
-                    priority=1,
-                    query_sent=f"{seed} [cp={cursor_position}]",
-                    results_count=len(cp_results),
-                    results=cp_results,
-                    time_ms=round(elapsed, 1),
-                    status="ok" if cp_results else "empty",
-                )
-                trace_entries.append(entry)
-                if cp_results:
-                    all_keywords.update(cp_results)
+                experiments = [
+                    # 1. Standard cp=0 (baseline — already know doesn't give prefixes)
+                    ("cp0_standard", raw_url, seed, {"cp": 0}),
+                    # 2. Space before seed + cp=0 (Gemini theory)
+                    ("cp0_space_before", raw_url, " " + seed, {"cp": 0}),
+                    # 3. %20 encoded space before seed (GPT theory)
+                    ("cp0_encoded_space", raw_url, " " + seed, {"cp": 0}),
+                    # 4. Plus before seed (GPT theory: q=+seed)
+                    ("cp0_plus_prefix", raw_url, "+" + seed, {"cp": 0}),
+                    # 5. suggestqueries.google.com endpoint + cp=0
+                    ("cp0_suggest_endpoint", suggest_url, seed, {"cp": 0}),
+                    # 6. Reversed seed (reversed autocomplete trick)
+                    ("reversed_seed", raw_url, " ".join(seed.split()[::-1]) + " ", {}),
+                    # 7. suggestqueries.google.com WITHOUT cp (just different endpoint)
+                    ("suggest_no_cp", suggest_url, seed + " ", {}),
+                ]
 
-                # Request 2: space + seed with cp=0 (Gemini theory: prefix discovery)
-                space_seed = " " + seed
-                raw_params2 = {
-                    "q": space_seed, "client": "chrome", "hl": language, "gl": country,
-                    "cp": 0, "ie": "utf-8", "oe": "utf-8"
-                }
-                try:
-                    raw_resp2 = await client.get(raw_url, params=raw_params2, headers=raw_headers, timeout=10.0)
-                    logger.info(f"[CP=0+SPACE] Raw response: {raw_resp2.text[:500]}")
-                except Exception as e:
-                    logger.info(f"[CP=0+SPACE] Raw request failed: {e}")
+                for label, url, q_text, extra_params in experiments:
+                    t0 = time.time()
+                    exp_results = await run_experiment(label, url, q_text, extra_params)
+                    elapsed = (time.time() - t0) * 1000
 
-                t0 = time.time()
-                cp_results2 = await self.fetch_suggestions(
-                    space_seed, country, language, client, "chrome", 0
-                )
-                elapsed2 = (time.time() - t0) * 1000
-
-                entry2 = SuffixTraceEntry(
-                    suffix_val=f"sp+cp=0",
-                    suffix_label=f"space_prefix_cp0",
-                    suffix_type="A",
-                    priority=1,
-                    query_sent=f"[space]{seed} [cp=0]",
-                    results_count=len(cp_results2),
-                    results=cp_results2,
-                    time_ms=round(elapsed2, 1),
-                    status="ok" if cp_results2 else "empty",
-                )
-                trace_entries.append(entry2)
-                if cp_results2:
-                    all_keywords.update(cp_results2)
+                    entry = SuffixTraceEntry(
+                        suffix_val=label,
+                        suffix_label=label,
+                        suffix_type="A",
+                        priority=1,
+                        query_sent=f"q={q_text} [{label}]",
+                        results_count=len(exp_results),
+                        results=exp_results,
+                        time_ms=round(elapsed, 1),
+                        status="ok" if exp_results else "empty",
+                    )
+                    trace_entries.append(entry)
+                    if exp_results:
+                        all_keywords.update(exp_results)
 
         total_time = (time.time() - total_start) * 1000
 
