@@ -34,11 +34,14 @@ SUFFIXES_RU = {
     # Type A: Depth / Wildcard — always useful
     "A": [
         {"val": "*", "label": "wildcard"},
-        {"val": " *", "label": "double_space"},  # deep trigger
-        {"val": "_*", "label": "underscore"},     # compound terms
-        {"val": "- *", "label": "hyphen"},        # specs/models
-        {"val": ".*", "label": "dot"},            # file extensions, abbreviations
-        {"val": "? *", "label": "question_mark"}, # conversational long-tail
+        {"val": " *", "label": "double_space"},      # 2 spaces — pushes past top results
+        {"val": "  *", "label": "triple_space"},      # 3 spaces — deepest layer
+        {"val": "* *", "label": "double_wildcard"},   # 2 slots — brand+geo, dose+form
+        {"val": "* * *", "label": "triple_wildcard"}, # 3 slots — long-tail extractor
+        {"val": "_*", "label": "underscore"},         # compound terms
+        {"val": "- *", "label": "hyphen"},            # specs/models
+        {"val": ".*", "label": "dot"},                # file extensions
+        {"val": "? *", "label": "question_mark"},     # conversational long-tail
     ],
 
     # Type B: Prepositions — contextual
@@ -414,11 +417,32 @@ class SuffixGenerator:
                     markers=[m for m in active_markers],
                 ))
 
-        # Experimental mechanics always get priority 2 (deep dig)
-        experimental_labels = {"double_space", "underscore", "hyphen", "dot", "question_mark"}
-        for r in results:
-            if r.suffix_label in experimental_labels and r.priority == 1:
-                r.priority = 2
+        # ── COMBO GENERATION ──
+        # Auto-generate extended versions: each B/C/D suffix + extra wildcard slot(s)
+        # "в *" → "в * *"  (two-word tail after preposition)
+        # "цена *" → "цена * *"  (price + brand/geo)
+        # Scalable: any new suffix in B/C/D automatically gets combos
+        combo_extensions = ["*"]  # add one extra wildcard slot
+        
+        base_results = [r for r in results if r.suffix_type in ("B", "C", "D") and r.priority > 0]
+        
+        for base in base_results:
+            for ext in combo_extensions:
+                combo_val = f"{base.suffix_val} {ext}"
+                combo_label = f"{base.suffix_label}+wc"
+                combo_query = f"{seed_lower} {combo_val}".strip()
+                
+                results.append(SuffixQuery(
+                    query=combo_query,
+                    suffix_val=combo_val,
+                    suffix_label=combo_label,
+                    suffix_type=base.suffix_type,
+                    priority=base.priority,
+                    markers=[m for m in active_markers],
+                ))
+
+        # NOTE: All mechanics in P1 for A/B testing phase.
+        # After live test, move low-performers to P2 based on tracer data.
 
         return analysis, results
 
