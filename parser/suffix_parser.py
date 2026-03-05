@@ -84,10 +84,10 @@ class SuffixParser:
         self.adaptive_delay = AdaptiveDelay()
 
     async def fetch_suggestions(self, query: str, country: str, language: str,
-                                 client: httpx.AsyncClient) -> List[str]:
+                                 client: httpx.AsyncClient, google_client: str = "firefox") -> List[str]:
         """Google Autocomplete — same as main.py"""
         url = "https://www.google.com/complete/search"
-        params = {"q": query, "client": "firefox", "hl": language, "gl": country}
+        params = {"q": query, "client": google_client, "hl": language, "gl": country}
         headers = {"User-Agent": random.choice(USER_AGENTS)}
 
         try:
@@ -108,7 +108,7 @@ class SuffixParser:
 
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
                     parallel_limit: int = 5, include_numbers: bool = False,
-                    echelon: int = 0) -> SuffixParseResult:
+                    echelon: int = 0, google_client: str = "firefox") -> SuffixParseResult:
         """
         Main parse method.
         
@@ -157,7 +157,7 @@ class SuffixParser:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
 
                 t0 = time.time()
-                results = await self.fetch_suggestions(sq.query, country, language, client)
+                results = await self.fetch_suggestions(sq.query, country, language, client, google_client)
                 elapsed = (time.time() - t0) * 1000
 
                 entry = SuffixTraceEntry(
