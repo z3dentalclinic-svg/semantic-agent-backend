@@ -114,7 +114,17 @@ class SuffixParser:
                 try:
                     data = response.json()
                     if isinstance(data, list) and len(data) > 1:
-                        return data[1] if isinstance(data[1], list) else []
+                        raw = data[1]
+                        if isinstance(raw, list):
+                            # Flatten: could be ["s1", "s2"] or [["s1",0,[512]], ["s2",0,[512]]]
+                            result = []
+                            for item in raw:
+                                if isinstance(item, str):
+                                    result.append(item)
+                                elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
+                                    result.append(item[0])
+                            return result
+                        return []
                 except Exception:
                     pass
                 
@@ -124,7 +134,15 @@ class SuffixParser:
                     try:
                         data = json.loads(text)
                         if isinstance(data, list) and len(data) > 1:
-                            return data[1] if isinstance(data[1], list) else []
+                            raw = data[1]
+                            if isinstance(raw, list):
+                                result = []
+                                for item in raw:
+                                    if isinstance(item, str):
+                                        result.append(item)
+                                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
+                                        result.append(item[0])
+                                return result
                     except Exception:
                         pass
                 
