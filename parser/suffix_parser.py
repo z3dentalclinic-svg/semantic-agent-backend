@@ -264,10 +264,11 @@ class SuffixParser:
             await asyncio.gather(*tasks)
 
             # Extra: if cp=0 (or other explicit non-negative), send ONE bare-seed request
+            # IMPORTANT: cp=0 only works with client=chrome (firefox ignores it)
             if cursor_position is not None and cursor_position >= 0:
                 t0 = time.time()
                 cp_results = await self.fetch_suggestions(
-                    seed, country, language, client, google_client, cursor_position
+                    seed, country, language, client, "chrome", cursor_position
                 )
                 elapsed = (time.time() - t0) * 1000
 
