@@ -1,336 +1,78 @@
 """
-Suffix Parser v1.0 — Sends generated suffix queries to Google Autocomplete.
+Suffix Map API endpoint — drop-in for main.py
 
-Features:
-- Parallel execution via asyncio.Semaphore  
-- AdaptiveDelay from existing codebase
-- Per-suffix tracer: tracks hits, empty, timing
-- Aggregated stats for suffix map optimization
+Usage in main.py:
+    from parser.suffix_endpoint import register_suffix_endpoint
+    register_suffix_endpoint(app)
 """
 
-import asyncio
-import httpx
-import time
-import random
-import json
-import re
-from typing import List, Dict, Optional
-from dataclasses import dataclass, field, asdict
-
-from parser.suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis
+from fastapi import FastAPI, Query
+from parser.suffix_parser import SuffixParser
+from dataclasses import asdict
 
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-]
+_suffix_parser = None
+
+def get_suffix_parser():
+    global _suffix_parser
+    if _suffix_parser is None:
+        _suffix_parser = SuffixParser(lang="ru")
+    return _suffix_parser
 
 
-class AdaptiveDelay:
-    """Copied from main.py — auto-tuning delay between requests"""
+def register_suffix_endpoint(app: FastAPI):
+    """Register /api/suffix-map endpoint on the FastAPI app"""
 
-    def __init__(self, initial_delay: float = 0.2, min_delay: float = 0.1, max_delay: float = 1.0):
-        self.delay = initial_delay
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-
-    def get_delay(self) -> float:
-        return self.delay
-
-    def on_success(self):
-        self.delay = max(self.min_delay, self.delay * 0.95)
-
-    def on_rate_limit(self):
-        self.delay = min(self.max_delay, self.delay * 1.5)
-
-
-@dataclass
-class SuffixTraceEntry:
-    """Trace data for a single suffix query"""
-    suffix_val: str
-    suffix_label: str
-    suffix_type: str  # A, B, C, D
-    priority: int
-    query_sent: str
-    results_count: int = 0
-    results: List[str] = field(default_factory=list)
-    time_ms: float = 0.0
-    status: str = "pending"  # ok, empty, error, blocked, rate_limit
-
-
-@dataclass 
-class SuffixParseResult:
-    """Full result of suffix parsing"""
-    seed: str
-    analysis: Dict
-    all_keywords: List[str] = field(default_factory=list)
-    total_queries: int = 0
-    successful_queries: int = 0
-    empty_queries: int = 0
-    error_queries: int = 0
-    blocked_queries: int = 0
-    total_time_ms: float = 0.0
-    trace: List[Dict] = field(default_factory=list)
-    summary_by_type: Dict = field(default_factory=dict)
-    summary_by_suffix: Dict = field(default_factory=dict)
-
-
-class SuffixParser:
-    """
-    Orchestrates suffix generation + autocomplete fetching + tracing.
-    """
-
-    def __init__(self, lang: str = "ru"):
-        self.generator = SuffixGenerator(lang=lang)
-        self.adaptive_delay = AdaptiveDelay()
-
-    def _clean_suggestion(self, text: str) -> str:
-        """Strip HTML tags (<b>, </b> etc) from autocomplete suggestions."""
-        return re.sub(r'<[^>]+>', '', text).strip()
-
-    async def fetch_suggestions(self, query: str, country: str, language: str,
-                                 client: httpx.AsyncClient, google_client: str = "firefox",
-                                 cursor_position: int = None) -> List[str]:
-        """Google Autocomplete with multi-client support."""
-        url = "https://www.google.com/complete/search"
-        params = {
-            "q": query,
-            "client": google_client,
-            "hl": language,
-            "gl": country,
-            "ie": "utf-8",
-            "oe": "utf-8",
-        }
-        # cp = cursor position
-        # None → auto: cp=len(query) — tells Google "cursor is at the end"
-        # -1 → don't send cp at all (old behavior)
-        # 0+ → explicit value (e.g. 0 = cursor at start for prefix discovery)
-        if cursor_position is not None and cursor_position == -1:
-            pass  # don't add cp to params
-        elif cursor_position is not None:
-            params["cp"] = cursor_position
-        else:
-            params["cp"] = len(query)
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-
-        try:
-            response = await client.get(url, params=params, headers=headers, timeout=10.0)
-
-            if response.status_code == 429:
-                self.adaptive_delay.on_rate_limit()
-                return []
-
-            self.adaptive_delay.on_success()
-
-            if response.status_code == 200:
-                text = response.text.strip()
-                
-                # Try clean JSON first (firefox, chrome, chrome-omni)
-                try:
-                    data = response.json()
-                    if isinstance(data, list) and len(data) > 1:
-                        raw = data[1]
-                        if isinstance(raw, list):
-                            # Flatten: could be ["s1", "s2"] or [["s1",0,[512]], ["s2",0,[512]]]
-                            result = []
-                            for item in raw:
-                                if isinstance(item, str):
-                                    result.append(self._clean_suggestion(item))
-                                elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                    result.append(self._clean_suggestion(item[0]))
-                            return result
-                        return []
-                except Exception:
-                    pass
-                
-                # Strip security prefix )]}'  (gws-wiz, psy-ab)
-                if text.startswith(")]}'"):
-                    text = text[4:].strip()
-                    try:
-                        data = json.loads(text)
-                        if isinstance(data, list) and len(data) > 1:
-                            raw = data[1]
-                            if isinstance(raw, list):
-                                result = []
-                                for item in raw:
-                                    if isinstance(item, str):
-                                        result.append(self._clean_suggestion(item))
-                                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                        result.append(self._clean_suggestion(item[0]))
-                                return result
-                    except Exception:
-                        pass
-                
-                # Strip JSONP callback: window.google.ac.h(...) or callback(...)
-                jsonp_match = re.search(r'\((\[.+\])\)\s*;?\s*$', text, re.DOTALL)
-                if jsonp_match:
-                    try:
-                        data = json.loads(jsonp_match.group(1))
-                        if isinstance(data, list) and len(data) > 1:
-                            # psy-ab/gws-wiz sometimes nests suggestions differently
-                            suggestions = data[1]
-                            if isinstance(suggestions, list):
-                                # Could be list of strings or list of [string, ...]
-                                result = []
-                                for item in suggestions:
-                                    if isinstance(item, str):
-                                        result.append(self._clean_suggestion(item))
-                                    elif isinstance(item, list) and len(item) > 0:
-                                        result.append(self._clean_suggestion(str(item[0])))
-                                return result
-                    except Exception:
-                        pass
-
-        except Exception:
-            pass
-        return []
-
-    async def parse(self, seed: str, country: str = "ua", language: str = "ru",
-                    parallel_limit: int = 5, include_numbers: bool = False,
-                    echelon: int = 0, google_client: str = "firefox",
-                    cursor_position: int = None) -> SuffixParseResult:
+    @app.get("/api/suffix-map")
+    async def suffix_map_endpoint(
+        seed: str = Query(..., description="Базовый запрос"),
+        country: str = Query("ua", description="Код страны"),
+        language: str = Query("ru", description="Язык"),
+        parallel: int = Query(5, description="Параллельных запросов"),
+        source: str = Query("google", description="Источник"),
+        echelon: int = Query(0, description="0=все, 1=только P1, 2=только P2"),
+        include_numbers: bool = Query(False, description="Числовые суффиксы 0-9"),
+        filters: str = Query("none", description="Фильтры (для совместимости)"),
+        google_client: str = Query("firefox", description="Autocomplete client: firefox/chrome/chrome-omni/safari/psy-ab/gws-wiz"),
+        cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
+    ):
         """
-        Main parse method.
-        
-        Args:
-            seed: Input keyword
-            country: Target country code
-            language: Language code
-            parallel_limit: Max concurrent requests
-            include_numbers: Add numeric suffixes
-            echelon: 0=all, 1=only priority 1, 2=only priority 2
+        SUFFIX MAP: Smart suffix expansion with priority matrix + tracer.
+        Returns keywords + detailed suffix tracer data.
         """
-        total_start = time.time()
-
-        # Step 1: Generate queries
-        analysis, all_queries = self.generator.generate(seed, include_numbers=include_numbers)
-        analysis_summary = self.generator.summary(analysis, all_queries)
-
-        # Step 2: Filter by echelon
-        if echelon == 1:
-            queries_to_send = [q for q in all_queries if q.priority == 1]
-        elif echelon == 2:
-            queries_to_send = [q for q in all_queries if q.priority == 2]
-        else:
-            queries_to_send = [q for q in all_queries if q.priority > 0]
-
-        blocked_queries = [q for q in all_queries if q.priority == 0]
-
-        # Step 3: Send to autocomplete in parallel
-        semaphore = asyncio.Semaphore(parallel_limit)
-        all_keywords = set()
-        trace_entries: List[SuffixTraceEntry] = []
-
-        # Add blocked to trace
-        for bq in blocked_queries:
-            trace_entries.append(SuffixTraceEntry(
-                suffix_val=bq.suffix_val,
-                suffix_label=bq.suffix_label,
-                suffix_type=bq.suffix_type,
-                priority=0,
-                query_sent=bq.query,
-                status=f"blocked:{bq.blocked_by}",
-            ))
-
-        async def fetch_one(sq: SuffixQuery, client: httpx.AsyncClient):
-            async with semaphore:
-                await asyncio.sleep(self.adaptive_delay.get_delay())
-
-                t0 = time.time()
-                # Suffix queries: use auto cp=len (None) or no cp (-1)
-                suffix_cp = -1 if cursor_position == -1 else None
-                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, suffix_cp)
-                elapsed = (time.time() - t0) * 1000
-
-                entry = SuffixTraceEntry(
-                    suffix_val=sq.suffix_val,
-                    suffix_label=sq.suffix_label,
-                    suffix_type=sq.suffix_type,
-                    priority=sq.priority,
-                    query_sent=sq.query,
-                    results_count=len(results),
-                    results=results,
-                    time_ms=round(elapsed, 1),
-                    status="ok" if results else "empty",
-                )
-                trace_entries.append(entry)
-
-                if results:
-                    all_keywords.update(results)
-
-        async with httpx.AsyncClient() as client:
-            tasks = [fetch_one(sq, client) for sq in queries_to_send]
-            await asyncio.gather(*tasks)
-
-            # Extra: if cp=0 (or other explicit non-negative), send ONE bare-seed request
-            if cursor_position is not None and cursor_position >= 0:
-                t0 = time.time()
-                cp_results = await self.fetch_suggestions(
-                    seed, country, language, client, google_client, cursor_position
-                )
-                elapsed = (time.time() - t0) * 1000
-
-                entry = SuffixTraceEntry(
-                    suffix_val=f"cp={cursor_position}",
-                    suffix_label=f"cursor_cp{cursor_position}",
-                    suffix_type="A",
-                    priority=1,
-                    query_sent=f"{seed} [cp={cursor_position}]",
-                    results_count=len(cp_results),
-                    results=cp_results,
-                    time_ms=round(elapsed, 1),
-                    status="ok" if cp_results else "empty",
-                )
-                trace_entries.append(entry)
-
-                if cp_results:
-                    all_keywords.update(cp_results)
-
-        total_time = (time.time() - total_start) * 1000
-
-        # Step 4: Build result with trace
-        ok_count = sum(1 for t in trace_entries if t.status == "ok")
-        empty_count = sum(1 for t in trace_entries if t.status == "empty")
-        blocked_count = sum(1 for t in trace_entries if t.status.startswith("blocked"))
-
-        # Summary by suffix type
-        summary_by_type = {}
-        for stype in ["A", "B", "C", "D"]:
-            type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
-            summary_by_type[stype] = {
-                "queries_sent": len(type_entries),
-                "with_results": sum(1 for t in type_entries if t.status == "ok"),
-                "empty": sum(1 for t in type_entries if t.status == "empty"),
-                "total_keywords": sum(t.results_count for t in type_entries),
-                "avg_time_ms": round(
-                    sum(t.time_ms for t in type_entries) / max(len(type_entries), 1), 1
-                ),
-            }
-
-        # Summary by individual suffix
-        summary_by_suffix = {}
-        for t in trace_entries:
-            if not t.status.startswith("blocked"):
-                summary_by_suffix[t.suffix_label] = {
-                    "type": t.suffix_type,
-                    "priority": t.priority,
-                    "results_count": t.results_count,
-                    "time_ms": t.time_ms,
-                    "status": t.status,
-                }
-
-        return SuffixParseResult(
+        sp = get_suffix_parser()
+        result = await sp.parse(
             seed=seed,
-            analysis=analysis_summary,
-            all_keywords=sorted(list(all_keywords)),
-            total_queries=len(queries_to_send),
-            successful_queries=ok_count,
-            empty_queries=empty_count,
-            error_queries=0,
-            blocked_queries=blocked_count,
-            total_time_ms=round(total_time, 1),
-            trace=[asdict(t) for t in trace_entries],
-            summary_by_type=summary_by_type,
-            summary_by_suffix=summary_by_suffix,
+            country=country,
+            language=language,
+            parallel_limit=parallel,
+            include_numbers=include_numbers,
+            echelon=echelon,
+            google_client=google_client,
+            cursor_position=cp,
         )
+
+        # Format response compatible with existing HTML displayResults
+        return {
+            "method": "suffix-map",
+            "seed": seed,
+            "google_client": google_client,
+            "cursor_position": cp,
+            "keywords": [{"keyword": kw} for kw in result.all_keywords],
+            "keywords_grey": [],
+            "anchors": [],
+            "total": len(result.all_keywords),
+            "time": f"{result.total_time_ms:.0f}ms",
+            "suffix_trace": {
+                "analysis": result.analysis,
+                "total_keywords": len(result.all_keywords),
+                "total_time_ms": result.total_time_ms,
+                "total_queries": result.total_queries,
+                "successful_queries": result.successful_queries,
+                "empty_queries": result.empty_queries,
+                "blocked_queries": result.blocked_queries,
+                "trace": result.trace,
+                "summary_by_type": result.summary_by_type,
+                "summary_by_suffix": result.summary_by_suffix,
+            },
+        }
