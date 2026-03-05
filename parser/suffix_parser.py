@@ -85,17 +85,18 @@ class SuffixParser:
         self.generator = SuffixGenerator(lang=lang)
         self.adaptive_delay = AdaptiveDelay()
 
+    def _clean_suggestion(self, text: str) -> str:
+        """Strip HTML tags (<b>, </b> etc) from autocomplete suggestions."""
+        return re.sub(r'<[^>]+>', '', text).strip()
+
     async def fetch_suggestions(self, query: str, country: str, language: str,
-                                 client: httpx.AsyncClient, google_client: str = "firefox") -> List[str]:
-        """Google Autocomplete with multi-client support.
-        
-        Different clients return different formats:
-        - firefox/chrome → clean JSON: ["query", ["s1", "s2"]]
-        - psy-ab/gws-wiz → JSONP or prefixed: )]}'\\n["query", [...]]
-        - safari → may return JSONP callback(...)
-        """
+                                 client: httpx.AsyncClient, google_client: str = "firefox",
+                                 cursor_position: int = None) -> List[str]:
+        """Google Autocomplete with multi-client support."""
         url = "https://www.google.com/complete/search"
         params = {"q": query, "client": google_client, "hl": language, "gl": country}
+        if cursor_position is not None:
+            params["cp"] = cursor_position
         headers = {"User-Agent": random.choice(USER_AGENTS)}
 
         try:
@@ -120,9 +121,9 @@ class SuffixParser:
                             result = []
                             for item in raw:
                                 if isinstance(item, str):
-                                    result.append(item)
+                                    result.append(self._clean_suggestion(item))
                                 elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                    result.append(item[0])
+                                    result.append(self._clean_suggestion(item[0]))
                             return result
                         return []
                 except Exception:
@@ -139,9 +140,9 @@ class SuffixParser:
                                 result = []
                                 for item in raw:
                                     if isinstance(item, str):
-                                        result.append(item)
+                                        result.append(self._clean_suggestion(item))
                                     elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                        result.append(item[0])
+                                        result.append(self._clean_suggestion(item[0]))
                                 return result
                     except Exception:
                         pass
@@ -159,9 +160,9 @@ class SuffixParser:
                                 result = []
                                 for item in suggestions:
                                     if isinstance(item, str):
-                                        result.append(item)
+                                        result.append(self._clean_suggestion(item))
                                     elif isinstance(item, list) and len(item) > 0:
-                                        result.append(str(item[0]))
+                                        result.append(self._clean_suggestion(str(item[0])))
                                 return result
                     except Exception:
                         pass
@@ -172,7 +173,8 @@ class SuffixParser:
 
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
                     parallel_limit: int = 5, include_numbers: bool = False,
-                    echelon: int = 0, google_client: str = "firefox") -> SuffixParseResult:
+                    echelon: int = 0, google_client: str = "firefox",
+                    cursor_position: int = None) -> SuffixParseResult:
         """
         Main parse method.
         
@@ -221,7 +223,7 @@ class SuffixParser:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
 
                 t0 = time.time()
-                results = await self.fetch_suggestions(sq.query, country, language, client, google_client)
+                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, cursor_position)
                 elapsed = (time.time() - t0) * 1000
 
                 entry = SuffixTraceEntry(
