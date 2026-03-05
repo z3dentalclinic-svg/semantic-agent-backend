@@ -31,57 +31,52 @@ from dataclasses import dataclass, field
 # ══════════════════════════════════════════════
 
 SUFFIXES_RU = {
-    # Type A: Depth — trailing spaces tell Google "suggest more"
+    # Type A: Depth / Wildcard — always useful
     "A": [
-        {"val": "", "label": "space_1"},             # 1 trailing space (basic)
-        {"val": " ", "label": "space_2"},            # 2 trailing spaces (deeper)
-        {"val": "  ", "label": "space_3"},           # 3 trailing spaces (deepest)
-        {"val": "_", "label": "underscore"},         # compound terms
-        {"val": "-", "label": "hyphen"},             # specs/models
-        {"val": ".", "label": "dot"},                # file extensions
-        {"val": "?", "label": "question_mark"},      # conversational long-tail
+        {"val": "*", "label": "wildcard"},
+        {"val": " *", "label": "double_space"},  # deep trigger
     ],
 
-    # Type B: Prepositions — trailing space after preposition
+    # Type B: Prepositions — contextual
     "B": [
-        {"val": "в", "label": "prep_v"},
-        {"val": "на", "label": "prep_na"},
-        {"val": "для", "label": "prep_dlya"},
-        {"val": "с", "label": "prep_s"},
-        {"val": "от", "label": "prep_ot"},
-        {"val": "под", "label": "prep_pod"},
-        {"val": "из", "label": "prep_iz"},
-        {"val": "без", "label": "prep_bez"},
+        {"val": "в *", "label": "prep_v"},
+        {"val": "на *", "label": "prep_na"},
+        {"val": "для *", "label": "prep_dlya"},
+        {"val": "с *", "label": "prep_s"},
+        {"val": "от *", "label": "prep_ot"},
+        {"val": "под *", "label": "prep_pod"},
+        {"val": "из *", "label": "prep_iz"},
+        {"val": "без *", "label": "prep_bez"},
     ],
 
-    # Type C: Questions — trailing space after question word
+    # Type C: Questions — informational intent
     "C": [
-        {"val": "как", "label": "q_kak"},
-        {"val": "какой", "label": "q_kakoy"},
-        {"val": "где", "label": "q_gde"},
-        {"val": "сколько", "label": "q_skolko"},
-        {"val": "почему", "label": "q_pochemu"},
+        {"val": "как *", "label": "q_kak"},
+        {"val": "какой *", "label": "q_kakoy"},
+        {"val": "где *", "label": "q_gde"},
+        {"val": "сколько *", "label": "q_skolko"},
+        {"val": "почему *", "label": "q_pochemu"},
     ],
 
-    # Type D: Finalizers — trailing space after intent word
+    # Type D: Finalizers — transaction / reputation
     "D": [
-        {"val": "купить", "label": "fin_kupit"},
-        {"val": "цена", "label": "fin_tsena"},
-        {"val": "отзывы", "label": "fin_otzyvy"},
-        {"val": "обзор", "label": "fin_obzor"},
-        {"val": "сравнение", "label": "fin_sravnenie"},
-        {"val": "неисправности", "label": "fin_neispravnosti"},
-        {"val": "характеристики", "label": "fin_harakteristiki"},
-        {"val": "аналоги", "label": "fin_analogi"},
-        {"val": "или", "label": "fin_ili"},
-        {"val": "vs", "label": "fin_vs"},
-        {"val": "вместо", "label": "fin_vmesto"},
-        {"val": "форум", "label": "fin_forum"},
+        {"val": "купить *", "label": "fin_kupit"},
+        {"val": "цена *", "label": "fin_tsena"},
+        {"val": "отзывы *", "label": "fin_otzyvy"},
+        {"val": "обзор *", "label": "fin_obzor"},
+        {"val": "сравнение *", "label": "fin_sravnenie"},
+        {"val": "неисправности *", "label": "fin_neispravnosti"},
+        {"val": "характеристики *", "label": "fin_harakteristiki"},
+        {"val": "аналоги *", "label": "fin_analogi"},
+        {"val": "или *", "label": "fin_ili"},
+        {"val": "vs *", "label": "fin_vs"},
+        {"val": "вместо *", "label": "fin_vmesto"},
+        {"val": "форум *", "label": "fin_forum"},
     ],
 
-    # Numeric (subtype of A)
+    # Numeric (subtype of A, always priority 1)
     "A_num": [
-        {"val": f"{i}", "label": f"num_{i}"} for i in range(10)
+        {"val": f"* {i}", "label": f"num_{i}"} for i in range(10)
     ],
 }
 
@@ -309,23 +304,6 @@ class SuffixGenerator:
 
         return False
 
-    def _build_query(self, seed: str, suffix_val: str) -> str:
-        """
-        Build query for Google Autocomplete.
-        
-        CRITICAL: trailing space must be preserved!
-        Google Autocomplete uses trailing space as "suggest next word" signal.
-        .strip() was killing this — causing empty results.
-        
-        "ремонт пылесосов" + "цена" → "ремонт пылесосов цена "  (space at end!)
-        "ремонт пылесосов" + ""     → "ремонт пылесосов "       (just seed + space)
-        "ремонт пылесосов" + " "    → "ремонт пылесосов  "      (double space)
-        """
-        if suffix_val:
-            return f"{seed} {suffix_val} "
-        else:
-            return f"{seed} "
-
     def generate(self, seed: str, include_numbers: bool = False) -> Tuple[SeedAnalysis, List[SuffixQuery]]:
         """
         Main method: analyze seed → generate suffix queries with priorities.
@@ -338,7 +316,7 @@ class SuffixGenerator:
         if analysis.l_level == "L6+":
             queries = []
             for s in self.suffixes["A"]:
-                q = self._build_query(seed_lower, s['val'])
+                q = f"{seed_lower} {s['val']}".strip()
                 queries.append(SuffixQuery(
                     query=q, suffix_val=s["val"], suffix_label=s["label"],
                     suffix_type="A", priority=1, markers=[analysis.l_level]
@@ -398,7 +376,7 @@ class SuffixGenerator:
                 blocked = self._check_self_match(suffix_val, seed_words, seed_lemmas, analysis)
                 if blocked:
                     results.append(SuffixQuery(
-                        query=self._build_query(seed_lower, suffix_val),
+                        query=f"{seed_lower} {suffix_val}".strip(),
                         suffix_val=suffix_val,
                         suffix_label=suffix_label,
                         suffix_type=stype,
@@ -408,7 +386,7 @@ class SuffixGenerator:
                     ))
                     continue
 
-                query_str = self._build_query(seed_lower, suffix_val)
+                query_str = f"{seed_lower} {suffix_val}".strip()
 
                 results.append(SuffixQuery(
                     query=query_str,
@@ -422,7 +400,7 @@ class SuffixGenerator:
         # Numeric suffixes (always priority 1, part of type A)
         if include_numbers:
             for s in self.suffixes.get("A_num", []):
-                query_str = self._build_query(seed_lower, s["val"])
+                query_str = f"{seed_lower} {s['val']}".strip()
                 results.append(SuffixQuery(
                     query=query_str,
                     suffix_val=s["val"],
@@ -432,31 +410,10 @@ class SuffixGenerator:
                     markers=[m for m in active_markers],
                 ))
 
-        # ── COMBO GENERATION ──
-        # Auto-generate extended versions: each B/C/D suffix + extra space
-        # "цена " → "цена  " (double space = deeper completion after цена)
-        # "в " → "в  " (deeper completion after preposition)
-        # Scalable: any new suffix in B/C/D automatically gets combos
-        
-        base_results = [r for r in results if r.suffix_type in ("B", "C", "D") and r.priority > 0]
-        
-        for base in base_results:
-            combo_val = f"{base.suffix_val} +"  # display: "цена +"
-            combo_label = f"{base.suffix_label}+wc"
-            # Double space after suffix word = "fill more words here"
-            combo_query = f"{seed_lower} {base.suffix_val}  "
-            
-            results.append(SuffixQuery(
-                query=combo_query,
-                suffix_val=combo_val,
-                suffix_label=combo_label,
-                suffix_type=base.suffix_type,
-                priority=base.priority,
-                markers=[m for m in active_markers],
-            ))
-
-        # NOTE: All mechanics in P1 for A/B testing phase.
-        # After live test, move low-performers to P2 based on tracer data.
+        # Double-space suffix always gets +1 (but max 2)
+        for r in results:
+            if r.suffix_label == "double_space" and r.priority == 1:
+                r.priority = 2
 
         return analysis, results
 
@@ -481,10 +438,10 @@ class SuffixGenerator:
         2. P-level: if suffix preposition already in seed → block
         Returns reason string if blocked, None if OK.
         """
-        # Extract meaningful words from suffix (skip empty/space-only)
-        suffix_parts = suffix_val.strip().split()
+        # Extract first word from suffix (before *)
+        suffix_parts = suffix_val.replace("*", "").strip().split()
         if not suffix_parts:
-            return None  # pure space/wildcard — never blocked
+            return None  # pure wildcard — never blocked
 
         suffix_keyword = suffix_parts[0].lower()
 
