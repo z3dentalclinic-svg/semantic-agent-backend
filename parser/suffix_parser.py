@@ -94,9 +94,24 @@ class SuffixParser:
                                  cursor_position: int = None) -> List[str]:
         """Google Autocomplete with multi-client support."""
         url = "https://www.google.com/complete/search"
-        params = {"q": query, "client": google_client, "hl": language, "gl": country}
-        if cursor_position is not None:
+        params = {
+            "q": query,
+            "client": google_client,
+            "hl": language,
+            "gl": country,
+            "ie": "utf-8",
+            "oe": "utf-8",
+        }
+        # cp = cursor position
+        # None → auto: cp=len(query) — tells Google "cursor is at the end"
+        # -1 → don't send cp at all (old behavior)
+        # 0+ → explicit value (e.g. 0 = cursor at start for prefix discovery)
+        if cursor_position is not None and cursor_position == -1:
+            pass  # don't add cp to params
+        elif cursor_position is not None:
             params["cp"] = cursor_position
+        else:
+            params["cp"] = len(query)
         headers = {"User-Agent": random.choice(USER_AGENTS)}
 
         try:
@@ -223,8 +238,9 @@ class SuffixParser:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
 
                 t0 = time.time()
-                # cp only applies to bare seed, not suffix queries
-                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, None)
+                # Suffix queries: use auto cp=len (None) or no cp (-1)
+                suffix_cp = -1 if cursor_position == -1 else None
+                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, suffix_cp)
                 elapsed = (time.time() - t0) * 1000
 
                 entry = SuffixTraceEntry(
@@ -247,8 +263,8 @@ class SuffixParser:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
             await asyncio.gather(*tasks)
 
-            # Extra: if cp is set, send ONE bare-seed request with cp parameter
-            if cursor_position is not None:
+            # Extra: if cp=0 (or other explicit non-negative), send ONE bare-seed request
+            if cursor_position is not None and cursor_position >= 0:
                 t0 = time.time()
                 cp_results = await self.fetch_suggestions(
                     seed, country, language, client, google_client, cursor_position
