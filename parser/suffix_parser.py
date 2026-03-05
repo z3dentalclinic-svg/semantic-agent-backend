@@ -223,7 +223,8 @@ class SuffixParser:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
 
                 t0 = time.time()
-                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, cursor_position)
+                # cp only applies to bare seed, not suffix queries
+                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, None)
                 elapsed = (time.time() - t0) * 1000
 
                 entry = SuffixTraceEntry(
@@ -245,6 +246,30 @@ class SuffixParser:
         async with httpx.AsyncClient() as client:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
             await asyncio.gather(*tasks)
+
+            # Extra: if cp is set, send ONE bare-seed request with cp parameter
+            if cursor_position is not None:
+                t0 = time.time()
+                cp_results = await self.fetch_suggestions(
+                    seed, country, language, client, google_client, cursor_position
+                )
+                elapsed = (time.time() - t0) * 1000
+
+                entry = SuffixTraceEntry(
+                    suffix_val=f"cp={cursor_position}",
+                    suffix_label=f"cursor_cp{cursor_position}",
+                    suffix_type="A",
+                    priority=1,
+                    query_sent=f"{seed} [cp={cursor_position}]",
+                    results_count=len(cp_results),
+                    results=cp_results,
+                    time_ms=round(elapsed, 1),
+                    status="ok" if cp_results else "empty",
+                )
+                trace_entries.append(entry)
+
+                if cp_results:
+                    all_keywords.update(cp_results)
 
         total_time = (time.time() - total_start) * 1000
 
