@@ -12,6 +12,8 @@ import asyncio
 import httpx
 import time
 import random
+import json
+import re
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -85,7 +87,13 @@ class SuffixParser:
 
     async def fetch_suggestions(self, query: str, country: str, language: str,
                                  client: httpx.AsyncClient, google_client: str = "firefox") -> List[str]:
-        """Google Autocomplete — same as main.py"""
+        """Google Autocomplete with multi-client support.
+        
+        Different clients return different formats:
+        - firefox/chrome → clean JSON: ["query", ["s1", "s2"]]
+        - psy-ab/gws-wiz → JSONP or prefixed: )]}'\\n["query", [...]]
+        - safari → may return JSONP callback(...)
+        """
         url = "https://www.google.com/complete/search"
         params = {"q": query, "client": google_client, "hl": language, "gl": country}
         headers = {"User-Agent": random.choice(USER_AGENTS)}
@@ -100,8 +108,46 @@ class SuffixParser:
             self.adaptive_delay.on_success()
 
             if response.status_code == 200:
-                data = response.json()
-                return data[1] if len(data) > 1 else []
+                text = response.text.strip()
+                
+                # Try clean JSON first (firefox, chrome, chrome-omni)
+                try:
+                    data = response.json()
+                    if isinstance(data, list) and len(data) > 1:
+                        return data[1] if isinstance(data[1], list) else []
+                except Exception:
+                    pass
+                
+                # Strip security prefix )]}'  (gws-wiz, psy-ab)
+                if text.startswith(")]}'"):
+                    text = text[4:].strip()
+                    try:
+                        data = json.loads(text)
+                        if isinstance(data, list) and len(data) > 1:
+                            return data[1] if isinstance(data[1], list) else []
+                    except Exception:
+                        pass
+                
+                # Strip JSONP callback: window.google.ac.h(...) or callback(...)
+                jsonp_match = re.search(r'\((\[.+\])\)\s*;?\s*$', text, re.DOTALL)
+                if jsonp_match:
+                    try:
+                        data = json.loads(jsonp_match.group(1))
+                        if isinstance(data, list) and len(data) > 1:
+                            # psy-ab/gws-wiz sometimes nests suggestions differently
+                            suggestions = data[1]
+                            if isinstance(suggestions, list):
+                                # Could be list of strings or list of [string, ...]
+                                result = []
+                                for item in suggestions:
+                                    if isinstance(item, str):
+                                        result.append(item)
+                                    elif isinstance(item, list) and len(item) > 0:
+                                        result.append(str(item[0]))
+                                return result
+                    except Exception:
+                        pass
+
         except Exception:
             pass
         return []
