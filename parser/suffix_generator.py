@@ -414,7 +414,7 @@ class SuffixGenerator:
 
         results = []
 
-        def expand_type_a(seed_lower, suffix_val, suffix_label, priority, markers):
+        def expand_type_a(seed_lower, suffix_val, suffix_label, priority, markers, stype="A"):
             """
             Generate 4 cp variants for Type A symbols.
             v1: сид символ       cp = после символа (конец строки)
@@ -440,7 +440,7 @@ class SuffixGenerator:
                     query=q,
                     suffix_val=suffix_val,
                     suffix_label=f"{suffix_label}_{vname}",
-                    suffix_type="A",
+                    suffix_type=stype,
                     priority=priority,
                     markers=list(markers),
                     cp_override=cp,
@@ -475,7 +475,7 @@ class SuffixGenerator:
 
                 # All types: expand into 4 cp variants for full testing
                 # After tracer analysis — keep best variant per suffix, drop rest
-                results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers))
+                results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype))
 
         # Numeric suffixes (always priority 1, part of type A)
         if include_numbers:
