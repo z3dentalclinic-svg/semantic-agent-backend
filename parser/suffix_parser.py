@@ -346,7 +346,6 @@ class SuffixParser:
             for char in ALPHABET:
                 await asyncio.sleep(0.2)
                 q = f"{seed} {char}"
-                from dataclasses import replace as dc_replace
                 sq_simple = SuffixQuery(
                     query=q,
                     suffix_val=char,
@@ -357,7 +356,23 @@ class SuffixParser:
                     cp_override=-1,
                 )
                 t0 = time.time()
-                results = await self.fetch_suggestions(q, country, language, client, "firefox", -1)
+                # E_simple: точная копия старого парсера — firefox, без cp, без ie/oe
+                url = "https://www.google.com/complete/search"
+                params = {"q": q, "client": "firefox", "hl": language, "gl": country}
+                headers = {"User-Agent": random.choice(USER_AGENTS)}
+                try:
+                    resp = await client.get(url, params=params, headers=headers, timeout=10.0)
+                    if char == "о":
+                        logger.warning(f"E_SIMPLE DEBUG | q={repr(q)} | status={resp.status_code} | body={repr(resp.text[:500])}")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        results = data[1] if len(data) > 1 else []
+                    else:
+                        results = []
+                except Exception as e:
+                    if char == "о":
+                        logger.warning(f"E_SIMPLE EXCEPTION | q={repr(q)} | error={e}")
+                    results = []
                 elapsed = (time.time() - t0) * 1000
                 _record_results(sq_simple, results, elapsed)
 
