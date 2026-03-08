@@ -526,6 +526,11 @@ class SuffixGenerator:
         q = f"{s} {L}"
         out.append(sq(q, len(q), "plain"))
 
+        # 1b. сид а  (cp не передаётся — точная копия старого алфавитного перебора)
+        # Старый main.py: params = {"q": query, "client": "firefox"} без cp
+        # Даёт ~10% уникальных ключей которые plain с cp не находит
+        out.append(sq(q, -1, "plain_nocp"))
+
         # 2. сид а  (+ trailing space)
         q = f"{s} {L} "
         out.append(sq(q, len(q), "trail"))
