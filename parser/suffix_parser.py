@@ -368,22 +368,24 @@ class SuffixParser:
 
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
-            # Исключаем слова сида, делаем запрос кандидат + сид без cp
+            # Исключаем слова сида, делаем запрос сид + кандидат без cp
             seed_words_set = set(seed.lower().split())
             from collections import Counter
+            import re as _re
             word_counter: Counter = Counter()
             for kw in all_keywords:
                 for word in kw.lower().split():
-                    if word not in seed_words_set and len(word) > 2:
-                        word_counter[word] += 1
+                    if word not in seed_words_set and len(word) >= 4:
+                        # только кириллица, без символов и латиницы
+                        if _re.match(r'^[а-яёіїєґ]+$', word):
+                            word_counter[word] += 1
 
             candidates = sorted(w for w, cnt in word_counter.items() if cnt >= 2)
 
             async def fetch_candidate(cand: str):
                 async with semaphore:
                     await asyncio.sleep(0.2)
-                    q = f"{cand} {seed.lower()}"
-                    from dataclasses import replace as dc_replace
+                    q = f"{seed.lower()} {cand}"
                     sq_cand = SuffixQuery(
                         query=q,
                         suffix_val=cand,
