@@ -55,12 +55,23 @@ def register_suffix_endpoint(app: FastAPI):
         )
 
         # Format response compatible with existing HTML displayResults
+        # all_keywords now: [{keyword, sources, weight, is_suffix_expanded}, ...]
+        keywords_for_html = []
+        for kw_data in result.all_keywords:
+            keywords_for_html.append({
+                "keyword": kw_data["keyword"],
+                "source_type": kw_data["sources"][0]["suffix_type"] if kw_data["sources"] else "?",
+                "weight": kw_data["weight"],
+                "is_suffix_expanded": True,
+                "sources": kw_data["sources"],
+            })
+
         return {
             "method": "suffix-map",
             "seed": seed,
             "google_client": google_client,
             "cursor_position": cp,
-            "keywords": [{"keyword": kw} for kw in result.all_keywords],
+            "keywords": keywords_for_html,
             "keywords_grey": [],
             "anchors": [],
             "total": len(result.all_keywords),
