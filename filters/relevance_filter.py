@@ -17,7 +17,7 @@ def is_nearly_same(s1: str, s2: str) -> bool:
 
 
 async def filter_relevant_keywords(keywords: List[str], seed: str, language: str = 'ru') -> List[str]:
-    seed_roots = [w.lower()[:5] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
+    seed_roots = [w.lower()[:min(4, len(w) - 1)] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
     filtered = []
     
     for kw in keywords:
