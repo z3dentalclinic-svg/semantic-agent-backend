@@ -66,7 +66,7 @@ class SuffixParseResult:
     """Full result of suffix parsing"""
     seed: str
     analysis: Dict
-    all_keywords: List[str] = field(default_factory=list)
+    all_keywords: List[Dict] = field(default_factory=list)  # [{keyword, sources, weight, is_suffix_expanded}]
     total_queries: int = 0
     successful_queries: int = 0
     empty_queries: int = 0
@@ -211,19 +211,29 @@ class SuffixParser:
                     include_letters: bool = False) -> SuffixParseResult:
         """
         Main parse method.
-        
-        Args:
-            seed: Input keyword
-            country: Target country code
-            language: Language code
-            parallel_limit: Max concurrent requests
-            include_numbers: Add numeric suffixes
-            echelon: 0=all, 1=only priority 1, 2=only priority 2
+
+        Architecture:
+        - A/B/C/D queries: run concurrently with semaphore
+        - E queries: grouped by letter; all letters run in parallel,
+          each letter's 14 queries are sequential (avoids Google rate limiting)
         """
         total_start = time.time()
 
+        # Determine region from country
+        if country in ("ua", "by", "kz"):
+            region = "ua"
+        elif country in ("ru",):
+            region = "ru"
+        else:
+            region = "ua"  # default to UA for non-RU markets
+
         # Step 1: Generate queries
-        analysis, all_queries = self.generator.generate(seed, include_numbers=include_numbers, include_letters=include_letters)
+        analysis, all_queries = self.generator.generate(
+            seed,
+            include_numbers=include_numbers,
+            include_letters=include_letters,
+            region=region,
+        )
         analysis_summary = self.generator.summary(analysis, all_queries)
 
         # Step 2: Filter by echelon
@@ -236,9 +246,21 @@ class SuffixParser:
 
         blocked_queries = [q for q in all_queries if q.priority == 0]
 
-        # Step 3: Send to autocomplete in parallel
-        semaphore = asyncio.Semaphore(parallel_limit)
-        all_keywords = set()
+        # Step 3: Separate E from other types
+        e_queries_by_letter: Dict[str, List] = {}
+        other_queries = []
+        for q in queries_to_send:
+            if q.suffix_type == "E":
+                letter = q.suffix_val
+                if letter not in e_queries_by_letter:
+                    e_queries_by_letter[letter] = []
+                e_queries_by_letter[letter].append(q)
+            else:
+                other_queries.append(q)
+
+        # Step 4: Shared state (thread-safe via asyncio — single event loop)
+        # all_keywords: keyword → {sources, weight, is_suffix_expanded}
+        all_keywords: Dict[str, Dict] = {}
         trace_entries: List[SuffixTraceEntry] = []
 
         # Add blocked to trace
@@ -252,56 +274,85 @@ class SuffixParser:
                 status=f"blocked:{bq.blocked_by}",
             ))
 
-        async def fetch_one(sq: SuffixQuery, client: httpx.AsyncClient):
+        def _record_results(sq: "SuffixQuery", results: List[str], elapsed_ms: float):
+            """Update shared state after fetch. Called from both code paths."""
+            entry = SuffixTraceEntry(
+                suffix_val=sq.suffix_val,
+                suffix_label=sq.suffix_label,
+                suffix_type=sq.suffix_type,
+                priority=sq.priority,
+                query_sent=sq.query,
+                cp_override=sq.cp_override,
+                results_count=len(results),
+                results=results,
+                time_ms=round(elapsed_ms, 1),
+                status="ok" if results else "empty",
+            )
+            trace_entries.append(entry)
+
+            source_info = {
+                "suffix_type": sq.suffix_type,
+                "suffix_val": sq.suffix_val,
+                "suffix_label": sq.suffix_label,
+                "priority": sq.priority,
+            }
+            for kw in results:
+                if kw not in all_keywords:
+                    all_keywords[kw] = {
+                        "sources": [],
+                        "weight": 0,
+                        "is_suffix_expanded": True,
+                    }
+                all_keywords[kw]["sources"].append(source_info)
+                all_keywords[kw]["weight"] += 1
+
+        async def fetch_one_tracked(sq, client: httpx.AsyncClient):
+            """Fetch single query and record results."""
+            if sq.cp_override is not None:
+                cp = sq.cp_override
+            elif cursor_position == -1:
+                cp = -1
+            else:
+                cp = None
+
+            t0 = time.time()
+            results = await self.fetch_suggestions(sq.query, country, language, client, google_client, cp)
+            elapsed = (time.time() - t0) * 1000
+            _record_results(sq, results, elapsed)
+
+        # Step 5a: Other queries (A/B/C/D) — concurrent with semaphore
+        semaphore = asyncio.Semaphore(parallel_limit)
+
+        async def fetch_with_semaphore(sq, client):
             async with semaphore:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
+                await fetch_one_tracked(sq, client)
 
-                # Type A: generator already expanded into 4 variants with cp_override
-                # Type B/C/D: single query, cp = len(query)
-                if sq.cp_override is not None:
-                    cp = sq.cp_override
-                elif cursor_position == -1:
-                    cp = -1
-                else:
-                    cp = None  # auto = len(query)
-
-                t0 = time.time()
-                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, cp)
-                elapsed = (time.time() - t0) * 1000
-
-                entry = SuffixTraceEntry(
-                    suffix_val=sq.suffix_val,
-                    suffix_label=sq.suffix_label,
-                    suffix_type=sq.suffix_type,
-                    priority=sq.priority,
-                    query_sent=sq.query,
-                    cp_override=cp,
-                    results_count=len(results),
-                    results=results,
-                    time_ms=round(elapsed, 1),
-                    status="ok" if results else "empty",
-                )
-                trace_entries.append(entry)
-
-                if results:
-                    all_keywords.update(results)
+        # Step 5b: E queries — per letter sequential, all letters in parallel
+        async def run_letter(letter_queries: List, client: httpx.AsyncClient):
+            """Run one letter's queries sequentially."""
+            for sq in letter_queries:
+                await asyncio.sleep(self.adaptive_delay.get_delay())
+                await fetch_one_tracked(sq, client)
 
         async with httpx.AsyncClient() as client:
-            tasks = [fetch_one(sq, client) for sq in queries_to_send]
+            # Build task list
+            tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
+            # All letters in parallel (each letter sequential internally)
+            for letter, letter_qs in e_queries_by_letter.items():
+                tasks.append(run_letter(letter_qs, client))
             await asyncio.gather(*tasks)
-
-
 
         total_time = (time.time() - total_start) * 1000
 
-        # Step 4: Build result with trace
+        # Step 6: Build result
         ok_count = sum(1 for t in trace_entries if t.status == "ok")
         empty_count = sum(1 for t in trace_entries if t.status == "empty")
         blocked_count = sum(1 for t in trace_entries if t.status.startswith("blocked"))
 
         # Summary by suffix type
         summary_by_type = {}
-        for stype in ["A", "B", "C", "D", "E"]:
+        for stype in ["A_ua", "A_ru", "B", "C", "D", "E"]:
             type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
             summary_by_type[stype] = {
                 "queries_sent": len(type_entries),
@@ -325,10 +376,16 @@ class SuffixParser:
                     "status": t.status,
                 }
 
+        # Build final keyword list sorted by weight desc, then alphabetically
+        keywords_list = sorted(
+            [{"keyword": kw, **data} for kw, data in all_keywords.items()],
+            key=lambda x: (-x["weight"], x["keyword"])
+        )
+
         return SuffixParseResult(
             seed=seed,
             analysis=analysis_summary,
-            all_keywords=sorted(list(all_keywords)),
+            all_keywords=keywords_list,
             total_queries=len(queries_to_send),
             successful_queries=ok_count,
             empty_queries=empty_count,
