@@ -31,92 +31,59 @@ from dataclasses import dataclass, field
 # ══════════════════════════════════════════════
 
 SUFFIXES_RU = {
-    # Type A: Symbols & Wildcards — full map for testing
-    # 4 variants per symbol via fetch_one (v1/v2/v3/v4)
-    # After tracer analysis — remove non-performers
-    "A": [
-        # ── Wildcards ──
-        {"val": "*",       "label": "wildcard"},          # P1
-        {"val": " *",      "label": "double_space"},      # P2
-        {"val": "  *",     "label": "triple_space"},      # P2
-        {"val": "* *",     "label": "double_wildcard"},   # P2
-        {"val": "* * *",   "label": "triple_wildcard"},   # P2
-        {"val": "* * * *", "label": "quad_space"},        # P3
-        {"val": "**",      "label": "double_asterisk"},   # P2
-        {"val": "***",     "label": "triple_asterisk"},   # P2
-
-        # ── Пунктуация P1 (реально встречается в подсказках) ──
-        {"val": "-",  "label": "hyphen"},        # модели, диапазоны
-        {"val": ".",  "label": "dot"},           # домены, версии, файлы
-        {"val": "/",  "label": "slash"},         # категории, размеры
-
-        # ── Пунктуация P2 ──
-        {"val": ":",  "label": "colon"},
-        {"val": "_",  "label": "underscore"},
-        {"val": ",",  "label": "comma"},
-        {"val": "?",  "label": "question_mark"},
-        {"val": "'",  "label": "apostrophe"},
-        {"val": "(",  "label": "lparen"},
-        {"val": ")",  "label": "rparen"},
-        {"val": "+",  "label": "plus"},
-        {"val": "@",  "label": "at"},
-        {"val": "%",  "label": "percent"},
-        {"val": "$",  "label": "dollar"},
-
-        # ── Пунктуация P3 (экспериментальные) ──
-        {"val": '"',  "label": "quote"},
-        {"val": "&",  "label": "ampersand"},
-        {"val": "!",  "label": "exclamation"},
-        {"val": "#",  "label": "hash"},
-        {"val": "=",  "label": "equal"},
-        {"val": "~",  "label": "tilde"},
-        {"val": "|",  "label": "pipe"},
-        {"val": "\\", "label": "backslash"},
-        {"val": ";",  "label": "semicolon"},
-        {"val": "[",  "label": "lbracket"},
-        {"val": "]",  "label": "rbracket"},
-        {"val": "{",  "label": "lbrace"},
-        {"val": "}",  "label": "rbrace"},
-        {"val": "<",  "label": "less"},
-        {"val": ">",  "label": "greater"},
-        {"val": "^",  "label": "caret"},
+    # Type A: Symbols — 2 cluster representatives (proven on 4 datasets)
+    # UA-cluster: `:` → Kyiv/Kharkiv/Odesa/Allo/Comfy results
+    # RU-cluster: `&` → SPb/Moscow/DNS/Novosibirsk results
+    # All 16 UA-symbols are identical (exclusive=0), same for 22 RU-symbols.
+    # Only 1 representative per cluster needed.
+    # v1+v2 only (v3/v4 dropped — 0-3 unique results).
+    "A_ua": [
+        {"val": ":", "label": "sym_ua"},   # UA-cluster representative
+    ],
+    "A_ru": [
+        {"val": "&", "label": "sym_ru"},   # RU-cluster representative
     ],
 
     # Type B: Prepositions — contextual
+    # v1+v2+v3 only (v4 dropped — 0 results everywhere)
     "B": [
-        {"val": "в *", "label": "prep_v"},
-        {"val": "на *", "label": "prep_na"},
-        {"val": "для *", "label": "prep_dlya"},
-        {"val": "с *", "label": "prep_s"},
-        {"val": "от *", "label": "prep_ot"},
-        {"val": "под *", "label": "prep_pod"},
-        {"val": "из *", "label": "prep_iz"},
-        {"val": "без *", "label": "prep_bez"},
+        {"val": "в *",    "label": "prep_v"},
+        {"val": "на *",   "label": "prep_na"},
+        {"val": "для *",  "label": "prep_dlya"},
+        {"val": "с *",    "label": "prep_s"},
+        {"val": "от *",   "label": "prep_ot"},
+        {"val": "под *",  "label": "prep_pod"},
+        {"val": "из *",   "label": "prep_iz"},
+        {"val": "без *",  "label": "prep_bez"},
     ],
 
     # Type C: Questions — informational intent
+    # v1+v2+v3 only
     "C": [
-        {"val": "как *", "label": "q_kak"},
-        {"val": "какой *", "label": "q_kakoy"},
-        {"val": "где *", "label": "q_gde"},
+        {"val": "как *",     "label": "q_kak"},
+        {"val": "какой *",   "label": "q_kakoy"},
+        {"val": "где *",     "label": "q_gde"},
         {"val": "сколько *", "label": "q_skolko"},
-        {"val": "почему *", "label": "q_pochemu"},
+        {"val": "почему *",  "label": "q_pochemu"},
     ],
 
     # Type D: Finalizers — transaction / reputation
+    # v1+v2+v3 only
+    # Removed: неисправности * (stable garbage on all 3 datasets)
+    # Added:   и * (union, gives exclusive results like или *)
     "D": [
-        {"val": "купить *", "label": "fin_kupit"},
-        {"val": "цена *", "label": "fin_tsena"},
-        {"val": "отзывы *", "label": "fin_otzyvy"},
-        {"val": "обзор *", "label": "fin_obzor"},
-        {"val": "сравнение *", "label": "fin_sravnenie"},
-        {"val": "неисправности *", "label": "fin_neispravnosti"},
-        {"val": "характеристики *", "label": "fin_harakteristiki"},
-        {"val": "аналоги *", "label": "fin_analogi"},
-        {"val": "или *", "label": "fin_ili"},
-        {"val": "vs *", "label": "fin_vs"},
-        {"val": "вместо *", "label": "fin_vmesto"},
-        {"val": "форум *", "label": "fin_forum"},
+        {"val": "купить *",        "label": "fin_kupit"},
+        {"val": "цена *",          "label": "fin_tsena"},
+        {"val": "отзывы *",        "label": "fin_otzyvy"},
+        {"val": "обзор *",         "label": "fin_obzor"},
+        {"val": "сравнение *",     "label": "fin_sravnenie"},
+        {"val": "характеристики *","label": "fin_harakteristiki"},
+        {"val": "аналоги *",       "label": "fin_analogi"},
+        {"val": "или *",           "label": "fin_ili"},
+        {"val": "и *",             "label": "fin_i"},
+        {"val": "vs *",            "label": "fin_vs"},
+        {"val": "вместо *",        "label": "fin_vmesto"},
+        {"val": "форум *",         "label": "fin_forum"},
     ],
 
     # Numeric (subtype of A, always priority 1)
@@ -144,10 +111,14 @@ PREP_SET_RU = {"в", "во", "на", "для", "с", "со", "от", "под", "
                "за", "по", "до", "при", "между", "через", "про", "об", "о", "к", "ко", "у"}
 
 # ══════════════════════════════════════════════
-# LETTER SWEEP — test alphabet for autocomplete structure research
-# 5 vowels + 5 consonants; excludes ъ, ы, ь and rare letters
+# LETTER SWEEP — full commercial alphabet
+# Removed: ъ ы ь (never start words)
+#          в с   (covered by Type B prepositions)
+#          и     (covered by Type D финализатор)
+#          ё     (almost no commercial queries)
+# Result: 26 letters
 # ══════════════════════════════════════════════
-LETTER_SWEEP_RU = list("аеиоубвдкр")
+LETTER_SWEEP_RU = list("абгдежзйклмнопртуфхцчшщэюя")
 
 
 # ══════════════════════════════════════════════
@@ -357,13 +328,21 @@ class SuffixGenerator:
 
         return False
 
-    def generate(self, seed: str, include_numbers: bool = False, include_letters: bool = False) -> Tuple[SeedAnalysis, List[SuffixQuery]]:
+    def generate(self, seed: str, include_numbers: bool = False, include_letters: bool = False,
+                 region: str = "ua") -> Tuple[SeedAnalysis, List[SuffixQuery]]:
         """
         Main method: analyze seed → generate suffix queries with priorities.
         Returns (analysis, queries).
+
+        Args:
+            region: "ua" → use A_ua (:), "ru" → use A_ru (&), "all" → both
         """
         analysis = self.analyze_seed(seed)
         seed_lower = seed.lower().strip()
+
+        # Auto-detect numeric suffixes from seed
+        if any(c.isdigit() for c in seed_lower):
+            include_numbers = True
 
         # L6+: only wildcards
         if analysis.l_level == "L6+":
@@ -416,11 +395,13 @@ class SuffixGenerator:
 
         def expand_type_a(seed_lower, suffix_val, suffix_label, priority, markers, stype="A"):
             """
-            Generate 4 cp variants for Type A symbols.
-            v1: сид символ       cp = после символа (конец строки)
-            v2: сид символ       cp = перед символом
-            v3: сид символ       cp = после пробела между сидом и символом
-            v4: сид символ       cp = перед пробелом (конец сида)
+            Generate cp variants for suffix queries.
+            v1: сид символ   cp = конец строки (после символа)
+            v2: сид символ   cp = перед символом
+            v3: сид символ   cp = после пробела между сидом и символом
+
+            Type A:     v1 + v2       (v3/v4 дают 0-3 уникальных — убраны)
+            Type B/C/D: v1 + v2 + v3  (v4 = 0 везде — убран)
             """
             base = f"{seed_lower} {suffix_val}"
             seed_end = len(seed_lower)           # позиция конца сида
@@ -428,12 +409,15 @@ class SuffixGenerator:
             sym_start = seed_end + 1             # позиция начала символа
             sym_end = len(base)                  # позиция конца символа (конец строки)
 
-            variants = [
+            all_variants = [
                 (base, sym_end,   "v1"),  # курсор в конце, после символа
                 (base, sym_start, "v2"),  # курсор перед символом
-                (base, space_pos, "v3"),  # курсор на месте пробела (перед ним)
-                (base, seed_end,  "v4"),  # курсор в конце сида
+                (base, space_pos, "v3"),  # курсор на месте пробела
             ]
+            # Type A: v1+v2 only; Type B/C/D: v1+v2+v3
+            max_v = 2 if stype in ("A", "A_ua", "A_ru") else 3
+            variants = all_variants[:max_v]
+
             out = []
             for q, cp, vname in variants:
                 out.append(SuffixQuery(
@@ -448,8 +432,24 @@ class SuffixGenerator:
                 ))
             return out
 
-        # Process each suffix type
-        for stype in ["A", "B", "C", "D"]:
+        # Process Type A: A_ua and/or A_ru based on region
+        a_types = []
+        if region in ("ua", "all"):
+            a_types.append("A_ua")
+        if region in ("ru", "all"):
+            a_types.append("A_ru")
+        if not a_types:
+            a_types = ["A_ua"]  # fallback
+
+        for stype in a_types:
+            priority = self._calc_priority("A", active_markers)
+            for s in self.suffixes.get(stype, []):
+                suffix_val = s["val"]
+                suffix_label = s["label"]
+                results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype))
+
+        # Process Types B, C, D
+        for stype in ["B", "C", "D"]:
             suffix_list = self.suffixes.get(stype, [])
 
             # Calculate priority using min() rule
@@ -496,15 +496,14 @@ class SuffixGenerator:
 
     def _build_letter_structures(self, seed_lower: str, letter: str) -> List["SuffixQuery"]:
         """
-        Build 21 test structures for a single letter.
-        Covers 5 dimensions:
-          D1: plain + trailing space
-          D2: wildcard combos (before / after / sandwich) + trailing variants
-          D3: cp variants for wc_before and letter_wc structures
-          D4: A_local symbol (:) + letter combos
-          D5: A_general symbol (-) + letter combos
-        
-        cp_override = None  → would auto = len(query), but we set explicitly here
+        Build 14 test structures for a single letter (was 21, removed 7 zero-result structures).
+
+        Removed (0 unique on all datasets):
+          col_B, col_Lwc, col_wcL, hyp_B, Lwc_cpEnd, wcB_cpEnd, wcB_cpStar
+
+        Kept (14):
+          plain, trail, wcB_trail, Lwc_trail, sandwich, wcB_cpMid,
+          Lwc_cpAL, Lwc_cpBL, col_B_trail, L_col, hyp_B_trail, hyp_Lwc, hyp_wcL, L_hyp
         """
         s = seed_lower
         L = letter
@@ -522,94 +521,70 @@ class SuffixGenerator:
                 variant=struct_name,
             )
 
-        # ── DIMENSION 1: буква без символов ──────────────────────────────
+        # ── D1: буква без символов ───────────────────────────────────────
         # 1. сид а  (cp = конец)
         q = f"{s} {L}"
         out.append(sq(q, len(q), "plain"))
 
-        # 2. сид а  (+ trailing space, cp = конец)
+        # 2. сид а  (+ trailing space)
         q = f"{s} {L} "
         out.append(sq(q, len(q), "trail"))
 
-        # ── DIMENSION 2: буква + wildcard ────────────────────────────────
-        # 3. сид * а  (cp = конец, после буквы)
-        q = f"{s} * {L}"
-        out.append(sq(q, len(q), "wcB_cpEnd"))
-
-        # 4. сид * а  (+ trailing space)
+        # ── D2: буква + wildcard ─────────────────────────────────────────
+        # 3. сид * а  (+ trailing space)  [wcB_cpEnd убран — 0 unique]
         q = f"{s} * {L} "
         out.append(sq(q, len(q), "wcB_trail"))
 
-        # 5. сид а *  (cp = конец, после *)
-        q = f"{s} {L} *"
-        out.append(sq(q, len(q), "Lwc_cpEnd"))
-
-        # 6. сид а *  (+ trailing space)
+        # 4. сид а *  (+ trailing space)  [Lwc_cpEnd убран — 0 unique]
         q = f"{s} {L} * "
         out.append(sq(q, len(q), "Lwc_trail"))
 
-        # 7. сид * а *  (sandwich, cp = конец)
+        # 5. сид * а *  (sandwich, cp = конец)
         q = f"{s} * {L} *"
         out.append(sq(q, len(q), "sandwich"))
 
-        # ── DIMENSION 3: cp варианты для wcB и Lwc ───────────────────────
-        # [3] сид * а  → 2 дополнительных cp:
-        #   cp перед * (= len("сид "))
-        q = f"{s} * {L}"
-        out.append(sq(q, len(s) + 1, "wcB_cpStar"))
+        # ── D3: cp варианты ──────────────────────────────────────────────
+        # wcB_cpStar убран (0 unique). Оставляем wcB_cpMid:
         #   cp между * и буквой (= len("сид * "))
+        q = f"{s} * {L}"
         out.append(sq(q, len(s) + 3, "wcB_cpMid"))
 
-        # [5] сид а *  → 2 дополнительных cp:
+        # Lwc cp варианты:
         #   cp после "а " (перед *)
         q = f"{s} {L} *"
         out.append(sq(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL"))
         #   cp перед "а" (после пробела сида)
         out.append(sq(q, len(s) + 1, "Lwc_cpBL"))
 
-        # ── DIMENSION 4: A_local (:) + буква ─────────────────────────────
-        # 8. сид : а
-        q = f"{s} : {L}"
-        out.append(sq(q, len(q), "col_B"))
-
-        # 9. сид : а  (+ trailing space)
+        # ── D4: A_local (:) + буква ──────────────────────────────────────
+        # col_B убран (0 unique). col_Lwc, col_wcL убраны.
+        # 6. сид : а  (+ trailing space)
         q = f"{s} : {L} "
         out.append(sq(q, len(q), "col_B_trail"))
 
-        # 10. сид : а *
-        q = f"{s} : {L} *"
-        out.append(sq(q, len(q), "col_Lwc"))
-
-        # 11. сид : * а
-        q = f"{s} : * {L}"
-        out.append(sq(q, len(q), "col_wcL"))
-
-        # 12. сид а :
+        # 7. сид а :
         q = f"{s} {L} :"
         out.append(sq(q, len(q), "L_col"))
 
-        # ── DIMENSION 5: A_general (-) + буква ───────────────────────────
-        # 13. сид - а
-        q = f"{s} - {L}"
-        out.append(sq(q, len(q), "hyp_B"))
-
-        # 14. сид - а  (+ trailing space)
+        # ── D5: A_general (-) + буква ────────────────────────────────────
+        # hyp_B убран (0 unique).
+        # 8. сид - а  (+ trailing space)
         q = f"{s} - {L} "
         out.append(sq(q, len(q), "hyp_B_trail"))
 
-        # 15. сид - а *
+        # 9. сид - а *
         q = f"{s} - {L} *"
         out.append(sq(q, len(q), "hyp_Lwc"))
 
-        # 16. сид - * а
+        # 10. сид - * а
         q = f"{s} - * {L}"
         out.append(sq(q, len(q), "hyp_wcL"))
 
-        # 17. сид а -
+        # 11. сид а -
         q = f"{s} {L} -"
         out.append(sq(q, len(q), "L_hyp"))
 
-        return out  # 21 entries per letter
+        return out  # 14 entries per letter
 
     def _calc_priority(self, suffix_type: str, active_markers: List[str]) -> int:
         """
@@ -627,33 +602,36 @@ class SuffixGenerator:
     def _check_self_match(self, suffix_val: str, seed_words: Set[str],
                           seed_lemmas: Set[str], analysis: SeedAnalysis) -> Optional[str]:
         """
-        Self-Match filter:
-        1. Token-level: if suffix keyword already in seed → block
-        2. P-level: if suffix preposition already in seed → block
+        Self-Match filter — blocks suffix if any meaningful word overlaps with seed.
+        1. P-level: if suffix preposition already in seed → block
+        2. Universal word check: any non-wildcard word from suffix in seed → block
+           (covers L-marker: "купить айфон про макс" + "купить *" → blocked)
         Returns reason string if blocked, None if OK.
         """
-        # Extract first word from suffix (before *)
+        # Extract all non-wildcard words from suffix
         suffix_parts = suffix_val.replace("*", "").strip().split()
         if not suffix_parts:
             return None  # pure wildcard — never blocked
 
-        suffix_keyword = suffix_parts[0].lower()
+        for suffix_keyword in suffix_parts:
+            suffix_keyword = suffix_keyword.lower()
 
-        # P-level: preposition self-match
-        if suffix_keyword in PREP_SET_RU:
-            if suffix_keyword in analysis.p_words_found:
-                return f"prep_self_match:{suffix_keyword}"
+            # P-level: preposition self-match
+            if suffix_keyword in PREP_SET_RU:
+                if suffix_keyword in analysis.p_words_found:
+                    return f"prep_self_match:{suffix_keyword}"
+                continue  # preposition not in seed — OK, skip further checks
 
-        # Token-level: word or lemma already in seed
-        if suffix_keyword in seed_words:
-            return f"word_self_match:{suffix_keyword}"
+            # Token-level: word already in seed
+            if suffix_keyword in seed_words:
+                return f"word_self_match:{suffix_keyword}"
 
-        # Lemma check
-        suffix_lemma_parsed = self.morph.parse(suffix_keyword)
-        if suffix_lemma_parsed:
-            suffix_lemma = suffix_lemma_parsed[0].normal_form
-            if suffix_lemma in seed_lemmas:
-                return f"lemma_self_match:{suffix_keyword}→{suffix_lemma}"
+            # Lemma-level: lemma already in seed
+            suffix_lemma_parsed = self.morph.parse(suffix_keyword)
+            if suffix_lemma_parsed:
+                suffix_lemma = suffix_lemma_parsed[0].normal_form
+                if suffix_lemma in seed_lemmas:
+                    return f"lemma_self_match:{suffix_keyword}→{suffix_lemma}"
 
         return None
 
