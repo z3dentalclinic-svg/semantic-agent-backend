@@ -362,16 +362,12 @@ class SuffixParser:
                 headers = {"User-Agent": random.choice(USER_AGENTS)}
                 try:
                     resp = await client.get(url, params=params, headers=headers, timeout=10.0)
-                    if char == "о":
-                        logger.warning(f"E_SIMPLE DEBUG | q={repr(q)} | status={resp.status_code} | body={repr(resp.text[:500])}")
                     if resp.status_code == 200:
                         data = resp.json()
                         results = data[1] if len(data) > 1 else []
                     else:
                         results = []
-                except Exception as e:
-                    if char == "о":
-                        logger.warning(f"E_SIMPLE EXCEPTION | q={repr(q)} | error={e}")
+                except Exception:
                     results = []
                 elapsed = (time.time() - t0) * 1000
                 _record_results(sq_simple, results, elapsed)
