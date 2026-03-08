@@ -366,6 +366,41 @@ class SuffixParser:
 
             await asyncio.gather(*tasks)
 
+            # ── Phase 2: candidate expansion (как в старом парсере) ──────
+            # Собираем слова которые встречаются 2+ раз в результатах
+            # Исключаем слова сида, делаем запрос кандидат + сид без cp
+            seed_words_set = set(seed.lower().split())
+            from collections import Counter
+            word_counter: Counter = Counter()
+            for kw in all_keywords:
+                for word in kw.lower().split():
+                    if word not in seed_words_set and len(word) > 2:
+                        word_counter[word] += 1
+
+            candidates = sorted(w for w, cnt in word_counter.items() if cnt >= 2)
+
+            async def fetch_candidate(cand: str):
+                async with semaphore:
+                    await asyncio.sleep(0.2)
+                    q = f"{cand} {seed.lower()}"
+                    from dataclasses import replace as dc_replace
+                    sq_cand = SuffixQuery(
+                        query=q,
+                        suffix_val=cand,
+                        suffix_label=f"cand_{cand}",
+                        suffix_type="P2",
+                        priority=1,
+                        markers=["candidate"],
+                        cp_override=-1,
+                    )
+                    t0 = time.time()
+                    results = await self.fetch_suggestions(q, country, language, client, google_client, -1)
+                    elapsed = (time.time() - t0) * 1000
+                    _record_results(sq_cand, results, elapsed)
+
+            if candidates:
+                await asyncio.gather(*[fetch_candidate(c) for c in candidates])
+
         total_time = (time.time() - total_start) * 1000
 
         # Step 6: Build result
@@ -375,7 +410,7 @@ class SuffixParser:
 
         # Summary by suffix type
         summary_by_type = {}
-        for stype in ["A_ua", "A_ru", "B", "C", "D", "E", "E_ff"]:
+        for stype in ["A_ua", "A_ru", "B", "C", "D", "E", "E_ff", "P2"]:
             type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
             summary_by_type[stype] = {
                 "queries_sent": len(type_entries),
