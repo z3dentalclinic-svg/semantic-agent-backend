@@ -335,6 +335,21 @@ class SuffixParser:
                     ("reversed_seed", raw_url, " ".join(seed.split()[::-1]) + " ", {}),
                     # 7. suggestqueries.google.com WITHOUT cp (just different endpoint)
                     ("suggest_no_cp", suggest_url, seed + " ", {}),
+
+                    # ═══ CP PROOF-OF-CONCEPT (SerpApi "K Kardashian" test) ═══
+                    # Theory: q="K Kardashian", cp=1 → cursor after "K" → Google
+                    # should complete "K" as first word → gives "Kim Kardashian" etc.
+                    # If cp works: results differ between cp0/cp1/no_cp.
+                    # If same results in all 3 → cp is useless for us.
+                    #
+                    # HOW TO TRIGGER: send any seed with cp=0 via UI,
+                    # then look for kard_cp0 / kard_cp1 / kard_no_cp in tracer.
+                    #
+                    # "K Kardashian" is the canonical SerpApi example, we use it
+                    # as a fixed control query independent of user seed.
+                    ("kard_no_cp",  raw_url, "K Kardashian", {}),
+                    ("kard_cp0",    raw_url, "K Kardashian", {"cp": 0}),
+                    ("kard_cp1",    raw_url, "K Kardashian", {"cp": 1}),
                 ]
 
                 for label, url, q_text, extra_params in experiments:
