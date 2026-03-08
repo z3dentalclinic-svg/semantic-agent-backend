@@ -35,6 +35,7 @@ def register_suffix_endpoint(app: FastAPI):
         filters: str = Query("none", description="Фильтры (для совместимости)"),
         google_client: str = Query("firefox", description="Autocomplete client: firefox/chrome/chrome-omni/safari/psy-ab/gws-wiz"),
         cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
+        include_letters: bool = Query(False, description="Letter Sweep — буквенный перебор (а е и о у б в д к р)"),
     ):
         """
         SUFFIX MAP: Smart suffix expansion with priority matrix + tracer.
@@ -50,6 +51,7 @@ def register_suffix_endpoint(app: FastAPI):
             echelon=echelon,
             google_client=google_client,
             cursor_position=cp,
+            include_letters=include_letters,
         )
 
         # Format response compatible with existing HTML displayResults
