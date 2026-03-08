@@ -254,132 +254,51 @@ class SuffixParser:
             async with semaphore:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
 
-                t0 = time.time()
-                # Suffix queries: use auto cp=len (None) or no cp (-1)
-                suffix_cp = -1 if cursor_position == -1 else None
-                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, suffix_cp)
-                elapsed = (time.time() - t0) * 1000
+                # Базовый текст суффикса без звёздочки и пробелов по краям
+                suffix_clean = sq.suffix_val.replace("*", "").strip()
 
-                entry = SuffixTraceEntry(
-                    suffix_val=sq.suffix_val,
-                    suffix_label=sq.suffix_label,
-                    suffix_type=sq.suffix_type,
-                    priority=sq.priority,
-                    query_sent=sq.query,
-                    results_count=len(results),
-                    results=results,
-                    time_ms=round(elapsed, 1),
-                    status="ok" if results else "empty",
-                )
-                trace_entries.append(entry)
+                # 4 варианта запроса:
+                # v1: "сид суффикс*"  cp после *  (без пробела перед *)
+                # v2: "сид суффикс*"  cp перед *  (без пробела перед *)
+                # v3: "сид суффикс *" cp перед *  (пробел перед *, курсор до *)
+                # v4: "сид суффикс *" cp после *  (пробел перед *, курсор после *)
+                seed_lower = seed.lower().strip()
+                base_nospace = f"{seed_lower} {suffix_clean}*" if suffix_clean else f"{seed_lower}*"
+                base_space   = f"{seed_lower} {suffix_clean} *" if suffix_clean else f"{seed_lower} *"
 
-                if results:
-                    all_keywords.update(results)
+                variants = [
+                    (sq.suffix_label + "_v1", base_nospace, len(base_nospace)),
+                    (sq.suffix_label + "_v2", base_nospace, len(base_nospace) - 1),
+                    (sq.suffix_label + "_v3", base_space,   len(base_space) - 1),
+                    (sq.suffix_label + "_v4", base_space,   len(base_space)),
+                ]
+
+                for vlabel, vquery, vcp in variants:
+                    t0 = time.time()
+                    results = await self.fetch_suggestions(vquery, country, language, client, google_client, vcp)
+                    elapsed = (time.time() - t0) * 1000
+
+                    entry = SuffixTraceEntry(
+                        suffix_val=sq.suffix_val,
+                        suffix_label=vlabel,
+                        suffix_type=sq.suffix_type,
+                        priority=sq.priority,
+                        query_sent=vquery,
+                        results_count=len(results),
+                        results=results,
+                        time_ms=round(elapsed, 1),
+                        status="ok" if results else "empty",
+                    )
+                    trace_entries.append(entry)
+
+                    if results:
+                        all_keywords.update(results)
 
         async with httpx.AsyncClient() as client:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
             await asyncio.gather(*tasks)
 
-            # ═══ PREFIX EXPERIMENTS ═══
-            # All untested prefix/cp theories in one block
-            if cursor_position is not None and cursor_position >= 0:
-                logger = logging.getLogger(__name__)
-                raw_url = "https://www.google.com/complete/search"
-                suggest_url = "https://suggestqueries.google.com/complete/search"
-                hdrs = {"User-Agent": random.choice(USER_AGENTS)}
 
-                # Helper to run one experiment
-                async def run_experiment(label, url, q_text, params_extra, use_client="chrome"):
-                    params_exp = {
-                        "q": q_text, "client": use_client,
-                        "hl": language, "gl": country,
-                        "ie": "utf-8", "oe": "utf-8",
-                    }
-                    params_exp.update(params_extra)
-                    try:
-                        resp = await client.get(url, params=params_exp, headers=hdrs, timeout=10.0)
-                        logger.info(f"[{label}] URL: {resp.url}")
-                        logger.info(f"[{label}] Raw: {resp.text[:500]}")
-                        # Parse response
-                        results = []
-                        data = resp.json()
-                        if isinstance(data, list) and len(data) > 1:
-                            raw = data[1]
-                            if isinstance(raw, list):
-                                for item in raw:
-                                    if isinstance(item, str):
-                                        results.append(self._clean_suggestion(item))
-                                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                        results.append(self._clean_suggestion(item[0]))
-                                    elif isinstance(item, dict):
-                                        s = item.get("suggestion") or item.get("value") or item.get("text", "")
-                                        if s:
-                                            results.append(self._clean_suggestion(str(s)))
-                        return results
-                    except Exception as e:
-                        logger.info(f"[{label}] Error: {e}")
-                        return []
-
-                experiments = [
-                    # 1. Standard cp=0 (baseline — already know doesn't give prefixes)
-                    ("cp0_standard", raw_url, seed, {"cp": 0}),
-                    # 2. Space before seed + cp=0 (Gemini theory)
-                    ("cp0_space_before", raw_url, " " + seed, {"cp": 0}),
-                    # 3. %20 encoded space before seed (GPT theory)
-                    ("cp0_encoded_space", raw_url, " " + seed, {"cp": 0}),
-                    # 4. Plus before seed (GPT theory: q=+seed)
-                    ("cp0_plus_prefix", raw_url, "+" + seed, {"cp": 0}),
-                    # 5. suggestqueries.google.com endpoint + cp=0
-                    ("cp0_suggest_endpoint", suggest_url, seed, {"cp": 0}),
-                    # 6. Reversed seed (reversed autocomplete trick)
-                    ("reversed_seed", raw_url, " ".join(seed.split()[::-1]) + " ", {}),
-                    # 7. suggestqueries.google.com WITHOUT cp (just different endpoint)
-                    ("suggest_no_cp", suggest_url, seed + " ", {}),
-
-                    # ═══ CP PROOF-OF-CONCEPT (уже доказано что работает) ═══
-                    ("kard_no_cp", raw_url, "K Kardashian", {}),
-                    ("kard_cp0",   raw_url, "K Kardashian", {"cp": 0}),
-                    ("kard_cp1",   raw_url, "K Kardashian", {"cp": 1}),
-
-                    # ═══ SUFFIX CURSOR EXPERIMENTS ═══
-                    # Тестируем позицию курсора для суффиксов.
-                    # Все 7 вариантов на одном сиде — сравниваем результаты.
-
-                    # 1. Дефолт: курсор в конце сида (без пробела)
-                    ("suf_default",      raw_url, seed,           {"cp": len(seed)}),
-                    # 2. Сид + пробел, курсор после пробела
-                    ("suf_space_end",    raw_url, seed + " ",     {"cp": len(seed) + 1}),
-                    # 3. Сид + двойной пробел, курсор в конце
-                    ("suf_2space_end",   raw_url, seed + "  ",    {"cp": len(seed) + 2}),
-                    # 4. Сид + " а", курсор после "а"
-                    ("suf_a_after",      raw_url, seed + " а",    {"cp": len(seed + " а")}),
-                    # 5. Сид + " а", курсор перед "а" (после пробела)
-                    ("suf_a_before",     raw_url, seed + " а",    {"cp": len(seed) + 1}),
-                    # 6. Сид + " а ", курсор после пробела за "а"
-                    ("suf_a_space",      raw_url, seed + " а ",   {"cp": len(seed + " а ")}),
-                    # 7. Сид + "  а", двойной пробел перед буквой, курсор после "а"
-                    ("suf_2space_a",     raw_url, seed + "  а",   {"cp": len(seed + "  а")}),
-                ]
-
-                for label, url, q_text, extra_params in experiments:
-                    t0 = time.time()
-                    exp_results = await run_experiment(label, url, q_text, extra_params)
-                    elapsed = (time.time() - t0) * 1000
-
-                    entry = SuffixTraceEntry(
-                        suffix_val=label,
-                        suffix_label=label,
-                        suffix_type="A",
-                        priority=1,
-                        query_sent=f"q={q_text} [{label}]",
-                        results_count=len(exp_results),
-                        results=exp_results,
-                        time_ms=round(elapsed, 1),
-                        status="ok" if exp_results else "empty",
-                    )
-                    trace_entries.append(entry)
-                    if exp_results:
-                        all_keywords.update(exp_results)
 
         total_time = (time.time() - total_start) * 1000
 
