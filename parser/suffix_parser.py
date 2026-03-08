@@ -480,7 +480,7 @@ class SuffixParser:
             # ── Яндекс: B/C/D + алфавит ──────────────────────────────────
             async def run_yandex(client: httpx.AsyncClient):
                 # B/C/D запросы
-                for sq in non_e_queries:
+                for sq in other_queries:
                     if sq.suffix_type not in ("B", "C", "D"):
                         continue
                     await asyncio.sleep(0.2)
@@ -508,7 +508,7 @@ class SuffixParser:
             # ── Бинг: B/C/D + алфавит ────────────────────────────────────
             async def run_bing(client: httpx.AsyncClient):
                 # B/C/D запросы
-                for sq in non_e_queries:
+                for sq in other_queries:
                     if sq.suffix_type not in ("B", "C", "D"):
                         continue
                     await asyncio.sleep(0.2)
