@@ -306,6 +306,9 @@ class SuffixParser:
                 all_keywords[kw]["sources"].append(source_info)
                 all_keywords[kw]["weight"] += 1
 
+        # Step 5a: Other queries (A/B/C/D) — concurrent with semaphore
+        semaphore = asyncio.Semaphore(parallel_limit)
+
         async def fetch_one_tracked(sq, client: httpx.AsyncClient, force_client: str = None):
             """Fetch single query and record results."""
             if sq.cp_override is not None:
@@ -335,8 +338,28 @@ class SuffixParser:
             elapsed = (time.time() - t0) * 1000
             _record_results(sq_ff, results, elapsed)
 
-        # Step 5a: Other queries (A/B/C/D) — concurrent with semaphore
-        semaphore = asyncio.Semaphore(parallel_limit)
+        # Step 5d: E_simple — точная копия старого алфавитного перебора
+        # seed + буква, firefox, без cp — 29 запросов (алфавит + ё)
+        ALPHABET = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
+
+        async def run_e_simple(client: httpx.AsyncClient):
+            for char in ALPHABET:
+                await asyncio.sleep(0.2)
+                q = f"{seed} {char}"
+                from dataclasses import replace as dc_replace
+                sq_simple = SuffixQuery(
+                    query=q,
+                    suffix_val=char,
+                    suffix_label=f"simple_{char}",
+                    suffix_type="E_simple",
+                    priority=1,
+                    markers=["e_simple"],
+                    cp_override=-1,
+                )
+                t0 = time.time()
+                results = await self.fetch_suggestions(q, country, language, client, "firefox", -1)
+                elapsed = (time.time() - t0) * 1000
+                _record_results(sq_simple, results, elapsed)
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
@@ -363,6 +386,9 @@ class SuffixParser:
             for letter, letter_qs in e_queries_by_letter.items():
                 tasks.append(run_letter_chrome(letter_qs, client))
                 tasks.append(run_letter_firefox(letter_qs, client))
+
+            # E_simple — точная копия старого алфавитного свипа (параллельно с остальными)
+            tasks.append(run_e_simple(client))
 
             await asyncio.gather(*tasks)
 
@@ -412,7 +438,7 @@ class SuffixParser:
 
         # Summary by suffix type
         summary_by_type = {}
-        for stype in ["A_ua", "A_ru", "B", "C", "D", "E", "E_ff", "P2"]:
+        for stype in ["A_ua", "A_ru", "B", "C", "D", "E", "E_ff", "E_simple", "P2"]:
             type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
             summary_by_type[stype] = {
                 "queries_sent": len(type_entries),
