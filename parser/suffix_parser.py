@@ -51,9 +51,10 @@ class SuffixTraceEntry:
     """Trace data for a single suffix query"""
     suffix_val: str
     suffix_label: str
-    suffix_type: str  # A, B, C, D
+    suffix_type: str  # A, B, C, D, E
     priority: int
     query_sent: str
+    cp_override: Optional[int] = None   # ← actual cp sent to Google
     results_count: int = 0
     results: List[str] = field(default_factory=list)
     time_ms: float = 0.0
@@ -274,6 +275,7 @@ class SuffixParser:
                     suffix_type=sq.suffix_type,
                     priority=sq.priority,
                     query_sent=sq.query,
+                    cp_override=cp,
                     results_count=len(results),
                     results=results,
                     time_ms=round(elapsed, 1),
