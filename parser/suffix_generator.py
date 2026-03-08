@@ -186,7 +186,9 @@ class SuffixQuery:
     suffix_type: str  # A, B, C, D
     priority: int     # 1 or 2
     markers: List[str]
-    blocked_by: Optional[str] = None  # If self-matched, reason
+    blocked_by: Optional[str] = None   # If self-matched, reason
+    cp_override: Optional[int] = None  # explicit cursor position; None = auto (len(query))
+    variant: Optional[str] = None      # v1/v2/v3/v4 for tracer
 
 
 class SuffixGenerator:
@@ -406,6 +408,40 @@ class SuffixGenerator:
 
         results = []
 
+        def expand_type_a(seed_lower, suffix_val, suffix_label, priority, markers):
+            """
+            Generate 4 cp variants for Type A symbols.
+            v1: сид символ       cp = после символа (конец строки)
+            v2: сид символ       cp = перед символом
+            v3: сид символ       cp = после пробела между сидом и символом
+            v4: сид символ       cp = перед пробелом (конец сида)
+            """
+            base = f"{seed_lower} {suffix_val}"
+            seed_end = len(seed_lower)           # позиция конца сида
+            space_pos = seed_end                 # позиция пробела = len(seed_lower)
+            sym_start = seed_end + 1             # позиция начала символа
+            sym_end = len(base)                  # позиция конца символа (конец строки)
+
+            variants = [
+                (base, sym_end,   "v1"),  # курсор в конце, после символа
+                (base, sym_start, "v2"),  # курсор перед символом
+                (base, space_pos, "v3"),  # курсор на месте пробела (перед ним)
+                (base, seed_end,  "v4"),  # курсор в конце сида
+            ]
+            out = []
+            for q, cp, vname in variants:
+                out.append(SuffixQuery(
+                    query=q,
+                    suffix_val=suffix_val,
+                    suffix_label=f"{suffix_label}_{vname}",
+                    suffix_type="A",
+                    priority=priority,
+                    markers=list(markers),
+                    cp_override=cp,
+                    variant=vname,
+                ))
+            return out
+
         # Process each suffix type
         for stype in ["A", "B", "C", "D"]:
             suffix_list = self.suffixes.get(stype, [])
@@ -429,6 +465,11 @@ class SuffixGenerator:
                         markers=[m for m in active_markers],
                         blocked_by=blocked,
                     ))
+                    continue
+
+                # Type A: expand into 4 cp variants for testing
+                if stype == "A":
+                    results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers))
                     continue
 
                 query_str = f"{seed_lower} {suffix_val}".strip()
