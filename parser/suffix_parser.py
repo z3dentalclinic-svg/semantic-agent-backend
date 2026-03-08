@@ -332,18 +332,23 @@ class SuffixParser:
 
         # Допустимые одиночные буквы (предлоги/союзы)
         _ALLOWED_SINGLE_LETTERS = {"в", "с", "к", "у", "о", "а", "и", "б"}
-        # Спецсимволы которые не должны встречаться как отдельные слова
         _BAD_SYMBOLS = set("-*|~%\\!:^@#$&+=[]{}()<>/?'\"")
+        _seed_words = set(seed.lower().split())
 
         def _is_garbage_keyword(kw: str) -> bool:
             """Возвращает True если ключ содержит мусорные токены."""
-            for word in kw.split():
-                # одиночный спецсимвол как отдельное слово
-                if len(word) == 1 and word in _BAD_SYMBOLS:
+            words = kw.split()
+            for word in words:
+                # слово целиком из спецсимволов (*, **, ***, -- и т.д.)
+                if word and all(c in _BAD_SYMBOLS for c in word):
                     return True
                 # одиночная буква не из допустимых
                 if len(word) == 1 and word.isalpha() and word.lower() not in _ALLOWED_SINGLE_LETTERS:
                     return True
+            # После слов сида должно быть хотя бы одно слово ≥4 букв
+            tail = [w for w in words if w.lower() not in _seed_words]
+            if tail and not any(len(w) >= 4 and w.isalpha() for w in tail):
+                return True
             return False
 
         def _record_results(sq: "SuffixQuery", results: List[str], elapsed_ms: float):
@@ -477,63 +482,53 @@ class SuffixParser:
 
             await asyncio.gather(*tasks)
 
-            # ── Яндекс: B/C/D + алфавит ──────────────────────────────────
-            async def run_yandex(client: httpx.AsyncClient):
-                # B/C/D запросы
-                for sq in other_queries:
-                    if sq.suffix_type not in ("B", "C", "D"):
-                        continue
-                    await asyncio.sleep(0.2)
-                    results = await self.fetch_suggestions_yandex(sq.query, language, client)
+            # ── Яндекс + Бинг: параллельно через semaphore ───────────────
+            ya_sem = asyncio.Semaphore(5)
+            bi_sem = asyncio.Semaphore(5)
+
+            async def fetch_ya(sq_orig, suffix_type, suffix_label):
+                async with ya_sem:
+                    await asyncio.sleep(0.1)
                     sq_ya = SuffixQuery(
-                        query=sq.query, suffix_val=sq.suffix_val,
-                        suffix_label=sq.suffix_label + "_ya",
-                        suffix_type=sq.suffix_type + "_ya",
-                        priority=sq.priority, markers=sq.markers, cp_override=-1,
+                        query=sq_orig.query, suffix_val=sq_orig.suffix_val,
+                        suffix_label=suffix_label, suffix_type=suffix_type,
+                        priority=sq_orig.priority, markers=sq_orig.markers, cp_override=-1,
                     )
-                    _record_results(sq_ya, results, 0)
-                # алфавит
-                for char in ALPHABET:
-                    await asyncio.sleep(0.2)
-                    q = f"{seed} {char}"
-                    sq_ya = SuffixQuery(
-                        query=q, suffix_val=char,
-                        suffix_label=f"simple_{char}_ya",
-                        suffix_type="E_simple_ya",
-                        priority=1, markers=["e_simple_ya"], cp_override=-1,
-                    )
-                    results = await self.fetch_suggestions_yandex(q, language, client)
+                    results = await self.fetch_suggestions_yandex(sq_orig.query, language, client)
                     _record_results(sq_ya, results, 0)
 
-            # ── Бинг: B/C/D + алфавит ────────────────────────────────────
-            async def run_bing(client: httpx.AsyncClient):
-                # B/C/D запросы
-                for sq in other_queries:
-                    if sq.suffix_type not in ("B", "C", "D"):
-                        continue
-                    await asyncio.sleep(0.2)
-                    results = await self.fetch_suggestions_bing(sq.query, language, country, client)
+            async def fetch_bi(sq_orig, suffix_type, suffix_label):
+                async with bi_sem:
+                    await asyncio.sleep(0.1)
                     sq_bi = SuffixQuery(
-                        query=sq.query, suffix_val=sq.suffix_val,
-                        suffix_label=sq.suffix_label + "_bi",
-                        suffix_type=sq.suffix_type + "_bi",
-                        priority=sq.priority, markers=sq.markers, cp_override=-1,
+                        query=sq_orig.query, suffix_val=sq_orig.suffix_val,
+                        suffix_label=suffix_label, suffix_type=suffix_type,
+                        priority=sq_orig.priority, markers=sq_orig.markers, cp_override=-1,
                     )
-                    _record_results(sq_bi, results, 0)
-                # алфавит
-                for char in ALPHABET:
-                    await asyncio.sleep(0.2)
-                    q = f"{seed} {char}"
-                    sq_bi = SuffixQuery(
-                        query=q, suffix_val=char,
-                        suffix_label=f"simple_{char}_bi",
-                        suffix_type="E_simple_bi",
-                        priority=1, markers=["e_simple_bi"], cp_override=-1,
-                    )
-                    results = await self.fetch_suggestions_bing(q, language, country, client)
+                    results = await self.fetch_suggestions_bing(sq_orig.query, language, country, client)
                     _record_results(sq_bi, results, 0)
 
-            await asyncio.gather(run_yandex(client), run_bing(client))
+            ya_tasks = []
+            bi_tasks = []
+
+            for sq in other_queries:
+                if sq.suffix_type not in ("B", "C", "D"):
+                    continue
+                ya_tasks.append(fetch_ya(sq, sq.suffix_type + "_ya", sq.suffix_label + "_ya"))
+                bi_tasks.append(fetch_bi(sq, sq.suffix_type + "_bi", sq.suffix_label + "_bi"))
+
+            for char in ALPHABET:
+                q = f"{seed} {char}"
+                sq_char = SuffixQuery(
+                    query=q, suffix_val=char,
+                    suffix_label=f"simple_{char}",
+                    suffix_type="E_simple", priority=1,
+                    markers=[], cp_override=-1,
+                )
+                ya_tasks.append(fetch_ya(sq_char, "E_simple_ya", f"simple_{char}_ya"))
+                bi_tasks.append(fetch_bi(sq_char, "E_simple_bi", f"simple_{char}_bi"))
+
+            await asyncio.gather(*ya_tasks, *bi_tasks)
 
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
