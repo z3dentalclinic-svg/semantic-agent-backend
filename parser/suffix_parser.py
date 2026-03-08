@@ -206,7 +206,8 @@ class SuffixParser:
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
                     parallel_limit: int = 5, include_numbers: bool = False,
                     echelon: int = 0, google_client: str = "firefox",
-                    cursor_position: int = None) -> SuffixParseResult:
+                    cursor_position: int = None,
+                    include_letters: bool = False) -> SuffixParseResult:
         """
         Main parse method.
         
@@ -221,7 +222,7 @@ class SuffixParser:
         total_start = time.time()
 
         # Step 1: Generate queries
-        analysis, all_queries = self.generator.generate(seed, include_numbers=include_numbers)
+        analysis, all_queries = self.generator.generate(seed, include_numbers=include_numbers, include_letters=include_letters)
         analysis_summary = self.generator.summary(analysis, all_queries)
 
         # Step 2: Filter by echelon
@@ -298,7 +299,7 @@ class SuffixParser:
 
         # Summary by suffix type
         summary_by_type = {}
-        for stype in ["A", "B", "C", "D"]:
+        for stype in ["A", "B", "C", "D", "E"]:
             type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
             summary_by_type[stype] = {
                 "queries_sent": len(type_entries),
