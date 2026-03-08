@@ -343,21 +343,17 @@ class SuffixParser:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
                 await fetch_one_tracked(sq, client)
 
-        LETTER_BATCH_SIZE = 5  # параллельных структур внутри буквы
-
-        # Step 5b: E chrome — батчи по 5 структур параллельно, все буквы параллельно
+        # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
         async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
-            for i in range(0, len(letter_queries), LETTER_BATCH_SIZE):
-                batch = letter_queries[i:i + LETTER_BATCH_SIZE]
-                await asyncio.gather(*[fetch_one_tracked(sq, client) for sq in batch])
+            for sq in letter_queries:
                 await asyncio.sleep(0.2)
+                await fetch_one_tracked(sq, client)
 
         # Step 5c: E firefox — то же самое под firefox
         async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
-            for i in range(0, len(letter_queries), LETTER_BATCH_SIZE):
-                batch = letter_queries[i:i + LETTER_BATCH_SIZE]
-                await asyncio.gather(*[fetch_one_firefox(sq, client) for sq in batch])
+            for sq in letter_queries:
                 await asyncio.sleep(0.2)
+                await fetch_one_firefox(sq, client)
 
         async with httpx.AsyncClient() as client:
             # A/B/C/D — с cp, текущий агент
