@@ -467,34 +467,14 @@ class SuffixGenerator:
                     ))
                     continue
 
-                # Type A: expand into 4 cp variants for testing
-                if stype == "A":
-                    results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers))
-                    continue
-
-                query_str = f"{seed_lower} {suffix_val}".strip()
-
-                results.append(SuffixQuery(
-                    query=query_str,
-                    suffix_val=suffix_val,
-                    suffix_label=suffix_label,
-                    suffix_type=stype,
-                    priority=priority,
-                    markers=[m for m in active_markers],
-                ))
+                # All types: expand into 4 cp variants for full testing
+                # After tracer analysis — keep best variant per suffix, drop rest
+                results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers))
 
         # Numeric suffixes (always priority 1, part of type A)
         if include_numbers:
             for s in self.suffixes.get("A_num", []):
-                query_str = f"{seed_lower} {s['val']}".strip()
-                results.append(SuffixQuery(
-                    query=query_str,
-                    suffix_val=s["val"],
-                    suffix_label=s["label"],
-                    suffix_type="A",
-                    priority=1,
-                    markers=[m for m in active_markers],
-                ))
+                results.extend(expand_type_a(seed_lower, s["val"], s["label"], 1, active_markers))
 
         # Double-space suffix always gets +1 (but max 2)
         for r in results:
