@@ -1342,7 +1342,8 @@ def apply_smart_fix(result: dict, seed: str, language: str):
                 golden_seed = seed
         
         # Нормализация с golden base
-        norm_keywords = normalize_keywords(raw_keywords, language, golden_seed)
+        # norm_keywords = normalize_keywords(raw_keywords, language, golden_seed)  # ВРЕМЕННО ОТКЛЮЧЕНО
+        norm_keywords = raw_keywords
         
         # Убираем дубликаты (сохраняя порядок)
         result["keywords"] = list(dict.fromkeys(norm_keywords))
