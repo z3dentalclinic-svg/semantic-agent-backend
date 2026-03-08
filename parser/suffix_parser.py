@@ -204,6 +204,62 @@ class SuffixParser:
             pass
         return []
 
+    async def fetch_suggestions_yandex(self, query: str, language: str,
+                                        client: httpx.AsyncClient) -> List[str]:
+        """Yandex Suggest — suggest-ff.cgi endpoint."""
+        url = "https://suggest.yandex.ru/suggest-ff.cgi"
+        params = {
+            "part": query,
+            "uil": language,
+            "srv": "suggest_smart",
+            "yu": "1",
+        }
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        try:
+            response = await client.get(url, params=params, headers=headers, timeout=10.0)
+            if response.status_code == 429:
+                self.adaptive_delay.on_rate_limit()
+                return []
+            self.adaptive_delay.on_success()
+            if response.status_code == 200:
+                data = response.json()
+                # Яндекс возвращает [query, [suggestion1, suggestion2, ...]]
+                if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                    return [str(s) for s in data[1] if s]
+        except Exception:
+            pass
+        return []
+
+    async def fetch_suggestions_bing(self, query: str, language: str, country: str,
+                                      client: httpx.AsyncClient) -> List[str]:
+        """Bing Autosuggest — AS/Suggestions endpoint."""
+        url = "https://www.bing.com/AS/Suggestions"
+        params = {
+            "q": query,
+            "mkt": f"{language}-{country.upper()}",
+            "cvid": "0",
+            "qry": query,
+        }
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        try:
+            response = await client.get(url, params=params, headers=headers, timeout=10.0)
+            if response.status_code == 429:
+                self.adaptive_delay.on_rate_limit()
+                return []
+            self.adaptive_delay.on_success()
+            if response.status_code == 200:
+                data = response.json()
+                results = []
+                for group in data.get("AS", {}).get("Results", []):
+                    for item in group.get("Suggests", []):
+                        text = item.get("Txt", "")
+                        if text:
+                            results.append(text)
+                return results
+        except Exception:
+            pass
+        return []
+
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
                     parallel_limit: int = 5, include_numbers: bool = False,
                     echelon: int = 0, google_client: str = "firefox",
@@ -274,6 +330,22 @@ class SuffixParser:
                 status=f"blocked:{bq.blocked_by}",
             ))
 
+        # Допустимые одиночные буквы (предлоги/союзы)
+        _ALLOWED_SINGLE_LETTERS = {"в", "с", "к", "у", "о", "а", "и", "б"}
+        # Спецсимволы которые не должны встречаться как отдельные слова
+        _BAD_SYMBOLS = set("-*|~%\\!:^@#$&+=[]{}()<>/?'\"")
+
+        def _is_garbage_keyword(kw: str) -> bool:
+            """Возвращает True если ключ содержит мусорные токены."""
+            for word in kw.split():
+                # одиночный спецсимвол как отдельное слово
+                if len(word) == 1 and word in _BAD_SYMBOLS:
+                    return True
+                # одиночная буква не из допустимых
+                if len(word) == 1 and word.isalpha() and word.lower() not in _ALLOWED_SINGLE_LETTERS:
+                    return True
+            return False
+
         def _record_results(sq: "SuffixQuery", results: List[str], elapsed_ms: float):
             """Update shared state after fetch. Called from both code paths."""
             entry = SuffixTraceEntry(
@@ -297,6 +369,8 @@ class SuffixParser:
                 "priority": sq.priority,
             }
             for kw in results:
+                if _is_garbage_keyword(kw):
+                    continue
                 if kw not in all_keywords:
                     all_keywords[kw] = {
                         "sources": [],
@@ -403,6 +477,64 @@ class SuffixParser:
 
             await asyncio.gather(*tasks)
 
+            # ── Яндекс: B/C/D + алфавит ──────────────────────────────────
+            async def run_yandex(client: httpx.AsyncClient):
+                # B/C/D запросы
+                for sq in non_e_queries:
+                    if sq.suffix_type not in ("B", "C", "D"):
+                        continue
+                    await asyncio.sleep(0.2)
+                    results = await self.fetch_suggestions_yandex(sq.query, language, client)
+                    sq_ya = SuffixQuery(
+                        query=sq.query, suffix_val=sq.suffix_val,
+                        suffix_label=sq.suffix_label + "_ya",
+                        suffix_type=sq.suffix_type + "_ya",
+                        priority=sq.priority, markers=sq.markers, cp_override=-1,
+                    )
+                    _record_results(sq_ya, results, 0)
+                # алфавит
+                for char in ALPHABET:
+                    await asyncio.sleep(0.2)
+                    q = f"{seed} {char}"
+                    sq_ya = SuffixQuery(
+                        query=q, suffix_val=char,
+                        suffix_label=f"simple_{char}_ya",
+                        suffix_type="E_simple_ya",
+                        priority=1, markers=["e_simple_ya"], cp_override=-1,
+                    )
+                    results = await self.fetch_suggestions_yandex(q, language, client)
+                    _record_results(sq_ya, results, 0)
+
+            # ── Бинг: B/C/D + алфавит ────────────────────────────────────
+            async def run_bing(client: httpx.AsyncClient):
+                # B/C/D запросы
+                for sq in non_e_queries:
+                    if sq.suffix_type not in ("B", "C", "D"):
+                        continue
+                    await asyncio.sleep(0.2)
+                    results = await self.fetch_suggestions_bing(sq.query, language, country, client)
+                    sq_bi = SuffixQuery(
+                        query=sq.query, suffix_val=sq.suffix_val,
+                        suffix_label=sq.suffix_label + "_bi",
+                        suffix_type=sq.suffix_type + "_bi",
+                        priority=sq.priority, markers=sq.markers, cp_override=-1,
+                    )
+                    _record_results(sq_bi, results, 0)
+                # алфавит
+                for char in ALPHABET:
+                    await asyncio.sleep(0.2)
+                    q = f"{seed} {char}"
+                    sq_bi = SuffixQuery(
+                        query=q, suffix_val=char,
+                        suffix_label=f"simple_{char}_bi",
+                        suffix_type="E_simple_bi",
+                        priority=1, markers=["e_simple_bi"], cp_override=-1,
+                    )
+                    results = await self.fetch_suggestions_bing(q, language, country, client)
+                    _record_results(sq_bi, results, 0)
+
+            await asyncio.gather(run_yandex(client), run_bing(client))
+
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
             # Исключаем слова сида, делаем запрос сид + кандидат без cp
@@ -449,7 +581,9 @@ class SuffixParser:
 
         # Summary by suffix type
         summary_by_type = {}
-        for stype in ["A_ua", "A_ru", "B", "C", "D", "E", "E_ff", "E_simple", "P2"]:
+        for stype in ["A_ua", "A_ru", "B", "C", "D", "E", "E_ff", "E_simple",
+                      "B_ya", "C_ya", "D_ya", "E_simple_ya",
+                      "B_bi", "C_bi", "D_bi", "E_simple_bi", "P2"]:
             type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
             summary_by_type[stype] = {
                 "queries_sent": len(type_entries),
