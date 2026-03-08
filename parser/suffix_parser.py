@@ -254,45 +254,34 @@ class SuffixParser:
             async with semaphore:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
 
-                # Базовый текст суффикса без звёздочки и пробелов по краям
-                suffix_clean = sq.suffix_val.replace("*", "").strip()
+                # Type A: generator already expanded into 4 variants with cp_override
+                # Type B/C/D: single query, cp = len(query)
+                if sq.cp_override is not None:
+                    cp = sq.cp_override
+                elif cursor_position == -1:
+                    cp = -1
+                else:
+                    cp = None  # auto = len(query)
 
-                # 4 варианта запроса:
-                # v1: "сид суффикс*"  cp после *  (без пробела перед *)
-                # v2: "сид суффикс*"  cp перед *  (без пробела перед *)
-                # v3: "сид суффикс *" cp перед *  (пробел перед *, курсор до *)
-                # v4: "сид суффикс *" cp после *  (пробел перед *, курсор после *)
-                seed_lower = seed.lower().strip()
-                base_nospace = f"{seed_lower} {suffix_clean}*" if suffix_clean else f"{seed_lower}*"
-                base_space   = f"{seed_lower} {suffix_clean} *" if suffix_clean else f"{seed_lower} *"
+                t0 = time.time()
+                results = await self.fetch_suggestions(sq.query, country, language, client, google_client, cp)
+                elapsed = (time.time() - t0) * 1000
 
-                variants = [
-                    (sq.suffix_label + "_v1", base_nospace, len(base_nospace)),
-                    (sq.suffix_label + "_v2", base_nospace, len(base_nospace) - 1),
-                    (sq.suffix_label + "_v3", base_space,   len(base_space) - 1),
-                    (sq.suffix_label + "_v4", base_space,   len(base_space)),
-                ]
+                entry = SuffixTraceEntry(
+                    suffix_val=sq.suffix_val,
+                    suffix_label=sq.suffix_label,
+                    suffix_type=sq.suffix_type,
+                    priority=sq.priority,
+                    query_sent=sq.query,
+                    results_count=len(results),
+                    results=results,
+                    time_ms=round(elapsed, 1),
+                    status="ok" if results else "empty",
+                )
+                trace_entries.append(entry)
 
-                for vlabel, vquery, vcp in variants:
-                    t0 = time.time()
-                    results = await self.fetch_suggestions(vquery, country, language, client, google_client, vcp)
-                    elapsed = (time.time() - t0) * 1000
-
-                    entry = SuffixTraceEntry(
-                        suffix_val=sq.suffix_val,
-                        suffix_label=vlabel,
-                        suffix_type=sq.suffix_type,
-                        priority=sq.priority,
-                        query_sent=vquery,
-                        results_count=len(results),
-                        results=results,
-                        time_ms=round(elapsed, 1),
-                        status="ok" if results else "empty",
-                    )
-                    trace_entries.append(entry)
-
-                    if results:
-                        all_keywords.update(results)
+                if results:
+                    all_keywords.update(results)
 
         async with httpx.AsyncClient() as client:
             tasks = [fetch_one(sq, client) for sq in queries_to_send]
