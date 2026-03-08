@@ -31,10 +31,55 @@ from dataclasses import dataclass, field
 # ══════════════════════════════════════════════
 
 SUFFIXES_RU = {
-    # Type A: Depth / Wildcard — always useful
+    # Type A: Symbols & Wildcards — full map for testing
+    # 4 variants per symbol via fetch_one (v1/v2/v3/v4)
+    # After tracer analysis — remove non-performers
     "A": [
-        {"val": "*", "label": "wildcard"},
-        {"val": " *", "label": "double_space"},  # deep trigger
+        # ── Wildcards ──
+        {"val": "*",       "label": "wildcard"},          # P1
+        {"val": " *",      "label": "double_space"},      # P2
+        {"val": "  *",     "label": "triple_space"},      # P2
+        {"val": "* *",     "label": "double_wildcard"},   # P2
+        {"val": "* * *",   "label": "triple_wildcard"},   # P2
+        {"val": "* * * *", "label": "quad_space"},        # P3
+        {"val": "**",      "label": "double_asterisk"},   # P2
+        {"val": "***",     "label": "triple_asterisk"},   # P2
+
+        # ── Пунктуация P1 (реально встречается в подсказках) ──
+        {"val": "-",  "label": "hyphen"},        # модели, диапазоны
+        {"val": ".",  "label": "dot"},           # домены, версии, файлы
+        {"val": "/",  "label": "slash"},         # категории, размеры
+
+        # ── Пунктуация P2 ──
+        {"val": ":",  "label": "colon"},
+        {"val": "_",  "label": "underscore"},
+        {"val": ",",  "label": "comma"},
+        {"val": "?",  "label": "question_mark"},
+        {"val": "'",  "label": "apostrophe"},
+        {"val": "(",  "label": "lparen"},
+        {"val": ")",  "label": "rparen"},
+        {"val": "+",  "label": "plus"},
+        {"val": "@",  "label": "at"},
+        {"val": "%",  "label": "percent"},
+        {"val": "$",  "label": "dollar"},
+
+        # ── Пунктуация P3 (экспериментальные) ──
+        {"val": '"',  "label": "quote"},
+        {"val": "&",  "label": "ampersand"},
+        {"val": "!",  "label": "exclamation"},
+        {"val": "#",  "label": "hash"},
+        {"val": "=",  "label": "equal"},
+        {"val": "~",  "label": "tilde"},
+        {"val": "|",  "label": "pipe"},
+        {"val": "\\", "label": "backslash"},
+        {"val": ";",  "label": "semicolon"},
+        {"val": "[",  "label": "lbracket"},
+        {"val": "]",  "label": "rbracket"},
+        {"val": "{",  "label": "lbrace"},
+        {"val": "}",  "label": "rbrace"},
+        {"val": "<",  "label": "less"},
+        {"val": ">",  "label": "greater"},
+        {"val": "^",  "label": "caret"},
     ],
 
     # Type B: Prepositions — contextual
