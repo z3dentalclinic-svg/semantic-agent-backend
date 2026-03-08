@@ -502,7 +502,7 @@ class SuffixGenerator:
           col_B, col_Lwc, col_wcL, hyp_B, Lwc_cpEnd, wcB_cpEnd, wcB_cpStar
 
         Kept (14):
-          plain, trail, wcB_trail, Lwc_trail, sandwich, wcB_cpMid,
+          plain, trail, sandwich, wcB_cpMid,
           Lwc_cpAL, Lwc_cpBL, col_B_trail, L_col, hyp_B_trail, hyp_Lwc, hyp_wcL, L_hyp
         """
         s = seed_lower
@@ -536,13 +536,8 @@ class SuffixGenerator:
         out.append(sq(q, len(q), "trail"))
 
         # ── D2: буква + wildcard ─────────────────────────────────────────
-        # 3. сид * а  (+ trailing space)  [wcB_cpEnd убран — 0 unique]
-        q = f"{s} * {L} "
-        out.append(sq(q, len(q), "wcB_trail"))
-
-        # 4. сид а *  (+ trailing space)  [Lwc_cpEnd убран — 0 unique]
-        q = f"{s} {L} * "
-        out.append(sq(q, len(q), "Lwc_trail"))
+        # УДАЛЕНО: wcB_trail (сид * а ) — 92-94% мусор на 3 датасетах
+        # УДАЛЕНО: Lwc_trail (сид а * ) — 92-93% мусор на 3 датасетах
 
         # 5. сид * а *  (sandwich, cp = конец)
         q = f"{s} * {L} *"
