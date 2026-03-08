@@ -480,9 +480,7 @@ class SuffixParser:
             # E_simple — точная копия старого алфавитного свипа (параллельно с остальными)
             tasks.append(run_e_simple(client))
 
-            await asyncio.gather(*tasks)
-
-            # ── Яндекс + Бинг: параллельно через semaphore ───────────────
+            # Яндекс + Бинг — параллельно с Google
             ya_sem = asyncio.Semaphore(5)
             bi_sem = asyncio.Semaphore(5)
 
@@ -508,14 +506,11 @@ class SuffixParser:
                     results = await self.fetch_suggestions_bing(sq_orig.query, language, country, client)
                     _record_results(sq_bi, results, 0)
 
-            ya_tasks = []
-            bi_tasks = []
-
             for sq in other_queries:
                 if sq.suffix_type not in ("B", "C", "D"):
                     continue
-                ya_tasks.append(fetch_ya(sq, sq.suffix_type + "_ya", sq.suffix_label + "_ya"))
-                bi_tasks.append(fetch_bi(sq, sq.suffix_type + "_bi", sq.suffix_label + "_bi"))
+                tasks.append(fetch_ya(sq, sq.suffix_type + "_ya", sq.suffix_label + "_ya"))
+                tasks.append(fetch_bi(sq, sq.suffix_type + "_bi", sq.suffix_label + "_bi"))
 
             for char in ALPHABET:
                 q = f"{seed} {char}"
@@ -525,11 +520,10 @@ class SuffixParser:
                     suffix_type="E_simple", priority=1,
                     markers=[], cp_override=-1,
                 )
-                ya_tasks.append(fetch_ya(sq_char, "E_simple_ya", f"simple_{char}_ya"))
-                bi_tasks.append(fetch_bi(sq_char, "E_simple_bi", f"simple_{char}_bi"))
+                tasks.append(fetch_ya(sq_char, "E_simple_ya", f"simple_{char}_ya"))
+                tasks.append(fetch_bi(sq_char, "E_simple_bi", f"simple_{char}_bi"))
 
-            await asyncio.gather(*ya_tasks, *bi_tasks)
-
+            await asyncio.gather(*tasks)
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
             # Исключаем слова сида, делаем запрос сид + кандидат без cp
