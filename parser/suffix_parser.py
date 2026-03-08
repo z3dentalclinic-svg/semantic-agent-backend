@@ -335,13 +335,43 @@ class SuffixParser:
                 await asyncio.sleep(self.adaptive_delay.get_delay())
                 await fetch_one_tracked(sq, client)
 
+        async def fetch_one_nocp(sq, client: httpx.AsyncClient):
+            """Second pass: same query but without cp — mimics old fetch_suggestions behavior."""
+            # Build a clone with _nocp label and cp=-1
+            from dataclasses import replace as dc_replace
+            sq_nocp = dc_replace(
+                sq,
+                suffix_label=sq.suffix_label + "_nocp",
+                suffix_type=sq.suffix_type + "_nocp",
+                cp_override=-1,
+            )
+            t0 = time.time()
+            results = await self.fetch_suggestions(sq.query, country, language, client, google_client, -1)
+            elapsed = (time.time() - t0) * 1000
+            _record_results(sq_nocp, results, elapsed)
+
+        async def fetch_with_semaphore_nocp(sq, client):
+            async with semaphore:
+                await asyncio.sleep(self.adaptive_delay.get_delay())
+                await fetch_one_nocp(sq, client)
+
+        async def run_letter_nocp(letter_queries: List, client: httpx.AsyncClient):
+            for sq in letter_queries:
+                await asyncio.sleep(self.adaptive_delay.get_delay())
+                await fetch_one_nocp(sq, client)
+
         async with httpx.AsyncClient() as client:
-            # Build task list
+            # Прогон 1 — с cp (текущая логика)
             tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
-            # All letters in parallel (each letter sequential internally)
             for letter, letter_qs in e_queries_by_letter.items():
                 tasks.append(run_letter(letter_qs, client))
             await asyncio.gather(*tasks)
+
+            # Прогон 2 — без cp (nocp), те же запросы
+            tasks_nocp = [fetch_with_semaphore_nocp(sq, client) for sq in other_queries]
+            for letter, letter_qs in e_queries_by_letter.items():
+                tasks_nocp.append(run_letter_nocp(letter_qs, client))
+            await asyncio.gather(*tasks_nocp)
 
         total_time = (time.time() - total_start) * 1000
 
@@ -352,7 +382,8 @@ class SuffixParser:
 
         # Summary by suffix type
         summary_by_type = {}
-        for stype in ["A_ua", "A_ru", "B", "C", "D", "E"]:
+        for stype in ["A_ua", "A_ru", "B", "C", "D", "E",
+                      "A_ua_nocp", "A_ru_nocp", "B_nocp", "C_nocp", "D_nocp", "E_nocp"]:
             type_entries = [t for t in trace_entries if t.suffix_type == stype and not t.status.startswith("blocked")]
             summary_by_type[stype] = {
                 "queries_sent": len(type_entries),
