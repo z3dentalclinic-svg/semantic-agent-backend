@@ -603,8 +603,9 @@ class SuffixParser:
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_cand, results, elapsed)
 
-            if candidates:
-                await asyncio.gather(*[fetch_candidate(c) for c in candidates])
+            # P2 временно отключён для замера времени
+            # if candidates:
+            #     await asyncio.gather(*[fetch_candidate(c) for c in candidates])
 
         total_time = (time.time() - total_start) * 1000
 
