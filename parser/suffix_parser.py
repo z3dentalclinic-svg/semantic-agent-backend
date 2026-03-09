@@ -576,7 +576,7 @@ class SuffixParser:
                         cp_override=-1,
                     )
                     t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, client, google_client, -1)
+                    results = await self.fetch_suggestions(q, country, language, google_client, google_client, -1)
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_cand, results, elapsed)
 
