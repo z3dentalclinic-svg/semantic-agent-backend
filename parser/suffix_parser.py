@@ -423,7 +423,7 @@ class SuffixParser:
 
         async def run_e_simple(client: httpx.AsyncClient):
             for char in ALPHABET:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
                 q = f"{seed} {char}"
                 sq_simple = SuffixQuery(
                     query=q,
@@ -459,13 +459,13 @@ class SuffixParser:
         # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
         async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
                 await fetch_one_tracked(sq, client)
 
         # Step 5c: E firefox — то же самое под firefox
         async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
                 await fetch_one_firefox(sq, client)
 
         async def run_google(client: httpx.AsyncClient):
@@ -562,9 +562,11 @@ class SuffixParser:
 
             candidates = sorted(w for w, cnt in word_counter.items() if cnt >= 2)
 
+            p2_semaphore = asyncio.Semaphore(10)
+
             async def fetch_candidate(cand: str):
-                async with semaphore:
-                    await asyncio.sleep(0.2)
+                async with p2_semaphore:
+                    await asyncio.sleep(0.1)
                     q = f"{seed.lower()} {cand}"
                     sq_cand = SuffixQuery(
                         query=q,
