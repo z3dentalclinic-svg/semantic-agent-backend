@@ -468,24 +468,16 @@ class SuffixParser:
                 await asyncio.sleep(0.2)
                 await fetch_one_firefox(sq, client)
 
-        async with httpx.AsyncClient() as client:
-            # A/B/C/D — с cp, текущий агент
+        async def run_google(client: httpx.AsyncClient):
             tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
-
-            # E chrome + E firefox — все буквы параллельно, оба агента одновременно
             for letter, letter_qs in e_queries_by_letter.items():
                 tasks.append(run_letter_chrome(letter_qs, client))
                 tasks.append(run_letter_firefox(letter_qs, client))
-
-            # E_simple — точная копия старого алфавитного свипа (параллельно с остальными)
             tasks.append(run_e_simple(client))
-
-            # Google — основной gather
             await asyncio.gather(*tasks)
 
-            # Яндекс + Бинг — после Google, параллельно между собой
+        async def run_yandex(client: httpx.AsyncClient):
             ya_sem = asyncio.Semaphore(5)
-            bi_sem = asyncio.Semaphore(5)
 
             async def fetch_ya(sq_orig, suffix_type, suffix_label):
                 async with ya_sem:
@@ -498,6 +490,27 @@ class SuffixParser:
                     results = await self.fetch_suggestions_yandex(sq_orig.query, language, client)
                     _record_results(sq_ya, results, 0)
 
+            ya_tasks = []
+            for sq in other_queries:
+                if sq.suffix_type not in ("B", "C", "D"):
+                    continue
+                ya_tasks.append(fetch_ya(sq, sq.suffix_type + "_ya", sq.suffix_label + "_ya"))
+
+            for char in ALPHABET:
+                q = f"{seed} {char}"
+                sq_char = SuffixQuery(
+                    query=q, suffix_val=char,
+                    suffix_label=f"simple_{char}",
+                    suffix_type="E_simple", priority=1,
+                    markers=[], cp_override=-1,
+                )
+                ya_tasks.append(fetch_ya(sq_char, "E_simple_ya", f"simple_{char}_ya"))
+
+            await asyncio.gather(*ya_tasks)
+
+        async def run_bing(client: httpx.AsyncClient):
+            bi_sem = asyncio.Semaphore(5)
+
             async def fetch_bi(sq_orig, suffix_type, suffix_label):
                 async with bi_sem:
                     await asyncio.sleep(0.1)
@@ -509,12 +522,11 @@ class SuffixParser:
                     results = await self.fetch_suggestions_bing(sq_orig.query, language, country, client)
                     _record_results(sq_bi, results, 0)
 
-            ya_bi_tasks = []
+            bi_tasks = []
             for sq in other_queries:
                 if sq.suffix_type not in ("B", "C", "D"):
                     continue
-                ya_bi_tasks.append(fetch_ya(sq, sq.suffix_type + "_ya", sq.suffix_label + "_ya"))
-                ya_bi_tasks.append(fetch_bi(sq, sq.suffix_type + "_bi", sq.suffix_label + "_bi"))
+                bi_tasks.append(fetch_bi(sq, sq.suffix_type + "_bi", sq.suffix_label + "_bi"))
 
             for char in ALPHABET:
                 q = f"{seed} {char}"
@@ -524,10 +536,16 @@ class SuffixParser:
                     suffix_type="E_simple", priority=1,
                     markers=[], cp_override=-1,
                 )
-                ya_bi_tasks.append(fetch_ya(sq_char, "E_simple_ya", f"simple_{char}_ya"))
-                ya_bi_tasks.append(fetch_bi(sq_char, "E_simple_bi", f"simple_{char}_bi"))
+                bi_tasks.append(fetch_bi(sq_char, "E_simple_bi", f"simple_{char}_bi"))
 
-            await asyncio.gather(*ya_bi_tasks)
+            await asyncio.gather(*bi_tasks)
+
+        async with httpx.AsyncClient() as google_client,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
+            await asyncio.gather(
+                run_google(google_client),
+                run_yandex(ya_client),
+                run_bing(bi_client),
+            )
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
             # Исключаем слова сида, делаем запрос сид + кандидат без cp
