@@ -10,13 +10,17 @@ from fastapi import FastAPI, Query
 from parser.suffix_parser import SuffixParser
 from dataclasses import asdict
 
+try:
+    from main import GEO_DB as _GEO_DB
+except ImportError:
+    _GEO_DB = {}
 
 _suffix_parser = None
 
 def get_suffix_parser():
     global _suffix_parser
     if _suffix_parser is None:
-        _suffix_parser = SuffixParser(lang="ru")
+        _suffix_parser = SuffixParser(lang="ru", geo_db=_GEO_DB)
     return _suffix_parser
 
 
