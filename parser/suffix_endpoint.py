@@ -10,17 +10,24 @@ from fastapi import FastAPI, Query
 from parser.suffix_parser import SuffixParser
 from dataclasses import asdict
 
-try:
-    from main import GEO_DB as _GEO_DB
-except ImportError:
-    _GEO_DB = {}
 
 _suffix_parser = None
+
+def _get_geo_db() -> dict:
+    """Ленивый импорт GEO_DB из main — вызывается при первом запросе."""
+    try:
+        import sys
+        main_module = sys.modules.get("main") or sys.modules.get("__main__")
+        if main_module and hasattr(main_module, "GEO_DB"):
+            return main_module.GEO_DB
+    except Exception:
+        pass
+    return {}
 
 def get_suffix_parser():
     global _suffix_parser
     if _suffix_parser is None:
-        _suffix_parser = SuffixParser(lang="ru", geo_db=_GEO_DB)
+        _suffix_parser = SuffixParser(lang="ru", geo_db=_get_geo_db())
     return _suffix_parser
 
 
