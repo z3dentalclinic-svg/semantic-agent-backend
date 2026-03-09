@@ -561,9 +561,26 @@ class SuffixParser:
                         if _re.match(r'^[а-яёіїєґ]+$', word):
                             word_counter[word] += 1
 
+            # Лемматизация для проверки гео (москве→москва, краснодаре→краснодар)
+            try:
+                import sys
+                main_mod = sys.modules.get("main") or sys.modules.get("__main__")
+                _morph = getattr(getattr(main_mod, "_keyword_filter", None), "morph_ru", None) if main_mod else None
+            except Exception:
+                _morph = None
+
+            def _is_geo(word: str) -> bool:
+                if word in self.geo_db:
+                    return True
+                if _morph:
+                    lemma = _morph.parse(word)[0].normal_form
+                    if lemma in self.geo_db:
+                        return True
+                return False
+
             candidates = sorted(
                 w for w, cnt in word_counter.items()
-                if cnt >= 2 and w not in self.geo_db
+                if cnt >= 2 and not _is_geo(w)
             )
 
             p2_semaphore = asyncio.Semaphore(10)
