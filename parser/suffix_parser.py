@@ -453,7 +453,7 @@ class SuffixParser:
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
-                await asyncio.sleep(self.adaptive_delay.get_delay())
+                await asyncio.sleep(0.1)
                 await fetch_one_tracked(sq, client)
 
         # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
@@ -540,9 +540,9 @@ class SuffixParser:
 
             await asyncio.gather(*bi_tasks)
 
-        async with httpx.AsyncClient() as google_client,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
+        async with httpx.AsyncClient() as g_http,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
             await asyncio.gather(
-                run_google(google_client),
+                run_google(g_http),
                 run_yandex(ya_client),
                 run_bing(bi_client),
             )
@@ -576,7 +576,7 @@ class SuffixParser:
                         cp_override=-1,
                     )
                     t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, google_client, google_client, -1)
+                    results = await self.fetch_suggestions(q, country, language, g_http, google_client, -1)
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_cand, results, elapsed)
 
