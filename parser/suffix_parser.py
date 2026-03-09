@@ -83,9 +83,10 @@ class SuffixParser:
     Orchestrates suffix generation + autocomplete fetching + tracing.
     """
 
-    def __init__(self, lang: str = "ru"):
+    def __init__(self, lang: str = "ru", geo_db: dict = None):
         self.generator = SuffixGenerator(lang=lang)
         self.adaptive_delay = AdaptiveDelay()
+        self.geo_db: dict = geo_db or {}
 
     def _clean_suggestion(self, text: str) -> str:
         """Strip HTML tags (<b>, </b> etc) from autocomplete suggestions."""
@@ -560,7 +561,10 @@ class SuffixParser:
                         if _re.match(r'^[а-яёіїєґ]+$', word):
                             word_counter[word] += 1
 
-            candidates = sorted(w for w, cnt in word_counter.items() if cnt >= 2)
+            candidates = sorted(
+                w for w, cnt in word_counter.items()
+                if cnt >= 2 and w not in self.geo_db
+            )
 
             p2_semaphore = asyncio.Semaphore(10)
 
