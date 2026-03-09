@@ -565,7 +565,7 @@ class SuffixParser:
             try:
                 import sys
                 main_mod = sys.modules.get("main") or sys.modules.get("__main__")
-                _morph = getattr(getattr(main_mod, "_keyword_filter", None), "morph_ru", None) if main_mod else None
+                _morph = getattr(getattr(main_mod, "parser", None), "morph_ru", None) if main_mod else None
             except Exception:
                 _morph = None
 
