@@ -15,11 +15,6 @@ Architecture:
 from fastapi import FastAPI, Query
 from typing import Optional
 
-try:
-    from main import GEO_DB as _GEO_DB
-except ImportError:
-    _GEO_DB = {}
-
 _prefix_parser = None
 
 
