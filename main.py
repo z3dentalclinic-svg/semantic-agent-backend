@@ -32,6 +32,7 @@ from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_
 from utils.normalizer import normalize_keywords
 from utils.tracer import FilterTracer
 from parser.suffix_endpoint import register_suffix_endpoint  # ← Suffix Map парсер v1.0
+from parser.prefix_endpoint import register_prefix_endpoint  # ← Prefix Map парсер v1.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +82,9 @@ async def preflight_handler():
 
 # ═══ SUFFIX MAP PARSER v1.0 ═══
 register_suffix_endpoint(app)
+
+# ═══ PREFIX MAP PARSER v1.0 ═══
+register_prefix_endpoint(app)
 
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
