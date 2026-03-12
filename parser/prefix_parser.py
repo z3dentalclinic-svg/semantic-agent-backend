@@ -42,7 +42,10 @@ import argparse
 from typing import Set, List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
-from prefix_generator import PrefixGenerator, PrefixQuery, ALL_GROUPS
+try:
+    from parser.prefix_generator import PrefixGenerator, PrefixQuery, ALL_GROUPS
+except ImportError:
+    from prefix_generator import PrefixGenerator, PrefixQuery, ALL_GROUPS
 
 
 logger = logging.getLogger(__name__)
