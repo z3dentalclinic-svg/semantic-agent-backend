@@ -458,15 +458,24 @@ class SuffixParser:
                 await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
 
+        # Структуры с 97-100% дублями на 5 сидах — убраны из Chrome E (6 шт)
+        # hyp_wcL нестабилен в E_ff (66-84% уникальных) — оставляем в Firefox
+        CHROME_E_SKIP = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain", "hyp_wcL"}
+        FF_E_SKIP     = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain"}
+
         # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
         async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
+                if sq.variant in CHROME_E_SKIP:
+                    continue
                 await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
 
         # Step 5c: E firefox — то же самое под firefox
         async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
+                if sq.variant in FF_E_SKIP:
+                    continue
                 await asyncio.sleep(0.3)
                 await fetch_one_firefox(sq, client)
 
@@ -511,6 +520,8 @@ class SuffixParser:
             await asyncio.gather(*ya_tasks)
 
         async def run_bing(client: httpx.AsyncClient):
+            if language == "ru":
+                return  # Bing returns 0 results for Russian queries on all tested seeds
             bi_sem = asyncio.Semaphore(5)
 
             async def fetch_bi(sq_orig, suffix_type, suffix_label):
