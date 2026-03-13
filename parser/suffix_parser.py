@@ -424,34 +424,39 @@ class SuffixParser:
         ALPHABET = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
 
         async def run_e_simple(client: httpx.AsyncClient):
-            for char in ALPHABET:
-                await asyncio.sleep(0.3)
-                q = f"{seed} {char}"
-                sq_simple = SuffixQuery(
-                    query=q,
-                    suffix_val=char,
-                    suffix_label=f"simple_{char}",
-                    suffix_type="E_simple",
-                    priority=1,
-                    markers=["e_simple"],
-                    cp_override=-1,
-                )
-                t0 = time.time()
-                # E_simple: точная копия старого парсера — firefox, без cp, без ie/oe
-                url = "https://www.google.com/complete/search"
-                params = {"q": q, "client": "firefox", "hl": language, "gl": country}
-                headers = {"User-Agent": random.choice(USER_AGENTS)}
-                try:
-                    resp = await client.get(url, params=params, headers=headers, timeout=10.0)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        results = data[1] if len(data) > 1 else []
-                    else:
+            e_simple_sem = asyncio.Semaphore(5)
+
+            async def fetch_simple_char(char: str):
+                async with e_simple_sem:
+                    await asyncio.sleep(0.3)
+                    q = f"{seed} {char}"
+                    sq_simple = SuffixQuery(
+                        query=q,
+                        suffix_val=char,
+                        suffix_label=f"simple_{char}",
+                        suffix_type="E_simple",
+                        priority=1,
+                        markers=["e_simple"],
+                        cp_override=-1,
+                    )
+                    t0 = time.time()
+                    # E_simple: точная копия старого парсера — firefox, без cp, без ie/oe
+                    url = "https://www.google.com/complete/search"
+                    params = {"q": q, "client": "firefox", "hl": language, "gl": country}
+                    headers = {"User-Agent": random.choice(USER_AGENTS)}
+                    try:
+                        resp = await client.get(url, params=params, headers=headers, timeout=10.0)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            results = data[1] if len(data) > 1 else []
+                        else:
+                            results = []
+                    except Exception:
                         results = []
-                except Exception:
-                    results = []
-                elapsed = (time.time() - t0) * 1000
-                _record_results(sq_simple, results, elapsed)
+                    elapsed = (time.time() - t0) * 1000
+                    _record_results(sq_simple, results, elapsed)
+
+            await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET])
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
@@ -557,7 +562,7 @@ class SuffixParser:
         async with httpx.AsyncClient(proxy=_google_proxy) as g_http,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
             await asyncio.gather(
                 run_google(g_http),
-                run_yandex(ya_client),
+                # run_yandex(ya_client),  # временно отключён для сравнения с Keyword Tool
                 run_bing(bi_client),
             )
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
