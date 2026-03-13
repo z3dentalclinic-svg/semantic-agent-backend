@@ -15,6 +15,7 @@ import random
 import json
 import re
 import logging
+import os
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -424,7 +425,7 @@ class SuffixParser:
 
         async def run_e_simple(client: httpx.AsyncClient):
             for char in ALPHABET:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 q = f"{seed} {char}"
                 sq_simple = SuffixQuery(
                     query=q,
@@ -454,19 +455,19 @@ class SuffixParser:
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
 
         # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
         async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
 
         # Step 5c: E firefox — то же самое под firefox
         async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 await fetch_one_firefox(sq, client)
 
         async def run_google(client: httpx.AsyncClient):
@@ -541,7 +542,8 @@ class SuffixParser:
 
             await asyncio.gather(*bi_tasks)
 
-        async with httpx.AsyncClient() as g_http,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
+        _google_proxy = os.getenv("GOOGLE_PROXY_URL") or None
+        async with httpx.AsyncClient(proxy=_google_proxy) as g_http,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
             await asyncio.gather(
                 run_google(g_http),
                 run_yandex(ya_client),
