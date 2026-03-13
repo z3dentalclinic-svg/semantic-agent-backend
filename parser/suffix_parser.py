@@ -263,7 +263,7 @@ class SuffixParser:
         return []
 
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
-                    parallel_limit: int = 15, include_numbers: bool = False,
+                    parallel_limit: int = 10, include_numbers: bool = False,
                     echelon: int = 0, google_client: str = "firefox",
                     cursor_position: int = None,
                     include_letters: bool = False) -> SuffixParseResult:
