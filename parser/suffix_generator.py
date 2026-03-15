@@ -477,6 +477,28 @@ class SuffixGenerator:
                 # After tracer analysis — keep best variant per suffix, drop rest
                 results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype))
 
+                # Type B trailing space variant — "сид в " (без wildcard)
+                # Даёт кластер гео-расширений (районы, локации) которые "в *" не вытаскивает.
+                # Пример: "курсы английского киев в " → "в центре", "в оболони", "на троещине"
+                # Только для предлогов "в" и "на" — остальные предлоги не дают гео-кластер.
+                # Блокируем если последнее слово сида — T-маркер (цена, стоимость...):
+                # "ремонт телефонов цена в " — Google игнорирует, бессмысленный запрос.
+                last_word_is_t = analysis.words[-1] in T_ROOTS_RU if analysis.words else False
+                if stype == "B" and suffix_val in ("в *", "на *") and not last_word_is_t:
+                    prep = suffix_val.replace(" *", "")  # "в" или "на"
+                    trail_q = f"{seed_lower} {prep} "
+                    trail_cp = len(trail_q)
+                    results.append(SuffixQuery(
+                        query=trail_q,
+                        suffix_val=prep,
+                        suffix_label=f"prep_{prep}_trail",
+                        suffix_type="B",
+                        priority=priority,
+                        markers=list(active_markers),
+                        cp_override=trail_cp,
+                        variant="trail",
+                    ))
+
         # Numeric suffixes (always priority 1, part of type A)
         if include_numbers:
             for s in self.suffixes.get("A_num", []):
