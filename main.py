@@ -33,6 +33,7 @@ from utils.normalizer import normalize_keywords
 from utils.tracer import FilterTracer
 from parser.suffix_endpoint import register_suffix_endpoint  # ← Suffix Map парсер v1.0
 from parser.prefix_endpoint import register_prefix_endpoint  # ← Prefix Map парсер v1.0
+from parser.infix_endpoint import register_infix_endpoint    # ← Infix Map парсер v2.6
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +86,9 @@ register_suffix_endpoint(app)
 
 # ═══ PREFIX MAP PARSER v1.0 ═══
 register_prefix_endpoint(app)
+
+# ═══ INFIX MAP PARSER v2.6 ═══
+register_infix_endpoint(app)
 
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
@@ -1363,6 +1367,11 @@ def apply_smart_fix(result: dict, seed: str, language: str):
 async def root():
     """Главная страница"""
     return FileResponse('static/index.html')
+
+@app.get("/infix")
+async def infix_ui():
+    """Infix Map UI"""
+    return FileResponse('static/infix_only.html')
 
 
 def _build_l2_config(pmi_valid=None, centroid_valid=None, centroid_trash=None):
