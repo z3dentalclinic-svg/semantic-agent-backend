@@ -115,6 +115,27 @@ class PrefixParseResult:
 
 
 # ══════════════════════════════════════════════
+# ФИЛЬТР МУСОРА
+# ══════════════════════════════════════════════
+
+# Предлоги и союзы — одиночные буквы из этого списка НЕ мусор
+_PREP_UNION = {"в","во","на","с","со","к","ко","о","у","и","а","б","я"}
+
+def _is_garbage_keyword(kw: str) -> bool:
+    """
+    Возвращает True если ключ — мусор:
+    1. Содержит спецсимволы запроса (* : & | \\)
+    2. Содержит одиночную букву которая не предлог/союз
+    """
+    if re.search(r'[*:|&\\]', kw):
+        return True
+    for w in kw.lower().split():
+        if len(w) == 1 and w not in _PREP_UNION:
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════
 # PARSER
 # ══════════════════════════════════════════════
 
@@ -302,6 +323,8 @@ class PrefixParser:
                         cursor_position=pq.cp,
                     )
                     elapsed = (time.time() - t0) * 1000
+                    # Фильтр мусора — убираем спецсимволы и нераскрытые буквы
+                    results = [kw for kw in results if not _is_garbage_keyword(kw)]
                     status = "ok" if results else "empty"
                     entry = PrefixTraceEntry(
                         group=pq.group, struct=pq.struct,
