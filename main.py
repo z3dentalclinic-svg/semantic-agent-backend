@@ -34,6 +34,7 @@ from utils.tracer import FilterTracer
 from parser.suffix_endpoint import register_suffix_endpoint  # ← Suffix Map парсер v1.0
 from parser.prefix_endpoint import register_prefix_endpoint  # ← Prefix Map парсер v1.0
 from parser.infix_endpoint import register_infix_endpoint    # ← Infix Map парсер v2.6
+from parser.morph_endpoint import register_morph_endpoint    # ← Morph Map Parser v1.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,6 +90,9 @@ register_prefix_endpoint(app)
 
 # ═══ INFIX MAP PARSER v2.6 ═══
 register_infix_endpoint(app)
+
+# ═══ MORPH MAP PARSER v1.0 ═══
+register_morph_endpoint(app)
 
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
@@ -1372,6 +1376,11 @@ async def root():
 async def infix_ui():
     """Infix Map UI"""
     return FileResponse('static/infix_only.html')
+
+@app.get("/morphology")
+async def morphology_ui():
+    """Morphology Map UI"""
+    return FileResponse('static/morphology_only.html')
 
 
 def _build_l2_config(pmi_valid=None, centroid_valid=None, centroid_trash=None):
