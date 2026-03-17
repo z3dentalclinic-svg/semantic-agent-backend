@@ -388,14 +388,23 @@ class MorphParser:
 
             async def fetch_letter(letter_queries: List[MorphQuery]) -> List[tuple]:
                 async with letter_sem:
-                    results_list = []
-                    for q in letter_queries:
-                        for ua_type in _ua_list(q.ua_filter):
-                            res = await self._fetch(
-                                q.query, ua_type, q.cp_override, country, language, client
-                            )
-                            results_list.append((q, ua_type, res))
+                    # All structs × UA for this letter in parallel
+                    pairs = [
+                        (q, ua_type)
+                        for q in letter_queries
+                        for ua_type in _ua_list(q.ua_filter)
+                    ]
+                    fetch_results = await asyncio.gather(*[
+                        self._fetch(q.query, ua_type, q.cp_override, country, language, client)
+                        for q, ua_type in pairs
+                    ], return_exceptions=True)
                     await asyncio.sleep(MORPH_DELAY)
+                    results_list = []
+                    for (q, ua_type), res in zip(pairs, fetch_results):
+                        if isinstance(res, Exception):
+                            logger.error(f"[MORPH] fetch error in letter: {res}")
+                            res = []
+                        results_list.append((q, ua_type, res))
                     return results_list
 
             letter_tasks = [
