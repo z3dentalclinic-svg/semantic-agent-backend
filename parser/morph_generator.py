@@ -138,6 +138,12 @@ class MorphGenerator:
         """
         Find first noun → build up to 12 case variants (6 cases × 2 numbers).
         Identical forms are automatically deduplicated.
+
+        Fallback chain:
+          1. First cyrillic NOUN score>=0.3
+          2. Any cyrillic NOUN
+          3. First cyrillic word that produces at least 1 inflection
+          4. If nothing inflects → use nomn_sing only (seed as-is)
         Returns None only if seed is empty.
         """
         words = seed.lower().strip().split()
@@ -147,13 +153,45 @@ class MorphGenerator:
         noun_data = self._find_first_noun(words)
 
         if noun_data is None:
-            # Last-resort: treat last word as target (any POS)
-            idx = len(words) - 1
+            # Fallback: try every cyrillic word, pick first NOUN that can be inflected
+            for idx, word in enumerate(words):
+                if not self._is_cyrillic_word(word):
+                    continue  # skip digits, latin (3060, rtx, ртх)
+                parses = self.morph.parse(word)
+                if not parses:
+                    continue
+                for p in parses:
+                    if p.tag.POS != 'NOUN':
+                        continue
+                    test = p.inflect({'nomn', 'sing'}) or p.inflect({'nomn', 'plur'})
+                    if test:
+                        noun_data = (idx, word, p.normal_form, p)
+                        break
+                if noun_data:
+                    break
+
+        if noun_data is None:
+            # Last-resort: no inflectable cyrillic word found.
+            # Use nomn_sing only (seed as-is) so at least one case runs.
+            # This handles "купить ртх 3060" — no noun, but we still sweep letters.
+            idx = next(
+                (i for i, w in enumerate(words) if self._is_cyrillic_word(w)),
+                len(words) - 1
+            )
             word = words[idx]
             parses = self.morph.parse(word)
             if not parses:
                 return None
             noun_data = (idx, word, parses[0].normal_form, parses[0])
+            # Force only nomn_sing — no inflection available
+            return MorphSeedAnalysis(
+                original_seed=seed.lower().strip(),
+                original_noun=word,
+                original_noun_idx=idx,
+                original_lemma=parses[0].normal_form,
+                case_variants={"nomn_sing": seed.lower().strip()},
+                skipped_cases=["all_other:no_inflectable_noun_found"],
+            )
 
         idx, word, lemma, parsed = noun_data
 
