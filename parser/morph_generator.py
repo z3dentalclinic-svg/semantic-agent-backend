@@ -77,6 +77,7 @@ class MorphQuery:
     cp_override: Optional[int] = None   # cursor position override for Google
     variant: Optional[str] = None       # v1/v2/v3/trail/plain/sandwich/...
     blocked_by: Optional[str] = None    # self-match reason if priority == 0
+    ua_filter: Optional[str] = None     # "chrome" / "firefox" / None=both
 
 
 @dataclass
@@ -377,6 +378,12 @@ class MorphGenerator:
         for (case_label, struct_name, ua) in self.PROVEN_TRIPLETS:
             triplets_by_case[case_label].append((struct_name, ua))
 
+        # (case_label, struct_name) → set of required UAs
+        # Если оба UA — ua_filter=None; если один — ua_filter="chrome"/"firefox"
+        ua_map: dict = _dd(set)
+        for (case_label, struct_name, ua) in self.PROVEN_TRIPLETS:
+            ua_map[(case_label, struct_name)].add(ua)
+
         for case_label, seed_variant in analysis.case_variants.items():
             if case_label not in triplets_by_case:
                 continue
@@ -399,6 +406,10 @@ class MorphGenerator:
                 if sq_struct not in needed_structs:
                     continue
 
+                # ua_filter: None=оба, "chrome"/"firefox"=только один
+                ua_set = ua_map[(case_label, sq_struct)]
+                ua_filter = None if len(ua_set) > 1 else next(iter(ua_set))
+
                 queries.append(MorphQuery(
                     case_label=case_label,
                     case_display=case_display,
@@ -411,6 +422,7 @@ class MorphGenerator:
                     cp_override=sq.cp_override,
                     variant=sq.variant,
                     blocked_by=sq.blocked_by,
+                    ua_filter=ua_filter,
                 ))
 
         return queries
