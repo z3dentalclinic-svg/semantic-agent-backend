@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-MORPH_DELAY = 0.4          # seconds between letter groups in E-type sweep
+MORPH_DELAY = 0.3          # seconds between letter groups in E-type sweep
 ABCD_SEMAPHORE = 10        # max parallel A/B/C/D requests per case group
 CASE_PARALLEL = True       # run all case groups in parallel (asyncio.gather)
 
@@ -108,6 +108,11 @@ GOOGLE_CLIENTS = {
     "chrome":  "chrome",
     "firefox": "firefox",
 }
+
+
+def _ua_list(ua_filter):
+    """Возвращает список UA для фетча. None=оба, иначе только указанный."""
+    return ["chrome", "firefox"] if ua_filter is None else [ua_filter]
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
@@ -347,7 +352,7 @@ class MorphParser:
             abcd_tasks = [
                 fetch_abcd(q, ua_type)
                 for q in abcd_queries
-                for ua_type in ["chrome", "firefox"]
+                for ua_type in _ua_list(q.ua_filter)
             ]
             abcd_results = await asyncio.gather(*abcd_tasks, return_exceptions=True)
 
@@ -370,38 +375,48 @@ class MorphParser:
                     "priority": q.priority,
                 }
 
-            # ── E (letters): grouped by letter, sequential ─────────────────
-            # Group by letter so we process all structures for one letter together
-            # before moving to the next letter (reduces per-letter burst)
+            # ── E (letters): parallel across letters, 0.3s delay per letter ──
+            # All letters launch simultaneously via asyncio.gather (like suffix parser).
+            # Within each letter: structures fetched sequentially, one sleep at end.
             by_letter: Dict[str, List[MorphQuery]] = defaultdict(list)
             for q in e_queries:
-                # suffix_label: "а_plain" → letter is suffix_val
                 by_letter[q.suffix_val].append(q)
 
-            for letter, letter_queries in by_letter.items():
-                # All 14 structures for this letter: fetch chrome+firefox per structure
-                # One MORPH_DELAY sleep at the END of the full letter group
-                # (not after every fetch — that would multiply delay by 28x per letter)
+            async def fetch_letter(letter_queries: List[MorphQuery]) -> List[tuple]:
+                results_list = []
                 for q in letter_queries:
-                    for ua_type in ["chrome", "firefox"]:
-                        results = await self._fetch(
+                    for ua_type in _ua_list(q.ua_filter):
+                        res = await self._fetch(
                             q.query, ua_type, q.cp_override, country, language, client
                         )
-                        all_raw.update(r.lower() for r in results)
-                        sl = q.suffix_label
-                        if sl not in case_trace:
-                            case_trace[sl] = {}
-                        case_trace[sl][ua_type] = {
-                            "query": q.query,
-                            "results": results,
-                            "count": len(results),
-                            "suffix_type": q.suffix_type,
-                            "suffix_val": q.suffix_val,
-                            "variant": q.variant,
-                            "priority": q.priority,
-                        }
-                # One delay after the full letter group (between letters)
+                        results_list.append((q, ua_type, res))
                 await asyncio.sleep(MORPH_DELAY)
+                return results_list
+
+            letter_tasks = [
+                fetch_letter(letter_queries)
+                for letter_queries in by_letter.values()
+            ]
+            letter_results = await asyncio.gather(*letter_tasks, return_exceptions=True)
+
+            for letter_batch in letter_results:
+                if isinstance(letter_batch, Exception):
+                    logger.error(f"[MORPH] Letter batch exception: {letter_batch}")
+                    continue
+                for q, ua_type, results in letter_batch:
+                    all_raw.update(r.lower() for r in results)
+                    sl = q.suffix_label
+                    if sl not in case_trace:
+                        case_trace[sl] = {}
+                    case_trace[sl][ua_type] = {
+                        "query": q.query,
+                        "results": results,
+                        "count": len(results),
+                        "suffix_type": q.suffix_type,
+                        "suffix_val": q.suffix_val,
+                        "variant": q.variant,
+                        "priority": q.priority,
+                    }
 
         return {
             "case_label": case_label,
