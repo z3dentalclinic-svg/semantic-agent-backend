@@ -115,6 +115,30 @@ def _ua_list(ua_filter):
     return ["chrome", "firefox"] if ua_filter is None else [ua_filter]
 
 
+# Однобуквенные предлоги/союзы — не мусор, пропускаем
+_VALID_SINGLE_LETTERS = {'в', 'к', 'с', 'у', 'о', 'и'}
+_SINGLE_CYR_LETTER = re.compile(r'^[а-яё]$')
+
+
+def _filter_letter_artifacts(results: List[str], seed_variant: str) -> List[str]:
+    """
+    Убивает мусор вида '[сид] [одна_буква] [слово]' прямо после фетча.
+    Исключение: предлоги/союзы в, к, с, у, о, и — валидные ключи.
+    Мусор:  'курс английского языка киев д кларк'  → убить
+    Норма:  'аренда авто без залога у частных лиц' → оставить
+    """
+    seed_len = len(seed_variant.lower().split())
+    clean = []
+    for r in results:
+        tokens = r.lower().split()
+        if (len(tokens) > seed_len + 1
+                and _SINGLE_CYR_LETTER.match(tokens[seed_len])
+                and tokens[seed_len] not in _VALID_SINGLE_LETTERS):
+            continue
+        clean.append(r)
+    return clean
+
+
 # ── Data classes ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -361,6 +385,7 @@ class MorphParser:
                     logger.error(f"[MORPH] ABCD fetch exception: {item}")
                     continue
                 q, ua_type, results = item
+                results = _filter_letter_artifacts(results, q.seed_variant)
                 all_raw.update(r.lower() for r in results)
                 sl = q.suffix_label
                 if sl not in case_trace:
@@ -386,6 +411,7 @@ class MorphParser:
                         results = await self._fetch(
                             q.query, ua_type, q.cp_override, country, language, client
                         )
+                        results = _filter_letter_artifacts(results, q.seed_variant)
                         all_raw.update(r.lower() for r in results)
                         sl = q.suffix_label
                         if sl not in case_trace:
