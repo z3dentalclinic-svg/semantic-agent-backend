@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 MORPH_DELAY = 0.3          # seconds between letter groups in E-type sweep
 ABCD_SEMAPHORE = 10        # max parallel A/B/C/D requests per case group
+LETTER_SEMAPHORE = 3       # max parallel letters in E-type sweep per case group
 CASE_PARALLEL = True       # run all case groups in parallel (asyncio.gather)
 
 
@@ -375,23 +376,27 @@ class MorphParser:
                     "priority": q.priority,
                 }
 
-            # ── E (letters): parallel across letters, 0.3s delay per letter ──
-            # All letters launch simultaneously via asyncio.gather (like suffix parser).
-            # Within each letter: structures fetched sequentially, one sleep at end.
+            # ── E (letters): semaphore-limited parallel (LETTER_SEMAPHORE=3) ──
+            # Letters run in parallel but max 3 at a time per case group.
+            # With 3 proxies × 3-4 cases × 3 letters × ~3 structs × ~1.5 UA ≈ 50 req/proxy
+            # Wall time: ceil(26/3) × 0.3s ≈ 2.7s instead of 26 × 0.3s = 7.8s
             by_letter: Dict[str, List[MorphQuery]] = defaultdict(list)
             for q in e_queries:
                 by_letter[q.suffix_val].append(q)
 
+            letter_sem = asyncio.Semaphore(LETTER_SEMAPHORE)
+
             async def fetch_letter(letter_queries: List[MorphQuery]) -> List[tuple]:
-                results_list = []
-                for q in letter_queries:
-                    for ua_type in _ua_list(q.ua_filter):
-                        res = await self._fetch(
-                            q.query, ua_type, q.cp_override, country, language, client
-                        )
-                        results_list.append((q, ua_type, res))
-                await asyncio.sleep(MORPH_DELAY)
-                return results_list
+                async with letter_sem:
+                    results_list = []
+                    for q in letter_queries:
+                        for ua_type in _ua_list(q.ua_filter):
+                            res = await self._fetch(
+                                q.query, ua_type, q.cp_override, country, language, client
+                            )
+                            results_list.append((q, ua_type, res))
+                    await asyncio.sleep(MORPH_DELAY)
+                    return results_list
 
             letter_tasks = [
                 fetch_letter(letter_queries)
