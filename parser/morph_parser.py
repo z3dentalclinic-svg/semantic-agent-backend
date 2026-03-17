@@ -123,17 +123,25 @@ _SINGLE_CYR_LETTER = re.compile(r'^[а-яё]$')
 def _filter_letter_artifacts(results: List[str], seed_variant: str) -> List[str]:
     """
     Убивает мусор вида '[сид] [одна_буква] [слово]' прямо после фетча.
+    Также убивает '[сид] - [одна_буква] [слово]' (с дефисом).
     Исключение: предлоги/союзы в, к, с, у, о, и — валидные ключи.
-    Мусор:  'курс английского языка киев д кларк'  → убить
-    Норма:  'аренда авто без залога у частных лиц' → оставить
+    Мусор:  'курс английского языка киев д кларк'      → убить
+    Мусор:  'имплантации зубов - д симферополь'        → убить
+    Норма:  'аренда авто без залога у частных лиц'     → оставить
     """
     seed_len = len(seed_variant.lower().split())
     clean = []
     for r in results:
         tokens = r.lower().split()
+        # Паттерн 1: [сид] [буква] [слово]
         if (len(tokens) > seed_len + 1
                 and _SINGLE_CYR_LETTER.match(tokens[seed_len])
                 and tokens[seed_len] not in _VALID_SINGLE_LETTERS):
+            continue
+        # Паттерн 2: [сид] - [буква] [слово] — всегда мусор, предлогов не бывает
+        if (len(tokens) > seed_len + 2
+                and tokens[seed_len] == '-'
+                and _SINGLE_CYR_LETTER.match(tokens[seed_len + 1])):
             continue
         clean.append(r)
     return clean
