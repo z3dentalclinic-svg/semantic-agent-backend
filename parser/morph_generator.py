@@ -268,7 +268,7 @@ class MorphGenerator:
         ("gent_sing",  "prep_bez",    "chrome"),   #   3
         ("gent_sing",  "q_pochemu",   "chrome"),   #   3
         ("gent_sing",  "prep_ot",     "chrome"),   #   3
-        ("ablt_sing",  "sym",         "chrome"),   #   3
+        # ("ablt_sing",  "sym",         "chrome"),   #   3  # DISABLED: мусор > 6 эксклюзивных ключей
         # ── По 2 ключа ────────────────────────────────────────────────
         ("nomn_plur",  "plain",       "firefox"),  #   2
         ("ablt_plur",  "wcB_cpMid",   "chrome"),   #   2
@@ -285,14 +285,14 @@ class MorphGenerator:
         ("gent_sing",  "fin_tsena",   "chrome"),   #   2
         ("ablt_plur",  "plain",       "chrome"),   #   2
         ("ablt_plur",  "prep_na",     "chrome"),   #   2
-        ("gent_sing",  "sym",         "chrome"),   #   2
+        # ("gent_sing",  "sym",         "chrome"),   #   2  # DISABLED: мусор > 6 эксклюзивных ключей
         ("gent_sing",  "fin_otzyvy",  "chrome"),   #   2
         ("gent_sing",  "fin_i",       "chrome"),   #   2
         # ── По 1 ключу ────────────────────────────────────────────────
         ("nomn_plur",  "plain_nocp",  "firefox"),  #   1
         ("datv_sing",  "wcB_cpMid",   "chrome"),   #   1
         ("datv_sing",  "trail",       "firefox"),  #   1
-        ("accs_sing",  "sym",         "firefox"),  #   1
+        # ("accs_sing",  "sym",         "firefox"),  #   1  # DISABLED: мусор > 6 эксклюзивных ключей
         ("datv_plur",  "wcB_cpMid",   "chrome"),   #   1
         ("nomn_sing",  "prep_bez",    "chrome"),   #   1
         ("ablt_sing",  "prep_s",      "chrome"),   #   1
