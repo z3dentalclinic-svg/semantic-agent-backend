@@ -50,6 +50,7 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "accs_plur":  ("accs", "plur", "Винительный мн.ч."),
     "ablt_plur":  ("ablt", "plur", "Творительный мн.ч."),
     "loct_plur":  ("loct", "plur", "Предложный мн.ч."),
+    "stem_cut":   ("nomn", "sing", "Усечённая лемма"),   # эксперимент
 }
 
 
@@ -218,6 +219,18 @@ class MorphGenerator:
             seen_variants.add(seed_variant)
             case_variants[case_label] = seed_variant
 
+        # ── stem_cut: усечённая лемма (эксперимент) ─────────────────────
+        # Обрезаем лемму на 3 символа чтобы убрать окончание до корня.
+        # "имплантация" → "имплантац" | "ремонт" пропускается (len<=5+3=8, нет).
+        # Цель: неопределённость токена → Google уходит в глубину индекса.
+        if len(lemma) > 5:
+            cut = lemma[:-3]
+            new_words = words.copy()
+            new_words[idx] = cut
+            stem_variant = " ".join(new_words)
+            if stem_variant not in seen_variants:
+                case_variants["stem_cut"] = stem_variant
+
         return MorphSeedAnalysis(
             original_seed=seed.lower().strip(),
             original_noun=word,
@@ -268,7 +281,7 @@ class MorphGenerator:
         ("gent_sing",  "prep_bez",    "chrome"),   #   3
         ("gent_sing",  "q_pochemu",   "chrome"),   #   3
         ("gent_sing",  "prep_ot",     "chrome"),   #   3
-        # ("ablt_sing",  "sym",         "chrome"),   #   3  # DISABLED: мусор > 6 эксклюзивных ключей
+        ("ablt_sing",  "sym",         "chrome"),   #   3
         # ── По 2 ключа ────────────────────────────────────────────────
         ("nomn_plur",  "plain",       "firefox"),  #   2
         ("ablt_plur",  "wcB_cpMid",   "chrome"),   #   2
@@ -285,14 +298,14 @@ class MorphGenerator:
         ("gent_sing",  "fin_tsena",   "chrome"),   #   2
         ("ablt_plur",  "plain",       "chrome"),   #   2
         ("ablt_plur",  "prep_na",     "chrome"),   #   2
-        # ("gent_sing",  "sym",         "chrome"),   #   2  # DISABLED: мусор > 6 эксклюзивных ключей
+        ("gent_sing",  "sym",         "chrome"),   #   2
         ("gent_sing",  "fin_otzyvy",  "chrome"),   #   2
         ("gent_sing",  "fin_i",       "chrome"),   #   2
         # ── По 1 ключу ────────────────────────────────────────────────
         ("nomn_plur",  "plain_nocp",  "firefox"),  #   1
         ("datv_sing",  "wcB_cpMid",   "chrome"),   #   1
         ("datv_sing",  "trail",       "firefox"),  #   1
-        # ("accs_sing",  "sym",         "firefox"),  #   1  # DISABLED: мусор > 6 эксклюзивных ключей
+        ("accs_sing",  "sym",         "firefox"),  #   1
         ("datv_plur",  "wcB_cpMid",   "chrome"),   #   1
         ("nomn_sing",  "prep_bez",    "chrome"),   #   1
         ("ablt_sing",  "prep_s",      "chrome"),   #   1
@@ -358,7 +371,36 @@ class MorphGenerator:
         По умолчанию: продакшн-режим (proven triplets).
         Для исследования нового датасета передай use_proven_triplets=False через endpoint.
         """
-        return self._generate_proven(analysis, region, include_numbers)
+        queries = self._generate_proven(analysis, region, include_numbers)
+
+        # stem_cut: полная карта (все 26 букв E-структур) — отдельно от proven
+        if "stem_cut" in analysis.case_variants:
+            stem_variant = analysis.case_variants["stem_cut"]
+            _seed_analysis, stem_suffix_queries = self.suffix_gen.generate(
+                seed=stem_variant,
+                include_numbers=include_numbers,
+                include_letters=True,
+                region=region,
+            )
+            for sq in stem_suffix_queries:
+                if sq.priority == 0:
+                    continue
+                queries.append(MorphQuery(
+                    case_label="stem_cut",
+                    case_display="Усечённая лемма",
+                    seed_variant=stem_variant,
+                    query=sq.query,
+                    suffix_val=sq.suffix_val,
+                    suffix_label=sq.suffix_label,
+                    suffix_type=sq.suffix_type,
+                    priority=sq.priority,
+                    cp_override=sq.cp_override,
+                    variant=sq.variant,
+                    blocked_by=sq.blocked_by,
+                    ua_filter=None,
+                ))
+
+        return queries
 
     def _generate_proven(
         self,
