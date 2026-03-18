@@ -543,9 +543,13 @@ class MorphParser:
         )
 
         # Per-case normalization
+        # stem_cut: пропускаем нормализацию — сохраняем сырой ответ Google для анализа
         case_norm_sets: Dict[str, Set[str]] = {}
         for cl, raw_set in case_raw_sets.items():
-            norm = self.normalizer.normalize(list(raw_set), analysis.original_lemma)
+            if cl == "stem_cut":
+                norm = sorted(raw_set)   # без нормализации — как вернул Google
+            else:
+                norm = self.normalizer.normalize(list(raw_set), analysis.original_lemma)
             case_norm_sets[cl] = set(norm)
             if cl in full_trace:
                 full_trace[cl]["_meta"]["normalized_count"] = len(norm)
