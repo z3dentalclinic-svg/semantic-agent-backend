@@ -102,11 +102,14 @@ UA_STRINGS = {
                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
                "Gecko/20100101 Firefox/121.0",
+    "youtube": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
 GOOGLE_CLIENTS = {
     "chrome":  "chrome",
     "firefox": "firefox",
+    "youtube": "youtube",
 }
 
 
@@ -245,11 +248,14 @@ class MorphParser:
         country: str,
         language: str,
         client: httpx.AsyncClient,
+        extra_params: dict = None,
+        client_override: str = None,
     ) -> List[str]:
         """Single Google Autocomplete fetch. Handles all known response formats."""
+        effective_client = client_override if client_override else GOOGLE_CLIENTS[ua_type]
         params = {
             "q": query,
-            "client": GOOGLE_CLIENTS[ua_type],
+            "client": effective_client,
             "hl": language,
             "gl": country,
             "ie": "utf-8",
@@ -260,6 +266,9 @@ class MorphParser:
         elif cp is None:
             params["cp"] = len(query)
         # cp == -1 → don't send cp (plain_nocp variant)
+
+        if extra_params:
+            params.update(extra_params)
 
         headers = {"User-Agent": UA_STRINGS[ua_type]}
 
@@ -377,7 +386,9 @@ class MorphParser:
             async def fetch_abcd(q: MorphQuery, ua_type: str) -> tuple:
                 async with sem:
                     results = await self._fetch(
-                        q.query, ua_type, q.cp_override, country, language, client
+                        q.query, ua_type, q.cp_override, country, language, client,
+                        extra_params=q.extra_params,
+                        client_override=q.client_override,
                     )
                     return q, ua_type, results
 
@@ -417,7 +428,9 @@ class MorphParser:
                 for q in letter_queries:
                     for ua_type in _ua_list(q.ua_filter):
                         results = await self._fetch(
-                            q.query, ua_type, q.cp_override, country, language, client
+                            q.query, ua_type, q.cp_override, country, language, client,
+                            extra_params=q.extra_params,
+                            client_override=q.client_override,
                         )
                         results = _filter_letter_artifacts(results, q.seed_variant)
                         all_raw.update(r.lower() for r in results)
