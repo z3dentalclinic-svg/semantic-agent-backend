@@ -55,6 +55,11 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "typo_w1":    ("nomn", "sing", "Удвоение первой буквы слова 1"),
     "cyr2lat_w1": ("nomn", "sing", "Замена кириллицы на латиницу в слове 1"),
     "cyr2lat_w2": ("nomn", "sing", "Замена кириллицы на латиницу в слове 2"),
+    # ── gemini experiment ─────────────────────────────────────────────────
+    "double_space": ("nomn", "sing", "Двойной пробел после wildcard"),
+    "ds_it":        ("nomn", "sing", "Параметр ds=it (информационный слой)"),
+    "client_yt":    ("nomn", "sing", "Client=youtube"),
+    "cp_one":       ("nomn", "sing", "Курсор cp=1 на маске"),
 }
 
 
@@ -82,7 +87,9 @@ class MorphQuery:
     cp_override: Optional[int] = None   # cursor position override for Google
     variant: Optional[str] = None       # v1/v2/v3/trail/plain/sandwich/...
     blocked_by: Optional[str] = None    # self-match reason if priority == 0
-    ua_filter: Optional[str] = None     # "chrome" / "firefox" / None=both
+    ua_filter: Optional[str] = None     # "chrome" / "firefox" / "youtube" / None=both
+    extra_params: Dict = field(default_factory=dict)  # дополнительные HTTP-параметры (ds=it и т.д.)
+    client_override: Optional[str] = None             # переопределить client (youtube и т.д.)
 
 
 @dataclass
@@ -260,6 +267,15 @@ class MorphGenerator:
                     case_variants["cyr2lat_w2"] = vcl2
                     seen_variants.add(vcl2)
 
+        # ── gemini experiment: все 4 используют оригинальный сид ─────────
+        original = seed.lower().strip()
+        for gcase in ("double_space", "ds_it", "client_yt", "cp_one"):
+            if original not in seen_variants:
+                case_variants[gcase] = original
+            else:
+                # если оригинал уже есть под другим именем — всё равно добавляем
+                case_variants[gcase] = original
+
         return MorphSeedAnalysis(
             original_seed=seed.lower().strip(),
             original_noun=word,
@@ -404,9 +420,21 @@ class MorphGenerator:
         # queries = self._generate_proven(analysis, region, include_numbers)
         queries = []
 
-        # mixed experiment: typo_w1 + cyr2lat_w1 + cyr2lat_w2
-        # include_letters=False — без буквенного свипа, только A/B/C/D структуры
-        for exp_label in ("typo_w1", "cyr2lat_w1", "cyr2lat_w2"):
+        # Конфигурация кейсов эксперимента:
+        #   label → (extra_params, client_override, cp_force)
+        #   cp_force=None → использовать cp_override из SuffixQuery как обычно
+        #   cp_force=N    → принудительно перебить cp для всех запросов кейса
+        EXP_CONFIG = {
+            "typo_w1":    ({}, None, None),
+            "cyr2lat_w1": ({}, None, None),
+            "cyr2lat_w2": ({}, None, None),
+            "double_space": ({}, None, 3),        # cp фиксирован=3, запрос с двойным пробелом
+            "ds_it":        ({"ds": "it"}, None, 2),  # ds=it параметр, cp=2
+            "client_yt":    ({}, "youtube", 2),    # client=youtube, cp=2
+            "cp_one":       ({}, None, 1),         # cp=1 для всех запросов
+        }
+
+        for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
             if exp_label not in analysis.case_variants:
                 continue
             exp_variant = analysis.case_variants[exp_label]
@@ -420,19 +448,32 @@ class MorphGenerator:
             for sq in exp_suffix_queries:
                 if sq.priority == 0:
                     continue
+
+                # double_space: заменяем "* сид" → "*  сид" (двойной пробел)
+                query_str = sq.query
+                if exp_label == "double_space" and "* " in query_str:
+                    query_str = query_str.replace("* ", "*  ", 1)
+
+                cp_val = cp_force if cp_force is not None else sq.cp_override
+
+                # client_yt: только youtube UA
+                ua = "youtube" if client_override == "youtube" else None
+
                 queries.append(MorphQuery(
                     case_label=exp_label,
                     case_display=display,
                     seed_variant=exp_variant,
-                    query=sq.query,
+                    query=query_str,
                     suffix_val=sq.suffix_val,
                     suffix_label=sq.suffix_label,
                     suffix_type=sq.suffix_type,
                     priority=sq.priority,
-                    cp_override=sq.cp_override,
+                    cp_override=cp_val,
                     variant=sq.variant,
                     blocked_by=sq.blocked_by,
-                    ua_filter=None,
+                    ua_filter=ua,
+                    extra_params=extra_params,
+                    client_override=client_override,
                 ))
 
         return queries
