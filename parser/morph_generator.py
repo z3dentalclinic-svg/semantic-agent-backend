@@ -51,10 +51,10 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "ablt_plur":  ("ablt", "plur", "Творительный мн.ч."),
     "loct_plur":  ("loct", "plur", "Предложный мн.ч."),
     "stem_cut":   ("nomn", "sing", "Усечённая лемма"),   # эксперимент
-    # ── typo experiment ───────────────────────────────────────────────────
+    # ── mixed experiment ──────────────────────────────────────────────────
     "typo_w1":    ("nomn", "sing", "Удвоение первой буквы слова 1"),
-    "typo_w2":    ("nomn", "sing", "Удвоение первой буквы слова 2"),
-    "typo_both":  ("nomn", "sing", "Удвоение обеих первых букв"),
+    "cyr2lat_w1": ("nomn", "sing", "Замена кириллицы на латиницу в слове 1"),
+    "cyr2lat_w2": ("nomn", "sing", "Замена кириллицы на латиницу в слове 2"),
 }
 
 
@@ -205,37 +205,25 @@ class MorphGenerator:
         seen_variants: set = set()
         skipped_cases: List[str] = []
 
-        # ── ЗАКОММЕНТИРОВАНО для эксперимента с опечатками ──────────────
+        # ── ЗАКОММЕНТИРОВАНО для эксперимента ──────────────────────────
         # for case_label, (case_tag, number_tag, _display) in CASES_RU.items():
-        #     inflected = parsed.inflect({case_tag, number_tag})
-        #     if inflected is None:
-        #         skipped_cases.append(f"{case_label}:no_inflection")
-        #         continue
-        #     new_words = words.copy()
-        #     new_words[idx] = inflected.word
-        #     seed_variant = " ".join(new_words)
-        #     if seed_variant in seen_variants:
-        #         skipped_cases.append(f"{case_label}:dup({inflected.word})")
-        #         continue
-        #     seen_variants.add(seed_variant)
-        #     case_variants[case_label] = seed_variant
+        #     ...
 
-        # ── stem_cut: ЗАКОММЕНТИРОВАНО для эксперимента ─────────────────
-        # if len(lemma) > 4:
-        #     cut_words = words.copy()
-        #     cut_words[idx] = lemma[:-2]
-        #     other_idx = 1 if idx == 0 else 0
-        #     if (other_idx < len(cut_words) and other_idx != idx
-        #             and re.match(r'^[а-яёА-ЯЁ]+$', cut_words[other_idx])
-        #             and len(cut_words[other_idx]) > 4):
-        #         cut_words[other_idx] = cut_words[other_idx][:-2]
-        #     stem_variant = " ".join(cut_words)
-        #     if stem_variant not in seen_variants:
-        #         case_variants["stem_cut"] = stem_variant
+        # ── mixed experiment ─────────────────────────────────────────────
+        # Таблица замены кириллицы на визуально идентичную латиницу
+        CYR2LAT = {
+            'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
+            'у': 'y', 'х': 'x', 'А': 'A', 'Е': 'E', 'О': 'O',
+            'Р': 'P', 'С': 'C', 'У': 'Y', 'Х': 'X',
+        }
 
-        # ── typo experiment: удвоение первой буквы ───────────────────────
-        # Алгоритм: берём первую букву слова и дублируем её
-        # "имплантация" → "иимплантация" | "зубов" → "ззубов"
+        def mix_cyr_lat(word):
+            """Заменяем первую найденную кириллическую букву на латинский аналог."""
+            for i, ch in enumerate(word):
+                if ch in CYR2LAT:
+                    return word[:i] + CYR2LAT[ch] + word[i+1:]
+            return word
+
         other_idx = 1 if idx == 0 else 0
         has_other = (other_idx < len(words)
                      and other_idx != idx
@@ -243,7 +231,7 @@ class MorphGenerator:
                      and len(words[other_idx]) > 2)
 
         # typo_w1: удвоение первой буквы первого существительного
-        w1_typo = words[idx][0] + words[idx]   # "и" + "имплантация" = "иимплантация"
+        w1_typo = words[idx][0] + words[idx]
         tw1 = words.copy()
         tw1[idx] = w1_typo
         v1 = " ".join(tw1)
@@ -251,24 +239,26 @@ class MorphGenerator:
             case_variants["typo_w1"] = v1
             seen_variants.add(v1)
 
-        # typo_w2: удвоение первой буквы второго слова
-        if has_other:
-            w2_typo = words[other_idx][0] + words[other_idx]
-            tw2 = words.copy()
-            tw2[other_idx] = w2_typo
-            v2 = " ".join(tw2)
-            if v2 not in seen_variants:
-                case_variants["typo_w2"] = v2
-                seen_variants.add(v2)
+        # cyr2lat_w1: замена буквы в первом слове
+        w1_lat = mix_cyr_lat(words[idx])
+        if w1_lat != words[idx]:
+            cl1 = words.copy()
+            cl1[idx] = w1_lat
+            vcl1 = " ".join(cl1)
+            if vcl1 not in seen_variants:
+                case_variants["cyr2lat_w1"] = vcl1
+                seen_variants.add(vcl1)
 
-            # typo_both: удвоение в обоих словах
-            tb = words.copy()
-            tb[idx] = w1_typo
-            tb[other_idx] = w2_typo
-            vb = " ".join(tb)
-            if vb not in seen_variants:
-                case_variants["typo_both"] = vb
-                seen_variants.add(vb)
+        # cyr2lat_w2: замена буквы во втором слове
+        if has_other:
+            w2_lat = mix_cyr_lat(words[other_idx])
+            if w2_lat != words[other_idx]:
+                cl2 = words.copy()
+                cl2[other_idx] = w2_lat
+                vcl2 = " ".join(cl2)
+                if vcl2 not in seen_variants:
+                    case_variants["cyr2lat_w2"] = vcl2
+                    seen_variants.add(vcl2)
 
         return MorphSeedAnalysis(
             original_seed=seed.lower().strip(),
@@ -410,32 +400,30 @@ class MorphGenerator:
         По умолчанию: продакшн-режим (proven triplets).
         Для исследования нового датасета передай use_proven_triplets=False через endpoint.
         """
-        # ── ЗАКОММЕНТИРОВАНО для эксперимента ────────────────────────────
+        # ── ЗАКОММЕНТИРОВАНО: proven triplets ────────────────────────────
         # queries = self._generate_proven(analysis, region, include_numbers)
         queries = []
 
-        # stem_cut: ЗАКОММЕНТИРОВАНО
-        # if "stem_cut" in analysis.case_variants: ...
-
-        # ── typo experiment: полная карта для трёх вариантов ─────────────
-        for typo_label in ("typo_w1", "typo_w2", "typo_both"):
-            if typo_label not in analysis.case_variants:
+        # mixed experiment: typo_w1 + cyr2lat_w1 + cyr2lat_w2
+        # include_letters=False — без буквенного свипа, только A/B/C/D структуры
+        for exp_label in ("typo_w1", "cyr2lat_w1", "cyr2lat_w2"):
+            if exp_label not in analysis.case_variants:
                 continue
-            typo_variant = analysis.case_variants[typo_label]
-            _seed_analysis, typo_suffix_queries = self.suffix_gen.generate(
-                seed=typo_variant,
+            exp_variant = analysis.case_variants[exp_label]
+            _seed_analysis, exp_suffix_queries = self.suffix_gen.generate(
+                seed=exp_variant,
                 include_numbers=include_numbers,
                 include_letters=True,
                 region=region,
             )
-            display = CASES_RU[typo_label][2]
-            for sq in typo_suffix_queries:
+            display = CASES_RU[exp_label][2]
+            for sq in exp_suffix_queries:
                 if sq.priority == 0:
                     continue
                 queries.append(MorphQuery(
-                    case_label=typo_label,
+                    case_label=exp_label,
                     case_display=display,
-                    seed_variant=typo_variant,
+                    seed_variant=exp_variant,
                     query=sq.query,
                     suffix_val=sq.suffix_val,
                     suffix_label=sq.suffix_label,
