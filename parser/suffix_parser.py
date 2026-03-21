@@ -94,7 +94,7 @@ class SuffixParser:
         return re.sub(r'<[^>]+>', '', text).strip()
 
     async def fetch_suggestions(self, query: str, country: str, language: str,
-                                 client: httpx.AsyncClient, google_client: str = "firefox",
+                                 client: httpx.AsyncClient, google_client: str = "chrome",
                                  cursor_position: int = None) -> List[str]:
         """Google Autocomplete with multi-client support."""
         url = "https://www.google.com/complete/search"
@@ -264,7 +264,7 @@ class SuffixParser:
 
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
                     parallel_limit: int = 5, include_numbers: bool = False,
-                    echelon: int = 0, google_client: str = "firefox",
+                    echelon: int = 0, google_client: str = "chrome",
                     cursor_position: int = None,
                     include_letters: bool = False) -> SuffixParseResult:
         """
@@ -405,58 +405,48 @@ class SuffixParser:
             elapsed = (time.time() - t0) * 1000
             _record_results(sq, results, elapsed)
 
-        async def fetch_one_firefox(sq, client: httpx.AsyncClient):
-            """Firefox pass for E — same query, firefox agent, cp not sent."""
-            from dataclasses import replace as dc_replace
-            sq_ff = dc_replace(
-                sq,
-                suffix_label=sq.suffix_label + "_ff",
-                suffix_type="E_ff",
-                cp_override=-1,
-            )
-            t0 = time.time()
-            results = await self.fetch_suggestions(sq.query, country, language, client, "firefox", -1)
-            elapsed = (time.time() - t0) * 1000
-            _record_results(sq_ff, results, elapsed)
+        # async def fetch_one_firefox(sq, client: httpx.AsyncClient):
+        #     """Firefox pass for E — same query, firefox agent, cp not sent."""
+        #     # ОТКЛЮЧЕНО для лайт-серча (только Chrome)
+        #     from dataclasses import replace as dc_replace
+        #     sq_ff = dc_replace(
+        #         sq,
+        #         suffix_label=sq.suffix_label + "_ff",
+        #         suffix_type="E_ff",
+        #         cp_override=-1,
+        #     )
+        #     t0 = time.time()
+        #     results = await self.fetch_suggestions(sq.query, country, language, client, "firefox", -1)
+        #     elapsed = (time.time() - t0) * 1000
+        #     _record_results(sq_ff, results, elapsed)
 
-        # Step 5d: E_simple — точная копия старого алфавитного перебора
-        # seed + буква, firefox, без cp — 29 запросов (алфавит + ё)
-        ALPHABET = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
-
-        async def run_e_simple(client: httpx.AsyncClient):
-            e_simple_sem = asyncio.Semaphore(5)
-
-            async def fetch_simple_char(char: str):
-                async with e_simple_sem:
-                    await asyncio.sleep(0.3)
-                    q = f"{seed} {char}"
-                    sq_simple = SuffixQuery(
-                        query=q,
-                        suffix_val=char,
-                        suffix_label=f"simple_{char}",
-                        suffix_type="E_simple",
-                        priority=1,
-                        markers=["e_simple"],
-                        cp_override=-1,
-                    )
-                    t0 = time.time()
-                    # E_simple: точная копия старого парсера — firefox, без cp, без ie/oe
-                    url = "https://www.google.com/complete/search"
-                    params = {"q": q, "client": "firefox", "hl": language, "gl": country}
-                    headers = {"User-Agent": random.choice(USER_AGENTS)}
-                    try:
-                        resp = await client.get(url, params=params, headers=headers, timeout=10.0)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            results = data[1] if len(data) > 1 else []
-                        else:
-                            results = []
-                    except Exception:
-                        results = []
-                    elapsed = (time.time() - t0) * 1000
-                    _record_results(sq_simple, results, elapsed)
-
-            await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET])
+        # Step 5d: E_simple — ОТКЛЮЧЕНО для лайт-серча (Firefox клиент)
+        # async def run_e_simple(client: httpx.AsyncClient):
+        #     e_simple_sem = asyncio.Semaphore(5)
+        #     async def fetch_simple_char(char: str):
+        #         async with e_simple_sem:
+        #             await asyncio.sleep(0.3)
+        #             q = f"{seed} {char}"
+        #             sq_simple = SuffixQuery(
+        #                 query=q, suffix_val=char, suffix_label=f"simple_{char}",
+        #                 suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
+        #             )
+        #             t0 = time.time()
+        #             url = "https://www.google.com/complete/search"
+        #             params = {"q": q, "client": "firefox", "hl": language, "gl": country}
+        #             headers = {"User-Agent": random.choice(USER_AGENTS)}
+        #             try:
+        #                 resp = await client.get(url, params=params, headers=headers, timeout=10.0)
+        #                 if resp.status_code == 200:
+        #                     data = resp.json()
+        #                     results = data[1] if len(data) > 1 else []
+        #                 else:
+        #                     results = []
+        #             except Exception:
+        #                 results = []
+        #             elapsed = (time.time() - t0) * 1000
+        #             _record_results(sq_simple, results, elapsed)
+        #     await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET])
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
@@ -476,20 +466,20 @@ class SuffixParser:
                 await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
 
-        # Step 5c: E firefox — то же самое под firefox
-        async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
-            for sq in letter_queries:
-                if sq.variant in FF_E_SKIP:
-                    continue
-                await asyncio.sleep(0.3)
-                await fetch_one_firefox(sq, client)
+        # Step 5c: E firefox — ОТКЛЮЧЕНО для лайт-серча
+        # async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
+        #     for sq in letter_queries:
+        #         if sq.variant in FF_E_SKIP:
+        #             continue
+        #         await asyncio.sleep(0.3)
+        #         await fetch_one_firefox(sq, client)
 
         async def run_google(client: httpx.AsyncClient):
             tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
             for letter, letter_qs in e_queries_by_letter.items():
                 tasks.append(run_letter_chrome(letter_qs, client))
-                tasks.append(run_letter_firefox(letter_qs, client))
-            tasks.append(run_e_simple(client))
+                # tasks.append(run_letter_firefox(letter_qs, client))  # ОТКЛЮЧЕНО для лайт-серча
+            # tasks.append(run_e_simple(client))  # ОТКЛЮЧЕНО для лайт-серча (Firefox)
             await asyncio.gather(*tasks)
 
         async def run_yandex(client: httpx.AsyncClient):
@@ -559,11 +549,11 @@ class SuffixParser:
             await asyncio.gather(*bi_tasks)
 
         _google_proxy = os.getenv("GOOGLE_PROXY_URL") or None
-        async with httpx.AsyncClient(proxy=_google_proxy) as g_http,                    httpx.AsyncClient() as ya_client,                    httpx.AsyncClient() as bi_client:
+        async with httpx.AsyncClient(proxy=_google_proxy) as g_http:
             await asyncio.gather(
                 run_google(g_http),
-                # run_yandex(ya_client),  # временно отключён для сравнения с Keyword Tool
-                run_bing(bi_client),
+                # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
+                # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
             )
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
