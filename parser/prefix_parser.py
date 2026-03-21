@@ -345,14 +345,14 @@ class PrefixParser:
             groups=groups or ALL_GROUPS,
         )
 
-        # Brute-suffix варианты: прогоняем те же группы с модифицированным сидом
-        for brute_seed in _brute_seed_variants(seed):
-            brute_matrix = self.generator.generate(
-                seed=brute_seed,
-                operator=operator,
-                groups=groups or ALL_GROUPS,
-            )
-            matrix.extend(brute_matrix)
+        # Brute-suffix варианты — ОТКЛЮЧЕНО для лайт-серча
+        # for brute_seed in _brute_seed_variants(seed):
+        #     brute_matrix = self.generator.generate(
+        #         seed=brute_seed,
+        #         operator=operator,
+        #         groups=groups or ALL_GROUPS,
+        #     )
+        #     matrix.extend(brute_matrix)
 
         # Shared state — защищена asyncio.Lock (оба агента пишут одновременно)
         kw_map: Dict[str, List[str]] = {}
@@ -426,10 +426,10 @@ class PrefixParser:
                 tasks = [fetch_one(pq, agent, client, semaphore) for pq in agent_queries]
                 await asyncio.gather(*tasks)
 
-        # Запускаем оба агента параллельно
+        # Запускаем только Chrome агента (Firefox ОТКЛЮЧЁН для лайт-серча)
         await asyncio.gather(
             run_agent("chrome"),
-            run_agent("firefox"),
+            # run_agent("firefox"),  # ОТКЛЮЧЕНО для лайт-серча
         )
 
         total_time = (time.time() - total_start) * 1000
