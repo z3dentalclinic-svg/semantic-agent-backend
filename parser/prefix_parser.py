@@ -45,21 +45,23 @@ from dataclasses import dataclass, field, asdict
 
 def _brute_seed_variants(seed: str) -> List[str]:
     """
-    Генерирует brute-suffix варианты сида для расширения префиксной карты.
+    Генерирует brute-suffix варианты сида по алгоритму Gemini «Last Consonant Rule».
 
     Алгоритм:
-      - Находим первое кириллическое слово длиннее 3 букв
-      - Отрезаем последний символ, добавляем окончания: и, ы, а, ю
-      - е пропускаем (дало 0 результатов в тестах)
+      1. Находим первое кириллическое слово длиннее 3 букв
+      2. Ищем последнюю согласную (й, ь, ъ — эфемерные, тоже отрезаем)
+      3. Всё после последней согласной — флексия, отрезаем
+      4. К основе подставляем 8 окончаний: и, а, е, у, ы, ом, ей, о
 
-    Пример: "имплантация зубов" →
-      имплантации зубов  (и)
-      имплантациы зубов  (ы)
-      имплантациа зубов  (а)
-      имплантацию зубов  (ю)
+    Покрывает все падежи включая творительный (-ом/-ей).
+    Пример: "имплантация зубов" → основа "имплантац" →
+      имплантации зубов, имплантацом зубов, имплантацей зубов, ...
     """
+    CONSONANTS = set('бвгджзйклмнпрстфхцчшщ')
+    EPHEMERAL  = set('йьъ')
+    ENDINGS    = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о']
+
     words = seed.lower().strip().split()
-    # Находим первое кириллическое слово > 3 букв
     target_idx = None
     for i, w in enumerate(words):
         if re.match(r'^[а-яёА-ЯЁ]{4,}$', w):
@@ -68,13 +70,30 @@ def _brute_seed_variants(seed: str) -> List[str]:
     if target_idx is None:
         return []
 
-    stem = words[target_idx][:-1]
+    word = words[target_idx]
+    stem_end = None
+    for i in range(len(word) - 1, -1, -1):
+        ch = word[i]
+        if ch in EPHEMERAL:
+            continue
+        if ch in CONSONANTS:
+            stem_end = i + 1
+            break
+
+    if stem_end is None:
+        return []
+
+    stem = word[:stem_end]
+    original_lower = seed.lower().strip()
     variants = []
-    for ending in ("и", "ы", "а", "ю"):
+    for ending in ENDINGS:
+        new_word = stem + ending
+        if new_word == word:
+            continue
         w = words.copy()
-        w[target_idx] = stem + ending
-        variant = " ".join(w)
-        if variant != seed.lower().strip():
+        w[target_idx] = new_word
+        variant = ' '.join(w)
+        if variant != original_lower:
             variants.append(variant)
     return variants
 
