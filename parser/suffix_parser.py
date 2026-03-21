@@ -420,33 +420,26 @@ class SuffixParser:
         #     elapsed = (time.time() - t0) * 1000
         #     _record_results(sq_ff, results, elapsed)
 
-        # Step 5d: E_simple — ОТКЛЮЧЕНО для лайт-серча (Firefox клиент)
-        # async def run_e_simple(client: httpx.AsyncClient):
-        #     e_simple_sem = asyncio.Semaphore(5)
-        #     async def fetch_simple_char(char: str):
-        #         async with e_simple_sem:
-        #             await asyncio.sleep(0.3)
-        #             q = f"{seed} {char}"
-        #             sq_simple = SuffixQuery(
-        #                 query=q, suffix_val=char, suffix_label=f"simple_{char}",
-        #                 suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
-        #             )
-        #             t0 = time.time()
-        #             url = "https://www.google.com/complete/search"
-        #             params = {"q": q, "client": "firefox", "hl": language, "gl": country}
-        #             headers = {"User-Agent": random.choice(USER_AGENTS)}
-        #             try:
-        #                 resp = await client.get(url, params=params, headers=headers, timeout=10.0)
-        #                 if resp.status_code == 200:
-        #                     data = resp.json()
-        #                     results = data[1] if len(data) > 1 else []
-        #                 else:
-        #                     results = []
-        #             except Exception:
-        #                 results = []
-        #             elapsed = (time.time() - t0) * 1000
-        #             _record_results(sq_simple, results, elapsed)
-        #     await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET])
+        # Step 5d: E_simple — алфавитный перебор через Chrome без cp
+        ALPHABET = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
+
+        async def run_e_simple(client: httpx.AsyncClient):
+            e_simple_sem = asyncio.Semaphore(5)
+
+            async def fetch_simple_char(char: str):
+                async with e_simple_sem:
+                    await asyncio.sleep(0.3)
+                    q = f"{seed} {char}"
+                    sq_simple = SuffixQuery(
+                        query=q, suffix_val=char, suffix_label=f"simple_{char}",
+                        suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
+                    )
+                    t0 = time.time()
+                    results = await self.fetch_suggestions(q, country, language, client, "chrome", -1)
+                    elapsed = (time.time() - t0) * 1000
+                    _record_results(sq_simple, results, elapsed)
+
+            await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET])
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
@@ -479,7 +472,7 @@ class SuffixParser:
             for letter, letter_qs in e_queries_by_letter.items():
                 tasks.append(run_letter_chrome(letter_qs, client))
                 # tasks.append(run_letter_firefox(letter_qs, client))  # ОТКЛЮЧЕНО для лайт-серча
-            # tasks.append(run_e_simple(client))  # ОТКЛЮЧЕНО для лайт-серча (Firefox)
+            tasks.append(run_e_simple(client))  # Chrome алфавитный перебор без cp
             await asyncio.gather(*tasks)
 
         async def run_yandex(client: httpx.AsyncClient):
