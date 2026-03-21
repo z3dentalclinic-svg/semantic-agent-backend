@@ -1,385 +1,713 @@
 """
-Prefix Generator v1.0 — Full prefix matrix for research testing.
+Morph Generator v2.0 — Full suffix map × all case variants.
 
-Architecture mirrors suffix_generator.py:
-    - PrefixQuery dataclass (analog of SuffixQuery)
-    - STRUCTURES per group (G1–G9, PA, PC)
-    - PrefixGenerator.generate() → List[PrefixQuery]
-    - Self-contained: no dependency on suffix_generator
+Architecture:
+- Finds first noun in seed → generates up to 12 case variants (6 cases × 2 numbers)
+- Identical case forms are deduplicated (e.g. accs_sing == nomn_sing for inanimate nouns)
+- For each unique case variant → runs FULL SuffixGenerator (A + B + C + D + E structures)
+- Result: case_variant × suffix_map = ~8,000+ queries per seed
 
-Matrix v2.0 (финализирована по 7 датасетам Chrome + 4 датасетам Firefox):
-    G1  — [OP] [S] *         5 cp variants    Chrome + Firefox
-    G2  — [OP] [S] <space>   2 variants       Chrome + Firefox
-    G3  — [OP] * [S] *       3 variants       Chrome + Firefox
-    G4  — * [OP] [S] *       3 variants       Chrome + Firefox
-    G5  — * [S] *            3 variants       Chrome + Firefox
-    G6  — [OP]  [S] *        2 variants       Chrome + Firefox
-    G7  — *[S]*              1 вариант        Chrome + Firefox  (схлопнуто с 4)
-    G8  — ** [S] *           1 вариант        Chrome + Firefox  (схлопнуто с 5)
-    G9  — без trailing *     2 варианта       Chrome + Firefox  (схлопнуто с 4)
-    PA  — [L] [S] ...        9 structures × 30 букв = 270 запросов  Chrome only
-    PC  — [вопрос] [S] *     11 запросов      Chrome + Firefox
+Query count estimate (10 active cases after dedup):
+  Type A (symbols):                  1 sym × 2 cp_variants × 10 = 20
+  Type B (prepositions + trail):     8 prep × (3 cp + 1 trail) × 10 = 320
+  Type C (questions):                5 q × 3 cp × 10 = 150
+  Type D (finalizers):               12 fin × 3 cp × 10 = 360
+  Type E (26 ltr × 14 struct × 10): 3640 MorphQuery objects
+  ─────────────────────────────────────────────────────────────────────
+  Total MorphQuery objects (before UA split):                   ~4,490
+  After ×2 UA (chrome/firefox) in parser for each query:        ~8,980
 
-Agents:
-    Chrome:  G1–G9 + PA + PC  (272 запроса)
-    Firefox: G1–G9 + PC only  (38 запросов)  PA даёт мусор на Firefox
-    Параллельно: Chrome и Firefox стартуют одновременно,
-                 внутри каждого агента запросы тоже параллельно.
-
-PA структуры (9 из 14 — по данным 7 датасетов):
-    ОСТАВЛЕНЫ:  cp1, cp0, wcB_cpMid, Lwc_cpBL, Lwc_cpAL,
-                hyp_Lwc, hyp_wcL, L_hyp, hyp_B_trail
-    УДАЛЕНЫ:    nocp (0/7), trail (0/7), sandwich (нестаб),
-                L_col (нестаб), col_B_trail (нестаб)
-
-Total: Chrome 272 + Firefox 38 = 310 запросов на сид
+Trace axes (for 10-dataset post-run analysis):
+  case_label   → which case inflection adds unique results
+  suffix_type  → A/B/C/D/E — which suffix class per case
+  suffix_label → exact suffix structure (prep_v_v1, а_plain, etc.)
+  ua_type      → chrome vs firefox — which UA per structure
 """
 
+import pymorphy3
+import re
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
-from typing import List, Optional
+
+from parser.suffix_generator import SuffixGenerator, SuffixQuery
 
 
 # ══════════════════════════════════════════════
-# CONSTANTS
+# CASE DEFINITIONS
 # ══════════════════════════════════════════════
 
-# 33 буквы — полный алфавит минус ъ ы ь (не начинают слова)
-# Оставляем все 33 для полного теста — после прогона уберём пустые
-LETTERS_RU = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
-
-# Вопросы для Type PC
-QUESTIONS_RU = ["как", "какой", "где", "сколько", "почему"]
-
-# Группы для удобства итерации
-ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC"]
+# case_label → (pymorphy3_case_tag, pymorphy3_number_tag, human_display)
+CASES_RU: Dict[str, Tuple[str, str, str]] = {
+    "nomn_sing": ("nomn", "sing", "Именительный ед.ч."),
+    "gent_sing":  ("gent", "sing", "Родительный ед.ч."),
+    "datv_sing":  ("datv", "sing", "Дательный ед.ч."),
+    "accs_sing":  ("accs", "sing", "Винительный ед.ч."),
+    "ablt_sing":  ("ablt", "sing", "Творительный ед.ч."),
+    "loct_sing":  ("loct", "sing", "Предложный ед.ч."),
+    "nomn_plur":  ("nomn", "plur", "Именительный мн.ч."),
+    "gent_plur":  ("gent", "plur", "Родительный мн.ч."),
+    "datv_plur":  ("datv", "plur", "Дательный мн.ч."),
+    "accs_plur":  ("accs", "plur", "Винительный мн.ч."),
+    "ablt_plur":  ("ablt", "plur", "Творительный мн.ч."),
+    "loct_plur":  ("loct", "plur", "Предложный мн.ч."),
+    "stem_cut":   ("nomn", "sing", "Усечённая лемма"),   # эксперимент
+    # ── mixed experiment ──────────────────────────────────────────────────
+    "typo_w1":    ("nomn", "sing", "Удвоение первой буквы слова 1"),
+    "cyr2lat_w1": ("nomn", "sing", "Замена кириллицы на латиницу в слове 1"),
+    "cyr2lat_w2": ("nomn", "sing", "Замена кириллицы на латиницу в слове 2"),
+    # ── gemini experiment ─────────────────────────────────────────────────
+    "double_space": ("nomn", "sing", "Двойной пробел после wildcard"),
+    "ds_it":        ("nomn", "sing", "Параметр ds=it (информационный слой)"),
+    "client_yt":    ("nomn", "sing", "Client=youtube"),
+    "cp_one":       ("nomn", "sing", "Курсор cp=1 на маске"),
+    # ── suffix brute-force experiment ─────────────────────────────────────
+    # Берём первое существительное, отрезаем последний символ, добавляем окончание.
+    # Google fuzzy-матчит шум к ближайшему падежу и открывает нужный карман.
+    # brute_и = уже gent_sing (контрольный), brute_ы/а/е = новые несуществующие формы
+    "brute_и":  ("nomn", "sing", "Brute suffix: -и"),
+    "brute_а":  ("nomn", "sing", "Brute suffix: -а"),
+    "brute_е":  ("nomn", "sing", "Brute suffix: -е"),
+    "brute_у":  ("nomn", "sing", "Brute suffix: -у"),
+    "brute_ы":  ("nomn", "sing", "Brute suffix: -ы"),
+    "brute_ом": ("nomn", "sing", "Brute suffix: -ом (творительный муж.р)"),
+    "brute_ей": ("nomn", "sing", "Brute suffix: -ей (творительный жен.р)"),
+    "brute_о":  ("nomn", "sing", "Brute suffix: -о"),
+}
 
 
 # ══════════════════════════════════════════════
-# DATACLASS
+# DATA CLASSES
 # ══════════════════════════════════════════════
 
 @dataclass
-class PrefixQuery:
-    """Single generated prefix query with full metadata."""
-    query: str            # Полная строка запроса отправляемая в Google
-    group: str            # G1..G9, PA, PC
-    struct: str           # Название структуры (для трейсера)
-    operator: str         # Оператор или буква
-    op_type: str          # "letter" / "question" / "intent" / "prep" / "symbol"
-    cp: int               # Cursor position (-1 = не передавать)
-    cp_note: str          # Человекочитаемое описание позиции курсора
+class MorphQuery:
+    """
+    Single generated query: full SuffixQuery metadata + case metadata.
+    Parser iterates these, fetches Google (chrome + firefox), records trace.
+    """
+    # ── Case metadata ──────────────────────────────────────────────────────
+    case_label: str        # "gent_sing"
+    case_display: str      # "Родительный ед.ч."
+    seed_variant: str      # Inflected seed: "курса английского языка киев"
 
-    # Агенты для запуска
-    agents: tuple = ("chrome",)  # ("chrome",) | ("firefox",) | ("chrome", "firefox")
+    # ── Suffix metadata (mirrors SuffixQuery) ─────────────────────────────
+    query: str             # Full query: "курса английского языка киев а"
+    suffix_val: str        # "а" / "в *" / ":" / "купить *"
+    suffix_label: str      # "а_plain" / "prep_v_v1" / "fin_kupit_v1"
+    suffix_type: str       # A / B / C / D / E
+    priority: int          # 1 or 2 (0 = blocked — recorded in trace but not fetched)
+    cp_override: Optional[int] = None   # cursor position override for Google
+    variant: Optional[str] = None       # v1/v2/v3/trail/plain/sandwich/...
+    blocked_by: Optional[str] = None    # self-match reason if priority == 0
+    ua_filter: Optional[str] = None     # "chrome" / "firefox" / "youtube" / None=both
+    extra_params: Dict = field(default_factory=dict)  # дополнительные HTTP-параметры (ds=it и т.д.)
+    client_override: Optional[str] = None             # переопределить client (youtube и т.д.)
 
-    # Флаги для аналитики
-    is_alpha: bool = False       # Входит в алфавитный перебор
-    is_question: bool = False    # Вопросительный оператор
-    letter: Optional[str] = None # Буква для PA группы
+
+@dataclass
+class MorphSeedAnalysis:
+    """Result of morphological seed analysis."""
+    original_seed: str
+    original_noun: str           # Word that was inflected, e.g. "курсов"
+    original_noun_idx: int       # Position in word list (0-based)
+    original_lemma: str          # Lemma: "курс"
+    case_variants: Dict[str, str]   # case_label → seed_variant (deduped)
+    skipped_cases: List[str]        # Reasons for skipped cases
 
 
 # ══════════════════════════════════════════════
 # GENERATOR
 # ══════════════════════════════════════════════
 
-class PrefixGenerator:
+class MorphGenerator:
     """
-    Generates all prefix query variants for a seed.
+    Generates full suffix map for all unique case variants of the first noun in seed.
 
-    Usage:
-        gen = PrefixGenerator()
-        queries = gen.generate(seed="имплантация зубов", operator="купить")
-        # → List[PrefixQuery], ~471 запросов с полным стеком
-
-    Args:
-        seed:      Базовый запрос
-        operator:  Оператор для G1-G9 групп (купить, цена, как и т.д.)
-        groups:    Набор групп для генерации. None = все группы.
-        op_type:   Тип оператора (определяется автоматически если None)
+    Core idea: for each case_variant string → call SuffixGenerator.generate().
+    SuffixGenerator already handles everything:
+      A/B/C/D/E structures, cp_override variants, self-match filter,
+      trailing space ("в " / "на "), priority matrix, letter sweep.
+    We just stamp case_label + case_display + seed_variant on every SuffixQuery.
     """
 
-    # Типы операторов для метаданных
-    _INTENTS   = {"купить", "цена", "отзывы", "обзор", "характеристики",
-                  "аналоги", "vs", "сравнение", "или", "вместо", "форум"}
-    _PREPS     = {"в", "на", "для", "с", "от", "под", "из", "без"}
-    _QUESTIONS = set(QUESTIONS_RU)
+    def __init__(self, lang: str = "ru"):
+        self.lang = lang
+        self.morph = pymorphy3.MorphAnalyzer(lang=lang)
+        self.suffix_gen = SuffixGenerator(lang=lang)
 
-    def _detect_op_type(self, op: str) -> str:
-        if op in self._INTENTS:   return "intent"
-        if op in self._PREPS:     return "prep"
-        if op in self._QUESTIONS: return "question"
-        return "other"
+    # ── Noun detection ─────────────────────────────────────────────────────
 
-    def generate(
-        self,
-        seed: str,
-        operator: str = "купить",
-        groups: Optional[List[str]] = None,
-        op_type: Optional[str] = None,
-    ) -> List[PrefixQuery]:
+    def _is_cyrillic_word(self, word: str) -> bool:
+        return bool(re.match(r'^[а-яёА-ЯЁ]+$', word))
+
+    def _find_first_noun(self, words: List[str]) -> Optional[Tuple[int, str, str, object]]:
         """
-        Generate full prefix matrix.
-        Returns list of PrefixQuery sorted by group then struct.
+        Find first noun in word list.
+        Pass 1 (strict):   POS=NOUN + score>=0.3 + cyrillic
+        Pass 2 (fallback): any POS=NOUN + cyrillic
+        Returns (idx, word, lemma, parsed_obj) or None.
         """
-        S   = seed.strip()
-        OP  = operator.strip()
-        grp = set(groups) if groups else set(ALL_GROUPS)
-        ot  = op_type or self._detect_op_type(OP)
-        out: List[PrefixQuery] = []
+        for strict in [True, False]:
+            for idx, word in enumerate(words):
+                if not self._is_cyrillic_word(word):
+                    continue
+                for p in self.morph.parse(word):
+                    if p.tag.POS == 'NOUN':
+                        if not strict or p.score >= 0.3:
+                            return idx, word, p.normal_form, p
+        return None
 
-        BOTH   = ("chrome", "firefox")
-        CHROME = ("chrome",)
+    # ── Seed analysis ──────────────────────────────────────────────────────
 
-        def q(group: str, struct: str, query: str, cp: int,
-              cp_note: str, op_val: str = OP, op_t: str = ot,
-              is_alpha: bool = False, is_q: bool = False,
-              letter: str = None, agents: tuple = BOTH) -> PrefixQuery:
-            return PrefixQuery(
-                query=query, group=group, struct=struct,
-                operator=op_val, op_type=op_t, cp=cp, cp_note=cp_note,
-                agents=agents,
-                is_alpha=is_alpha, is_question=is_q, letter=letter,
+    def analyze_seed(self, seed: str) -> Optional[MorphSeedAnalysis]:
+        """
+        Find first noun → build up to 12 case variants (6 cases × 2 numbers).
+        Identical forms are automatically deduplicated.
+
+        Fallback chain:
+          1. First cyrillic NOUN score>=0.3
+          2. Any cyrillic NOUN
+          3. First cyrillic word that produces at least 1 inflection
+          4. If nothing inflects → use nomn_sing only (seed as-is)
+        Returns None only if seed is empty.
+        """
+        words = seed.lower().strip().split()
+        if not words:
+            return None
+
+        noun_data = self._find_first_noun(words)
+
+        if noun_data is None:
+            # Fallback: try every cyrillic word, pick first NOUN that can be inflected
+            for idx, word in enumerate(words):
+                if not self._is_cyrillic_word(word):
+                    continue  # skip digits, latin (3060, rtx, ртх)
+                parses = self.morph.parse(word)
+                if not parses:
+                    continue
+                for p in parses:
+                    if p.tag.POS != 'NOUN':
+                        continue
+                    test = p.inflect({'nomn', 'sing'}) or p.inflect({'nomn', 'plur'})
+                    if test:
+                        noun_data = (idx, word, p.normal_form, p)
+                        break
+                if noun_data:
+                    break
+
+        if noun_data is None:
+            # Last-resort: no inflectable cyrillic word found.
+            # Use nomn_sing only (seed as-is) so at least one case runs.
+            # This handles "купить ртх 3060" — no noun, but we still sweep letters.
+            idx = next(
+                (i for i, w in enumerate(words) if self._is_cyrillic_word(w)),
+                len(words) - 1
+            )
+            word = words[idx]
+            parses = self.morph.parse(word)
+            if not parses:
+                return None
+            noun_data = (idx, word, parses[0].normal_form, parses[0])
+            # Force only nomn_sing — no inflection available
+            return MorphSeedAnalysis(
+                original_seed=seed.lower().strip(),
+                original_noun=word,
+                original_noun_idx=idx,
+                original_lemma=parses[0].normal_form,
+                case_variants={"nomn_sing": seed.lower().strip()},
+                skipped_cases=["all_other:no_inflectable_noun_found"],
             )
 
-        # ─────────────────────────────────────────────────────────────
-        # G1 — [OP] [S] *  — 5 cp variants
-        # Базовые позиции курсора для стандартной структуры
-        # ─────────────────────────────────────────────────────────────
-        if "G1" in grp:
-            base = f"{OP} {S} *"
-            # vP1: cp после OP пробел, перед S — Google видит OP как первую букву
-            out.append(q("G1", "vP1_afterOP_space", base,
-                         len(OP) + 1, "после OP, перед S"))
-            # vP2: cp на последнем символе OP — OP как отдельный блок
-            out.append(q("G1", "vP2_onOP_end", base,
-                         len(OP), "на конце OP, перед пробелом"))
-            # vP3: cp в начале строки
-            out.append(q("G1", "vP3_start", base,
-                         0, "начало строки"))
-            # vP4: cp после S, перед *
-            out.append(q("G1", "vP4_afterS", base,
-                         len(OP) + 1 + len(S) + 1, "после S, перед *"))
-            # vP5: cp в конце строки
-            out.append(q("G1", "vP5_end", base,
-                         len(base), "конец строки"))
+        idx, word, lemma, parsed = noun_data
 
-        # ─────────────────────────────────────────────────────────────
-        # G2 — [OP] [S] <space>  — trailing space вместо *
-        # В суффиксе trailing space = "предложи следующее слово"
-        # ─────────────────────────────────────────────────────────────
-        if "G2" in grp:
-            trail = f"{OP} {S} "
-            out.append(q("G2", "trail_afterOP", trail,
-                         len(OP) + 1, "после OP, trailing space"))
-            out.append(q("G2", "trail_end", trail,
-                         len(trail), "конец строки, trailing space"))
+        case_variants: Dict[str, str] = {}
+        seen_variants: set = set()
+        skipped_cases: List[str] = []
 
-        # ─────────────────────────────────────────────────────────────
-        # G3 — [OP] * [S] *  — wildcard как разделитель
-        # ─────────────────────────────────────────────────────────────
-        if "G3" in grp:
-            b = f"{OP} * {S} *"
-            out.append(q("G3", "wc_afterOP",   b,
-                         len(OP) + 1, "после OP, перед *"))
-            out.append(q("G3", "wc_afterStar", b,
-                         len(OP) + 3, "после *, перед S"))
-            out.append(q("G3", "wc_afterS",    b,
-                         len(OP) + 3 + len(S) + 1, "после S, перед конечным *"))
+        # ── ЗАКОММЕНТИРОВАНО для эксперимента ──────────────────────────
+        # for case_label, (case_tag, number_tag, _display) in CASES_RU.items():
+        #     ...
 
-        # ─────────────────────────────────────────────────────────────
-        # G4 — * [OP] [S] *  — обратный wildcard перед оператором
-        # ─────────────────────────────────────────────────────────────
-        if "G4" in grp:
-            b = f"* {OP} {S} *"
-            out.append(q("G4", "rwc_afterStar",  b,
-                         2, "после первого *, перед OP"))
-            out.append(q("G4", "rwc_afterOP",    b,
-                         2 + len(OP) + 1, "после OP, перед S"))
-            out.append(q("G4", "rwc_afterS",     b,
-                         2 + len(OP) + 1 + len(S) + 1, "после S, перед *"))
+        # ── mixed experiment ─────────────────────────────────────────────
+        # Таблица замены кириллицы на визуально идентичную латиницу
+        CYR2LAT = {
+            'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
+            'у': 'y', 'х': 'x', 'А': 'A', 'Е': 'E', 'О': 'O',
+            'Р': 'P', 'С': 'C', 'У': 'Y', 'Х': 'X',
+        }
 
-        # ─────────────────────────────────────────────────────────────
-        # G5 — * [S] *  /  * [S] <space>  — чистый prefix wildcard
-        # Без оператора — что Google дополняет перед сидом
-        # ─────────────────────────────────────────────────────────────
-        if "G5" in grp:
-            b_star  = f"* {S} *"
-            b_trail = f"* {S} "
-            out.append(q("G5", "pxwc_afterStar", b_star,  2, "после *, перед S",
-                         op_val="*", op_t="symbol"))
-            out.append(q("G5", "pxwc_afterS",    b_star,
-                         2 + len(S) + 1, "после S, перед конечным *",
-                         op_val="*", op_t="symbol"))
-            out.append(q("G5", "pxwc_trail",     b_trail,
-                         len(b_trail), "trailing space (без конечного *)",
-                         op_val="*", op_t="symbol"))
+        def mix_cyr_lat(word):
+            """Заменяем первую найденную кириллическую букву на латинский аналог."""
+            for i, ch in enumerate(word):
+                if ch in CYR2LAT:
+                    return word[:i] + CYR2LAT[ch] + word[i+1:]
+            return word
 
-        # ─────────────────────────────────────────────────────────────
-        # G6 — [OP]<двойной пробел>[S] *  — нормализует ли Google?
-        # ─────────────────────────────────────────────────────────────
-        if "G6" in grp:
-            b = f"{OP}  {S} *"
-            out.append(q("G6", "dbl_afterOP", b,
-                         len(OP) + 2, "после двойного пробела, перед S"))
-            out.append(q("G6", "dbl_afterS",  b,
-                         len(OP) + 2 + len(S) + 1, "после S, перед *"))
+        other_idx = 1 if idx == 0 else 0
+        has_other = (other_idx < len(words)
+                     and other_idx != idx
+                     and re.match(r'^[а-яёА-ЯЁ]+$', words[other_idx])
+                     and len(words[other_idx]) > 2)
 
-        # ─────────────────────────────────────────────────────────────
-        # G7 — A_local (:) / A_general (*) перед сидом
-        # Зеркало Type A из суффикса — гео-кластеры
-        # ─────────────────────────────────────────────────────────────
-        if "G7" in grp:
-            # Схлопнуто до 1 запроса: все 4 варианта (local/general × cp) давали
-            # идентичный результат на всех 7 датасетах. Оставлен sym_general_afterSym.
-            out.append(q("G7", "sym_general_afterSym", f"* {S} *",
-                         2, "после *, перед S",
-                         op_val="*", op_t="symbol"))
+        # typo_w1: удвоение первой буквы первого существительного
+        w1_typo = words[idx][0] + words[idx]
+        tw1 = words.copy()
+        tw1[idx] = w1_typo
+        v1 = " ".join(tw1)
+        if v1 not in seen_variants:
+            case_variants["typo_w1"] = v1
+            seen_variants.add(v1)
 
-        # ─────────────────────────────────────────────────────────────
-        # G8 — ** / *** / * *  — вытягивание брендов (Дайсон ремонт пылесосов)
-        # ─────────────────────────────────────────────────────────────
-        if "G8" in grp:
-            # Схлопнуто до 1 запроса: все 5 вариантов давали идентичный результат
-            # на всех 7 датасетах (Chrome). Оставлен dstar_afterStar.
-            out.append(q("G8", "dstar_afterStar", f"** {S} *",
-                         3, "после **, перед S", op_val="**", op_t="symbol"))
+        # cyr2lat_w1: замена буквы в первом слове
+        w1_lat = mix_cyr_lat(words[idx])
+        if w1_lat != words[idx]:
+            cl1 = words.copy()
+            cl1[idx] = w1_lat
+            vcl1 = " ".join(cl1)
+            if vcl1 not in seen_variants:
+                case_variants["cyr2lat_w1"] = vcl1
+                seen_variants.add(vcl1)
 
-        # ─────────────────────────────────────────────────────────────
-        # G9 — без trailing *  — контроль режима
-        # ─────────────────────────────────────────────────────────────
-        if "G9" in grp:
-            # Два варианта — дают разные результаты (trailing space меняет режим).
-            # nostar_spstar и nostar_single схлопнуты: идентичны nostar_dstar.
-            out.append(q("G9", "nostar_dstar",    f"** {S}",
-                         3, "после **, перед S, без *",
-                         op_val="**", op_t="symbol"))
-            out.append(q("G9", "nostar_dstar_tr", f"** {S} ",
-                         3 + len(S) + 1, "trailing space — другой режим",
-                         op_val="**", op_t="symbol"))
+        # cyr2lat_w2: замена буквы во втором слове
+        if has_other:
+            w2_lat = mix_cyr_lat(words[other_idx])
+            if w2_lat != words[other_idx]:
+                cl2 = words.copy()
+                cl2[other_idx] = w2_lat
+                vcl2 = " ".join(cl2)
+                if vcl2 not in seen_variants:
+                    case_variants["cyr2lat_w2"] = vcl2
+                    seen_variants.add(vcl2)
 
-        # ─────────────────────────────────────────────────────────────
-        # PA — Алфавитный перебор: 9 структур × 30 букв = 270 запросов
-        # Chrome only — Firefox даёт мусор (буква остаётся в начале ключа)
-        #
-        # Оставлены (по 7 датасетам):
-        #   cp1, cp0, wcB_cpMid, Lwc_cpBL, Lwc_cpAL,
-        #   hyp_Lwc, hyp_wcL, L_hyp, hyp_B_trail
-        # Удалены:
-        #   nocp (0 уник на всех датасетах), trail (0 уник),
-        #   sandwich (нестаб), L_col (нестаб), col_B_trail (нестаб)
-        # ─────────────────────────────────────────────────────────────
-        if "PA" in grp:
-            for L in LETTERS_RU:
-                qstr = f"{L} {S}"
+        # ── gemini experiment: все 4 используют оригинальный сид ─────────
+        original = seed.lower().strip()
+        for gcase in ("double_space", "ds_it", "client_yt", "cp_one"):
+            if original not in seen_variants:
+                case_variants[gcase] = original
+            else:
+                # если оригинал уже есть под другим именем — всё равно добавляем
+                case_variants[gcase] = original
 
-                # 1. cp0 — L S  cp=0 (курсор в начале строки)
-                # По аналогии с kard_cp0: даёт слова ДО буквы (префиксы)
-                out.append(q("PA", f"{L}_cp0", qstr,
-                             0, "cp=0, начало строки",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+        # ── suffix brute-force: алгоритм Gemini «Last Consonant Rule»
+        #    Ищем последнюю согласную → отрезаем флексию → подставляем 8 окончаний.
+        #    Покрывает все падежи включая творительный (-ом/-ей).
+        _CONSONANTS = set('бвгджзйклмнпрстфхцчшщ')
+        _EPHEMERAL  = set('йьъ')
+        _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о']
+        _BRUTE_LABELS  = ['brute_и', 'brute_а', 'brute_е', 'brute_у',
+                          'brute_ы', 'brute_ом', 'brute_ей', 'brute_о']
 
-                # 2. cp1 — L S  cp=1 (курсор после буквы)
-                # По аналогии с kard_cp1: Google раскрывает букву в полное слово
-                out.append(q("PA", f"{L}_cp1", qstr,
-                             1, "cp=1, после буквы",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+        noun_word = words[idx]
+        stem_end = None
+        for _i in range(len(noun_word) - 1, -1, -1):
+            _ch = noun_word[_i]
+            if _ch in _EPHEMERAL:
+                continue
+            if _ch in _CONSONANTS:
+                stem_end = _i + 1
+                break
 
-                # 3. wcB_cpMid — L * S  cp между * и S
-                # (nocp, trail, sandwich удалены — 0 уникальных на 7 датасетах)
-                qstr = f"{L} * {S}"
-                # cp = после "L * " = len(L) + 3
-                out.append(q("PA", f"{L}_wcB_cpMid", qstr,
-                             len(L) + 3, "cp между * и S",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+        if stem_end is not None:
+            noun_stem = noun_word[:stem_end]
+            for blabel, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
+                new_word = noun_stem + bending
+                if new_word == noun_word:
+                    continue
+                bwords = words.copy()
+                bwords[idx] = new_word
+                case_variants[blabel] = " ".join(bwords)
 
-                # 6. Lwc_cpAL — L S *  cp после "L S " перед *
-                qstr = f"{L} {S} *"
-                out.append(q("PA", f"{L}_Lwc_cpAL", qstr,
-                             len(L) + 1 + len(S) + 1, "cp после S, перед *",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+        return MorphSeedAnalysis(
+            original_seed=seed.lower().strip(),
+            original_noun=word,
+            original_noun_idx=idx,
+            original_lemma=lemma,
+            case_variants=case_variants,
+            skipped_cases=skipped_cases,
+        )
 
-                # 7. Lwc_cpBL — L S *  cp после "L " перед S
-                out.append(q("PA", f"{L}_Lwc_cpBL", qstr,
-                             len(L) + 1, "cp после L, перед S",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+    # ── Query generation ───────────────────────────────────────────────────
 
-                # 8. hyp_B_trail — L - S <space>  (col_B_trail и L_col удалены — нестабильны)
-                qstr = f"{L} - {S} "
-                out.append(q("PA", f"{L}_hyp_B_trail", qstr,
-                             len(qstr), "дефис + буква, trailing space",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+    # ══════════════════════════════════════════════════════════════════════
+    # PROVEN_TRIPLETS — 79 доказанных связок из анализа 10 датасетов
+    # Анализ: analysis_triplets.py | Файл: morph_target_keywords.md
+    # Покрытие: 486/505 целевых ключей (96%) | ~950 запросов вместо 8000
+    #
+    # Формат: (case_label, struct_name, ua)
+    # struct_name соответствует именам в suffix_generator.py
+    # ══════════════════════════════════════════════════════════════════════
+    PROVEN_TRIPLETS: List[Tuple[str, str, str]] = [
+        # ── Топ по количеству ключей ──────────────────────────────────
+        ("gent_sing",  "wcB_cpMid",   "chrome"),   # 133 ключей
+        ("accs_sing",  "wcB_cpMid",   "chrome"),   #  44
+        ("nomn_sing",  "plain",       "firefox"),  #  36
+        ("nomn_sing",  "wcB_cpMid",   "chrome"),   #  33
+        ("ablt_sing",  "wcB_cpMid",   "chrome"),   #  30
+        ("nomn_sing",  "q_kak",       "chrome"),   #  11
+        ("ablt_plur",  "prep_bez",    "chrome"),   #  11
+        ("gent_sing",  "q_kakoy",     "chrome"),   #  10
+        ("gent_sing",  "plain",       "firefox"),  #   9
+        ("nomn_sing",  "plain",       "chrome"),   #   8
+        ("nomn_sing",  "prep_s",      "chrome"),   #   8
+        ("datv_plur",  "plain",       "firefox"),  #   7
+        ("gent_sing",  "trail",       "firefox"),  #   6
+        ("ablt_sing",  "trail",       "firefox"),  #   6
+        ("gent_sing",  "q_kak",       "chrome"),   #   6
+        ("gent_sing",  "plain",       "chrome"),   #   6
+        ("gent_sing",  "Lwc_cpBL",    "chrome"),   #   5
+        ("nomn_sing",  "trail",       "firefox"),  #   5
+        ("nomn_sing",  "fin_i",       "chrome"),   #   5
+        ("gent_sing",  "prep_na",     "chrome"),   #   5
+        ("nomn_sing",  "q_skolko",    "chrome"),   #   5
+        ("nomn_sing",  "q_gde",       "chrome"),   #   4
+        ("nomn_sing",  "prep_dlya",   "chrome"),   #   4
+        ("nomn_sing",  "fin_ili",     "chrome"),   #   4
+        ("loct_sing",  "plain",       "firefox"),  #   3
+        ("nomn_sing",  "q_kakoy",     "chrome"),   #   3
+        ("gent_sing",  "prep_bez",    "chrome"),   #   3
+        ("gent_sing",  "q_pochemu",   "chrome"),   #   3
+        ("gent_sing",  "prep_ot",     "chrome"),   #   3
+        ("ablt_sing",  "sym",         "chrome"),   #   3
+        # ── По 2 ключа ────────────────────────────────────────────────
+        ("nomn_plur",  "plain",       "firefox"),  #   2
+        ("ablt_plur",  "wcB_cpMid",   "chrome"),   #   2
+        ("nomn_sing",  "plain_nocp",  "chrome"),   #   2
+        ("nomn_plur",  "q_pochemu",   "chrome"),   #   2
+        ("nomn_sing",  "q_pochemu",   "chrome"),   #   2
+        ("gent_sing",  "q_skolko",    "chrome"),   #   2
+        ("gent_plur",  "plain",       "firefox"),  #   2
+        ("accs_sing",  "plain",       "firefox"),  #   2
+        ("datv_plur",  "trail",       "firefox"),  #   2
+        ("accs_sing",  "prep_na",     "chrome"),   #   2
+        ("gent_sing",  "prep_s",      "chrome"),   #   2
+        ("gent_sing",  "prep_dlya",   "chrome"),   #   2
+        ("gent_sing",  "fin_tsena",   "chrome"),   #   2
+        ("ablt_plur",  "plain",       "chrome"),   #   2
+        ("ablt_plur",  "prep_na",     "chrome"),   #   2
+        ("gent_sing",  "sym",         "chrome"),   #   2
+        ("gent_sing",  "fin_otzyvy",  "chrome"),   #   2
+        ("gent_sing",  "fin_i",       "chrome"),   #   2
+        # ── По 1 ключу ────────────────────────────────────────────────
+        ("nomn_plur",  "plain_nocp",  "firefox"),  #   1
+        ("datv_sing",  "wcB_cpMid",   "chrome"),   #   1
+        ("datv_sing",  "trail",       "firefox"),  #   1
+        ("accs_sing",  "sym",         "firefox"),  #   1
+        ("datv_plur",  "wcB_cpMid",   "chrome"),   #   1
+        ("nomn_sing",  "prep_bez",    "chrome"),   #   1
+        ("ablt_sing",  "prep_s",      "chrome"),   #   1
+        ("gent_sing",  "prep_s",      "firefox"),  #   1
+        ("datv_sing",  "plain",       "firefox"),  #   1
+        ("loct_plur",  "q_skolko",    "chrome"),   #   1
+        ("gent_plur",  "plain",       "chrome"),   #   1
+        ("datv_plur",  "plain_nocp",  "firefox"),  #   1
+        ("ablt_plur",  "plain",       "firefox"),  #   1
+        ("accs_sing",  "q_kak",       "chrome"),   #   1
+        ("loct_plur",  "prep_v",      "chrome"),   #   1
+        ("nomn_sing",  "prep_na",     "chrome"),   #   1
+        ("nomn_sing",  "prep_v",      "chrome"),   #   1
+        ("nomn_sing",  "prep_pod",    "chrome"),   #   1
+        ("nomn_sing",  "trail",       "chrome"),   #   1
+        ("datv_plur",  "q_pochemu",   "chrome"),   #   1
+        ("gent_sing",  "fin_forum",   "chrome"),   #   1
+        ("gent_plur",  "fin_analogi", "chrome"),   #   1
+        ("gent_sing",  "prep_iz",     "chrome"),   #   1
+        ("accs_sing",  "q_kakoy",     "chrome"),   #   1
+        ("gent_plur",  "q_kakoy",     "chrome"),   #   1
+        ("ablt_plur",  "prep_ot",     "chrome"),   #   1
+        ("accs_sing",  "prep_v",      "chrome"),   #   1
+        ("gent_sing",  "Lwc_cpBL",    "firefox"),  #   1
+        ("accs_sing",  "q_pochemu",   "chrome"),   #   1
+        ("nomn_sing",  "prep_ot",     "chrome"),   #   1
+        ("gent_sing",  "fin_vmesto",  "chrome"),   #   1
+    ]
 
-                # 9.  hyp_Lwc — L - S *
-                qstr = f"{L} - {S} *"
-                out.append(q("PA", f"{L}_hyp_Lwc", qstr,
-                             len(qstr), "дефис + буква + *",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+    # Маппинг struct_name → suffix_label prefix для фильтрации SuffixQuery
+    _STRUCT_TO_VARIANT = {
+        "plain":       "plain",
+        "plain_nocp":  "plain_nocp",
+        "trail":       "trail",
+        "wcB_cpMid":   "wcB_cpMid",
+        "Lwc_cpBL":    "Lwc_cpBL",
+        "sym":         "sym",
+        "prep_na":     "prep_na",   "prep_dlya": "prep_dlya",
+        "prep_bez":    "prep_bez",  "prep_s":    "prep_s",
+        "prep_ot":     "prep_ot",   "prep_v":    "prep_v",
+        "prep_pod":    "prep_pod",  "prep_iz":   "prep_iz",
+        "q_kak":       "q_kak",     "q_kakoy":   "q_kakoy",
+        "q_skolko":    "q_skolko",  "q_pochemu": "q_pochemu",
+        "q_gde":       "q_gde",
+        "fin_i":       "fin_i",     "fin_ili":   "fin_ili",
+        "fin_otzyvy":  "fin_otzyvy","fin_tsena": "fin_tsena",
+        "fin_forum":   "fin_forum", "fin_analogi":"fin_analogi",
+        "fin_vmesto":  "fin_vmesto",
+    }
 
-                # 10. hyp_wcL — L - * S
-                qstr = f"{L} - * {S}"
-                out.append(q("PA", f"{L}_hyp_wcL", qstr,
-                             len(qstr), "дефис + * + S",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+    def generate_queries(
+        self,
+        analysis: MorphSeedAnalysis,
+        region: str = "ua",
+        include_numbers: bool = False,
+        include_letters: bool = True,
+    ) -> List[MorphQuery]:
+        """
+        РЕЖИМ ВЫБИРАЕТСЯ АВТОМАТИЧЕСКИ:
+          use_proven_triplets=True  → ~950 запросов, 96% покрытия (ПРОДАКШН)
+          use_proven_triplets=False → ~8000 запросов, 100% покрытия (ИССЛЕДОВАНИЕ)
 
-                # 11. L_hyp — L S -
-                qstr = f"{L} {S} -"
-                out.append(q("PA", f"{L}_L_hyp", qstr,
-                             len(qstr), "буква + S + дефис",
-                             op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+        По умолчанию: продакшн-режим (proven triplets).
+        Для исследования нового датасета передай use_proven_triplets=False через endpoint.
+        """
+        # ── ЗАКОММЕНТИРОВАНО: proven triplets ────────────────────────────
+        # queries = self._generate_proven(analysis, region, include_numbers)
+        queries = []
 
-        # ─────────────────────────────────────────────────────────────
-        # PC — Вопросы: 5 вопросов × 2-3 cp = 11 запросов
-        # Зеркало Type C из суффикса (вопрос перед сидом)
-        # ─────────────────────────────────────────────────────────────
-        if "PC" in grp:
-            for qw in QUESTIONS_RU:
-                base = f"{qw} {S} *"
-                # vP1: cp после вопроса, перед S
-                out.append(q("PC", f"{qw}_vP1", base,
-                             len(qw) + 1, "после вопроса, перед S",
-                             op_val=qw, op_t="question",
-                             is_q=True))
-                # vP2: cp на конце слова вопроса
-                out.append(q("PC", f"{qw}_vP2", base,
-                             len(qw), "на конце вопроса",
-                             op_val=qw, op_t="question",
-                             is_q=True))
-                # vP3: только для "почему" — в суффиксе v1/v2 всегда empty, v3 даёт 6
-                if qw == "почему":
-                    out.append(q("PC", f"{qw}_vP3", base,
-                                 len(qw) + 1 + len(S) + 1, "после S, перед * (только почему)",
-                                 op_val=qw, op_t="question",
-                                 is_q=True))
+        # Конфигурация кейсов эксперимента:
+        #   label → (extra_params, client_override, cp_force)
+        #   cp_force=None → использовать cp_override из SuffixQuery как обычно
+        #   cp_force=N    → принудительно перебить cp для всех запросов кейса
+        EXP_CONFIG = {
+            "typo_w1":    ({}, None, None),
+            "cyr2lat_w1": ({}, None, None),
+            "cyr2lat_w2": ({}, None, None),
+            "double_space": ({}, None, 3),
+            "ds_it":        ({"ds": "it"}, None, 2),
+            "client_yt":    ({}, "youtube", 2),
+            "cp_one":       ({}, None, 1),
+            # brute suffix: Last Consonant Rule, 8 окончаний
+            "brute_и":  ({}, None, None),
+            "brute_а":  ({}, None, None),
+            "brute_е":  ({}, None, None),
+            "brute_у":  ({}, None, None),
+            "brute_ы":  ({}, None, None),
+            "brute_ом": ({}, None, None),
+            "brute_ей": ({}, None, None),
+            "brute_о":  ({}, None, None),
+        }
 
-        return out
+        for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
+            if exp_label not in analysis.case_variants:
+                continue
+            exp_variant = analysis.case_variants[exp_label]
+            _seed_analysis, exp_suffix_queries = self.suffix_gen.generate(
+                seed=exp_variant,
+                include_numbers=include_numbers,
+                include_letters=True,
+                region=region,
+            )
+            display = CASES_RU[exp_label][2]
+            for sq in exp_suffix_queries:
+                if sq.priority == 0:
+                    continue
 
-    def summary(self, queries: List[PrefixQuery]) -> dict:
-        """Stats for tracer — mirrors suffix_generator.summary()"""
-        by_group = {}
-        for g in ALL_GROUPS:
-            gq = [q for q in queries if q.group == g]
-            by_group[g] = {"total": len(gq)}
+                # double_space: заменяем "* сид" → "*  сид" (двойной пробел)
+                query_str = sq.query
+                if exp_label == "double_space" and "* " in query_str:
+                    query_str = query_str.replace("* ", "*  ", 1)
 
-        alpha_total    = sum(1 for q in queries if q.is_alpha)
-        question_total = sum(1 for q in queries if q.is_question)
-        chrome_total   = sum(1 for q in queries if "chrome"  in q.agents)
-        firefox_total  = sum(1 for q in queries if "firefox" in q.agents)
+                cp_val = cp_force if cp_force is not None else sq.cp_override
+
+                # client_yt: только youtube UA
+                ua = "youtube" if client_override == "youtube" else None
+
+                queries.append(MorphQuery(
+                    case_label=exp_label,
+                    case_display=display,
+                    seed_variant=exp_variant,
+                    query=query_str,
+                    suffix_val=sq.suffix_val,
+                    suffix_label=sq.suffix_label,
+                    suffix_type=sq.suffix_type,
+                    priority=sq.priority,
+                    cp_override=cp_val,
+                    variant=sq.variant,
+                    blocked_by=sq.blocked_by,
+                    ua_filter=ua,
+                    extra_params=extra_params,
+                    client_override=client_override,
+                ))
+
+        return queries
+
+    def _generate_proven(
+        self,
+        analysis: MorphSeedAnalysis,
+        region: str = "ua",
+        include_numbers: bool = False,
+    ) -> List[MorphQuery]:
+        """
+        ПРОДАКШН: генерирует запросы только для 79 доказанных связок.
+        ~950 запросов | 96% покрытия целевых ключей | ~18с wall time.
+        """
+        queries: List[MorphQuery] = []
+
+        # Группируем триплеты по case для эффективности
+        from collections import defaultdict as _dd
+        triplets_by_case: dict = _dd(list)
+        for (case_label, struct_name, ua) in self.PROVEN_TRIPLETS:
+            triplets_by_case[case_label].append((struct_name, ua))
+
+        # (case_label, struct_name) → set of required UAs
+        # Если оба UA — ua_filter=None; если один — ua_filter="chrome"/"firefox"
+        ua_map: dict = _dd(set)
+        for (case_label, struct_name, ua) in self.PROVEN_TRIPLETS:
+            ua_map[(case_label, struct_name)].add(ua)
+
+        for case_label, seed_variant in analysis.case_variants.items():
+            if case_label not in triplets_by_case:
+                continue
+
+            _case_tag, _number_tag, case_display = CASES_RU[case_label]
+
+            # Генерируем ПОЛНУЮ карту суффиксов для фильтрации
+            _seed_analysis, all_suffix_queries = self.suffix_gen.generate(
+                seed=seed_variant,
+                include_numbers=include_numbers,
+                include_letters=True,
+                region=region,
+            )
+
+            needed_structs = {s for s, ua in triplets_by_case[case_label]}
+
+            for sq in all_suffix_queries:
+                # Определяем struct_name этого запроса
+                sq_struct = self._sq_to_struct(sq.suffix_label)
+                if sq_struct not in needed_structs:
+                    continue
+
+                # ua_filter: None=оба, "chrome"/"firefox"=только один
+                ua_set = ua_map[(case_label, sq_struct)]
+                ua_filter = None if len(ua_set) > 1 else next(iter(ua_set))
+
+                queries.append(MorphQuery(
+                    case_label=case_label,
+                    case_display=case_display,
+                    seed_variant=seed_variant,
+                    query=sq.query,
+                    suffix_val=sq.suffix_val,
+                    suffix_label=sq.suffix_label,
+                    suffix_type=sq.suffix_type,
+                    priority=sq.priority,
+                    cp_override=sq.cp_override,
+                    variant=sq.variant,
+                    blocked_by=sq.blocked_by,
+                    ua_filter=ua_filter,
+                ))
+
+        return queries
+
+    def _generate_full(
+        self,
+        analysis: MorphSeedAnalysis,
+        region: str = "ua",
+        include_numbers: bool = False,
+        include_letters: bool = True,
+    ) -> List[MorphQuery]:
+        """
+        ИССЛЕДОВАНИЕ: полная карта суффиксов × все падежи.
+        ~8000 запросов | 100% покрытия | используется при include_letters=full.
+
+        # ── СТАРАЯ ЛОГИКА (закомментирована, сохранена для справки) ──────
+        # for case_label, seed_variant in analysis.case_variants.items():
+        #     _case_tag, _number_tag, case_display = CASES_RU[case_label]
+        #     _seed_analysis, suffix_queries = self.suffix_gen.generate(
+        #         seed=seed_variant,
+        #         include_numbers=include_numbers,
+        #         include_letters=include_letters,
+        #         region=region,
+        #     )
+        #     for sq in suffix_queries:
+        #         queries.append(MorphQuery(case_label=case_label, ...))
+        # ─────────────────────────────────────────────────────────────────
+        """
+        queries: List[MorphQuery] = []
+        for case_label, seed_variant in analysis.case_variants.items():
+            _case_tag, _number_tag, case_display = CASES_RU[case_label]
+            _seed_analysis, suffix_queries = self.suffix_gen.generate(
+                seed=seed_variant,
+                include_numbers=include_numbers,
+                include_letters=include_letters,
+                region=region,
+            )
+            for sq in suffix_queries:
+                queries.append(MorphQuery(
+                    case_label=case_label,
+                    case_display=case_display,
+                    seed_variant=seed_variant,
+                    query=sq.query,
+                    suffix_val=sq.suffix_val,
+                    suffix_label=sq.suffix_label,
+                    suffix_type=sq.suffix_type,
+                    priority=sq.priority,
+                    cp_override=sq.cp_override,
+                    variant=sq.variant,
+                    blocked_by=sq.blocked_by,
+                ))
+        return queries
+
+    @staticmethod
+    def _sq_to_struct(suffix_label: str) -> str:
+        """Определяет struct_name из suffix_label SuffixQuery."""
+        if '_plain_nocp' in suffix_label: return 'plain_nocp'
+        if '_plain' in suffix_label: return 'plain'
+        if '_trail' in suffix_label: return 'trail'
+        if '_wcB_cpMid' in suffix_label: return 'wcB_cpMid'
+        if '_Lwc_cpBL' in suffix_label: return 'Lwc_cpBL'
+        if 'sym_ua' in suffix_label or 'sym_ru' in suffix_label: return 'sym'
+        if 'prep_na_' in suffix_label: return 'prep_na'
+        if 'prep_dlya_' in suffix_label: return 'prep_dlya'
+        if 'prep_bez_' in suffix_label: return 'prep_bez'
+        if 'prep_s_' in suffix_label: return 'prep_s'
+        if 'prep_ot_' in suffix_label: return 'prep_ot'
+        if 'prep_v_' in suffix_label: return 'prep_v'
+        if 'prep_pod_' in suffix_label: return 'prep_pod'
+        if 'prep_iz_' in suffix_label: return 'prep_iz'
+        if 'q_kak_' in suffix_label: return 'q_kak'
+        if 'q_kakoy_' in suffix_label: return 'q_kakoy'
+        if 'q_skolko_' in suffix_label: return 'q_skolko'
+        if 'q_pochemu_' in suffix_label: return 'q_pochemu'
+        if 'q_gde_' in suffix_label: return 'q_gde'
+        if 'fin_i_' in suffix_label: return 'fin_i'
+        if 'fin_ili_' in suffix_label: return 'fin_ili'
+        if 'fin_otzyvy_' in suffix_label: return 'fin_otzyvy'
+        if 'fin_tsena_' in suffix_label: return 'fin_tsena'
+        if 'fin_forum_' in suffix_label: return 'fin_forum'
+        if 'fin_analogi_' in suffix_label: return 'fin_analogi'
+        if 'fin_vmesto_' in suffix_label: return 'fin_vmesto'
+        return suffix_label
+
+    # ── Summary ────────────────────────────────────────────────────────────
+
+    def summary(self, analysis: MorphSeedAnalysis, queries: List[MorphQuery]) -> Dict:
+        """Human-readable summary for logging and HTML trace display."""
+        active = [q for q in queries if q.priority > 0]
+        blocked = [q for q in queries if q.priority == 0]
+
+        by_case: Dict = {}
+        for case_label in analysis.case_variants:
+            case_qs = [q for q in queries if q.case_label == case_label]
+            case_active = [q for q in case_qs if q.priority > 0]
+            by_case[case_label] = {
+                "seed_variant": analysis.case_variants[case_label],
+                "total": len(case_qs),
+                "active": len(case_active),
+                "blocked": len(case_qs) - len(case_active),
+                "by_type": {
+                    t: len([q for q in case_active if q.suffix_type == t])
+                    for t in ["A", "B", "C", "D", "E"]
+                },
+            }
 
         return {
-            "total_queries":   len(queries),
-            "chrome_queries":  chrome_total,
-            "firefox_queries": firefox_total,
-            "by_group":        by_group,
-            "alpha_queries":   alpha_total,
-            "question_queries": question_total,
-            "groups_enabled":  list({q.group for q in queries}),
+            "original_seed": analysis.original_seed,
+            "noun": analysis.original_noun,
+            "lemma": analysis.original_lemma,
+            "noun_position": analysis.original_noun_idx,
+            "cases_active": len(analysis.case_variants),
+            "cases_skipped": len(analysis.skipped_cases),
+            "skipped_detail": analysis.skipped_cases,
+            "case_variants": analysis.case_variants,
+            "total_morph_queries": len(queries),
+            "active_morph_queries": len(active),
+            "blocked_morph_queries": len(blocked),
+            "by_case": by_case,
         }
