@@ -344,15 +344,16 @@ class SuffixGenerator:
         if any(c.isdigit() for c in seed_lower):
             include_numbers = True
 
-        # L6+: only wildcards
+        # L6+: only symbols (A_ua + A_ru), v1 only
         if analysis.l_level == "L6+":
             queries = []
-            for s in self.suffixes["A"]:
-                q = f"{seed_lower} {s['val']}".strip()
-                queries.append(SuffixQuery(
-                    query=q, suffix_val=s["val"], suffix_label=s["label"],
-                    suffix_type="A", priority=1, markers=[analysis.l_level]
-                ))
+            for stype in ["A_ua", "A_ru"]:
+                for s in self.suffixes.get(stype, []):
+                    q = f"{seed_lower} {s['val']}".strip()
+                    queries.append(SuffixQuery(
+                        query=q, suffix_val=s["val"], suffix_label=s["label"],
+                        suffix_type=stype, priority=1, markers=[analysis.l_level]
+                    ))
             return analysis, queries
 
         # Collect active markers for matrix lookup
