@@ -60,6 +60,15 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "ds_it":        ("nomn", "sing", "Параметр ds=it (информационный слой)"),
     "client_yt":    ("nomn", "sing", "Client=youtube"),
     "cp_one":       ("nomn", "sing", "Курсор cp=1 на маске"),
+    # ── suffix brute-force experiment ─────────────────────────────────────
+    # Берём первое существительное, отрезаем последний символ, добавляем окончание.
+    # Google fuzzy-матчит шум к ближайшему падежу и открывает нужный карман.
+    # brute_и = уже gent_sing (контрольный), brute_ы/а/е = новые несуществующие формы
+    "brute_и":  ("nomn", "sing", "Brute suffix: окончание -и (контроль = gent_sing)"),
+    "brute_ы":  ("nomn", "sing", "Brute suffix: окончание -ы"),
+    "brute_а":  ("nomn", "sing", "Brute suffix: окончание -а"),
+    "brute_е":  ("nomn", "sing", "Brute suffix: окончание -е"),
+    "brute_ю":  ("nomn", "sing", "Brute suffix: окончание -ю (контроль = accs_sing)"),
 }
 
 
@@ -276,6 +285,21 @@ class MorphGenerator:
                 # если оригинал уже есть под другим именем — всё равно добавляем
                 case_variants[gcase] = original
 
+        # ── suffix brute-force: отрезаем последний символ существительного,
+        #    добавляем окончание. Google fuzzy-матчит к ближайшему падежу.
+        brute_endings = {
+            "brute_и": "и",
+            "brute_ы": "ы",
+            "brute_а": "а",
+            "brute_е": "е",
+            "brute_ю": "ю",
+        }
+        noun_stem = words[idx][:-1]  # отрезаем последний символ существительного
+        for blabel, bending in brute_endings.items():
+            bwords = words.copy()
+            bwords[idx] = noun_stem + bending
+            case_variants[blabel] = " ".join(bwords)
+
         return MorphSeedAnalysis(
             original_seed=seed.lower().strip(),
             original_noun=word,
@@ -428,10 +452,16 @@ class MorphGenerator:
             "typo_w1":    ({}, None, None),
             "cyr2lat_w1": ({}, None, None),
             "cyr2lat_w2": ({}, None, None),
-            "double_space": ({}, None, 3),        # cp фиксирован=3, запрос с двойным пробелом
-            "ds_it":        ({"ds": "it"}, None, 2),  # ds=it параметр, cp=2
-            "client_yt":    ({}, "youtube", 2),    # client=youtube, cp=2
-            "cp_one":       ({}, None, 1),         # cp=1 для всех запросов
+            "double_space": ({}, None, 3),
+            "ds_it":        ({"ds": "it"}, None, 2),
+            "client_yt":    ({}, "youtube", 2),
+            "cp_one":       ({}, None, 1),
+            # brute suffix: обычный запрос, cp как обычно
+            "brute_и": ({}, None, None),
+            "brute_ы": ({}, None, None),
+            "brute_а": ({}, None, None),
+            "brute_е": ({}, None, None),
+            "brute_ю": ({}, None, None),
         }
 
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
