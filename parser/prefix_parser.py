@@ -42,6 +42,42 @@ import argparse
 from typing import Set, List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
+
+def _brute_seed_variants(seed: str) -> List[str]:
+    """
+    Генерирует brute-suffix варианты сида для расширения префиксной карты.
+
+    Алгоритм:
+      - Находим первое кириллическое слово длиннее 3 букв
+      - Отрезаем последний символ, добавляем окончания: и, ы, а, ю
+      - е пропускаем (дало 0 результатов в тестах)
+
+    Пример: "имплантация зубов" →
+      имплантации зубов  (и)
+      имплантациы зубов  (ы)
+      имплантациа зубов  (а)
+      имплантацию зубов  (ю)
+    """
+    words = seed.lower().strip().split()
+    # Находим первое кириллическое слово > 3 букв
+    target_idx = None
+    for i, w in enumerate(words):
+        if re.match(r'^[а-яёА-ЯЁ]{4,}$', w):
+            target_idx = i
+            break
+    if target_idx is None:
+        return []
+
+    stem = words[target_idx][:-1]
+    variants = []
+    for ending in ("и", "ы", "а", "ю"):
+        w = words.copy()
+        w[target_idx] = stem + ending
+        variant = " ".join(w)
+        if variant != seed.lower().strip():
+            variants.append(variant)
+    return variants
+
 try:
     from parser.prefix_generator import PrefixGenerator, PrefixQuery, ALL_GROUPS
 except ImportError:
@@ -298,6 +334,15 @@ class PrefixParser:
             operator=operator,
             groups=groups or ALL_GROUPS,
         )
+
+        # Brute-suffix варианты: прогоняем те же группы с модифицированным сидом
+        for brute_seed in _brute_seed_variants(seed):
+            brute_matrix = self.generator.generate(
+                seed=brute_seed,
+                operator=operator,
+                groups=groups or ALL_GROUPS,
+            )
+            matrix.extend(brute_matrix)
 
         # Shared state — защищена asyncio.Lock (оба агента пишут одновременно)
         kw_map: Dict[str, List[str]] = {}
