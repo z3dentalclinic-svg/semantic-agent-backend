@@ -99,8 +99,12 @@ USER_AGENTS = [
 ]
 
 # Batch size for parallel execution
-BATCH_SIZE = 10
-DELAY_BETWEEN_REQUESTS = 0.1  # seconds
+BATCH_SIZE = 5
+DELAY_BETWEEN_REQUESTS = 0.3  # seconds
+
+# Proxy from env (same as suffix/morph parsers)
+import os as _os
+_PROXY_URL = _os.getenv("GOOGLE_PROXY_URL", "").strip() or None
 
 
 # ══════════════════════════════════════════════
@@ -418,7 +422,7 @@ class PrefixParser:
             if not agent_queries:
                 return
             semaphore = asyncio.Semaphore(BATCH_SIZE)
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(proxy=_PROXY_URL) as client:
                 tasks = [fetch_one(pq, agent, client, semaphore) for pq in agent_queries]
                 await asyncio.gather(*tasks)
 
