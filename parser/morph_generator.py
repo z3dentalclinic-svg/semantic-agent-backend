@@ -64,11 +64,14 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     # Берём первое существительное, отрезаем последний символ, добавляем окончание.
     # Google fuzzy-матчит шум к ближайшему падежу и открывает нужный карман.
     # brute_и = уже gent_sing (контрольный), brute_ы/а/е = новые несуществующие формы
-    "brute_и":  ("nomn", "sing", "Brute suffix: окончание -и (контроль = gent_sing)"),
-    "brute_ы":  ("nomn", "sing", "Brute suffix: окончание -ы"),
-    "brute_а":  ("nomn", "sing", "Brute suffix: окончание -а"),
-    "brute_е":  ("nomn", "sing", "Brute suffix: окончание -е"),
-    "brute_ю":  ("nomn", "sing", "Brute suffix: окончание -ю (контроль = accs_sing)"),
+    "brute_и":  ("nomn", "sing", "Brute suffix: -и"),
+    "brute_а":  ("nomn", "sing", "Brute suffix: -а"),
+    "brute_е":  ("nomn", "sing", "Brute suffix: -е"),
+    "brute_у":  ("nomn", "sing", "Brute suffix: -у"),
+    "brute_ы":  ("nomn", "sing", "Brute suffix: -ы"),
+    "brute_ом": ("nomn", "sing", "Brute suffix: -ом (творительный муж.р)"),
+    "brute_ей": ("nomn", "sing", "Brute suffix: -ей (творительный жен.р)"),
+    "brute_о":  ("nomn", "sing", "Brute suffix: -о"),
 }
 
 
@@ -286,18 +289,19 @@ class MorphGenerator:
                 case_variants[gcase] = original
 
         # ── suffix brute-force: отрезаем последний символ существительного,
-        #    добавляем окончание. Google fuzzy-матчит к ближайшему падежу.
-        brute_endings = {
-            "brute_и": "и",
-            "brute_ы": "ы",
-            "brute_а": "а",
-            "brute_е": "е",
-            "brute_ю": "ю",
-        }
-        noun_stem = words[idx][:-1]  # отрезаем последний символ существительного
-        for blabel, bending in brute_endings.items():
+        #    подставляем 8 окончаний включая творительный (-ом/-ей).
+        _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о']
+        _BRUTE_LABELS  = ['brute_и', 'brute_а', 'brute_е', 'brute_у',
+                          'brute_ы', 'brute_ом', 'brute_ей', 'brute_о']
+
+        noun_word = words[idx]
+        noun_stem = noun_word[:-1]  # отрезаем последний символ
+        for blabel, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
+            new_word = noun_stem + bending
+            if new_word == noun_word:
+                continue
             bwords = words.copy()
-            bwords[idx] = noun_stem + bending
+            bwords[idx] = new_word
             case_variants[blabel] = " ".join(bwords)
 
         return MorphSeedAnalysis(
@@ -456,12 +460,15 @@ class MorphGenerator:
             "ds_it":        ({"ds": "it"}, None, 2),
             "client_yt":    ({}, "youtube", 2),
             "cp_one":       ({}, None, 1),
-            # brute suffix: обычный запрос, cp как обычно
-            "brute_и": ({}, None, None),
-            "brute_ы": ({}, None, None),
-            "brute_а": ({}, None, None),
-            "brute_е": ({}, None, None),
-            "brute_ю": ({}, None, None),
+            # brute suffix: Last Consonant Rule, 8 окончаний
+            "brute_и":  ({}, None, None),
+            "brute_а":  ({}, None, None),
+            "brute_е":  ({}, None, None),
+            "brute_у":  ({}, None, None),
+            "brute_ы":  ({}, None, None),
+            "brute_ом": ({}, None, None),
+            "brute_ей": ({}, None, None),
+            "brute_о":  ({}, None, None),
         }
 
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
