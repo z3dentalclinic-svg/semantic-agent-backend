@@ -448,7 +448,7 @@ class SuffixParser:
 
         # Структуры с 97-100% дублями на 5 сидах — убраны из Chrome E (6 шт)
         # hyp_wcL нестабилен в E_ff (66-84% уникальных) — оставляем в Firefox
-        CHROME_E_SKIP = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain", "hyp_wcL"}
+        CHROME_E_SKIP = set()  # ТЕСТ: все 13 структур включены, определяем что даёт уникальные
         FF_E_SKIP     = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain"}
 
         # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
