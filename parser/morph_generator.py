@@ -72,6 +72,7 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "brute_ом": ("nomn", "sing", "Brute suffix: -ом (творительный муж.р)"),
     "brute_ей": ("nomn", "sing", "Brute suffix: -ей (творительный жен.р)"),
     "brute_о":  ("nomn", "sing", "Brute suffix: -о"),
+    "brute_ю":  ("nomn", "sing", "Brute suffix: -ю (винительный жен.р)"),
 }
 
 
@@ -290,9 +291,9 @@ class MorphGenerator:
 
         # ── suffix brute-force: отрезаем последний символ существительного,
         #    подставляем 8 окончаний включая творительный (-ом/-ей).
-        _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о']
+        _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о', 'ю']
         _BRUTE_LABELS  = ['brute_и', 'brute_а', 'brute_е', 'brute_у',
-                          'brute_ы', 'brute_ом', 'brute_ей', 'brute_о']
+                          'brute_ы', 'brute_ом', 'brute_ей', 'brute_о', 'brute_ю']
 
         noun_word = words[idx]
         noun_stem = noun_word[:-1]  # отрезаем последний символ
@@ -469,6 +470,7 @@ class MorphGenerator:
             "brute_ом": ({}, None, None),
             "brute_ей": ({}, None, None),
             "brute_о":  ({}, None, None),
+            "brute_ю":  ({}, None, None),
         }
 
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
