@@ -44,7 +44,7 @@ def register_suffix_endpoint(app: FastAPI):
         echelon: int = Query(0, description="0=все, 1=только P1, 2=только P2"),
         include_numbers: bool = Query(False, description="Числовые суффиксы 0-9"),
         filters: str = Query("none", description="Фильтры (для совместимости)"),
-        google_client: str = Query("firefox", description="Autocomplete client: firefox/chrome/chrome-omni/safari/psy-ab/gws-wiz"),
+        google_client: str = Query("chrome", description="Autocomplete client: firefox/chrome/chrome-omni/safari/psy-ab/gws-wiz"),
         cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
         include_letters: bool = Query(True, description="Letter Sweep — буквенный перебор (а е и о у б в д к р)"),
     ):
