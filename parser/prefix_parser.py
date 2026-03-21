@@ -1,5 +1,5 @@
 """
-Prefix Parser v2.0 — Dual-agent parallel execution (Chrome + Firefox).
+Prefix Parser v2.01 — Dual-agent parallel execution (Chrome + Firefox).
 
 Architecture mirrors suffix_parser.py:
     - Shared fetch_suggestions() method (identical to suffix_parser)
