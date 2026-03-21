@@ -649,11 +649,16 @@ class SuffixParser:
             key=lambda x: (-x["weight"], x["keyword"])
         )
 
+        e_sent = sum(
+            1 for letter_qs in e_queries_by_letter.values()
+            for sq in letter_qs if sq.variant not in CHROME_E_SKIP
+        )
+
         return SuffixParseResult(
             seed=seed,
             analysis=analysis_summary,
             all_keywords=keywords_list,
-            total_queries=len(queries_to_send),
+            total_queries=len(other_queries) + e_sent + len(ALPHABET),
             successful_queries=ok_count,
             empty_queries=empty_count,
             error_queries=0,
