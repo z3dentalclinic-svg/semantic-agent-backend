@@ -583,7 +583,13 @@ class SuffixParser:
             await asyncio.gather(*phase1_tasks)
 
             # Phase 2: E chrome — только буквы где E_simple дал >= 3 результатов
-            await run_e_chrome_with_novelty(client)
+            try:
+                await run_e_chrome_with_novelty(client)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[Phase2Error] seed={seed!r} error in run_e_chrome_with_novelty: {e!r}"
+                )
 
         async def run_yandex(client: httpx.AsyncClient):
             ya_sem = asyncio.Semaphore(5)
