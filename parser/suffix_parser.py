@@ -14,7 +14,6 @@ import time
 import random
 import json
 import re
-import logging
 import os
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
@@ -88,7 +87,8 @@ class SuffixParser:
         self.generator = SuffixGenerator(lang=lang)
         self.adaptive_delay = AdaptiveDelay()
         self.geo_db: dict = geo_db or {}
-        self.morph = morph  # pymorphy3.MorphAnalyzer — пробрасывается из main.py
+        # morph: используем переданный из main или generator.morph (всегда доступен)
+        self.morph = morph or self.generator.morph
 
     def get_light_fingerprint(self, text: str) -> str:
         """
@@ -553,16 +553,15 @@ class SuffixParser:
 
         # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
         async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
-            import logging
-            _log = logging.getLogger(__name__)
 
             # Debug: что лежит в e_queries_by_letter и trace_entries
             e_simple_in_trace = [t for t in trace_entries if t.suffix_type == "E_simple"]
-            _log.warning(
+            print(
                 f"[Phase2Start] seed={seed!r} "
                 f"e_queries_by_letter keys={list(e_queries_by_letter.keys())[:5]}... "
                 f"total={len(e_queries_by_letter)} "
-                f"e_simple_in_trace={len(e_simple_in_trace)}"
+                f"e_simple_in_trace={len(e_simple_in_trace)} "
+                f"morph_available={self.morph is not None}"
             )
             # Строим карту: буква → кол-во результатов E_simple
             e_simple_counts: Dict[str, int] = {}
@@ -582,8 +581,7 @@ class SuffixParser:
                     active_letters.append(L)
 
             if skipped_simple:
-                import logging
-                logging.getLogger(__name__).warning(
+                print(
                     f"[PerLetterSkip] seed={seed!r} "
                     f"skipped {len(skipped_simple)}/{len(letters)} letters "
                     f"(E_simple < {E_SIMPLE_MIN_RESULTS}): {skipped_simple}"
@@ -616,15 +614,14 @@ class SuffixParser:
 
                 new_intents = len(current_fps() - fps_before)
 
-                import logging
-                logging.getLogger(__name__).warning(
+                print(
                     f"[NoveltyCheck] seed={seed!r} batch={batch} "
                     f"new_intents={new_intents}"
                 )
 
                 if new_intents < E_NOVELTY_MIN_NEW:
                     skipped = active_letters[batch_start + E_NOVELTY_BATCH:]
-                    logging.getLogger(__name__).warning(
+                    print(
                         f"[NoveltyThreshold] seed={seed!r} "
                         f"stopped after {batch_start + E_NOVELTY_BATCH}/{len(active_letters)} active letters, "
                         f"skipped={skipped}"
@@ -649,10 +646,7 @@ class SuffixParser:
             try:
                 await run_e_chrome_with_novelty(client)
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"[Phase2Error] seed={seed!r} error in run_e_chrome_with_novelty: {e!r}"
-                )
+                print(f"[Phase2Error] seed={seed!r} error in run_e_chrome_with_novelty: {e!r}")
 
         async def run_yandex(client: httpx.AsyncClient):
             ya_sem = asyncio.Semaphore(5)
@@ -741,22 +735,11 @@ class SuffixParser:
                         if _re.match(r'^[а-яёіїєґ]+$', word):
                             word_counter[word] += 1
 
-            # Лемматизация для проверки гео (москве→москва, краснодаре→краснодар)
-            try:
-                import sys
-                main_mod = sys.modules.get("main") or sys.modules.get("__main__")
-                _morph = getattr(getattr(main_mod, "parser", None), "morph_ru", None) if main_mod else None
-            except Exception:
-                _morph = None
-
             def _is_geo(word: str) -> bool:
                 if word in self.geo_db:
                     return True
-                if _morph:
-                    lemma = _morph.parse(word)[0].normal_form
-                    if lemma in self.geo_db:
-                        return True
-                return False
+                lemma = self.morph.parse(word)[0].normal_form
+                return lemma in self.geo_db
 
             candidates = sorted(
                 w for w, cnt in word_counter.items()
