@@ -89,6 +89,27 @@ class SuffixParser:
         self.adaptive_delay = AdaptiveDelay()
         self.geo_db: dict = geo_db or {}
 
+    def get_fingerprint(self, text: str) -> str:
+        """
+        Normalize phrase to intent fingerprint for deduplication.
+        "купить аккумулятор на скутер" == "аккумулятор скутер купить" → same fingerprint.
+        """
+        text = text.lower()
+        text = re.sub(r'[^а-яёa-z0-9\s]', '', text)
+        words = text.split()
+        # Убираем короткие предлоги (кроме значимых)
+        words = [w for w in words if len(w) > 2 or w in {"до", "из"}]
+        # Грубый стемминг для схлопывания падежей
+        stemmed = []
+        for w in words:
+            if len(w) > 6:
+                stemmed.append(w[:-3])
+            elif len(w) > 4:
+                stemmed.append(w[:-2])
+            else:
+                stemmed.append(w)
+        return "|".join(sorted(set(stemmed)))
+
     def _clean_suggestion(self, text: str) -> str:
         """Strip HTML tags (<b>, </b> etc) from autocomplete suggestions."""
         return re.sub(r'<[^>]+>', '', text).strip()
@@ -458,6 +479,11 @@ class SuffixParser:
         # если E_simple для буквы вернул < N результатов — E_chrome для неё бесполезен
         E_SIMPLE_MIN_RESULTS = 3
 
+        # Fingerprint novelty threshold для батчей:
+        # если батч из 5 букв принёс < N новых интентов — дальше не идём
+        E_NOVELTY_BATCH = 5
+        E_NOVELTY_MIN_NEW = 3
+
         # Step 5b: E chrome — последовательно с задержкой
         async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
@@ -466,7 +492,7 @@ class SuffixParser:
                 await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
 
-        # Step 5b2: E chrome с per-letter skip на основе E_simple результатов
+        # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
         async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
             # Строим карту: буква → кол-во результатов E_simple
             e_simple_counts: Dict[str, int] = {}
@@ -475,30 +501,50 @@ class SuffixParser:
                     e_simple_counts[t.suffix_val] = t.results_count
 
             letters = list(e_queries_by_letter.keys())
-            skipped = []
-            active = []
+            skipped_simple = []
+            active_letters = []
 
+            # Per-letter skip: убираем буквы где E_simple дал < 3 результатов
             for L in letters:
-                count = e_simple_counts.get(L, 0)
-                if count < E_SIMPLE_MIN_RESULTS:
-                    skipped.append(L)
+                if e_simple_counts.get(L, 0) < E_SIMPLE_MIN_RESULTS:
+                    skipped_simple.append(L)
                 else:
-                    active.append(L)
+                    active_letters.append(L)
 
-            # Запускаем только активные буквы — все параллельно как раньше
-            if active:
-                await asyncio.gather(*[
-                    run_letter_chrome(e_queries_by_letter[L], client)
-                    for L in active
-                ])
-
-            if skipped:
+            if skipped_simple:
                 import logging
                 logging.getLogger(__name__).info(
                     f"[PerLetterSkip] seed={seed!r} "
-                    f"skipped {len(skipped)}/{len(letters)} letters "
-                    f"(E_simple < {E_SIMPLE_MIN_RESULTS}): {skipped}"
+                    f"skipped {len(skipped_simple)}/{len(letters)} letters "
+                    f"(E_simple < {E_SIMPLE_MIN_RESULTS}): {skipped_simple}"
                 )
+
+            # Fingerprint novelty: батчи по 5 букв
+            def current_fps():
+                return {self.get_fingerprint(kw) for kw in all_keywords.keys()}
+
+            skipped_novelty = []
+            for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
+                batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
+
+                fps_before = current_fps()
+
+                await asyncio.gather(*[
+                    run_letter_chrome(e_queries_by_letter[L], client)
+                    for L in batch
+                ])
+
+                new_intents = len(current_fps() - fps_before)
+
+                if new_intents < E_NOVELTY_MIN_NEW:
+                    skipped_novelty = active_letters[batch_start + E_NOVELTY_BATCH:]
+                    import logging
+                    logging.getLogger(__name__).info(
+                        f"[NoveltyThreshold] seed={seed!r} "
+                        f"stopped after {batch_start + E_NOVELTY_BATCH}/{len(active_letters)} active letters, "
+                        f"new_intents={new_intents}, skipped={skipped_novelty}"
+                    )
+                    break
 
         # Step 5c: E firefox — ОТКЛЮЧЕНО для лайт-серча
         # async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
