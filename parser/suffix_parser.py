@@ -527,7 +527,7 @@ class SuffixParser:
 
             if skipped_simple:
                 import logging
-                logging.getLogger(__name__).info(
+                logging.getLogger(__name__).warning(
                     f"[PerLetterSkip] seed={seed!r} "
                     f"skipped {len(skipped_simple)}/{len(letters)} letters "
                     f"(E_simple < {E_SIMPLE_MIN_RESULTS}): {skipped_simple}"
@@ -554,14 +554,14 @@ class SuffixParser:
                 new_intents = len(current_fps() - fps_before)
 
                 import logging
-                logging.getLogger(__name__).info(
+                logging.getLogger(__name__).warning(
                     f"[NoveltyCheck] seed={seed!r} batch={batch} "
                     f"new_intents={new_intents}"
                 )
 
                 if new_intents < E_NOVELTY_MIN_NEW:
                     skipped = active_letters[batch_start + E_NOVELTY_BATCH:]
-                    logging.getLogger(__name__).info(
+                    logging.getLogger(__name__).warning(
                         f"[NoveltyThreshold] seed={seed!r} "
                         f"stopped after {batch_start + E_NOVELTY_BATCH}/{len(active_letters)} active letters, "
                         f"skipped={skipped}"
