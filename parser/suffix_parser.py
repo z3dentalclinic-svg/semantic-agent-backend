@@ -421,7 +421,9 @@ class SuffixParser:
         #     _record_results(sq_ff, results, elapsed)
 
         # Step 5d: E_simple — алфавитный перебор через Chrome без cp
-        ALPHABET = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
+        # Отсортирован по частотности: высокочастотные первыми — Novelty Threshold
+        # срабатывает на хвосте (щ/э/ю/я), а не в середине.
+        ALPHABET = list("ксрпмнадтбвгзеиёжлоуфхцчшйщэюя")
 
         async def run_e_simple(client: httpx.AsyncClient):
             e_simple_sem = asyncio.Semaphore(5)
@@ -451,6 +453,10 @@ class SuffixParser:
         CHROME_E_SKIP = set()  # ТЕСТ: все 13 структур включены, определяем что даёт уникальные
         FF_E_SKIP     = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain"}
 
+        # Novelty Threshold — параметры
+        E_NOVELTY_BATCH = 5    # проверяем каждые N букв
+        E_NOVELTY_MIN_NEW = 3  # минимум новых ключей в батче чтобы продолжить
+
         # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
         async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
             for sq in letter_queries:
@@ -458,6 +464,41 @@ class SuffixParser:
                     continue
                 await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client)
+
+        # Step 5b2: E chrome с Novelty Threshold — батчи по E_NOVELTY_BATCH букв
+        async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
+            letters = list(e_queries_by_letter.keys())  # уже в частотном порядке
+            total_letters = len(letters)
+            skipped_from = None
+
+            for batch_start in range(0, total_letters, E_NOVELTY_BATCH):
+                batch = letters[batch_start:batch_start + E_NOVELTY_BATCH]
+
+                # Снимок ключей ДО батча
+                keywords_before = set(all_keywords.keys())
+
+                # Запускаем батч параллельно
+                await asyncio.gather(*[
+                    run_letter_chrome(e_queries_by_letter[L], client)
+                    for L in batch
+                ])
+
+                # Считаем новые ключи
+                new_count = len(set(all_keywords.keys()) - keywords_before)
+
+                if new_count < E_NOVELTY_MIN_NEW:
+                    skipped_from = batch_start + E_NOVELTY_BATCH
+                    break  # хвост алфавита не даёт новых — останавливаемся
+
+            # Логируем сколько букв скипнули
+            if skipped_from is not None:
+                skipped_letters = letters[skipped_from:]
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[NoveltyThreshold] seed={seed!r} "
+                    f"stopped after {skipped_from}/{total_letters} letters, "
+                    f"skipped={skipped_letters}"
+                )
 
         # Step 5c: E firefox — ОТКЛЮЧЕНО для лайт-серча
         # async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
@@ -468,12 +509,13 @@ class SuffixParser:
         #         await fetch_one_firefox(sq, client)
 
         async def run_google(client: httpx.AsyncClient):
-            tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
-            for letter, letter_qs in e_queries_by_letter.items():
-                tasks.append(run_letter_chrome(letter_qs, client))
-                # tasks.append(run_letter_firefox(letter_qs, client))  # ОТКЛЮЧЕНО для лайт-серча
-            tasks.append(run_e_simple(client))  # Chrome алфавитный перебор без cp
-            await asyncio.gather(*tasks)
+            # Phase 1: A/B/C/D + E_simple — параллельно (как раньше)
+            phase1_tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
+            phase1_tasks.append(run_e_simple(client))
+            await asyncio.gather(*phase1_tasks)
+
+            # Phase 2: E chrome — батчами с Novelty Threshold
+            await run_e_chrome_with_novelty(client)
 
         async def run_yandex(client: httpx.AsyncClient):
             ya_sem = asyncio.Semaphore(5)
