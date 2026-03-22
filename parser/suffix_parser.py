@@ -89,6 +89,16 @@ class SuffixParser:
         self.adaptive_delay = AdaptiveDelay()
         self.geo_db: dict = geo_db or {}
 
+    def get_light_fingerprint(self, text: str) -> str:
+        """
+        Лёгкий fingerprint для Novelty Check — только очистка и сортировка, БЕЗ стемминга.
+        Чувствительнее чем get_fingerprint — не склеивает разные формы слов.
+        """
+        text = text.lower()
+        text = re.sub(r'[^а-яёa-z0-9\s]', '', text)
+        words = text.split()
+        return "|".join(sorted(set(words)))
+
     def get_fingerprint(self, text: str) -> str:
         """
         Normalize phrase to intent fingerprint for deduplication.
@@ -527,7 +537,7 @@ class SuffixParser:
             # Каждый батч — до 70 запросов через семафор Semaphore(3)
             # Запросы идут плавно, novelty check видит реальные результаты
             def current_fps():
-                return {self.get_fingerprint(kw) for kw in all_keywords.keys()}
+                return {self.get_light_fingerprint(kw) for kw in all_keywords.keys()}
 
             for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
                 batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
