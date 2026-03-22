@@ -749,16 +749,17 @@ class SuffixParser:
             key=lambda x: (-x["weight"], x["keyword"])
         )
 
-        e_sent = sum(
-            1 for letter_qs in e_queries_by_letter.values()
-            for sq in letter_qs if sq.variant not in CHROME_E_SKIP
+        # Считаем реально отправленные запросы из trace (не заблокированные)
+        actual_sent = sum(
+            1 for t in trace_entries
+            if not t.status.startswith("blocked")
         )
 
         return SuffixParseResult(
             seed=seed,
             analysis=analysis_summary,
             all_keywords=keywords_list,
-            total_queries=len(other_queries) + e_sent + len(ALPHABET),
+            total_queries=actual_sent,
             successful_queries=ok_count,
             empty_queries=empty_count,
             error_queries=0,
