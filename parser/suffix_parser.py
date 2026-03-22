@@ -537,7 +537,7 @@ class SuffixParser:
         # Fingerprint novelty threshold для батчей:
         # если батч из 5 букв принёс < N новых интентов — дальше не идём
         E_NOVELTY_BATCH = 5
-        E_NOVELTY_MIN_NEW = 4  # П1 агрессив: было 2
+        E_NOVELTY_MIN_NEW = 2
 
         # Семафор для E chrome — не более 5 одновременных запросов
         # (предотвращает пачки из 70 запросов за 0.5 сек)
