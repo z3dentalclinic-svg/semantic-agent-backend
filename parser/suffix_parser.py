@@ -508,6 +508,17 @@ class SuffixParser:
 
         # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
         async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
+            import logging
+            _log = logging.getLogger(__name__)
+
+            # Debug: что лежит в e_queries_by_letter и trace_entries
+            e_simple_in_trace = [t for t in trace_entries if t.suffix_type == "E_simple"]
+            _log.warning(
+                f"[Phase2Start] seed={seed!r} "
+                f"e_queries_by_letter keys={list(e_queries_by_letter.keys())[:5]}... "
+                f"total={len(e_queries_by_letter)} "
+                f"e_simple_in_trace={len(e_simple_in_trace)}"
+            )
             # Строим карту: буква → кол-во результатов E_simple
             e_simple_counts: Dict[str, int] = {}
             for t in trace_entries:
