@@ -551,10 +551,9 @@ class SuffixGenerator:
         q = f"{s} {L}"
         out.append(sq(q, len(q), "plain"))
 
-        # 1b. сид а  (cp не передаётся — точная копия старого алфавитного перебора)
-        # Старый main.py: params = {"q": query, "client": "firefox"} без cp
-        # Даёт ~10% уникальных ключей которые plain с cp не находит
-        out.append(sq(q, -1, "plain_nocp"))
+        # 1b. сид а  (cp не передаётся)
+        # П0: 100% дубль plain на всех 4 датасетах, 0 GT-эксклюзивов
+        # out.append(sq(q, -1, "plain_nocp"))
 
         # 2. сид а  (+ trailing space)
         q = f"{s} {L} "
@@ -577,39 +576,47 @@ class SuffixGenerator:
         # Lwc cp варианты:
         #   cp после "а " (перед *)
         q = f"{s} {L} *"
-        out.append(sq(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах (гео-ключи игнорируем)
+        # out.append(sq(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL"))
         #   cp перед "а" (после пробела сида)
-        out.append(sq(q, len(s) + 1, "Lwc_cpBL"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах (все ключи гео)
+        # out.append(sq(q, len(s) + 1, "Lwc_cpBL"))
 
         # ── D4: A_local (:) + буква ──────────────────────────────────────
         # col_B убран (0 unique). col_Lwc, col_wcL убраны.
         # 6. сид : а  (+ trailing space)
         q = f"{s} : {L} "
-        out.append(sq(q, len(q), "col_B_trail"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах (гео-ключи игнорируем)
+        # out.append(sq(q, len(q), "col_B_trail"))
 
         # 7. сид а :
         q = f"{s} {L} :"
-        out.append(sq(q, len(q), "L_col"))
+        # П0: 100% дубль plain+sandwich на всех 4 датасетах
+        # out.append(sq(q, len(q), "L_col"))
 
         # ── D5: A_general (-) + буква ────────────────────────────────────
         # hyp_B убран (0 unique).
         # 8. сид - а  (+ trailing space)
         q = f"{s} - {L} "
-        out.append(sq(q, len(q), "hyp_B_trail"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах
+        # out.append(sq(q, len(q), "hyp_B_trail"))
 
         # 9. сид - а *
         q = f"{s} - {L} *"
-        out.append(sq(q, len(q), "hyp_Lwc"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах
+        # out.append(sq(q, len(q), "hyp_Lwc"))
 
         # 10. сид - * а
         q = f"{s} - * {L}"
-        out.append(sq(q, len(q), "hyp_wcL"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах
+        # out.append(sq(q, len(q), "hyp_wcL"))
 
         # 11. сид а -
         q = f"{s} {L} -"
-        out.append(sq(q, len(q), "L_hyp"))
+        # П0: 0 GT-эксклюзивов на 4 датасетах
+        # out.append(sq(q, len(q), "L_hyp"))
 
-        return out  # 14 entries per letter
+        return out  # П0: 4 активных структуры (plain, trail, sandwich, wcB_cpMid)
 
     def _calc_priority(self, suffix_type: str, active_markers: List[str]) -> int:
         """
