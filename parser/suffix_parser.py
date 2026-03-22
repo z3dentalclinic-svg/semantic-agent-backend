@@ -484,12 +484,16 @@ class SuffixParser:
         E_NOVELTY_BATCH = 5
         E_NOVELTY_MIN_NEW = 3
 
-        # Step 5b: E chrome — последовательно с задержкой
-        async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
-            for sq in letter_queries:
-                if sq.variant in CHROME_E_SKIP:
-                    continue
-                await asyncio.sleep(0.3)
+        # Семафор для E chrome — не более 5 одновременных запросов
+        # (предотвращает пачки из 70 запросов за 0.5 сек)
+        e_chrome_sem = asyncio.Semaphore(5)
+
+        async def fetch_e_chrome_one(sq: "SuffixQuery", client: httpx.AsyncClient):
+            """Один E chrome запрос через семафор с джиттером."""
+            if sq.variant in CHROME_E_SKIP:
+                return
+            async with e_chrome_sem:
+                await asyncio.sleep(random.uniform(0.3, 0.5))
                 await fetch_one_tracked(sq, client)
 
         # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
@@ -520,29 +524,37 @@ class SuffixParser:
                 )
 
             # Fingerprint novelty: батчи по 5 букв
+            # Каждый батч — до 70 запросов через семафор Semaphore(3)
+            # Запросы идут плавно, novelty check видит реальные результаты
             def current_fps():
                 return {self.get_fingerprint(kw) for kw in all_keywords.keys()}
 
-            skipped_novelty = []
             for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
                 batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
 
                 fps_before = current_fps()
 
-                await asyncio.gather(*[
-                    run_letter_chrome(e_queries_by_letter[L], client)
-                    for L in batch
-                ])
+                # Собираем все запросы батча и запускаем через семафор
+                tasks = []
+                for L in batch:
+                    for sq in e_queries_by_letter.get(L, []):
+                        tasks.append(fetch_e_chrome_one(sq, client))
+                await asyncio.gather(*tasks)
 
                 new_intents = len(current_fps() - fps_before)
 
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[NoveltyCheck] seed={seed!r} batch={batch} "
+                    f"new_intents={new_intents}"
+                )
+
                 if new_intents < E_NOVELTY_MIN_NEW:
-                    skipped_novelty = active_letters[batch_start + E_NOVELTY_BATCH:]
-                    import logging
+                    skipped = active_letters[batch_start + E_NOVELTY_BATCH:]
                     logging.getLogger(__name__).info(
                         f"[NoveltyThreshold] seed={seed!r} "
                         f"stopped after {batch_start + E_NOVELTY_BATCH}/{len(active_letters)} active letters, "
-                        f"new_intents={new_intents}, skipped={skipped_novelty}"
+                        f"skipped={skipped}"
                     )
                     break
 
