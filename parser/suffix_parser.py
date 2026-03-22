@@ -89,6 +89,37 @@ class SuffixParser:
         self.adaptive_delay = AdaptiveDelay()
         self.geo_db: dict = geo_db or {}
 
+    def get_light_fingerprint(self, text: str) -> str:
+        """
+        Лёгкий fingerprint для Novelty Check — только очистка и сортировка, БЕЗ стемминга.
+        Чувствительнее чем get_fingerprint — не склеивает разные формы слов.
+        """
+        text = text.lower()
+        text = re.sub(r'[^а-яёa-z0-9\s]', '', text)
+        words = text.split()
+        return "|".join(sorted(set(words)))
+
+    def get_fingerprint(self, text: str) -> str:
+        """
+        Normalize phrase to intent fingerprint for deduplication.
+        "купить аккумулятор на скутер" == "аккумулятор скутер купить" → same fingerprint.
+        """
+        text = text.lower()
+        text = re.sub(r'[^а-яёa-z0-9\s]', '', text)
+        words = text.split()
+        # Убираем короткие предлоги (кроме значимых)
+        words = [w for w in words if len(w) > 2 or w in {"до", "из"}]
+        # Грубый стемминг для схлопывания падежей
+        stemmed = []
+        for w in words:
+            if len(w) > 6:
+                stemmed.append(w[:-3])
+            elif len(w) > 4:
+                stemmed.append(w[:-2])
+            else:
+                stemmed.append(w)
+        return "|".join(sorted(set(stemmed)))
+
     def _clean_suggestion(self, text: str) -> str:
         """Strip HTML tags (<b>, </b> etc) from autocomplete suggestions."""
         return re.sub(r'<[^>]+>', '', text).strip()
@@ -421,7 +452,9 @@ class SuffixParser:
         #     _record_results(sq_ff, results, elapsed)
 
         # Step 5d: E_simple — алфавитный перебор через Chrome без cp
-        ALPHABET = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
+        # Отсортирован по частотности: высокочастотные первыми — Novelty Threshold
+        # срабатывает на хвосте (щ/э/ю/я), а не в середине.
+        ALPHABET = list("ксрпмнадтбвгзеиёжлоуфхцчшйщэюя")
 
         async def run_e_simple(client: httpx.AsyncClient):
             e_simple_sem = asyncio.Semaphore(5)
@@ -451,13 +484,100 @@ class SuffixParser:
         CHROME_E_SKIP = set()  # ТЕСТ: все 13 структур включены, определяем что даёт уникальные
         FF_E_SKIP     = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain"}
 
-        # Step 5b: E chrome — последовательно с задержкой, все буквы параллельно
-        async def run_letter_chrome(letter_queries: List, client: httpx.AsyncClient):
-            for sq in letter_queries:
-                if sq.variant in CHROME_E_SKIP:
-                    continue
-                await asyncio.sleep(0.3)
+        # Novelty Threshold — параметры
+        # E_simple per-letter threshold:
+        # если E_simple для буквы вернул < N результатов — E_chrome для неё бесполезен
+        E_SIMPLE_MIN_RESULTS = 3
+
+        # Fingerprint novelty threshold для батчей:
+        # если батч из 5 букв принёс < N новых интентов — дальше не идём
+        E_NOVELTY_BATCH = 5
+        E_NOVELTY_MIN_NEW = 2
+
+        # Семафор для E chrome — не более 5 одновременных запросов
+        # (предотвращает пачки из 70 запросов за 0.5 сек)
+        e_chrome_sem = asyncio.Semaphore(5)
+
+        async def fetch_e_chrome_one(sq: "SuffixQuery", client: httpx.AsyncClient):
+            """Один E chrome запрос через семафор с джиттером."""
+            if sq.variant in CHROME_E_SKIP:
+                return
+            async with e_chrome_sem:
+                await asyncio.sleep(random.uniform(0.3, 0.5))
                 await fetch_one_tracked(sq, client)
+
+        # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
+        async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
+            import logging
+            _log = logging.getLogger(__name__)
+
+            # Debug: что лежит в e_queries_by_letter и trace_entries
+            e_simple_in_trace = [t for t in trace_entries if t.suffix_type == "E_simple"]
+            _log.warning(
+                f"[Phase2Start] seed={seed!r} "
+                f"e_queries_by_letter keys={list(e_queries_by_letter.keys())[:5]}... "
+                f"total={len(e_queries_by_letter)} "
+                f"e_simple_in_trace={len(e_simple_in_trace)}"
+            )
+            # Строим карту: буква → кол-во результатов E_simple
+            e_simple_counts: Dict[str, int] = {}
+            for t in trace_entries:
+                if t.suffix_type == "E_simple" and t.suffix_val:
+                    e_simple_counts[t.suffix_val] = t.results_count
+
+            letters = list(e_queries_by_letter.keys())
+            skipped_simple = []
+            active_letters = []
+
+            # Per-letter skip: убираем буквы где E_simple дал < 3 результатов
+            for L in letters:
+                if e_simple_counts.get(L, 0) < E_SIMPLE_MIN_RESULTS:
+                    skipped_simple.append(L)
+                else:
+                    active_letters.append(L)
+
+            if skipped_simple:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[PerLetterSkip] seed={seed!r} "
+                    f"skipped {len(skipped_simple)}/{len(letters)} letters "
+                    f"(E_simple < {E_SIMPLE_MIN_RESULTS}): {skipped_simple}"
+                )
+
+            # Fingerprint novelty: батчи по 5 букв
+            # Каждый батч — до 70 запросов через семафор Semaphore(3)
+            # Запросы идут плавно, novelty check видит реальные результаты
+            def current_fps():
+                return {self.get_light_fingerprint(kw) for kw in all_keywords.keys()}
+
+            for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
+                batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
+
+                fps_before = current_fps()
+
+                # Собираем все запросы батча и запускаем через семафор
+                tasks = []
+                for L in batch:
+                    for sq in e_queries_by_letter.get(L, []):
+                        tasks.append(fetch_e_chrome_one(sq, client))
+                await asyncio.gather(*tasks)
+
+                new_intents = len(current_fps() - fps_before)
+
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[NoveltyCheck] seed={seed!r} batch={batch} "
+                    f"new_intents={new_intents}"
+                )
+
+                if new_intents < E_NOVELTY_MIN_NEW:
+                    skipped = active_letters[batch_start + E_NOVELTY_BATCH:]
+                    logging.getLogger(__name__).warning(
+                        f"[NoveltyThreshold] seed={seed!r} "
+                        f"stopped after {batch_start + E_NOVELTY_BATCH}/{len(active_letters)} active letters, "
+                        f"skipped={skipped}"
+                    )
+                    break
 
         # Step 5c: E firefox — ОТКЛЮЧЕНО для лайт-серча
         # async def run_letter_firefox(letter_queries: List, client: httpx.AsyncClient):
@@ -468,12 +588,19 @@ class SuffixParser:
         #         await fetch_one_firefox(sq, client)
 
         async def run_google(client: httpx.AsyncClient):
-            tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
-            for letter, letter_qs in e_queries_by_letter.items():
-                tasks.append(run_letter_chrome(letter_qs, client))
-                # tasks.append(run_letter_firefox(letter_qs, client))  # ОТКЛЮЧЕНО для лайт-серча
-            tasks.append(run_e_simple(client))  # Chrome алфавитный перебор без cp
-            await asyncio.gather(*tasks)
+            # Phase 1: A/B/C/D + E_simple — параллельно (как раньше)
+            phase1_tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
+            phase1_tasks.append(run_e_simple(client))
+            await asyncio.gather(*phase1_tasks)
+
+            # Phase 2: E chrome — только буквы где E_simple дал >= 3 результатов
+            try:
+                await run_e_chrome_with_novelty(client)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[Phase2Error] seed={seed!r} error in run_e_chrome_with_novelty: {e!r}"
+                )
 
         async def run_yandex(client: httpx.AsyncClient):
             ya_sem = asyncio.Semaphore(5)
@@ -649,16 +776,17 @@ class SuffixParser:
             key=lambda x: (-x["weight"], x["keyword"])
         )
 
-        e_sent = sum(
-            1 for letter_qs in e_queries_by_letter.values()
-            for sq in letter_qs if sq.variant not in CHROME_E_SKIP
+        # Считаем реально отправленные запросы из trace (не заблокированные)
+        actual_sent = sum(
+            1 for t in trace_entries
+            if not t.status.startswith("blocked")
         )
 
         return SuffixParseResult(
             seed=seed,
             analysis=analysis_summary,
             all_keywords=keywords_list,
-            total_queries=len(other_queries) + e_sent + len(ALPHABET),
+            total_queries=actual_sent,
             successful_queries=ok_count,
             empty_queries=empty_count,
             error_queries=0,
