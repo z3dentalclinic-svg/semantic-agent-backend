@@ -481,13 +481,18 @@ class SuffixParser:
 
         # Структуры с 97-100% дублями на 5 сидах — убраны из Chrome E (6 шт)
         # hyp_wcL нестабилен в E_ff (66-84% уникальных) — оставляем в Firefox
-        CHROME_E_SKIP = set()  # ТЕСТ: все 13 структур включены, определяем что даёт уникальные
+        # П0: безопасные удаления (100% дублей + 0 GT-эксклюзивов на 4 датасетах)
+        # Остаются активными: plain, trail, sandwich, wcB_cpMid
+        CHROME_E_SKIP = {
+            'L_col', 'hyp_B_trail', 'hyp_Lwc', 'hyp_wcL',
+            'Lwc_cpBL', 'L_hyp', 'col_B_trail', 'plain_nocp', 'Lwc_cpAL',
+        }
         FF_E_SKIP     = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain"}
 
         # Novelty Threshold — параметры
         # E_simple per-letter threshold:
         # если E_simple для буквы вернул < N результатов — E_chrome для неё бесполезен
-        E_SIMPLE_MIN_RESULTS = 3
+        E_SIMPLE_MIN_RESULTS = 7  # П1 агрессив: было 3
 
         # Fingerprint novelty threshold для батчей:
         # если батч из 5 букв принёс < N новых интентов — дальше не идём
