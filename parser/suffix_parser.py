@@ -492,7 +492,7 @@ class SuffixParser:
         # Novelty Threshold — параметры
         # E_simple per-letter threshold:
         # если E_simple для буквы вернул < N результатов — E_chrome для неё бесполезен
-        E_SIMPLE_MIN_RESULTS = 7  # П1 агрессив: было 3
+        E_SIMPLE_MIN_RESULTS = 10  # П1 агрессив: было 3→7→10
 
         # Fingerprint novelty threshold для батчей:
         # если батч из 5 букв принёс < N новых интентов — дальше не идём
