@@ -84,10 +84,11 @@ class SuffixParser:
     Orchestrates suffix generation + autocomplete fetching + tracing.
     """
 
-    def __init__(self, lang: str = "ru", geo_db: dict = None):
+    def __init__(self, lang: str = "ru", geo_db: dict = None, morph=None):
         self.generator = SuffixGenerator(lang=lang)
         self.adaptive_delay = AdaptiveDelay()
         self.geo_db: dict = geo_db or {}
+        self.morph = morph  # pymorphy3.MorphAnalyzer — пробрасывается из main.py
 
     def get_light_fingerprint(self, text: str) -> str:
         """
@@ -119,6 +120,45 @@ class SuffixParser:
             else:
                 stemmed.append(w)
         return "|".join(sorted(set(stemmed)))
+
+    def get_intent_fingerprint(self, text: str, seed_lemmas: set) -> str:
+        """
+        Intent fingerprint для Novelty Check — pymorphy3 лемматизация.
+        - Гео из geo_db → '__GEO__' (один токен на ключ)
+        - Слова сида → пропускаем
+        - Предлоги/союзы/частицы → пропускаем
+        - Сортировка → порядок слов не важен
+        Fallback на get_fingerprint если morph недоступен.
+        """
+        if not self.morph:
+            return self.get_fingerprint(text)
+
+        words = re.findall(r'[а-яёa-z0-9]+', text.lower())
+        result = []
+        geo_added = False
+
+        for w in words:
+            p = self.morph.parse(w)[0]
+            lemma = p.normal_form
+
+            # Слова сида пропускаем
+            if lemma in seed_lemmas:
+                continue
+
+            # Гео → один токен
+            if lemma in self.geo_db:
+                if not geo_added:
+                    result.append('__GEO__')
+                    geo_added = True
+                continue
+
+            # Служебные части речи пропускаем
+            if any(t in p.tag for t in ('PREP', 'CONJ', 'PRCL', 'INTJ')):
+                continue
+
+            result.append(lemma)
+
+        return '|'.join(sorted(set(result))) if result else '__EMPTY__'
 
     def _clean_suggestion(self, text: str) -> str:
         """Strip HTML tags (<b>, </b> etc) from autocomplete suggestions."""
@@ -552,8 +592,15 @@ class SuffixParser:
             # Fingerprint novelty: батчи по 5 букв
             # Каждый батч — до 70 запросов через семафор Semaphore(3)
             # Запросы идут плавно, novelty check видит реальные результаты
+            # Леммы сида для исключения из fingerprint
+            if self.morph:
+                seed_lemmas = {self.morph.parse(w)[0].normal_form
+                               for w in re.findall(r'[а-яёa-z0-9]+', seed.lower())}
+            else:
+                seed_lemmas = set(seed.lower().split())
+
             def current_fps():
-                return {self.get_fingerprint(kw) for kw in all_keywords.keys()}
+                return {self.get_intent_fingerprint(kw, seed_lemmas) for kw in all_keywords.keys()}
 
             for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
                 batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
