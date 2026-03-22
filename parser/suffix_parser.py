@@ -492,7 +492,7 @@ class SuffixParser:
         # Novelty Threshold — параметры
         # E_simple per-letter threshold:
         # если E_simple для буквы вернул < N результатов — E_chrome для неё бесполезен
-        E_SIMPLE_MIN_RESULTS = 16  # тест: полный скип E_chrome
+        E_SIMPLE_MIN_RESULTS = 10  # П1: было 3
 
         # Fingerprint novelty threshold для батчей:
         # если батч из 5 букв принёс < N новых интентов — дальше не идём
@@ -553,7 +553,7 @@ class SuffixParser:
             # Каждый батч — до 70 запросов через семафор Semaphore(3)
             # Запросы идут плавно, novelty check видит реальные результаты
             def current_fps():
-                return {self.get_light_fingerprint(kw) for kw in all_keywords.keys()}
+                return {self.get_fingerprint(kw) for kw in all_keywords.keys()}
 
             for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
                 batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
