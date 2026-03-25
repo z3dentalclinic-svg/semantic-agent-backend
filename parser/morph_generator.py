@@ -523,13 +523,80 @@ class MorphGenerator:
     Использует внутренний MorphSuffixGenerator — не зависит от suffix_generator.py.
     """
 
-    def __init__(self, lang: str = "ru"):
+    def __init__(self, lang: str = "ru", geo_db: dict = None):
         self.lang = lang
+        self.geo_db = geo_db or {}
         self.morph = pymorphy3.MorphAnalyzer(lang=lang)
         self.suffix_gen = MorphSuffixGenerator(lang=lang)  # ← внутренний, не SuffixGenerator
 
     def _is_cyrillic_word(self, word: str) -> bool:
         return bool(re.match(r'^[а-яёА-ЯЁ]+$', word))
+
+    def _is_inflectable_noun(self, word: str) -> bool:
+        """
+        Определяет является ли токен склоняемым существительным.
+
+        Пропускает:
+          - Цифры и слова с цифрами: "16", "s21", "1600w"
+          - Латиницу: "samsung", "galaxy", "lg"
+          - Короткие слова ≤ 2 символов
+          - Предлоги/союзы из MORPH_PREP_SET
+          - Гео из GEO_DB
+          - Имена собственные (Prop тег pymorphy3)
+          - Несклоняемые (Fixd тег pymorphy3): "авто", "такси", "кофе"
+          - POS != NOUN или score < 0.3
+        """
+        # Цифры или латиница
+        if not re.match(r'^[а-яёА-ЯЁ]+$', word):
+            return False
+        # Слишком короткое
+        if len(word) <= 2:
+            return False
+        # Предлог/союз
+        if word.lower() in MORPH_PREP_SET:
+            return False
+        # Гео из GEO_DB
+        if word.lower() in self.geo_db:
+            return False
+        # pymorphy3
+        parsed = self.morph.parse(word)
+        if not parsed:
+            return False
+        p = parsed[0]
+        # Не существительное или низкий score
+        if p.tag.POS != 'NOUN':
+            return False
+        if p.score < 0.3:
+            return False
+        # Несклоняемое
+        if 'Fixd' in str(p.tag):
+            return False
+        # Имя собственное (гео, имена)
+        if 'Prop' in str(p.tag):
+            return False
+        return True
+
+    def _find_inflectable_nouns(self, words: List[str]) -> List[Tuple[int, str, str]]:
+        """
+        Находит все склоняемые существительные в сиде.
+        Возвращает список (idx, word, lemma) — все валидные для склонения токены.
+
+        Примеры:
+          "ремонт пылесосов"       → [(0, "ремонт", "ремонт"), (1, "пылесосов", "пылесос")]
+          "аккумулятор на скутер"  → [(0, "аккумулятор", "аккумулятор"), (2, "скутер", "скутер")]
+          "услуги юриста лондон"   → [(0, "услуги", "услуга"), (1, "юриста", "юрист")]
+          "купить айфон 16"        → [] (нет кириллических сущ с нужным score)
+          "samsung galaxy s21"     → [] (вся латиница)
+        """
+        result = []
+        for idx, word in enumerate(words):
+            if not self._is_inflectable_noun(word):
+                continue
+            parsed = self.morph.parse(word)
+            if parsed:
+                lemma = parsed[0].normal_form
+                result.append((idx, word, lemma))
+        return result
 
     def _find_first_noun(self, words: List[str]) -> Optional[Tuple[int, str, str, object]]:
         for strict in [True, False]:
