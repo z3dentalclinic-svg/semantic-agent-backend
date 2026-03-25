@@ -51,6 +51,14 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "ds_it":        ("nomn", "sing", "Параметр ds=it (информационный слой)"),
     "client_yt":    ("nomn", "sing", "Client=youtube"),
     "cp_one":       ("nomn", "sing", "Курсор cp=1 на маске"),
+    # ── SEP (Suffix-Ending-Position) — стем + триггер ────────────────────
+    "sep_а":  ("nomn", "sing", "SEP триггер: -а"),
+    "sep_у":  ("nomn", "sing", "SEP триггер: -у"),
+    "sep_е":  ("nomn", "sing", "SEP триггер: -е"),
+    "sep_ы":  ("nomn", "sing", "SEP триггер: -ы"),
+    "sep_и":  ("nomn", "sing", "SEP триггер: -и"),
+    "sep_ов": ("nomn", "sing", "SEP триггер: -ов"),
+    "sep_ом": ("nomn", "sing", "SEP триггер: -ом"),
     # ── suffix brute-force experiment ─────────────────────────────────────
     "brute_и":  ("nomn", "sing", "Brute suffix: -и"),
     "brute_а":  ("nomn", "sing", "Brute suffix: -а"),
@@ -61,16 +69,6 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "brute_ей": ("nomn", "sing", "Brute suffix: -ей (творительный жен.р)"),
     "brute_о":  ("nomn", "sing", "Brute suffix: -о"),
     "brute_ю":  ("nomn", "sing", "Brute suffix: -ю (винительный жен.р)"),
-    # ── brute для второго существительного (индекс _1) ───────────────────
-    "brute_и_1":  ("nomn", "sing", "Brute suffix noun_1: -и"),
-    "brute_а_1":  ("nomn", "sing", "Brute suffix noun_1: -а"),
-    "brute_е_1":  ("nomn", "sing", "Brute suffix noun_1: -е"),
-    "brute_у_1":  ("nomn", "sing", "Brute suffix noun_1: -у"),
-    "brute_ы_1":  ("nomn", "sing", "Brute suffix noun_1: -ы"),
-    "brute_ом_1": ("nomn", "sing", "Brute suffix noun_1: -ом"),
-    "brute_ей_1": ("nomn", "sing", "Brute suffix noun_1: -ей"),
-    "brute_о_1":  ("nomn", "sing", "Brute suffix noun_1: -о"),
-    "brute_ю_1":  ("nomn", "sing", "Brute suffix noun_1: -ю"),
 }
 
 
@@ -149,6 +147,10 @@ MORPH_PREP_SET = {"в", "во", "на", "для", "с", "со", "от", "под"
 
 # ── Letter sweep — все 26 букв ────────────────────────────────────────────────
 MORPH_LETTER_SWEEP = list("кпмнрдтбгзжлоауфхцчшйеэюящ")
+
+# ── SEP: срезаем конечные гласные, клеим триггер ─────────────────────────────
+_SEP_VOWELS = set("аеёиоуыэюя")
+SEP_TRIGGERS = ["а", "у", "е", "ы", "и", "ов", "ом"]
 
 # ── Priority matrix ───────────────────────────────────────────────────────────
 
@@ -533,83 +535,13 @@ class MorphGenerator:
     Использует внутренний MorphSuffixGenerator — не зависит от suffix_generator.py.
     """
 
-    def __init__(self, lang: str = "ru", geo_db: dict = None):
+    def __init__(self, lang: str = "ru"):
         self.lang = lang
-        self.geo_db = geo_db or {}
         self.morph = pymorphy3.MorphAnalyzer(lang=lang)
         self.suffix_gen = MorphSuffixGenerator(lang=lang)  # ← внутренний, не SuffixGenerator
 
     def _is_cyrillic_word(self, word: str) -> bool:
         return bool(re.match(r'^[а-яёА-ЯЁ]+$', word))
-
-    def _is_inflectable_noun(self, word: str) -> bool:
-        """
-        Определяет является ли токен склоняемым существительным.
-
-        Пропускает:
-          - Цифры и слова с цифрами: "16", "s21", "1600w"
-          - Латиницу: "samsung", "galaxy", "lg"
-          - Короткие слова ≤ 2 символов
-          - Предлоги/союзы из MORPH_PREP_SET
-          - Гео из GEO_DB
-          - Имена собственные (Prop тег pymorphy3)
-          - Несклоняемые (Fixd тег pymorphy3): "авто", "такси", "кофе"
-          - POS != NOUN или score < 0.3
-        """
-        # Цифры или латиница
-        if not re.match(r'^[а-яёА-ЯЁ]+$', word):
-            return False
-        # Слишком короткое
-        if len(word) <= 2:
-            return False
-        # Предлог/союз
-        if word.lower() in MORPH_PREP_SET:
-            return False
-        # Гео из GEO_DB
-        if word.lower() in self.geo_db:
-            return False
-        # pymorphy3
-        parsed = self.morph.parse(word)
-        if not parsed:
-            return False
-        p = parsed[0]
-        # Не существительное или низкий score
-        if p.tag.POS != 'NOUN':
-            return False
-        if p.score < 0.3:
-            return False
-        # Несклоняемое
-        if 'Fixd' in str(p.tag):
-            return False
-        # Имя собственное (гео, имена)
-        if 'Prop' in str(p.tag):
-            return False
-        # T-маркер (цена, стоимость, купить...) — уже покрыты Type D финализаторами
-        if word.lower() in MORPH_T_ROOTS or p.normal_form in MORPH_T_ROOTS:
-            return False
-        return True
-
-    def _find_inflectable_nouns(self, words: List[str]) -> List[Tuple[int, str, str]]:
-        """
-        Находит все склоняемые существительные в сиде.
-        Возвращает список (idx, word, lemma) — все валидные для склонения токены.
-
-        Примеры:
-          "ремонт пылесосов"       → [(0, "ремонт", "ремонт"), (1, "пылесосов", "пылесос")]
-          "аккумулятор на скутер"  → [(0, "аккумулятор", "аккумулятор"), (2, "скутер", "скутер")]
-          "услуги юриста лондон"   → [(0, "услуги", "услуга"), (1, "юриста", "юрист")]
-          "купить айфон 16"        → [] (нет кириллических сущ с нужным score)
-          "samsung galaxy s21"     → [] (вся латиница)
-        """
-        result = []
-        for idx, word in enumerate(words):
-            if not self._is_inflectable_noun(word):
-                continue
-            parsed = self.morph.parse(word)
-            if parsed:
-                lemma = parsed[0].normal_form
-                result.append((idx, word, lemma))
-        return result
 
     def _find_first_noun(self, words: List[str]) -> Optional[Tuple[int, str, str, object]]:
         for strict in [True, False]:
@@ -721,39 +653,31 @@ class MorphGenerator:
         for gcase in ("double_space", "ds_it", "client_yt", "cp_one"):
             case_variants[gcase] = original
 
-        # brute-force окончания — для всех склоняемых существительных в сиде
-        # Stem берём от ЛЕММЫ (именительный ед.ч.), а не от текущей формы слова.
-        # Это критично: "пылесосов" → lemma="пылесос" → stem="пылесо" → "пылесоса"
-        # вместо "пылесосов"[:-1]="пылесосо" → "пылесосои" (мусор).
+        # brute-force окончания
         _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о', 'ю']
         _BRUTE_LABELS  = ['brute_и', 'brute_а', 'brute_е', 'brute_у',
                           'brute_ы', 'brute_ом', 'brute_ей', 'brute_о', 'brute_ю']
+        noun_word = words[idx]
+        noun_stem = noun_word[:-1]
+        for blabel, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
+            new_word = noun_stem + bending
+            if new_word == noun_word:
+                continue
+            bwords = words.copy(); bwords[idx] = new_word
+            case_variants[blabel] = " ".join(bwords)
 
-        # Находим все склоняемые существительные в сиде
-        inflectable = self._find_inflectable_nouns(words)
-
-        _VOWELS = set('аеёиоуыэюяАЕЁИОУЫЭЮЯ')
-
-        for noun_idx_in_list, (noun_pos, noun_word_br, noun_lemma_br) in enumerate(inflectable):
-            # Stem: если лемма заканчивается на гласную — отрезаем её (имплантация → имплантаци)
-            # Если на согласную — оставляем как есть (пылесос → пылесос, зуб → зуб)
-            if noun_lemma_br and noun_lemma_br[-1] in _VOWELS:
-                noun_stem = noun_lemma_br[:-1]
-            else:
-                noun_stem = noun_lemma_br
-            # Первое сущ → базовые метки (brute_и, ...) для совместимости с CASES_RU/EXP_CONFIG
-            # Остальные → индексированные (brute_и_1, brute_а_1, ...)
-            suffix_idx = "" if noun_idx_in_list == 0 else f"_{noun_idx_in_list}"
-
-            for blabel_base, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
-                blabel = blabel_base + suffix_idx
-                new_word = noun_stem + bending
-                # Пропускаем если совпадает с оригиналом или леммой
-                if new_word == noun_word_br or new_word == noun_lemma_br:
-                    continue
-                bwords = words.copy()
-                bwords[noun_pos] = new_word
-                case_variants[blabel] = " ".join(bwords)
+        # SEP (Suffix-Ending-Position) — срезаем конечные гласные, клеим триггер
+        sep_noun = words[idx]
+        sep_stem = sep_noun.rstrip("аеёиоуыэюя")
+        if not sep_stem:
+            sep_stem = sep_noun  # всё слово — гласные (маловероятно)
+        for trigger in SEP_TRIGGERS:
+            new_word = sep_stem + trigger
+            if new_word == sep_noun:
+                continue  # совпадает с оригиналом — пропускаем
+            sep_words = words.copy()
+            sep_words[idx] = new_word
+            case_variants[f"sep_{trigger}"] = " ".join(sep_words)
 
         return MorphSeedAnalysis(
             original_seed=seed.lower().strip(),
@@ -875,16 +799,14 @@ class MorphGenerator:
             "brute_ей": ({}, None, None),
             "brute_о":  ({}, None, None),
             "brute_ю":  ({}, None, None),
-            # ── brute для второго существительного ───────────────────────
-            "brute_и_1":  ({}, None, None),
-            "brute_а_1":  ({}, None, None),
-            "brute_е_1":  ({}, None, None),
-            "brute_у_1":  ({}, None, None),
-            "brute_ы_1":  ({}, None, None),
-            "brute_ом_1": ({}, None, None),
-            "brute_ей_1": ({}, None, None),
-            "brute_о_1":  ({}, None, None),
-            "brute_ю_1":  ({}, None, None),
+            # SEP — cp выставляется динамически (len(variant_seed))
+            "sep_а":  ({}, None, None),
+            "sep_у":  ({}, None, None),
+            "sep_е":  ({}, None, None),
+            "sep_ы":  ({}, None, None),
+            "sep_и":  ({}, None, None),
+            "sep_ов": ({}, None, None),
+            "sep_ом": ({}, None, None),
         }
 
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
@@ -904,7 +826,11 @@ class MorphGenerator:
                 query_str = sq.query
                 if exp_label == "double_space" and "* " in query_str:
                     query_str = query_str.replace("* ", "*  ", 1)
-                cp_val = cp_force if cp_force is not None else sq.cp_override
+                # SEP: курсор всегда после стем+триггера (конец variant_seed)
+                if exp_label.startswith("sep_"):
+                    cp_val = len(exp_variant)
+                else:
+                    cp_val = cp_force if cp_force is not None else sq.cp_override
                 ua = "youtube" if client_override == "youtube" else None
 
                 queries.append(MorphQuery(
