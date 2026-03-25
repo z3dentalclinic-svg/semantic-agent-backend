@@ -1,35 +1,26 @@
 """
-Morph Generator v2.0 — Full suffix map × all case variants.
+Morph Generator v3.0 — Самодостаточный файл, не зависит от suffix_generator.py.
+
+Содержит:
+  - Все суффиксные константы (A/B/C/D/E) — полностью раскомментированы
+  - MorphSuffixGenerator — внутренний генератор суффиксов для морфологии
+  - MorphGenerator — склоняет первое существительное сида, генерирует MorphQuery
+  - CASES_RU, MorphSeedAnalysis, MorphQuery — все датаклассы
+
+Изменения относительно v2.0:
+  - Убран импорт SuffixGenerator из suffix_generator.py
+  - Все структуры Type E раскомментированы (13 структур вместо 4)
+  - suffix_generator.py больше не влияет на морф-парсер
 
 Architecture:
-- Finds first noun in seed → generates up to 12 case variants (6 cases × 2 numbers)
-- Identical case forms are deduplicated (e.g. accs_sing == nomn_sing for inanimate nouns)
-- For each unique case variant → runs FULL SuffixGenerator (A + B + C + D + E structures)
-- Result: case_variant × suffix_map = ~8,000+ queries per seed
-
-Query count estimate (10 active cases after dedup):
-  Type A (symbols):                  1 sym × 2 cp_variants × 10 = 20
-  Type B (prepositions + trail):     8 prep × (3 cp + 1 trail) × 10 = 320
-  Type C (questions):                5 q × 3 cp × 10 = 150
-  Type D (finalizers):               12 fin × 3 cp × 10 = 360
-  Type E (26 ltr × 14 struct × 10): 3640 MorphQuery objects
-  ─────────────────────────────────────────────────────────────────────
-  Total MorphQuery objects (before UA split):                   ~4,490
-  After ×2 UA (chrome/firefox) in parser for each query:        ~8,980
-
-Trace axes (for 10-dataset post-run analysis):
-  case_label   → which case inflection adds unique results
-  suffix_type  → A/B/C/D/E — which suffix class per case
-  suffix_label → exact suffix structure (prep_v_v1, а_plain, etc.)
-  ua_type      → chrome vs firefox — which UA per structure
+  morph_generator.py (этот файл) ← morph_parser.py
+  suffix_generator.py             ← suffix_parser.py   (независимо)
 """
 
 import pymorphy3
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Set, Optional
 from dataclasses import dataclass, field
-
-from parser.suffix_generator import SuffixGenerator, SuffixQuery
 
 
 # ══════════════════════════════════════════════
@@ -50,7 +41,7 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "accs_plur":  ("accs", "plur", "Винительный мн.ч."),
     "ablt_plur":  ("ablt", "plur", "Творительный мн.ч."),
     "loct_plur":  ("loct", "plur", "Предложный мн.ч."),
-    "stem_cut":   ("nomn", "sing", "Усечённая лемма"),   # эксперимент
+    "stem_cut":   ("nomn", "sing", "Усечённая лемма"),
     # ── mixed experiment ──────────────────────────────────────────────────
     "typo_w1":    ("nomn", "sing", "Удвоение первой буквы слова 1"),
     "cyr2lat_w1": ("nomn", "sing", "Замена кириллицы на латиницу в слове 1"),
@@ -61,9 +52,6 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "client_yt":    ("nomn", "sing", "Client=youtube"),
     "cp_one":       ("nomn", "sing", "Курсор cp=1 на маске"),
     # ── suffix brute-force experiment ─────────────────────────────────────
-    # Берём первое существительное, отрезаем последний символ, добавляем окончание.
-    # Google fuzzy-матчит шум к ближайшему падежу и открывает нужный карман.
-    # brute_и = уже gent_sing (контрольный), brute_ы/а/е = новые несуществующие формы
     "brute_и":  ("nomn", "sing", "Brute suffix: -и"),
     "brute_а":  ("nomn", "sing", "Brute suffix: -а"),
     "brute_е":  ("nomn", "sing", "Brute suffix: -е"),
@@ -77,77 +65,473 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
 
 
 # ══════════════════════════════════════════════
-# DATA CLASSES
+# SUFFIX DEFINITIONS — внутренние для морфологии
+# Полностью независимы от suffix_generator.py
 # ══════════════════════════════════════════════
 
-@dataclass
-class MorphQuery:
-    """
-    Single generated query: full SuffixQuery metadata + case metadata.
-    Parser iterates these, fetches Google (chrome + firefox), records trace.
-    """
-    # ── Case metadata ──────────────────────────────────────────────────────
-    case_label: str        # "gent_sing"
-    case_display: str      # "Родительный ед.ч."
-    seed_variant: str      # Inflected seed: "курса английского языка киев"
+MORPH_SUFFIXES_RU = {
+    # Type A: Symbols
+    "A_ua": [
+        {"val": ":", "label": "sym_ua"},
+    ],
+    "A_ru": [
+        {"val": "&", "label": "sym_ru"},
+    ],
 
-    # ── Suffix metadata (mirrors SuffixQuery) ─────────────────────────────
-    query: str             # Full query: "курса английского языка киев а"
-    suffix_val: str        # "а" / "в *" / ":" / "купить *"
-    suffix_label: str      # "а_plain" / "prep_v_v1" / "fin_kupit_v1"
-    suffix_type: str       # A / B / C / D / E
-    priority: int          # 1 or 2 (0 = blocked — recorded in trace but not fetched)
-    cp_override: Optional[int] = None   # cursor position override for Google
-    variant: Optional[str] = None       # v1/v2/v3/trail/plain/sandwich/...
-    blocked_by: Optional[str] = None    # self-match reason if priority == 0
-    ua_filter: Optional[str] = None     # "chrome" / "firefox" / "youtube" / None=both
-    extra_params: Dict = field(default_factory=dict)  # дополнительные HTTP-параметры (ds=it и т.д.)
-    client_override: Optional[str] = None             # переопределить client (youtube и т.д.)
+    # Type B: Prepositions
+    "B": [
+        {"val": "в *",    "label": "prep_v"},
+        {"val": "на *",   "label": "prep_na"},
+        {"val": "для *",  "label": "prep_dlya"},
+        {"val": "с *",    "label": "prep_s"},
+        {"val": "от *",   "label": "prep_ot"},
+        {"val": "под *",  "label": "prep_pod"},
+        {"val": "из *",   "label": "prep_iz"},
+        {"val": "без *",  "label": "prep_bez"},
+    ],
 
+    # Type C: Questions
+    "C": [
+        {"val": "как *",     "label": "q_kak"},
+        {"val": "какой *",   "label": "q_kakoy"},
+        {"val": "где *",     "label": "q_gde"},
+        {"val": "сколько *", "label": "q_skolko"},
+        {"val": "почему *",  "label": "q_pochemu"},
+    ],
+
+    # Type D: Finalizers
+    "D": [
+        {"val": "купить *",         "label": "fin_kupit"},
+        {"val": "цена *",           "label": "fin_tsena"},
+        {"val": "отзывы *",         "label": "fin_otzyvy"},
+        {"val": "обзор *",          "label": "fin_obzor"},
+        {"val": "сравнение *",      "label": "fin_sravnenie"},
+        {"val": "характеристики *", "label": "fin_harakteristiki"},
+        {"val": "аналоги *",        "label": "fin_analogi"},
+        {"val": "или *",            "label": "fin_ili"},
+        {"val": "и *",              "label": "fin_i"},
+        {"val": "vs *",             "label": "fin_vs"},
+        {"val": "вместо *",         "label": "fin_vmesto"},
+        {"val": "форум *",          "label": "fin_forum"},
+    ],
+
+    # Numeric
+    "A_num": [
+        {"val": f"* {i}", "label": f"num_{i}"} for i in range(10)
+    ],
+}
+
+# ── Marker word sets ──────────────────────────────────────────────────────────
+
+MORPH_Q_WORDS = {"как", "какой", "какая", "какое", "какие", "где", "сколько",
+                 "почему", "зачем", "когда", "куда", "откуда", "чей", "чья",
+                 "чьё", "чьи", "который", "которая", "которое", "которые"}
+
+MORPH_T_ROOTS = {"купить", "купи", "куплю", "покупка", "покупать",
+                 "цена", "цену", "ценой", "ценах", "ценам",
+                 "стоимость", "стоит",
+                 "заказать", "заказ", "заказывать",
+                 "прайс", "недорого", "дешево", "дёшево", "скидка", "акция"}
+
+MORPH_PREP_SET = {"в", "во", "на", "для", "с", "со", "от", "под", "из", "без",
+                  "над", "за", "по", "до", "при", "между", "через", "про",
+                  "об", "о", "к", "ко", "у"}
+
+# ── Letter sweep — все 26 букв ────────────────────────────────────────────────
+MORPH_LETTER_SWEEP = list("кпмнрдтбгзжлоауфхцчшйеэюящ")
+
+# ── Priority matrix ───────────────────────────────────────────────────────────
+
+MORPH_PRIORITY_MATRIX = {
+    "Q":       {"A": 1, "B": 1, "C": 2, "D": 2},
+    "T":       {"A": 1, "B": 1, "C": 2, "D": 1},
+    "S":       {"A": 1, "B": 1, "C": 1, "D": 1},
+    "L1":      {"A": 1, "B": 1, "C": 1, "D": 1},
+    "L2":      {"A": 1, "B": 1, "C": 1, "D": 1},
+    "L3":      {"A": 1, "B": 1, "C": 2, "D": 1},
+    "L4":      {"A": 1, "B": 2, "C": 2, "D": 2},
+    "L5+":     {"A": 1, "B": 2, "C": 2, "D": 2},
+    "P":       {"A": 1, "B": 1, "C": 1, "D": 1},
+    "DEFAULT": {"A": 1, "B": 1, "C": 1, "D": 1},
+}
+
+
+# ══════════════════════════════════════════════
+# DATA CLASSES
+# ══════════════════════════════════════════════
 
 @dataclass
 class MorphSeedAnalysis:
     """Result of morphological seed analysis."""
     original_seed: str
-    original_noun: str           # Word that was inflected, e.g. "курсов"
-    original_noun_idx: int       # Position in word list (0-based)
-    original_lemma: str          # Lemma: "курс"
-    case_variants: Dict[str, str]   # case_label → seed_variant (deduped)
-    skipped_cases: List[str]        # Reasons for skipped cases
+    original_noun: str
+    original_noun_idx: int
+    original_lemma: str
+    case_variants: Dict[str, str]
+    skipped_cases: List[str]
+
+
+@dataclass
+class MorphQuery:
+    """Single generated query: full suffix metadata + case metadata."""
+    case_label: str
+    case_display: str
+    seed_variant: str
+    query: str
+    suffix_val: str
+    suffix_label: str
+    suffix_type: str
+    priority: int
+    cp_override: Optional[int] = None
+    variant: Optional[str] = None
+    blocked_by: Optional[str] = None
+    ua_filter: Optional[str] = None
+    extra_params: Dict = field(default_factory=dict)
+    client_override: Optional[str] = None
+
+
+# ── Internal seed analysis dataclass (used by MorphSuffixGenerator) ──────────
+
+@dataclass
+class _SeedAnalysis:
+    seed: str
+    words: List[str]
+    word_count: int
+    markers: Dict[str, bool] = field(default_factory=dict)
+    q_words_found: List[str] = field(default_factory=list)
+    t_words_found: List[str] = field(default_factory=list)
+    s_words_found: List[str] = field(default_factory=list)
+    p_words_found: List[str] = field(default_factory=list)
+    l_level: str = "L1"
+
+
+@dataclass
+class _SuffixQuery:
+    query: str
+    suffix_val: str
+    suffix_label: str
+    suffix_type: str
+    priority: int
+    markers: List[str]
+    blocked_by: Optional[str] = None
+    cp_override: Optional[int] = None
+    variant: Optional[str] = None
 
 
 # ══════════════════════════════════════════════
-# GENERATOR
+# MORPH SUFFIX GENERATOR
+# Внутренний — независим от suffix_generator.py
+# Type E: все 13 структур активны
+# ══════════════════════════════════════════════
+
+class MorphSuffixGenerator:
+
+    def __init__(self, lang: str = "ru"):
+        self.lang = lang
+        self.morph = pymorphy3.MorphAnalyzer(lang=lang)
+        self.suffixes = MORPH_SUFFIXES_RU
+
+    def analyze_seed(self, seed: str) -> _SeedAnalysis:
+        seed_lower = seed.lower().strip()
+        words = seed_lower.split()
+        analysis = _SeedAnalysis(seed=seed_lower, words=words, word_count=len(words))
+
+        if len(words) >= 6:   analysis.l_level = "L6+"
+        elif len(words) >= 5: analysis.l_level = "L5+"
+        elif len(words) == 4: analysis.l_level = "L4"
+        elif len(words) == 3: analysis.l_level = "L3"
+        elif len(words) == 2: analysis.l_level = "L2"
+        else:                  analysis.l_level = "L1"
+
+        for w in words:
+            if w in MORPH_Q_WORDS:
+                analysis.q_words_found.append(w)
+        analysis.markers["Q"] = len(analysis.q_words_found) > 0
+
+        for w in words:
+            if w in MORPH_T_ROOTS:
+                analysis.t_words_found.append(w)
+                continue
+            parsed = self.morph.parse(w)
+            if parsed and parsed[0].normal_form in MORPH_T_ROOTS:
+                analysis.t_words_found.append(w)
+        analysis.markers["T"] = len(analysis.t_words_found) > 0
+
+        for w in words:
+            if w in MORPH_PREP_SET:
+                analysis.p_words_found.append(w)
+        analysis.markers["P"] = len(analysis.p_words_found) > 0
+
+        for w in words:
+            if w in MORPH_PREP_SET or w in MORPH_Q_WORDS:
+                continue
+            if self._is_service_word(w):
+                analysis.s_words_found.append(w)
+        analysis.markers["S"] = len(analysis.s_words_found) > 0
+
+        return analysis
+
+    def _is_service_word(self, word: str) -> bool:
+        parsed_list = self.morph.parse(word)
+        if not parsed_list:
+            return False
+        parsed = parsed_list[0]
+        if parsed.tag.POS != "NOUN" or parsed.score < 0.3:
+            return False
+        normal = parsed.normal_form
+        if len(normal) < 4:
+            return False
+        for form in parsed.lexeme:
+            if form.tag.POS in ("VERB", "INFN") and "tran" in form.tag:
+                return True
+        verb_candidates = []
+        if normal.endswith("ка") and len(normal) > 4:
+            stem = normal[:-2]
+            if len(stem) >= 3:
+                verb_candidates += [stem + "ить", stem + "ять", stem + "ать",
+                                    stem + "ивать", stem + "лять"]
+        if normal.endswith("ние") or normal.endswith("ание") or normal.endswith("ение"):
+            stem = normal[:-3]
+            if len(stem) >= 3:
+                verb_candidates += [stem + "ать", stem + "ить", stem + "ять"]
+        for vc in verb_candidates:
+            p_list = self.morph.parse(vc)
+            for p in p_list:
+                if p.tag.POS in ("VERB", "INFN") and "tran" in p.tag:
+                    if p.normal_form == vc or p.normal_form.startswith(vc[:4]):
+                        return True
+        return False
+
+    def generate(
+        self,
+        seed: str,
+        include_numbers: bool = False,
+        include_letters: bool = True,
+        region: str = "ua",
+    ) -> Tuple[_SeedAnalysis, List[_SuffixQuery]]:
+
+        analysis = self.analyze_seed(seed)
+        seed_lower = seed.lower().strip()
+
+        seed_words: Set[str] = set(seed_lower.split())
+        seed_lemmas: Set[str] = set()
+        for w in seed_words:
+            p = self.morph.parse(w)
+            if p:
+                seed_lemmas.add(p[0].normal_form)
+
+        active_markers: List[str] = []
+        for marker in ["Q", "T", "S", "P"]:
+            if analysis.markers.get(marker):
+                active_markers.append(marker)
+        active_markers.append(analysis.l_level)
+        if not active_markers:
+            active_markers = ["DEFAULT"]
+
+        results: List[_SuffixQuery] = []
+
+        def make_sq(query, suffix_val, suffix_label, suffix_type, priority,
+                    cp=None, variant=None, blocked_by=None) -> _SuffixQuery:
+            return _SuffixQuery(
+                query=query, suffix_val=suffix_val, suffix_label=suffix_label,
+                suffix_type=suffix_type, priority=priority,
+                markers=list(active_markers), cp_override=cp,
+                variant=variant, blocked_by=blocked_by,
+            )
+
+        def expand_type_a(seed_str, val, label, priority, markers):
+            out = []
+            blocked = self._check_self_match(val, seed_words, seed_lemmas, analysis)
+            eff = 0 if blocked else priority
+            q = f"{seed_str} {val}"
+            out.append(make_sq(q, val, f"{label}_v1", "A", eff,
+                               cp=len(q), variant="v1", blocked_by=blocked))
+            q2 = f"{val} {seed_str}"
+            out.append(make_sq(q2, val, f"{label}_v2", "A", eff,
+                               cp=len(q2), variant="v2", blocked_by=blocked))
+            return out
+
+        # ── Type A ───────────────────────────────────────────────────────────
+        a_priority = self._calc_priority("A", active_markers)
+        if region in ("ua", "all"):
+            for s in self.suffixes["A_ua"]:
+                results.extend(expand_type_a(seed_lower, s["val"], s["label"],
+                                             a_priority, active_markers))
+        if region in ("ru", "all"):
+            for s in self.suffixes["A_ru"]:
+                results.extend(expand_type_a(seed_lower, s["val"], s["label"],
+                                             a_priority, active_markers))
+
+        # ── Type B ───────────────────────────────────────────────────────────
+        b_priority = self._calc_priority("B", active_markers)
+        for s in self.suffixes["B"]:
+            blocked = self._check_self_match(s["val"], seed_words, seed_lemmas, analysis)
+            eff = 0 if blocked else b_priority
+            base_label = s["label"]
+            val = s["val"]
+            for vi in range(1, 4):
+                q = f"{seed_lower} {val}"
+                results.append(make_sq(q, val, f"{base_label}_v{vi}", "B", eff,
+                                       cp=len(q), variant=f"v{vi}", blocked_by=blocked))
+            prep_word = val.split()[0]
+            q_trail = f"{seed_lower} {prep_word} "
+            results.append(make_sq(q_trail, val, f"prep_{prep_word}_trail", "B", eff,
+                                   cp=len(q_trail), variant="trail", blocked_by=blocked))
+
+        # ── Type C ───────────────────────────────────────────────────────────
+        c_priority = self._calc_priority("C", active_markers)
+        for s in self.suffixes["C"]:
+            blocked = self._check_self_match(s["val"], seed_words, seed_lemmas, analysis)
+            eff = 0 if blocked else c_priority
+            val = s["val"]
+            base_label = s["label"]
+            for vi in range(1, 4):
+                q = f"{seed_lower} {val}"
+                results.append(make_sq(q, val, f"{base_label}_v{vi}", "C", eff,
+                                       cp=len(q), variant=f"v{vi}", blocked_by=blocked))
+
+        # ── Type D ───────────────────────────────────────────────────────────
+        d_priority = self._calc_priority("D", active_markers)
+        for s in self.suffixes["D"]:
+            blocked = self._check_self_match(s["val"], seed_words, seed_lemmas, analysis)
+            eff = 0 if blocked else d_priority
+            val = s["val"]
+            base_label = s["label"]
+            for vi in range(1, 4):
+                q = f"{seed_lower} {val}"
+                results.append(make_sq(q, val, f"{base_label}_v{vi}", "D", eff,
+                                       cp=len(q), variant=f"v{vi}", blocked_by=blocked))
+
+        # ── Type A_num ───────────────────────────────────────────────────────
+        if include_numbers:
+            for s in self.suffixes["A_num"]:
+                results.extend(expand_type_a(seed_lower, s["val"], s["label"],
+                                             1, active_markers))
+
+        # ── Type E: Letter sweep — все 13 структур ───────────────────────────
+        if include_letters:
+            for letter in MORPH_LETTER_SWEEP:
+                results.extend(self._build_letter_structures(seed_lower, letter))
+
+        return analysis, results
+
+    def _build_letter_structures(self, seed_lower: str, letter: str) -> List[_SuffixQuery]:
+        """
+        13 структур для одной буквы.
+        В suffix_generator.py активны только 4 (plain, trail, sandwich, wcB_cpMid).
+        Здесь все раскомментированы.
+        """
+        s = seed_lower
+        L = letter
+        out = []
+
+        def sq(query: str, cp: int, struct_name: str) -> _SuffixQuery:
+            return _SuffixQuery(
+                query=query, suffix_val=L,
+                suffix_label=f"{L}_{struct_name}",
+                suffix_type="E", priority=1,
+                markers=["letter_sweep"],
+                cp_override=cp if cp >= 0 else None,
+                variant=struct_name,
+            )
+
+        # 1. plain: сид а  (cp = конец)
+        q = f"{s} {L}"
+        out.append(sq(q, len(q), "plain"))
+
+        # 2. plain_nocp: сид а  (cp не передаётся)
+        out.append(sq(q, -1, "plain_nocp"))
+
+        # 3. trail: сид а  (+ trailing space)
+        q = f"{s} {L} "
+        out.append(sq(q, len(q), "trail"))
+
+        # 4. sandwich: сид * а *
+        q = f"{s} * {L} *"
+        out.append(sq(q, len(q), "sandwich"))
+
+        # 5. wcB_cpMid: сид * а  (cp между * и буквой)
+        q = f"{s} * {L}"
+        out.append(sq(q, len(s) + 3, "wcB_cpMid"))
+
+        # 6. Lwc_cpAL: сид а *  (cp после "а ")
+        q = f"{s} {L} *"
+        out.append(sq(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL"))
+
+        # 7. Lwc_cpBL: сид а *  (cp перед "а")
+        out.append(sq(q, len(s) + 1, "Lwc_cpBL"))
+
+        # 8. col_B_trail: сид : а  (+ trailing space)
+        q = f"{s} : {L} "
+        out.append(sq(q, len(q), "col_B_trail"))
+
+        # 9. L_col: сид а :
+        q = f"{s} {L} :"
+        out.append(sq(q, len(q), "L_col"))
+
+        # 10. hyp_B_trail: сид - а  (+ trailing space)
+        q = f"{s} - {L} "
+        out.append(sq(q, len(q), "hyp_B_trail"))
+
+        # 11. hyp_Lwc: сид - а *
+        q = f"{s} - {L} *"
+        out.append(sq(q, len(q), "hyp_Lwc"))
+
+        # 12. hyp_wcL: сид - * а
+        q = f"{s} - * {L}"
+        out.append(sq(q, len(q), "hyp_wcL"))
+
+        # 13. L_hyp: сид а -
+        q = f"{s} {L} -"
+        out.append(sq(q, len(q), "L_hyp"))
+
+        return out  # 13 структур
+
+    def _calc_priority(self, suffix_type: str, active_markers: List[str]) -> int:
+        priorities = []
+        for marker in active_markers:
+            matrix_row = MORPH_PRIORITY_MATRIX.get(marker, MORPH_PRIORITY_MATRIX["DEFAULT"])
+            priorities.append(matrix_row.get(suffix_type, 1))
+        return min(priorities) if priorities else 1
+
+    def _check_self_match(self, suffix_val: str, seed_words: Set[str],
+                           seed_lemmas: Set[str], analysis: _SeedAnalysis) -> Optional[str]:
+        suffix_parts = suffix_val.replace("*", "").strip().split()
+        if not suffix_parts:
+            return None
+        for suffix_keyword in suffix_parts:
+            suffix_keyword = suffix_keyword.lower()
+            if suffix_keyword in MORPH_PREP_SET:
+                if suffix_keyword in analysis.p_words_found:
+                    return f"prep_self_match:{suffix_keyword}"
+                continue
+            if suffix_keyword in seed_words:
+                return f"word_self_match:{suffix_keyword}"
+            p = self.morph.parse(suffix_keyword)
+            if p and p[0].normal_form in seed_lemmas:
+                return f"lemma_self_match:{suffix_keyword}→{p[0].normal_form}"
+        return None
+
+
+# ══════════════════════════════════════════════
+# MORPH GENERATOR
 # ══════════════════════════════════════════════
 
 class MorphGenerator:
     """
     Generates full suffix map for all unique case variants of the first noun in seed.
-
-    Core idea: for each case_variant string → call SuffixGenerator.generate().
-    SuffixGenerator already handles everything:
-      A/B/C/D/E structures, cp_override variants, self-match filter,
-      trailing space ("в " / "на "), priority matrix, letter sweep.
-    We just stamp case_label + case_display + seed_variant on every SuffixQuery.
+    Использует внутренний MorphSuffixGenerator — не зависит от suffix_generator.py.
     """
 
     def __init__(self, lang: str = "ru"):
         self.lang = lang
         self.morph = pymorphy3.MorphAnalyzer(lang=lang)
-        self.suffix_gen = SuffixGenerator(lang=lang)
-
-    # ── Noun detection ─────────────────────────────────────────────────────
+        self.suffix_gen = MorphSuffixGenerator(lang=lang)  # ← внутренний, не SuffixGenerator
 
     def _is_cyrillic_word(self, word: str) -> bool:
         return bool(re.match(r'^[а-яёА-ЯЁ]+$', word))
 
     def _find_first_noun(self, words: List[str]) -> Optional[Tuple[int, str, str, object]]:
-        """
-        Find first noun in word list.
-        Pass 1 (strict):   POS=NOUN + score>=0.3 + cyrillic
-        Pass 2 (fallback): any POS=NOUN + cyrillic
-        Returns (idx, word, lemma, parsed_obj) or None.
-        """
         for strict in [True, False]:
             for idx, word in enumerate(words):
                 if not self._is_cyrillic_word(word):
@@ -158,20 +542,7 @@ class MorphGenerator:
                             return idx, word, p.normal_form, p
         return None
 
-    # ── Seed analysis ──────────────────────────────────────────────────────
-
     def analyze_seed(self, seed: str) -> Optional[MorphSeedAnalysis]:
-        """
-        Find first noun → build up to 12 case variants (6 cases × 2 numbers).
-        Identical forms are automatically deduplicated.
-
-        Fallback chain:
-          1. First cyrillic NOUN score>=0.3
-          2. Any cyrillic NOUN
-          3. First cyrillic word that produces at least 1 inflection
-          4. If nothing inflects → use nomn_sing only (seed as-is)
-        Returns None only if seed is empty.
-        """
         words = seed.lower().strip().split()
         if not words:
             return None
@@ -179,10 +550,9 @@ class MorphGenerator:
         noun_data = self._find_first_noun(words)
 
         if noun_data is None:
-            # Fallback: try every cyrillic word, pick first NOUN that can be inflected
             for idx, word in enumerate(words):
                 if not self._is_cyrillic_word(word):
-                    continue  # skip digits, latin (3060, rtx, ртх)
+                    continue
                 parses = self.morph.parse(word)
                 if not parses:
                     continue
@@ -197,9 +567,6 @@ class MorphGenerator:
                     break
 
         if noun_data is None:
-            # Last-resort: no inflectable cyrillic word found.
-            # Use nomn_sing only (seed as-is) so at least one case runs.
-            # This handles "купить ртх 3060" — no noun, but we still sweep letters.
             idx = next(
                 (i for i, w in enumerate(words) if self._is_cyrillic_word(w)),
                 len(words) - 1
@@ -208,8 +575,6 @@ class MorphGenerator:
             parses = self.morph.parse(word)
             if not parses:
                 return None
-            noun_data = (idx, word, parses[0].normal_form, parses[0])
-            # Force only nomn_sing — no inflection available
             return MorphSeedAnalysis(
                 original_seed=seed.lower().strip(),
                 original_noun=word,
@@ -225,24 +590,18 @@ class MorphGenerator:
         seen_variants: set = set()
         skipped_cases: List[str] = []
 
-        # ── ЗАКОММЕНТИРОВАНО для эксперимента ──────────────────────────
-        # for case_label, (case_tag, number_tag, _display) in CASES_RU.items():
-        #     ...
-
         # ── mixed experiment ─────────────────────────────────────────────
-        # Таблица замены кириллицы на визуально идентичную латиницу
         CYR2LAT = {
             'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
             'у': 'y', 'х': 'x', 'А': 'A', 'Е': 'E', 'О': 'O',
             'Р': 'P', 'С': 'C', 'У': 'Y', 'Х': 'X',
         }
 
-        def mix_cyr_lat(word):
-            """Заменяем первую найденную кириллическую букву на латинский аналог."""
-            for i, ch in enumerate(word):
+        def mix_cyr_lat(w):
+            for i, ch in enumerate(w):
                 if ch in CYR2LAT:
-                    return word[:i] + CYR2LAT[ch] + word[i+1:]
-            return word
+                    return w[:i] + CYR2LAT[ch] + w[i+1:]
+            return w
 
         other_idx = 1 if idx == 0 else 0
         has_other = (other_idx < len(words)
@@ -250,59 +609,49 @@ class MorphGenerator:
                      and re.match(r'^[а-яёА-ЯЁ]+$', words[other_idx])
                      and len(words[other_idx]) > 2)
 
-        # typo_w1: удвоение первой буквы первого существительного
+        # typo_w1
         w1_typo = words[idx][0] + words[idx]
-        tw1 = words.copy()
-        tw1[idx] = w1_typo
+        tw1 = words.copy(); tw1[idx] = w1_typo
         v1 = " ".join(tw1)
         if v1 not in seen_variants:
             case_variants["typo_w1"] = v1
             seen_variants.add(v1)
 
-        # cyr2lat_w1: замена буквы в первом слове
+        # cyr2lat_w1
         w1_lat = mix_cyr_lat(words[idx])
         if w1_lat != words[idx]:
-            cl1 = words.copy()
-            cl1[idx] = w1_lat
+            cl1 = words.copy(); cl1[idx] = w1_lat
             vcl1 = " ".join(cl1)
             if vcl1 not in seen_variants:
                 case_variants["cyr2lat_w1"] = vcl1
                 seen_variants.add(vcl1)
 
-        # cyr2lat_w2: замена буквы во втором слове
+        # cyr2lat_w2
         if has_other:
             w2_lat = mix_cyr_lat(words[other_idx])
             if w2_lat != words[other_idx]:
-                cl2 = words.copy()
-                cl2[other_idx] = w2_lat
+                cl2 = words.copy(); cl2[other_idx] = w2_lat
                 vcl2 = " ".join(cl2)
                 if vcl2 not in seen_variants:
                     case_variants["cyr2lat_w2"] = vcl2
                     seen_variants.add(vcl2)
 
-        # ── gemini experiment: все 4 используют оригинальный сид ─────────
+        # gemini experiments
         original = seed.lower().strip()
         for gcase in ("double_space", "ds_it", "client_yt", "cp_one"):
-            if original not in seen_variants:
-                case_variants[gcase] = original
-            else:
-                # если оригинал уже есть под другим именем — всё равно добавляем
-                case_variants[gcase] = original
+            case_variants[gcase] = original
 
-        # ── suffix brute-force: отрезаем последний символ существительного,
-        #    подставляем 8 окончаний включая творительный (-ом/-ей).
+        # brute-force окончания
         _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о', 'ю']
         _BRUTE_LABELS  = ['brute_и', 'brute_а', 'brute_е', 'brute_у',
                           'brute_ы', 'brute_ом', 'brute_ей', 'brute_о', 'brute_ю']
-
         noun_word = words[idx]
-        noun_stem = noun_word[:-1]  # отрезаем последний символ
+        noun_stem = noun_word[:-1]
         for blabel, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
             new_word = noun_stem + bending
             if new_word == noun_word:
                 continue
-            bwords = words.copy()
-            bwords[idx] = new_word
+            bwords = words.copy(); bwords[idx] = new_word
             case_variants[blabel] = " ".join(bwords)
 
         return MorphSeedAnalysis(
@@ -316,119 +665,87 @@ class MorphGenerator:
 
     # ── Query generation ───────────────────────────────────────────────────
 
-    # ══════════════════════════════════════════════════════════════════════
-    # PROVEN_TRIPLETS — 79 доказанных связок из анализа 10 датасетов
-    # Анализ: analysis_triplets.py | Файл: morph_target_keywords.md
-    # Покрытие: 486/505 целевых ключей (96%) | ~950 запросов вместо 8000
-    #
-    # Формат: (case_label, struct_name, ua)
-    # struct_name соответствует именам в suffix_generator.py
-    # ══════════════════════════════════════════════════════════════════════
     PROVEN_TRIPLETS: List[Tuple[str, str, str]] = [
-        # ── Топ по количеству ключей ──────────────────────────────────
-        ("gent_sing",  "wcB_cpMid",   "chrome"),   # 133 ключей
-        ("accs_sing",  "wcB_cpMid",   "chrome"),   #  44
-        ("nomn_sing",  "plain",       "firefox"),  #  36
-        ("nomn_sing",  "wcB_cpMid",   "chrome"),   #  33
-        ("ablt_sing",  "wcB_cpMid",   "chrome"),   #  30
-        ("nomn_sing",  "q_kak",       "chrome"),   #  11
-        ("ablt_plur",  "prep_bez",    "chrome"),   #  11
-        ("gent_sing",  "q_kakoy",     "chrome"),   #  10
-        ("gent_sing",  "plain",       "firefox"),  #   9
-        ("nomn_sing",  "plain",       "chrome"),   #   8
-        ("nomn_sing",  "prep_s",      "chrome"),   #   8
-        ("datv_plur",  "plain",       "firefox"),  #   7
-        ("gent_sing",  "trail",       "firefox"),  #   6
-        ("ablt_sing",  "trail",       "firefox"),  #   6
-        ("gent_sing",  "q_kak",       "chrome"),   #   6
-        ("gent_sing",  "plain",       "chrome"),   #   6
-        ("gent_sing",  "Lwc_cpBL",    "chrome"),   #   5
-        ("nomn_sing",  "trail",       "firefox"),  #   5
-        ("nomn_sing",  "fin_i",       "chrome"),   #   5
-        ("gent_sing",  "prep_na",     "chrome"),   #   5
-        ("nomn_sing",  "q_skolko",    "chrome"),   #   5
-        ("nomn_sing",  "q_gde",       "chrome"),   #   4
-        ("nomn_sing",  "prep_dlya",   "chrome"),   #   4
-        ("nomn_sing",  "fin_ili",     "chrome"),   #   4
-        ("loct_sing",  "plain",       "firefox"),  #   3
-        ("nomn_sing",  "q_kakoy",     "chrome"),   #   3
-        ("gent_sing",  "prep_bez",    "chrome"),   #   3
-        ("gent_sing",  "q_pochemu",   "chrome"),   #   3
-        ("gent_sing",  "prep_ot",     "chrome"),   #   3
-        ("ablt_sing",  "sym",         "chrome"),   #   3
-        # ── По 2 ключа ────────────────────────────────────────────────
-        ("nomn_plur",  "plain",       "firefox"),  #   2
-        ("ablt_plur",  "wcB_cpMid",   "chrome"),   #   2
-        ("nomn_sing",  "plain_nocp",  "chrome"),   #   2
-        ("nomn_plur",  "q_pochemu",   "chrome"),   #   2
-        ("nomn_sing",  "q_pochemu",   "chrome"),   #   2
-        ("gent_sing",  "q_skolko",    "chrome"),   #   2
-        ("gent_plur",  "plain",       "firefox"),  #   2
-        ("accs_sing",  "plain",       "firefox"),  #   2
-        ("datv_plur",  "trail",       "firefox"),  #   2
-        ("accs_sing",  "prep_na",     "chrome"),   #   2
-        ("gent_sing",  "prep_s",      "chrome"),   #   2
-        ("gent_sing",  "prep_dlya",   "chrome"),   #   2
-        ("gent_sing",  "fin_tsena",   "chrome"),   #   2
-        ("ablt_plur",  "plain",       "chrome"),   #   2
-        ("ablt_plur",  "prep_na",     "chrome"),   #   2
-        ("gent_sing",  "sym",         "chrome"),   #   2
-        ("gent_sing",  "fin_otzyvy",  "chrome"),   #   2
-        ("gent_sing",  "fin_i",       "chrome"),   #   2
-        # ── По 1 ключу ────────────────────────────────────────────────
-        ("nomn_plur",  "plain_nocp",  "firefox"),  #   1
-        ("datv_sing",  "wcB_cpMid",   "chrome"),   #   1
-        ("datv_sing",  "trail",       "firefox"),  #   1
-        ("accs_sing",  "sym",         "firefox"),  #   1
-        ("datv_plur",  "wcB_cpMid",   "chrome"),   #   1
-        ("nomn_sing",  "prep_bez",    "chrome"),   #   1
-        ("ablt_sing",  "prep_s",      "chrome"),   #   1
-        ("gent_sing",  "prep_s",      "firefox"),  #   1
-        ("datv_sing",  "plain",       "firefox"),  #   1
-        ("loct_plur",  "q_skolko",    "chrome"),   #   1
-        ("gent_plur",  "plain",       "chrome"),   #   1
-        ("datv_plur",  "plain_nocp",  "firefox"),  #   1
-        ("ablt_plur",  "plain",       "firefox"),  #   1
-        ("accs_sing",  "q_kak",       "chrome"),   #   1
-        ("loct_plur",  "prep_v",      "chrome"),   #   1
-        ("nomn_sing",  "prep_na",     "chrome"),   #   1
-        ("nomn_sing",  "prep_v",      "chrome"),   #   1
-        ("nomn_sing",  "prep_pod",    "chrome"),   #   1
-        ("nomn_sing",  "trail",       "chrome"),   #   1
-        ("datv_plur",  "q_pochemu",   "chrome"),   #   1
-        ("gent_sing",  "fin_forum",   "chrome"),   #   1
-        ("gent_plur",  "fin_analogi", "chrome"),   #   1
-        ("gent_sing",  "prep_iz",     "chrome"),   #   1
-        ("accs_sing",  "q_kakoy",     "chrome"),   #   1
-        ("gent_plur",  "q_kakoy",     "chrome"),   #   1
-        ("ablt_plur",  "prep_ot",     "chrome"),   #   1
-        ("accs_sing",  "prep_v",      "chrome"),   #   1
-        ("gent_sing",  "Lwc_cpBL",    "firefox"),  #   1
-        ("accs_sing",  "q_pochemu",   "chrome"),   #   1
-        ("nomn_sing",  "prep_ot",     "chrome"),   #   1
-        ("gent_sing",  "fin_vmesto",  "chrome"),   #   1
+        ("gent_sing",  "wcB_cpMid",   "chrome"),
+        ("accs_sing",  "wcB_cpMid",   "chrome"),
+        ("nomn_sing",  "plain",       "firefox"),
+        ("nomn_sing",  "wcB_cpMid",   "chrome"),
+        ("ablt_sing",  "wcB_cpMid",   "chrome"),
+        ("nomn_sing",  "q_kak",       "chrome"),
+        ("ablt_plur",  "prep_bez",    "chrome"),
+        ("gent_sing",  "q_kakoy",     "chrome"),
+        ("gent_sing",  "plain",       "firefox"),
+        ("nomn_sing",  "plain",       "chrome"),
+        ("nomn_sing",  "prep_s",      "chrome"),
+        ("datv_plur",  "plain",       "firefox"),
+        ("gent_sing",  "trail",       "firefox"),
+        ("ablt_sing",  "trail",       "firefox"),
+        ("gent_sing",  "q_kak",       "chrome"),
+        ("gent_sing",  "plain",       "chrome"),
+        ("gent_sing",  "Lwc_cpBL",    "chrome"),
+        ("nomn_sing",  "trail",       "firefox"),
+        ("nomn_sing",  "fin_i",       "chrome"),
+        ("gent_sing",  "prep_na",     "chrome"),
+        ("nomn_sing",  "q_skolko",    "chrome"),
+        ("nomn_sing",  "q_gde",       "chrome"),
+        ("nomn_sing",  "prep_dlya",   "chrome"),
+        ("nomn_sing",  "fin_ili",     "chrome"),
+        ("loct_sing",  "plain",       "firefox"),
+        ("nomn_sing",  "q_kakoy",     "chrome"),
+        ("gent_sing",  "prep_bez",    "chrome"),
+        ("gent_sing",  "q_pochemu",   "chrome"),
+        ("gent_sing",  "prep_ot",     "chrome"),
+        ("ablt_sing",  "sym",         "chrome"),
+        ("nomn_plur",  "plain",       "firefox"),
+        ("ablt_plur",  "wcB_cpMid",   "chrome"),
+        ("nomn_sing",  "plain_nocp",  "chrome"),
+        ("nomn_plur",  "q_pochemu",   "chrome"),
+        ("nomn_sing",  "q_pochemu",   "chrome"),
+        ("gent_sing",  "q_skolko",    "chrome"),
+        ("gent_plur",  "plain",       "firefox"),
+        ("accs_sing",  "plain",       "firefox"),
+        ("datv_plur",  "trail",       "firefox"),
+        ("accs_sing",  "prep_na",     "chrome"),
+        ("gent_sing",  "prep_s",      "chrome"),
+        ("gent_sing",  "prep_dlya",   "chrome"),
+        ("gent_sing",  "fin_tsena",   "chrome"),
+        ("ablt_plur",  "plain",       "chrome"),
+        ("ablt_plur",  "prep_na",     "chrome"),
+        ("gent_sing",  "sym",         "chrome"),
+        ("gent_sing",  "fin_otzyvy",  "chrome"),
+        ("gent_sing",  "fin_i",       "chrome"),
+        ("nomn_plur",  "plain_nocp",  "firefox"),
+        ("datv_sing",  "wcB_cpMid",   "chrome"),
+        ("datv_sing",  "trail",       "firefox"),
+        ("accs_sing",  "sym",         "firefox"),
+        ("datv_plur",  "wcB_cpMid",   "chrome"),
+        ("nomn_sing",  "prep_bez",    "chrome"),
+        ("ablt_sing",  "prep_s",      "chrome"),
+        ("gent_sing",  "prep_s",      "firefox"),
+        ("datv_sing",  "plain",       "firefox"),
+        ("loct_plur",  "q_skolko",    "chrome"),
+        ("gent_plur",  "plain",       "chrome"),
+        ("datv_plur",  "plain_nocp",  "firefox"),
+        ("ablt_plur",  "plain",       "firefox"),
+        ("accs_sing",  "q_kak",       "chrome"),
+        ("loct_plur",  "prep_v",      "chrome"),
+        ("nomn_sing",  "prep_na",     "chrome"),
+        ("nomn_sing",  "prep_v",      "chrome"),
+        ("nomn_sing",  "prep_pod",    "chrome"),
+        ("nomn_sing",  "trail",       "chrome"),
+        ("datv_plur",  "q_pochemu",   "chrome"),
+        ("gent_sing",  "fin_forum",   "chrome"),
+        ("gent_plur",  "fin_analogi", "chrome"),
+        ("gent_sing",  "prep_iz",     "chrome"),
+        ("accs_sing",  "q_kakoy",     "chrome"),
+        ("gent_plur",  "q_kakoy",     "chrome"),
+        ("ablt_plur",  "prep_ot",     "chrome"),
+        ("accs_sing",  "prep_v",      "chrome"),
+        ("gent_sing",  "Lwc_cpBL",    "firefox"),
+        ("accs_sing",  "q_pochemu",   "chrome"),
+        ("nomn_sing",  "prep_ot",     "chrome"),
+        ("gent_sing",  "fin_vmesto",  "chrome"),
     ]
-
-    # Маппинг struct_name → suffix_label prefix для фильтрации SuffixQuery
-    _STRUCT_TO_VARIANT = {
-        "plain":       "plain",
-        "plain_nocp":  "plain_nocp",
-        "trail":       "trail",
-        "wcB_cpMid":   "wcB_cpMid",
-        "Lwc_cpBL":    "Lwc_cpBL",
-        "sym":         "sym",
-        "prep_na":     "prep_na",   "prep_dlya": "prep_dlya",
-        "prep_bez":    "prep_bez",  "prep_s":    "prep_s",
-        "prep_ot":     "prep_ot",   "prep_v":    "prep_v",
-        "prep_pod":    "prep_pod",  "prep_iz":   "prep_iz",
-        "q_kak":       "q_kak",     "q_kakoy":   "q_kakoy",
-        "q_skolko":    "q_skolko",  "q_pochemu": "q_pochemu",
-        "q_gde":       "q_gde",
-        "fin_i":       "fin_i",     "fin_ili":   "fin_ili",
-        "fin_otzyvy":  "fin_otzyvy","fin_tsena": "fin_tsena",
-        "fin_forum":   "fin_forum", "fin_analogi":"fin_analogi",
-        "fin_vmesto":  "fin_vmesto",
-    }
 
     def generate_queries(
         self,
@@ -437,31 +754,17 @@ class MorphGenerator:
         include_numbers: bool = False,
         include_letters: bool = True,
     ) -> List[MorphQuery]:
-        """
-        РЕЖИМ ВЫБИРАЕТСЯ АВТОМАТИЧЕСКИ:
-          use_proven_triplets=True  → ~950 запросов, 96% покрытия (ПРОДАКШН)
-          use_proven_triplets=False → ~8000 запросов, 100% покрытия (ИССЛЕДОВАНИЕ)
 
-        По умолчанию: продакшн-режим (proven triplets).
-        Для исследования нового датасета передай use_proven_triplets=False через endpoint.
-        """
-        # ── ЗАКОММЕНТИРОВАНО: proven triplets ────────────────────────────
-        # queries = self._generate_proven(analysis, region, include_numbers)
-        queries = []
+        queries: List[MorphQuery] = []
 
-        # Конфигурация кейсов эксперимента:
-        #   label → (extra_params, client_override, cp_force)
-        #   cp_force=None → использовать cp_override из SuffixQuery как обычно
-        #   cp_force=N    → принудительно перебить cp для всех запросов кейса
         EXP_CONFIG = {
-            "typo_w1":    ({}, None, None),
-            "cyr2lat_w1": ({}, None, None),
-            "cyr2lat_w2": ({}, None, None),
+            "typo_w1":      ({}, None, None),
+            "cyr2lat_w1":   ({}, None, None),
+            "cyr2lat_w2":   ({}, None, None),
             "double_space": ({}, None, 3),
             "ds_it":        ({"ds": "it"}, None, 2),
             "client_yt":    ({}, "youtube", 2),
             "cp_one":       ({}, None, 1),
-            # brute suffix: Last Consonant Rule, 8 окончаний
             "brute_и":  ({}, None, None),
             "brute_а":  ({}, None, None),
             "brute_е":  ({}, None, None),
@@ -487,15 +790,10 @@ class MorphGenerator:
             for sq in exp_suffix_queries:
                 if sq.priority == 0:
                     continue
-
-                # double_space: заменяем "* сид" → "*  сид" (двойной пробел)
                 query_str = sq.query
                 if exp_label == "double_space" and "* " in query_str:
                     query_str = query_str.replace("* ", "*  ", 1)
-
                 cp_val = cp_force if cp_force is not None else sq.cp_override
-
-                # client_yt: только youtube UA
                 ua = "youtube" if client_override == "youtube" else None
 
                 queries.append(MorphQuery(
@@ -517,160 +815,39 @@ class MorphGenerator:
 
         return queries
 
-    def _generate_proven(
-        self,
-        analysis: MorphSeedAnalysis,
-        region: str = "ua",
-        include_numbers: bool = False,
-    ) -> List[MorphQuery]:
-        """
-        ПРОДАКШН: генерирует запросы только для 79 доказанных связок.
-        ~950 запросов | 96% покрытия целевых ключей | ~18с wall time.
-        """
-        queries: List[MorphQuery] = []
-
-        # Группируем триплеты по case для эффективности
-        from collections import defaultdict as _dd
-        triplets_by_case: dict = _dd(list)
-        for (case_label, struct_name, ua) in self.PROVEN_TRIPLETS:
-            triplets_by_case[case_label].append((struct_name, ua))
-
-        # (case_label, struct_name) → set of required UAs
-        # Если оба UA — ua_filter=None; если один — ua_filter="chrome"/"firefox"
-        ua_map: dict = _dd(set)
-        for (case_label, struct_name, ua) in self.PROVEN_TRIPLETS:
-            ua_map[(case_label, struct_name)].add(ua)
-
-        for case_label, seed_variant in analysis.case_variants.items():
-            if case_label not in triplets_by_case:
-                continue
-
-            _case_tag, _number_tag, case_display = CASES_RU[case_label]
-
-            # Генерируем ПОЛНУЮ карту суффиксов для фильтрации
-            _seed_analysis, all_suffix_queries = self.suffix_gen.generate(
-                seed=seed_variant,
-                include_numbers=include_numbers,
-                include_letters=True,
-                region=region,
-            )
-
-            needed_structs = {s for s, ua in triplets_by_case[case_label]}
-
-            for sq in all_suffix_queries:
-                # Определяем struct_name этого запроса
-                sq_struct = self._sq_to_struct(sq.suffix_label)
-                if sq_struct not in needed_structs:
-                    continue
-
-                # ua_filter: None=оба, "chrome"/"firefox"=только один
-                ua_set = ua_map[(case_label, sq_struct)]
-                ua_filter = None if len(ua_set) > 1 else next(iter(ua_set))
-
-                queries.append(MorphQuery(
-                    case_label=case_label,
-                    case_display=case_display,
-                    seed_variant=seed_variant,
-                    query=sq.query,
-                    suffix_val=sq.suffix_val,
-                    suffix_label=sq.suffix_label,
-                    suffix_type=sq.suffix_type,
-                    priority=sq.priority,
-                    cp_override=sq.cp_override,
-                    variant=sq.variant,
-                    blocked_by=sq.blocked_by,
-                    ua_filter=ua_filter,
-                ))
-
-        return queries
-
-    def _generate_full(
-        self,
-        analysis: MorphSeedAnalysis,
-        region: str = "ua",
-        include_numbers: bool = False,
-        include_letters: bool = True,
-    ) -> List[MorphQuery]:
-        """
-        ИССЛЕДОВАНИЕ: полная карта суффиксов × все падежи.
-        ~8000 запросов | 100% покрытия | используется при include_letters=full.
-
-        # ── СТАРАЯ ЛОГИКА (закомментирована, сохранена для справки) ──────
-        # for case_label, seed_variant in analysis.case_variants.items():
-        #     _case_tag, _number_tag, case_display = CASES_RU[case_label]
-        #     _seed_analysis, suffix_queries = self.suffix_gen.generate(
-        #         seed=seed_variant,
-        #         include_numbers=include_numbers,
-        #         include_letters=include_letters,
-        #         region=region,
-        #     )
-        #     for sq in suffix_queries:
-        #         queries.append(MorphQuery(case_label=case_label, ...))
-        # ─────────────────────────────────────────────────────────────────
-        """
-        queries: List[MorphQuery] = []
-        for case_label, seed_variant in analysis.case_variants.items():
-            _case_tag, _number_tag, case_display = CASES_RU[case_label]
-            _seed_analysis, suffix_queries = self.suffix_gen.generate(
-                seed=seed_variant,
-                include_numbers=include_numbers,
-                include_letters=include_letters,
-                region=region,
-            )
-            for sq in suffix_queries:
-                queries.append(MorphQuery(
-                    case_label=case_label,
-                    case_display=case_display,
-                    seed_variant=seed_variant,
-                    query=sq.query,
-                    suffix_val=sq.suffix_val,
-                    suffix_label=sq.suffix_label,
-                    suffix_type=sq.suffix_type,
-                    priority=sq.priority,
-                    cp_override=sq.cp_override,
-                    variant=sq.variant,
-                    blocked_by=sq.blocked_by,
-                ))
-        return queries
-
     @staticmethod
     def _sq_to_struct(suffix_label: str) -> str:
-        """Определяет struct_name из suffix_label SuffixQuery."""
         if '_plain_nocp' in suffix_label: return 'plain_nocp'
-        if '_plain' in suffix_label: return 'plain'
-        if '_trail' in suffix_label: return 'trail'
-        if '_wcB_cpMid' in suffix_label: return 'wcB_cpMid'
-        if '_Lwc_cpBL' in suffix_label: return 'Lwc_cpBL'
+        if '_plain' in suffix_label:      return 'plain'
+        if '_trail' in suffix_label:      return 'trail'
+        if '_wcB_cpMid' in suffix_label:  return 'wcB_cpMid'
+        if '_Lwc_cpBL' in suffix_label:   return 'Lwc_cpBL'
         if 'sym_ua' in suffix_label or 'sym_ru' in suffix_label: return 'sym'
-        if 'prep_na_' in suffix_label: return 'prep_na'
-        if 'prep_dlya_' in suffix_label: return 'prep_dlya'
-        if 'prep_bez_' in suffix_label: return 'prep_bez'
-        if 'prep_s_' in suffix_label: return 'prep_s'
-        if 'prep_ot_' in suffix_label: return 'prep_ot'
-        if 'prep_v_' in suffix_label: return 'prep_v'
-        if 'prep_pod_' in suffix_label: return 'prep_pod'
-        if 'prep_iz_' in suffix_label: return 'prep_iz'
-        if 'q_kak_' in suffix_label: return 'q_kak'
-        if 'q_kakoy_' in suffix_label: return 'q_kakoy'
-        if 'q_skolko_' in suffix_label: return 'q_skolko'
-        if 'q_pochemu_' in suffix_label: return 'q_pochemu'
-        if 'q_gde_' in suffix_label: return 'q_gde'
-        if 'fin_i_' in suffix_label: return 'fin_i'
-        if 'fin_ili_' in suffix_label: return 'fin_ili'
+        if 'prep_na_' in suffix_label:    return 'prep_na'
+        if 'prep_dlya_' in suffix_label:  return 'prep_dlya'
+        if 'prep_bez_' in suffix_label:   return 'prep_bez'
+        if 'prep_s_' in suffix_label:     return 'prep_s'
+        if 'prep_ot_' in suffix_label:    return 'prep_ot'
+        if 'prep_v_' in suffix_label:     return 'prep_v'
+        if 'prep_pod_' in suffix_label:   return 'prep_pod'
+        if 'prep_iz_' in suffix_label:    return 'prep_iz'
+        if 'q_kak_' in suffix_label:      return 'q_kak'
+        if 'q_kakoy_' in suffix_label:    return 'q_kakoy'
+        if 'q_skolko_' in suffix_label:   return 'q_skolko'
+        if 'q_pochemu_' in suffix_label:  return 'q_pochemu'
+        if 'q_gde_' in suffix_label:      return 'q_gde'
+        if 'fin_i_' in suffix_label:      return 'fin_i'
+        if 'fin_ili_' in suffix_label:    return 'fin_ili'
         if 'fin_otzyvy_' in suffix_label: return 'fin_otzyvy'
-        if 'fin_tsena_' in suffix_label: return 'fin_tsena'
-        if 'fin_forum_' in suffix_label: return 'fin_forum'
-        if 'fin_analogi_' in suffix_label: return 'fin_analogi'
+        if 'fin_tsena_' in suffix_label:  return 'fin_tsena'
+        if 'fin_forum_' in suffix_label:  return 'fin_forum'
+        if 'fin_analogi_' in suffix_label:return 'fin_analogi'
         if 'fin_vmesto_' in suffix_label: return 'fin_vmesto'
         return suffix_label
 
-    # ── Summary ────────────────────────────────────────────────────────────
-
     def summary(self, analysis: MorphSeedAnalysis, queries: List[MorphQuery]) -> Dict:
-        """Human-readable summary for logging and HTML trace display."""
         active = [q for q in queries if q.priority > 0]
         blocked = [q for q in queries if q.priority == 0]
-
         by_case: Dict = {}
         for case_label in analysis.case_variants:
             case_qs = [q for q in queries if q.case_label == case_label]
@@ -685,7 +862,6 @@ class MorphGenerator:
                     for t in ["A", "B", "C", "D", "E"]
                 },
             }
-
         return {
             "original_seed": analysis.original_seed,
             "noun": analysis.original_noun,
