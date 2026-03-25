@@ -800,14 +800,6 @@ class MorphGenerator:
             "brute_ей": ({}, None, None),
             "brute_о":  ({}, None, None),
             "brute_ю":  ({}, None, None),
-            # SEP — cp выставляется динамически (len(variant_seed))
-            "sep_а":  ({}, None, None),
-            "sep_у":  ({}, None, None),
-            "sep_е":  ({}, None, None),
-            "sep_ы":  ({}, None, None),
-            "sep_и":  ({}, None, None),
-            "sep_ов": ({}, None, None),
-            "sep_ом": ({}, None, None),
         }
 
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
@@ -827,11 +819,7 @@ class MorphGenerator:
                 query_str = sq.query
                 if exp_label == "double_space" and "* " in query_str:
                     query_str = query_str.replace("* ", "*  ", 1)
-                # SEP: курсор всегда после стем+триггера (конец variant_seed)
-                if exp_label.startswith("sep_"):
-                    cp_val = len(exp_variant)
-                else:
-                    cp_val = cp_force if cp_force is not None else sq.cp_override
+                cp_val = cp_force if cp_force is not None else sq.cp_override
                 ua = "youtube" if client_override == "youtube" else None
 
                 queries.append(MorphQuery(
@@ -851,7 +839,89 @@ class MorphGenerator:
                     client_override=client_override,
                 ))
 
+        # ── SEP (Suffix-Ending-Position) — отдельный блок ────────────────────
+        for sep_label, sep_variant in analysis.case_variants.items():
+            if not sep_label.startswith("sep_"):
+                continue
+            cp_val = len(sep_variant)
+            display = CASES_RU[sep_label][2]
+            for sq in self._build_sep_queries(sep_variant):
+                queries.append(MorphQuery(
+                    case_label=sep_label,
+                    case_display=display,
+                    seed_variant=sep_variant,
+                    query=sq["query"],
+                    suffix_val=sq["suffix_val"],
+                    suffix_label=sq["suffix_label"],
+                    suffix_type="SEP",
+                    priority=1,
+                    cp_override=cp_val,
+                    variant=sq["variant"],
+                    blocked_by=None,
+                    ua_filter=None,
+                    extra_params={},
+                    client_override=None,
+                ))
+
         return queries
+
+    def _build_sep_queries(self, sep_variant: str) -> List[Dict]:
+        """
+        SEP (Suffix-Ending-Position) — хирургические запросы без звёздочек.
+        Формат: "стем+триггер  суффикс _буква"  (двойной пробел, underscore)
+        Для plain (без суффикса): "стем+триггер   _буква" (тройной пробел)
+        cp всегда = len(sep_variant) — после триггера, перед суффиксом.
+
+        Карта суффиксов — из MORPH_SUFFIXES_RU (B/C/D) без звёздочек:
+          plain + предлоги + вопросы + финализаторы
+        """
+        # Универсальная карта суффиксов (без *)
+        suffix_map = [
+            ("", "plain"),
+            # Type B — предлоги
+            ("в",    "prep_v"),
+            ("на",   "prep_na"),
+            ("для",  "prep_dlya"),
+            ("с",    "prep_s"),
+            ("от",   "prep_ot"),
+            ("под",  "prep_pod"),
+            ("из",   "prep_iz"),
+            ("без",  "prep_bez"),
+            # Type C — вопросы
+            ("как",     "q_kak"),
+            ("какой",   "q_kakoy"),
+            ("где",     "q_gde"),
+            ("сколько", "q_skolko"),
+            ("почему",  "q_pochemu"),
+            # Type D — финализаторы
+            ("купить",          "fin_kupit"),
+            ("цена",            "fin_tsena"),
+            ("отзывы",          "fin_otzyvy"),
+            ("обзор",           "fin_obzor"),
+            ("сравнение",       "fin_sravnenie"),
+            ("характеристики",  "fin_harakt"),
+            ("аналоги",         "fin_analogi"),
+            ("или",             "fin_ili"),
+            ("и",               "fin_i"),
+            ("vs",              "fin_vs"),
+            ("вместо",          "fin_vmesto"),
+            ("форум",           "fin_forum"),
+        ]
+
+        out = []
+        for letter in MORPH_LETTER_SWEEP:
+            for sfx_val, sfx_label in suffix_map:
+                if sfx_val:
+                    query = f"{sep_variant}  {sfx_val} _{letter}"
+                else:
+                    query = f"{sep_variant}   _{letter}"
+                out.append({
+                    "query":       query,
+                    "suffix_val":  sfx_val,
+                    "suffix_label": f"sep_{sfx_label}_{letter}",
+                    "variant":     sfx_label,
+                })
+        return out
 
     @staticmethod
     def _sq_to_struct(suffix_label: str) -> str:
