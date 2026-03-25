@@ -495,7 +495,66 @@ class MorphSuffixGenerator:
         q = f"{s} {L} -"
         out.append(sq(q, len(q), "L_hyp"))
 
-        return out  # 13 структур
+        # ── SEP (Stem-Ending-Plain): стем + окончание-провокатор + буква ────
+        # Механика: Google видит незавершённое слово и fuzzy-матчит агрессивнее.
+        # "пластика лиц е а"  cp=len("пластика лиц е") → Google додумывает "лице/лицу/лицей"
+        # Отличие от brute: слово НЕ заменяется целиком, а расщепляется на стем + окончание.
+        # cp ставится ПОСЛЕ окончания (перед пробелом и буквой) — слово выглядит незаконченным.
+        _VOWELS_SEP = set('аеёиоуыэюяАЕЁИОУЫЭЮЯ')
+        words_for_sep = s.split()
+
+        # Ищем последнее ВАЛИДНОЕ существительное (не гео, не T-маркер, не латиница).
+        # Пример: "услуги юриста лондон" → берём "юриста", не "лондон"
+        _sep_target_idx = None
+        _sep_target_word = None
+        _sep_target_lemma = None
+        for _si in range(len(words_for_sep) - 1, -1, -1):
+            _sw = words_for_sep[_si]
+            if self._is_inflectable_noun(_sw):
+                _sep_target_idx = _si
+                _sep_target_word = _sw
+                _parsed_sep = self.morph.parse(_sw)
+                _sep_target_lemma = _parsed_sep[0].normal_form if _parsed_sep else _sw
+                break
+
+        if _sep_target_idx is not None and len(_sep_target_word) > 3:
+            base_phrase = " ".join(words_for_sep[:_sep_target_idx])
+            tail_phrase = " ".join(words_for_sep[_sep_target_idx + 1:])
+
+            # Стем от леммы
+            if _sep_target_lemma and _sep_target_lemma[-1] in _VOWELS_SEP:
+                sep_stem = _sep_target_lemma[:-1]
+            else:
+                sep_stem = _sep_target_lemma
+
+            sep_trigger_endings = ['а', 'у', 'е', 'ы', 'и', 'ом', 'ем', 'ов']
+
+            for sep_ending in sep_trigger_endings:
+                # "база стем окончание [хвост] буква"
+                # хвост = слова после целевого сущ (если есть)
+                parts = []
+                if base_phrase:
+                    parts.append(base_phrase)
+                parts.append(sep_stem)
+                parts.append(sep_ending)
+                # cp ставится ПОСЛЕ окончания (перед хвостом и буквой)
+                cp_sep = len(" ".join(parts))
+                if tail_phrase:
+                    parts.append(tail_phrase)
+                parts.append(L)
+                q_sep = " ".join(parts)
+                out.append(_SuffixQuery(
+                    query=q_sep,
+                    suffix_val=L,
+                    suffix_label=f"{L}_sep_{sep_ending}",
+                    suffix_type="E",
+                    priority=1,
+                    markers=["letter_sweep"],
+                    cp_override=cp_sep,
+                    variant=f"sep_{sep_ending}",
+                ))
+
+        return out  # 13 базовых + до 6 SEP структур
 
     def _calc_priority(self, suffix_type: str, active_markers: List[str]) -> int:
         priorities = []
@@ -583,6 +642,9 @@ class MorphGenerator:
             return False
         # Имя собственное (гео, имена)
         if 'Prop' in str(p.tag):
+            return False
+        # T-маркер (цена, стоимость, купить...) — уже покрыты Type D финализаторами
+        if word.lower() in MORPH_T_ROOTS or p.normal_form in MORPH_T_ROOTS:
             return False
         return True
 
