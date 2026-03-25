@@ -72,8 +72,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex='.*',  # Разрешает любые источники, включая локальные файлы
-    allow_credentials=True,
+    allow_origins=["*", "null"],   # "null" — для file:// локальных HTML
+    allow_origin_regex='.*',
+    allow_credentials=False,       # credentials несовместимы с allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
