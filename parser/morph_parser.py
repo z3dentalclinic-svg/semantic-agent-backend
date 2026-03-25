@@ -231,8 +231,8 @@ class MorphParser:
     Orchestrates: morph generation → parallel fetch → 4-axis trace → normalization.
     """
 
-    def __init__(self, lang: str = "ru"):
-        self.generator = MorphGenerator(lang=lang)
+    def __init__(self, lang: str = "ru", geo_db: dict = None):
+        self.generator = MorphGenerator(lang=lang, geo_db=geo_db)
         self.normalizer = MorphNormalizer(lang=lang)
 
     # ── HTTP ───────────────────────────────────────────────────────────────
