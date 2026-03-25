@@ -912,14 +912,14 @@ class MorphGenerator:
         for letter in MORPH_LETTER_SWEEP:
             for sfx_val, sfx_label in suffix_map:
                 if sfx_val:
-                    query = f"{sep_variant}  {sfx_val} _{letter}"
+                    query = f"{sep_variant}  {letter} {sfx_val}"
                 else:
-                    query = f"{sep_variant}   _{letter}"
+                    query = f"{sep_variant}  {letter}"
                 out.append({
-                    "query":       query,
-                    "suffix_val":  sfx_val,
+                    "query":        query,
+                    "suffix_val":   sfx_val,
                     "suffix_label": f"sep_{sfx_label}_{letter}",
-                    "variant":     sfx_label,
+                    "variant":      sfx_label,
                 })
         return out
 
