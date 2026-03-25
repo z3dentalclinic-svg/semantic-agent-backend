@@ -1,5 +1,5 @@
 """
-Morph Endpoint v2.1 — FastAPI registration for /api/morph-map.
+Morph Endpoint v2.0 — FastAPI registration for /api/morph-map.
 
 Route: GET /api/morph-map
 Params:
@@ -53,37 +53,16 @@ Response JSON:
 """
 
 import logging
-import sys
 from fastapi import FastAPI, Query
 from parser.morph_parser import MorphParser
 
 logger = logging.getLogger(__name__)
 
 
-def _get_geo_db() -> dict:
-    """Ленивый импорт GEO_DB из main — вызывается при первом запросе."""
-    try:
-        main_module = sys.modules.get("main") or sys.modules.get("__main__")
-        if main_module and hasattr(main_module, "GEO_DB"):
-            return main_module.GEO_DB
-    except Exception:
-        pass
-    return {}
-
-
 def register_morph_endpoint(app: FastAPI) -> None:
     """Register /api/morph-map on the given FastAPI app."""
 
-    # MorphParser инициализируется лениво при первом запросе
-    # чтобы GEO_DB успел загрузиться в main.py
-    _morph_parser: MorphParser | None = None
-
-    def get_morph_parser() -> MorphParser:
-        nonlocal _morph_parser
-        if _morph_parser is None:
-            _morph_parser = MorphParser(lang="ru", geo_db=_get_geo_db())
-            logger.info(f"[MORPH] MorphParser инициализирован, geo_db={len(_morph_parser.generator.geo_db)} записей")
-        return _morph_parser
+    morph_parser = MorphParser(lang="ru")
 
     @app.get("/api/morph-map")
     async def morph_map(
@@ -103,7 +82,7 @@ def register_morph_endpoint(app: FastAPI) -> None:
         ),
     ):
         """
-        Morphology Map Parser v2.1.
+        Morphology Map Parser v2.0.
 
         Generates all unique case variants of the first noun in seed,
         then runs the FULL suffix map (A+B+C+D+E) on each case variant.
@@ -115,7 +94,7 @@ def register_morph_endpoint(app: FastAPI) -> None:
             f"language={language} region={region} letters={include_letters}"
         )
 
-        result = await get_morph_parser().parse(
+        result = await morph_parser.parse(
             seed=seed,
             country=country,
             language=language,
@@ -132,6 +111,7 @@ def register_morph_endpoint(app: FastAPI) -> None:
                 for suffix_label, ua_data in case_data.items():
                     if suffix_label == "_meta":
                         continue
+                    # Keep only if suffix_type != E
                     any_ua = next(iter(ua_data.values()), {})
                     if any_ua.get("suffix_type") != "E":
                         filtered[suffix_label] = ua_data
