@@ -61,6 +61,16 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "brute_ей": ("nomn", "sing", "Brute suffix: -ей (творительный жен.р)"),
     "brute_о":  ("nomn", "sing", "Brute suffix: -о"),
     "brute_ю":  ("nomn", "sing", "Brute suffix: -ю (винительный жен.р)"),
+    # ── brute для второго существительного (индекс _1) ───────────────────
+    "brute_и_1":  ("nomn", "sing", "Brute suffix noun_1: -и"),
+    "brute_а_1":  ("nomn", "sing", "Brute suffix noun_1: -а"),
+    "brute_е_1":  ("nomn", "sing", "Brute suffix noun_1: -е"),
+    "brute_у_1":  ("nomn", "sing", "Brute suffix noun_1: -у"),
+    "brute_ы_1":  ("nomn", "sing", "Brute suffix noun_1: -ы"),
+    "brute_ом_1": ("nomn", "sing", "Brute suffix noun_1: -ом"),
+    "brute_ей_1": ("nomn", "sing", "Brute suffix noun_1: -ей"),
+    "brute_о_1":  ("nomn", "sing", "Brute suffix noun_1: -о"),
+    "brute_ю_1":  ("nomn", "sing", "Brute suffix noun_1: -ю"),
 }
 
 
@@ -708,18 +718,39 @@ class MorphGenerator:
         for gcase in ("double_space", "ds_it", "client_yt", "cp_one"):
             case_variants[gcase] = original
 
-        # brute-force окончания
+        # brute-force окончания — для всех склоняемых существительных в сиде
+        # Stem берём от ЛЕММЫ (именительный ед.ч.), а не от текущей формы слова.
+        # Это критично: "пылесосов" → lemma="пылесос" → stem="пылесо" → "пылесоса"
+        # вместо "пылесосов"[:-1]="пылесосо" → "пылесосои" (мусор).
         _BRUTE_ENDINGS = ['и', 'а', 'е', 'у', 'ы', 'ом', 'ей', 'о', 'ю']
         _BRUTE_LABELS  = ['brute_и', 'brute_а', 'brute_е', 'brute_у',
                           'brute_ы', 'brute_ом', 'brute_ей', 'brute_о', 'brute_ю']
-        noun_word = words[idx]
-        noun_stem = noun_word[:-1]
-        for blabel, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
-            new_word = noun_stem + bending
-            if new_word == noun_word:
-                continue
-            bwords = words.copy(); bwords[idx] = new_word
-            case_variants[blabel] = " ".join(bwords)
+
+        # Находим все склоняемые существительные в сиде
+        inflectable = self._find_inflectable_nouns(words)
+
+        _VOWELS = set('аеёиоуыэюяАЕЁИОУЫЭЮЯ')
+
+        for noun_idx_in_list, (noun_pos, noun_word_br, noun_lemma_br) in enumerate(inflectable):
+            # Stem: если лемма заканчивается на гласную — отрезаем её (имплантация → имплантаци)
+            # Если на согласную — оставляем как есть (пылесос → пылесос, зуб → зуб)
+            if noun_lemma_br and noun_lemma_br[-1] in _VOWELS:
+                noun_stem = noun_lemma_br[:-1]
+            else:
+                noun_stem = noun_lemma_br
+            # Первое сущ → базовые метки (brute_и, ...) для совместимости с CASES_RU/EXP_CONFIG
+            # Остальные → индексированные (brute_и_1, brute_а_1, ...)
+            suffix_idx = "" if noun_idx_in_list == 0 else f"_{noun_idx_in_list}"
+
+            for blabel_base, bending in zip(_BRUTE_LABELS, _BRUTE_ENDINGS):
+                blabel = blabel_base + suffix_idx
+                new_word = noun_stem + bending
+                # Пропускаем если совпадает с оригиналом или леммой
+                if new_word == noun_word_br or new_word == noun_lemma_br:
+                    continue
+                bwords = words.copy()
+                bwords[noun_pos] = new_word
+                case_variants[blabel] = " ".join(bwords)
 
         return MorphSeedAnalysis(
             original_seed=seed.lower().strip(),
@@ -841,6 +872,16 @@ class MorphGenerator:
             "brute_ей": ({}, None, None),
             "brute_о":  ({}, None, None),
             "brute_ю":  ({}, None, None),
+            # ── brute для второго существительного ───────────────────────
+            "brute_и_1":  ({}, None, None),
+            "brute_а_1":  ({}, None, None),
+            "brute_е_1":  ({}, None, None),
+            "brute_у_1":  ({}, None, None),
+            "brute_ы_1":  ({}, None, None),
+            "brute_ом_1": ({}, None, None),
+            "brute_ей_1": ({}, None, None),
+            "brute_о_1":  ({}, None, None),
+            "brute_ю_1":  ({}, None, None),
         }
 
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
