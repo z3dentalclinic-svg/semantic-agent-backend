@@ -535,8 +535,9 @@ class MorphGenerator:
     Использует внутренний MorphSuffixGenerator — не зависит от suffix_generator.py.
     """
 
-    def __init__(self, lang: str = "ru"):
+    def __init__(self, lang: str = "ru", geo_db: dict = None):
         self.lang = lang
+        self.geo_db = geo_db or {}
         self.morph = pymorphy3.MorphAnalyzer(lang=lang)
         self.suffix_gen = MorphSuffixGenerator(lang=lang)  # ← внутренний, не SuffixGenerator
 
