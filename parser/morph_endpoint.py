@@ -1,5 +1,5 @@
 """
-Morph Endpoint v2.01 — FastAPI registration for /api/morph-map.
+Morph Endpoint v2.0 — FastAPI registration for /api/morph-map.
 
 Route: GET /api/morph-map
 Params:
@@ -80,6 +80,10 @@ def register_morph_endpoint(app: FastAPI) -> None:
                 "Set False for fast smoke-test: only A/B/C/D structures, ~100 queries total."
             )
         ),
+        methods: str = Query(
+            "all",
+            description="Active methods (comma-separated): morph, sep, brute, exp. Default 'all' = everything.",
+        ),
     ):
         """
         Morphology Map Parser v2.0.
@@ -100,6 +104,7 @@ def register_morph_endpoint(app: FastAPI) -> None:
             language=language,
             region=region,
             include_numbers=False,
+            methods=methods,
         )
 
         # If include_letters=False — strip E-type entries from trace to save bandwidth
