@@ -603,6 +603,26 @@ class MorphGenerator:
         seen_variants: set = set()
         skipped_cases: List[str] = []
 
+        # ── Морфологические падежи (pymorphy3) ───────────────────────────────
+        for case_label, (case_tag, num_tag, _display) in CASES_RU.items():
+            # Пропускаем не-падежные лейблы (эксперименты, brute, sep)
+            if not (case_tag in ("nomn","gent","datv","accs","ablt","loct") and
+                    num_tag in ("sing","plur")):
+                continue
+            inflected = parsed.inflect({case_tag, num_tag})
+            if inflected is None:
+                skipped_cases.append(f"{case_label}:no_form")
+                continue
+            new_word = inflected.word
+            new_words = words.copy()
+            new_words[idx] = new_word
+            variant = " ".join(new_words)
+            if variant in seen_variants:
+                skipped_cases.append(f"{case_label}:dup")
+                continue
+            case_variants[case_label] = variant
+            seen_variants.add(variant)
+
         # ── mixed experiment ─────────────────────────────────────────────
         CYR2LAT = {
             'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c',
