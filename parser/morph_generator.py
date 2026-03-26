@@ -779,9 +779,25 @@ class MorphGenerator:
         region: str = "ua",
         include_numbers: bool = False,
         include_letters: bool = True,
+        methods: str = "all",  # "all" или комбинация: "morph,sep,brute,exp"
     ) -> List[MorphQuery]:
 
         queries: List[MorphQuery] = []
+
+        # Парсим активные методы
+        if methods == "all":
+            active = {"morph", "sep", "brute", "exp"}
+        else:
+            active = {m.strip().lower() for m in methods.split(",")}
+
+        EXP_LABELS = {
+            "typo_w1", "cyr2lat_w1", "cyr2lat_w2",
+            "double_space", "ds_it", "client_yt", "cp_one",
+        }
+        BRUTE_LABELS = {
+            "brute_и", "brute_а", "brute_е", "brute_у",
+            "brute_ы", "brute_ом", "brute_ей", "brute_о", "brute_ю",
+        }
 
         EXP_CONFIG = {
             "typo_w1":      ({}, None, None),
@@ -802,7 +818,47 @@ class MorphGenerator:
             "brute_ю":  ({}, None, None),
         }
 
+        # ── Морфология (падежи) ───────────────────────────────────────────────
+        if "morph" in active:
+            morph_labels = {k for k in analysis.case_variants
+                            if k not in EXP_LABELS and k not in BRUTE_LABELS
+                            and not k.startswith("sep_")}
+            for case_label in morph_labels:
+                case_variant = analysis.case_variants[case_label]
+                _seed_analysis, suffix_queries = self.suffix_gen.generate(
+                    seed=case_variant,
+                    include_numbers=include_numbers,
+                    include_letters=include_letters,
+                    region=region,
+                )
+                display = CASES_RU.get(case_label, ("", "", case_label))[2]
+                for sq in suffix_queries:
+                    if sq.priority == 0:
+                        continue
+                    queries.append(MorphQuery(
+                        case_label=case_label,
+                        case_display=display,
+                        seed_variant=case_variant,
+                        query=sq.query,
+                        suffix_val=sq.suffix_val,
+                        suffix_label=sq.suffix_label,
+                        suffix_type=sq.suffix_type,
+                        priority=sq.priority,
+                        cp_override=sq.cp_override,
+                        variant=sq.variant,
+                        blocked_by=sq.blocked_by,
+                        ua_filter=None,
+                        extra_params={},
+                        client_override=None,
+                    ))
+
         for exp_label, (extra_params, client_override, cp_force) in EXP_CONFIG.items():
+            # Фильтр по методу
+            if exp_label in BRUTE_LABELS and "brute" not in active:
+                continue
+            if exp_label in EXP_LABELS and "exp" not in active:
+                continue
+
             if exp_label not in analysis.case_variants:
                 continue
             exp_variant = analysis.case_variants[exp_label]
@@ -839,29 +895,30 @@ class MorphGenerator:
                     client_override=client_override,
                 ))
 
-        # ── SEP (Suffix-Ending-Position) — отдельный блок ────────────────────
-        for sep_label, sep_variant in analysis.case_variants.items():
-            if not sep_label.startswith("sep_"):
-                continue
-            cp_val = len(sep_variant)
-            display = CASES_RU[sep_label][2]
-            for sq in self._build_sep_queries(sep_variant):
-                queries.append(MorphQuery(
-                    case_label=sep_label,
-                    case_display=display,
-                    seed_variant=sep_variant,
-                    query=sq["query"],
-                    suffix_val=sq["suffix_val"],
-                    suffix_label=sq["suffix_label"],
-                    suffix_type="SEP",
-                    priority=1,
-                    cp_override=cp_val,
-                    variant=sq["variant"],
-                    blocked_by=None,
-                    ua_filter=None,
-                    extra_params={},
-                    client_override=None,
-                ))
+        # ── SEP ───────────────────────────────────────────────────────────────
+        if "sep" in active:
+            for sep_label, sep_variant in analysis.case_variants.items():
+                if not sep_label.startswith("sep_"):
+                    continue
+                cp_val = len(sep_variant)
+                display = CASES_RU[sep_label][2]
+                for sq in self._build_sep_queries(sep_variant):
+                    queries.append(MorphQuery(
+                        case_label=sep_label,
+                        case_display=display,
+                        seed_variant=sep_variant,
+                        query=sq["query"],
+                        suffix_val=sq["suffix_val"],
+                        suffix_label=sq["suffix_label"],
+                        suffix_type="SEP",
+                        priority=1,
+                        cp_override=cp_val,
+                        variant=sq["variant"],
+                        blocked_by=None,
+                        ua_filter=None,
+                        extra_params={},
+                        client_override=None,
+                    ))
 
         return queries
 
