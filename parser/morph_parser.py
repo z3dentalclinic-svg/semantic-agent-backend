@@ -464,6 +464,7 @@ class MorphParser:
         language: str = "ru",
         region: str = "ua",
         include_numbers: bool = False,
+        methods: str = "all",
     ) -> MorphParseResult:
         """
         Main parse method.
@@ -493,6 +494,7 @@ class MorphParser:
             region=region,
             include_numbers=include_numbers,
             include_letters=True,
+            methods=methods,
         )
         analysis_summary = self.generator.summary(analysis, all_queries)
 
