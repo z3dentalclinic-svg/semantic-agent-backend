@@ -806,7 +806,7 @@ class MorphGenerator:
 
         # Парсим активные методы
         if methods == "all":
-            active = {"morph", "sep", "brute", "exp"}
+            active = {"morph", "sep", "brute", "exp", "triggers"}
         else:
             active = {m.strip().lower() for m in methods.split(",")}
 
@@ -940,9 +940,147 @@ class MorphGenerator:
                         client_override=None,
                     ))
 
+        # ── TRIGGERS (Gemini deep-index метод) ───────────────────────────────
+        if "triggers" in active:
+            seed_lower = analysis.original_seed
+            for sq in self._build_trigger_queries(seed_lower):
+                queries.append(MorphQuery(
+                    case_label="triggers",
+                    case_display="Trigger deep-index",
+                    seed_variant=seed_lower,
+                    query=sq["query"],
+                    suffix_val=sq["symbol"],
+                    suffix_label=sq["label"],
+                    suffix_type="TRG",
+                    priority=1,
+                    cp_override=sq["cp"],
+                    variant=sq["variant"],
+                    blocked_by=None,
+                    ua_filter=None,
+                    extra_params={},
+                    client_override=None,
+                ))
+
         return queries
 
-    def _build_sep_queries(self, sep_variant: str) -> List[Dict]:
+    def _build_trigger_queries(self, seed: str) -> List[Dict]:
+        """
+        Trigger deep-index метод (Gemini architecture).
+        Формат: "{seed}  {symbol} {letter}"
+        CP = len("{seed}  {symbol}") - 1  ← строго на символе
+
+        Включает ВСЕ варианты Gemini:
+        - 12 символов × строчные буквы
+        - 12 символов × заглавные буквы (Case-Switch hack)
+        - 10 цифр × строчные буквы (цифровой детонатор)
+        - Double CP: каждый запрос дублируется с cp-1
+        - Точка без пробела: seed. + двойной пробел + буква
+        - Alt-space: один пробел заменён на \u00A0
+        """
+        # 12 символов Gemini
+        SYMBOLS = ['"', '(', '/', '+', '№', '?', '!', '-', '.', ':', '_', '[']
+        DIGITS  = list('0123456789')
+        LETTERS_LOWER = list('кпмнрдтбгзжлоауфхцчшйеэюящ')
+        LETTERS_UPPER = [l.upper() for l in LETTERS_LOWER]
+
+        out = []
+
+        def make(query, cp, symbol, label, variant):
+            return {
+                "query":   query,
+                "cp":      cp,
+                "symbol":  symbol,
+                "label":   f"trg_{label}",
+                "variant": variant,
+            }
+
+        for symbol in SYMBOLS:
+            sym_label = symbol if symbol.isalnum() else hex(ord(symbol))[2:]
+            left = f"{seed}  {symbol}"
+            cp_on_sym   = len(left) - 1  # на символе
+            cp_before_sym = cp_on_sym - 1  # на пробеле перед символом
+
+            for letter in LETTERS_LOWER:
+                q = f"{left} {letter}"
+                # cp на символе
+                out.append(make(q, cp_on_sym, symbol,
+                    f"{sym_label}_lo_{letter}", "cp_sym"))
+                # Double CP: cp-1 (пробел перед символом)
+                out.append(make(q, cp_before_sym, symbol,
+                    f"{sym_label}_lo_{letter}_dm1", "cp_sym_m1"))
+
+            for letter in LETTERS_UPPER:
+                q = f"{left} {letter}"
+                # Case-Switch hack — заглавная буква
+                out.append(make(q, cp_on_sym, symbol,
+                    f"{sym_label}_up_{letter}", "cp_sym_upper"))
+
+        # Цифровой детонатор: seed  {digit} {letter}
+        for digit in DIGITS:
+            left = f"{seed}  {digit}"
+            cp_on_digit = len(left) - 1
+            for letter in LETTERS_LOWER:
+                q = f"{left} {letter}"
+                out.append(make(q, cp_on_digit, digit,
+                    f"dig_{digit}_{letter}", "digit_trigger"))
+
+        # Точка без пробела: seed.  {letter}
+        left_dot = f"{seed}.  "
+        cp_dot = len(f"{seed}.") - 1  # на точке
+        for letter in LETTERS_LOWER:
+            q = f"{left_dot}{letter}"
+            out.append(make(q, cp_dot, ".",
+                f"dot_nospace_{letter}", "dot_prefix"))
+
+        # Alt-space: seed + неразрывный пробел + обычный пробел + symbol + letter
+        for symbol in [':',  '(', '№']:  # только топ-3 символа
+            sym_label = hex(ord(symbol))[2:]
+            left_alt = f"{seed}\u00A0 {symbol}"
+            cp_alt = len(left_alt) - 1
+            for letter in LETTERS_LOWER[:10]:  # первые 10 букв
+                q = f"{left_alt} {letter}"
+                out.append(make(q, cp_alt, symbol,
+                    f"alt_{sym_label}_{letter}", "alt_space"))
+
+        # ── Символ + предлог (Gemini "ударные связки") ───────────────────────
+        # Формат: "{seed}  {symbol} {prep} {letter}"
+        # CP = на последней букве предлога
+        # Каждая связка — отдельный лейбл для трейса
+        SYM_PREP_PAIRS = [
+            ("(", "для",  "скобка_для"),
+            ("+", "от",   "плюс_от"),
+            (":", "при",  "двоет_при"),
+            ("(", "из",   "скобка_из"),
+            ("/", "без",  "слеш_без"),
+            ("[", "за",   "скоб_за"),
+            ("+", "со",   "плюс_со"),
+            ("(", "на",   "скобка_на"),
+            (":", "по",   "двоет_по"),
+            ("/", "во",   "слеш_во"),
+            ("(", "до",   "скобка_до"),
+            ("+", "к",    "плюс_к"),
+        ]
+
+        for symbol, prep, pair_label in SYM_PREP_PAIRS:
+            # 1. Только символ (без предлога, без буквы) — прогон 1
+            left_sym = f"{seed}  {symbol}"
+            cp_sym = len(left_sym) - 1
+            out.append(make(f"{left_sym}", cp_sym, symbol,
+                f"sp_{pair_label}_sym_only", "sym_only"))
+
+            # 2. Символ + предлог (без буквы) — прогон 2
+            left_prep = f"{seed}  {symbol} {prep}"
+            cp_prep = len(left_prep) - 1  # на последней букве предлога
+            out.append(make(f"{left_prep}", cp_prep, symbol,
+                f"sp_{pair_label}_prep_only", "prep_only"))
+
+            # 3. Символ + предлог + буква — прогон 3
+            for letter in LETTERS_LOWER:
+                q = f"{left_prep} {letter}"
+                out.append(make(q, cp_prep, symbol,
+                    f"sp_{pair_label}_{letter}", "prep_letter"))
+
+        return out
         """
         SEP (Suffix-Ending-Position) — хирургические запросы без звёздочек.
         Формат: "стем+триггер  суффикс _буква"  (двойной пробел, underscore)
