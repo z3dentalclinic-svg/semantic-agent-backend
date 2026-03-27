@@ -59,6 +59,8 @@ CASES_RU: Dict[str, Tuple[str, str, str]] = {
     "sep_и":  ("nomn", "sing", "SEP триггер: -и"),
     "sep_ов": ("nomn", "sing", "SEP триггер: -ов"),
     "sep_ом": ("nomn", "sing", "SEP триггер: -ом"),
+    # ── Triggers (Gemini deep-index) ─────────────────────────────────────
+    "triggers": ("nomn", "sing", "Trigger deep-index"),
     # ── suffix brute-force experiment ─────────────────────────────────────
     "brute_и":  ("nomn", "sing", "Brute suffix: -и"),
     "brute_а":  ("nomn", "sing", "Brute suffix: -а"),
