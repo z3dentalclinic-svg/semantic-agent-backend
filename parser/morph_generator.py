@@ -1141,6 +1141,34 @@ class MorphGenerator:
                         out.append(make(q, cp_v2, symbol,
                             f"iv2_t3_{sym_label}_{letter}", "iv2_upper"))
 
+        # ── Dense contact (Gemini "плотный контакт") ─────────────────────────
+        # Символ приклеен к первому слову без пробела
+        # Формат T1: "{word1}{symbol}  {rest} {letter}"  cp = len(word1)
+        # Формат T2: "{word1} {symbol}{prep}  {rest} {letter}"  cp = на предлоге
+        DENSE_SYMBOLS = ['(', ':', '+', '№']
+        DENSE_PREPS   = ['для', 'от', 'при', 'к', 'с']
+        if len(words) >= 2:
+            w1 = words[0]
+            rest = " ".join(words[1:])
+            for symbol in DENSE_SYMBOLS:
+                sym_label = symbol if symbol.isalnum() else hex(ord(symbol))[2:]
+                cp_dense = len(w1)  # курсор на стыке, перед символом
+
+                # T1: плотная инъекция + буква
+                for letter in LETTERS_LOWER:
+                    q = f"{w1}{symbol}  {rest} {letter}"
+                    out.append(make(q, cp_dense, symbol,
+                        f"dense_t1_{sym_label}_{letter}", "dense_sym"))
+
+                # T2: предложная склейка: word1 (prep  rest letter
+                for prep in DENSE_PREPS:
+                    left_prep = f"{w1} {symbol}{prep}"
+                    cp_prep = len(left_prep) - 1  # на последней букве предлога
+                    for letter in LETTERS_LOWER:
+                        q = f"{left_prep}  {rest} {letter}"
+                        out.append(make(q, cp_prep, symbol,
+                            f"dense_t2_{sym_label}_{prep}_{letter}", "dense_prep"))
+
         return out
         """
         SEP (Suffix-Ending-Position) — хирургические запросы без звёздочек.
