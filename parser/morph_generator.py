@@ -1082,6 +1082,31 @@ class MorphGenerator:
                 out.append(make(q, cp_prep, symbol,
                     f"sp_{pair_label}_{letter}", "prep_letter"))
 
+        # ── Infix triggers: символ ВНУТРИ сида ───────────────────────────────
+        # Формат: "{prefix} {symbol} {suffix} {letter}"
+        # CP = на символе (len(prefix) + 1)
+        # Позиции: после каждого слова кроме последнего
+        words = seed.split()
+        INFIX_SYMBOLS = ['"', '(', '/', '+', '№', ':', ',']
+        if len(words) >= 2:
+            for pos in range(1, len(words)):  # позиция вставки
+                prefix = " ".join(words[:pos])
+                suffix_words = " ".join(words[pos:])
+                for symbol in INFIX_SYMBOLS:
+                    sym_label = symbol if symbol.isalnum() else hex(ord(symbol))[2:]
+                    query_base = f"{prefix} {symbol} {suffix_words}"
+                    cp_infix = len(prefix) + 1  # на символе
+
+                    # Без буквы — прогон 1
+                    out.append(make(query_base, cp_infix, symbol,
+                        f"infix_p{pos}_{sym_label}_only", "infix_only"))
+
+                    # С буквой в конце — прогон 2
+                    for letter in LETTERS_LOWER:
+                        q = f"{query_base} {letter}"
+                        out.append(make(q, cp_infix, symbol,
+                            f"infix_p{pos}_{sym_label}_{letter}", "infix_letter"))
+
         return out
         """
         SEP (Suffix-Ending-Position) — хирургические запросы без звёздочек.
