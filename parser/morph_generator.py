@@ -1107,6 +1107,40 @@ class MorphGenerator:
                         out.append(make(q, cp_infix, symbol,
                             f"infix_p{pos}_{sym_label}_{letter}", "infix_letter"))
 
+        # ── Infix v2 (Gemini): двойной пробел вокруг символа, только pos=1 ──
+        # Формат: "{word1}  {symbol}  {rest} {letter}"
+        # CP = len(word1) + 2  (на символе)
+        INFIX_V2_SYMBOLS = ['(', ':', '+', '№', '/', ',', '.', '[', '!', '?']
+        INFIX_V2_PREPS   = ['для', 'от', 'при', 'из', 'без', 'за', 'со', 'на', 'по', 'до']
+        if len(words) >= 2:
+            w1 = words[0]
+            rest = " ".join(words[1:])
+            for i, symbol in enumerate(INFIX_V2_SYMBOLS):
+                sym_label = symbol if symbol.isalnum() else hex(ord(symbol))[2:]
+                cp_v2 = len(w1) + 2  # на символе
+
+                # T1: чистый символ + буквенный sweep
+                for letter in LETTERS_LOWER:
+                    q = f"{w1}  {symbol}  {rest} {letter}"
+                    out.append(make(q, cp_v2, symbol,
+                        f"iv2_t1_{sym_label}_{letter}", "iv2_sym"))
+
+                # T2: символ + предлог + буква (cp на предлоге)
+                prep = INFIX_V2_PREPS[i]
+                left_prep = f"{w1}  {symbol} {prep}"
+                cp_prep = len(left_prep) - 1
+                for letter in LETTERS_LOWER:
+                    q = f"{left_prep}  {rest} {letter}"
+                    out.append(make(q, cp_prep, symbol,
+                        f"iv2_t2_{sym_label}_{prep}_{letter}", "iv2_prep"))
+
+                # T3: регистровый шок — заглавная буква (только топ-3 символа)
+                if symbol in ['(', ':', '№']:
+                    for letter in LETTERS_UPPER[:10]:
+                        q = f"{w1}  {symbol}  {rest} {letter}"
+                        out.append(make(q, cp_v2, symbol,
+                            f"iv2_t3_{sym_label}_{letter}", "iv2_upper"))
+
         return out
         """
         SEP (Suffix-Ending-Position) — хирургические запросы без звёздочек.
