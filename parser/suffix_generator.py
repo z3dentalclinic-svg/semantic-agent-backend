@@ -394,6 +394,14 @@ class SuffixGenerator:
             if p:
                 seed_lemmas.add(p[0].normal_form)
 
+        # П0: варианты B/C/D с 0 GT-эксклюзивов на 4 датасетах — безопасно удалить
+        # -11 запросов из 70 B/C/D без потерь GT
+        BCD_SKIP_VARIANTS = {
+            "prep_bez_v3", "prep_iz_v3", "prep_na_v3", "prep_pod_v3", "prep_ot_v2",
+            "q_gde_v1", "q_kakoy_v3", "q_pochemu_v3",
+            "fin_analogi_v3", "fin_i_v3", "fin_sravnenie_v3",
+        }
+
         results = []
 
         def expand_type_a(seed_lower, suffix_val, suffix_label, priority, markers, stype="A"):
@@ -476,9 +484,11 @@ class SuffixGenerator:
                     ))
                     continue
 
-                # All types: expand into 4 cp variants for full testing
-                # After tracer analysis — keep best variant per suffix, drop rest
-                results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype))
+                # All types: expand into cp variants, filter П0 skip variants
+                # suffix_label у variant = "{label}_{vname}" e.g. "prep_bez_v3"
+                expanded = expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype)
+                expanded = [q for q in expanded if q.suffix_label not in BCD_SKIP_VARIANTS]
+                results.extend(expanded)
 
                 # Type B trailing space variant — "сид в " (без wildcard)
                 # Даёт кластер гео-расширений (районы, локации) которые "в *" не вытаскивает.
