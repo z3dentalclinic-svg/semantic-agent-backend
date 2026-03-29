@@ -394,13 +394,8 @@ class SuffixGenerator:
             if p:
                 seed_lemmas.add(p[0].normal_form)
 
-        # П0: варианты B/C/D с 0 GT-эксклюзивов на 4 датасетах — безопасно удалить
-        # -11 запросов из 70 B/C/D без потерь GT
-        BCD_SKIP_VARIANTS = {
-            "prep_bez_v3", "prep_iz_v3", "prep_na_v3", "prep_pod_v3", "prep_ot_v2",
-            "q_gde_v1", "q_kakoy_v3", "q_pochemu_v3",
-            "fin_analogi_v3", "fin_i_v3", "fin_sravnenie_v3",
-        }
+        # Firefox: все структуры активны, BCD_SKIP пуст
+        BCD_SKIP_VARIANTS = set()
 
         results = []
 
@@ -562,8 +557,7 @@ class SuffixGenerator:
         out.append(sq(q, len(q), "plain"))
 
         # 1b. сид а  (cp не передаётся)
-        # П0: 100% дубль plain на всех 4 датасетах, 0 GT-эксклюзивов
-        # out.append(sq(q, -1, "plain_nocp"))
+        out.append(sq(q, -1, "plain_nocp"))
 
         # 2. сид а  (+ trailing space)
         q = f"{s} {L} "
@@ -586,45 +580,33 @@ class SuffixGenerator:
         # Lwc cp варианты:
         #   cp после "а " (перед *)
         q = f"{s} {L} *"
-        # П0: 0 GT-эксклюзивов на 4 датасетах (гео-ключи игнорируем)
-        # out.append(sq(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL"))
-        #   cp перед "а" (после пробела сида)
-        # П0: 0 GT-эксклюзивов на 4 датасетах (все ключи гео)
-        # out.append(sq(q, len(s) + 1, "Lwc_cpBL"))
+        out.append(sq(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL"))
+        out.append(sq(q, len(s) + 1, "Lwc_cpBL"))
 
         # ── D4: A_local (:) + буква ──────────────────────────────────────
         # col_B убран (0 unique). col_Lwc, col_wcL убраны.
         # 6. сид : а  (+ trailing space)
         q = f"{s} : {L} "
-        # П0: 0 GT-эксклюзивов на 4 датасетах (гео-ключи игнорируем)
-        # out.append(sq(q, len(q), "col_B_trail"))
+        out.append(sq(q, len(q), "col_B_trail"))
 
         # 7. сид а :
         q = f"{s} {L} :"
-        # П0: 100% дубль plain+sandwich на всех 4 датасетах
-        # out.append(sq(q, len(q), "L_col"))
+        out.append(sq(q, len(q), "L_col"))
 
         # ── D5: A_general (-) + буква ────────────────────────────────────
         # hyp_B убран (0 unique).
         # 8. сид - а  (+ trailing space)
         q = f"{s} - {L} "
-        # П0: 0 GT-эксклюзивов на 4 датасетах
-        # out.append(sq(q, len(q), "hyp_B_trail"))
+        out.append(sq(q, len(q), "hyp_B_trail"))
 
-        # 9. сид - а *
         q = f"{s} - {L} *"
-        # П0: 0 GT-эксклюзивов на 4 датасетах
-        # out.append(sq(q, len(q), "hyp_Lwc"))
+        out.append(sq(q, len(q), "hyp_Lwc"))
 
-        # 10. сид - * а
         q = f"{s} - * {L}"
-        # П0: 0 GT-эксклюзивов на 4 датасетах
-        # out.append(sq(q, len(q), "hyp_wcL"))
+        out.append(sq(q, len(q), "hyp_wcL"))
 
-        # 11. сид а -
         q = f"{s} {L} -"
-        # П0: 0 GT-эксклюзивов на 4 датасетах
-        # out.append(sq(q, len(q), "L_hyp"))
+        out.append(sq(q, len(q), "L_hyp"))
 
         return out  # П0: 4 активных структуры (plain, trail, sandwich, wcB_cpMid)
 
