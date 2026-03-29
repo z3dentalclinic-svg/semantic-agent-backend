@@ -374,8 +374,7 @@ class PrefixGenerator:
             "е_Lwc_cpAL", "т_Lwc_cpAL", "ё_Lwc_cpAL", "м_Lwc_cpAL",
             "н_Lwc_cpBL", "л_Lwc_cpBL", "к_Lwc_cpBL", "с_Lwc_cpBL",
             "й_Lwc_cpAL", "й_Lwc_cpBL", "ц_Lwc_cpBL", "ч_Lwc_cpAL",
-            "э_Lwc_cpAL", "х_Lwc_cpBL", "ж_Lwc_cpBL", "ш_Lwc_cpAL",
-            "м_Lwc_cpBL",
+            "э_Lwc_cpAL", "х_Lwc_cpBL", "ж_Lwc_cpBL",            "м_Lwc_cpBL",
 
             # ── П0: PA точечные — cp0 ────────────────────────────────────
             "а_cp0", "й_cp0", "ю_cp0", "щ_cp0",
@@ -406,10 +405,6 @@ class PrefixGenerator:
             "в_L_hyp", "е_hyp_Lwc", "э_L_hyp",
 
             # ── П1: PA cp1 — 1 уник на 1 датасете ────────────────────────
-            "в_cp1", "и_cp1", "о_cp0", "е_cp1", "х_cp1",
-            "г_cp1", "у_cp1", "э_cp1", "а_cp1",
-            "т_cp0", "н_cp0", "ц_cp0",
-
             # ── П1: PA wcB_cpMid — 1 уник ────────────────────────────────
             "б_wcB_cpMid", "р_wcB_cpMid", "в_wcB_cpMid",
             "х_wcB_cpMid", "ш_wcB_cpMid", "з_wcB_cpMid",
