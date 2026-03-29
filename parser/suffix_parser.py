@@ -18,7 +18,10 @@ import os
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
-from parser.suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis
+try:
+    from parser.suffix_generator_ff import SuffixGenerator, SuffixQuery, SeedAnalysis
+except ImportError:
+    from suffix_generator_ff import SuffixGenerator, SuffixQuery, SeedAnalysis
 
 
 USER_AGENTS = [
@@ -165,7 +168,7 @@ class SuffixParser:
         return re.sub(r'<[^>]+>', '', text).strip()
 
     async def fetch_suggestions(self, query: str, country: str, language: str,
-                                 client: httpx.AsyncClient, google_client: str = "chrome",
+                                 client: httpx.AsyncClient, google_client: str = "firefox",
                                  cursor_position: int = None) -> List[str]:
         """Google Autocomplete with multi-client support."""
         url = "https://www.google.com/complete/search"
@@ -335,7 +338,7 @@ class SuffixParser:
 
     async def parse(self, seed: str, country: str = "ua", language: str = "ru",
                     parallel_limit: int = 5, include_numbers: bool = False,
-                    echelon: int = 0, google_client: str = "chrome",
+                    echelon: int = 0, google_client: str = "firefox",
                     cursor_position: int = None,
                     include_letters: bool = False) -> SuffixParseResult:
         """
@@ -508,7 +511,7 @@ class SuffixParser:
                         suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
                     )
                     t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, client, "chrome", -1)
+                    results = await self.fetch_suggestions(q, country, language, client, "firefox", -1)
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_simple, results, elapsed)
 
@@ -544,12 +547,12 @@ class SuffixParser:
         e_chrome_sem = asyncio.Semaphore(5)
 
         async def fetch_e_chrome_one(sq: "SuffixQuery", client: httpx.AsyncClient):
-            """Один E chrome запрос через семафор с джиттером."""
-            if sq.variant in CHROME_E_SKIP:
+            """Один E firefox запрос через семафор с джиттером."""
+            if sq.variant in FF_E_SKIP:
                 return
             async with e_chrome_sem:
                 await asyncio.sleep(random.uniform(0.3, 0.5))
-                await fetch_one_tracked(sq, client)
+                await fetch_one_tracked(sq, client, force_client="firefox")
 
         # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
         async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
