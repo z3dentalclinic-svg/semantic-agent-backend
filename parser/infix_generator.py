@@ -197,13 +197,11 @@ QUESTIONS_KEEP = ["как", "сколько"]
 FINALIZERS_KEEP = ["и", "или", "vs"]
 # "и" восстановлена (v2.8): реальная потеря "17 айфон и 16 про сравнение"
 
-# Буквы E-группы: не все 29 букв дают unique вклад в nocp/Lstar
-# plain_cpAL — для всех 29 букв (все дают unique > 0)
-# plain_nocp_chr — только эти 3 буквы (остальные 26 unique=0)
-# "д" добавлен: 1 infix-эксклюзив "купить стекло для айфон 16 про"
-E_NOCP_LETTERS: frozenset = frozenset("ивд")
-# Lstar_cpAS — только эти 9 букв (остальные 20 unique=0)
-E_LSTAR_LETTERS: frozenset = frozenset("кушебюпот")
+# Буквы E-группы
+# v2.8 оптимизация: E_NOCP_LETTERS="ивд", E_LSTAR_LETTERS="кушебюпот"
+# Сейчас восстановлено до v2.6 baseline — все 29 букв для сравнения
+E_NOCP_LETTERS: frozenset = frozenset(LETTERS_RU)
+E_LSTAR_LETTERS: frozenset = frozenset(LETTERS_RU)
 
 ALL_GROUPS = ["WC", "A", "B", "C", "D", "E"]
 # WC восстановлена (v2.8): wc_nocp_chr давала реальные потери на айфоне
