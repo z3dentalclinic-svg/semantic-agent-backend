@@ -127,8 +127,8 @@ class PrefixGenerator:
         ot  = op_type or self._detect_op_type(OP)
         out: List[PrefixQuery] = []
 
-        BOTH   = ("chrome", "firefox")
-        CHROME = ("chrome",)
+        BOTH   = ("firefox",)
+        CHROME = ("firefox",)
 
         def q(group: str, struct: str, query: str, cp: int,
               cp_note: str, op_val: str = OP, op_t: str = ot,
@@ -363,80 +363,8 @@ class PrefixGenerator:
         # ── П0+П1: фильтр на основе анализа 3 датасетов ──────────────────
         # П0 = 120 структур с unique_contrib=0 на всех датасетах (0 GT потерь)
         # П1 = +55 структур с max unique_contrib=1 (~3.8% GT потерь)
-        PREFIX_SKIP = {
-            # ── П0: G-группы (0 уник на всех датасетах) ──────────────────
-            "dstar_afterStar", "sym_general_afterSym", "nostar_dstar",
-            "wc_afterOP", "wc_afterS", "rwc_afterOP", "rwc_afterS",
-            "vP4_afterS", "vP5_end", "dbl_afterOP", "dbl_afterS",
-
-            # ── П0: PA точечные — Lwc_cpAL (большинство букв) ────────────
-            "в_Lwc_cpAL", "и_Lwc_cpAL", "а_Lwc_cpAL", "б_Lwc_cpAL",
-            "е_Lwc_cpAL", "т_Lwc_cpAL", "ё_Lwc_cpAL", "м_Lwc_cpAL",
-            "н_Lwc_cpBL", "л_Lwc_cpBL", "к_Lwc_cpBL", "с_Lwc_cpBL",
-            "й_Lwc_cpAL", "й_Lwc_cpBL", "ц_Lwc_cpBL", "ч_Lwc_cpAL",
-            "э_Lwc_cpAL", "х_Lwc_cpBL", "ж_Lwc_cpBL",            "м_Lwc_cpBL",
-
-            # ── П0: PA точечные — cp0 ────────────────────────────────────
-            "а_cp0", "й_cp0", "ю_cp0", "щ_cp0",
-
-            # ── П0: PA точечные — wcB_cpMid ──────────────────────────────
-            "е_wcB_cpMid", "ю_wcB_cpMid", "ё_wcB_cpMid", "д_wcB_cpMid",
-
-            # ── П0: PA — hyp_wcL для всех букв ───────────────────────────
-            "и_hyp_wcL", "а_hyp_wcL",            "я_hyp_wcL", "ю_hyp_wcL", "э_hyp_wcL", "е_hyp_B_trail",
-            "э_hyp_B_trail", "д_hyp_Lwc", "х_hyp_wcL", "х_hyp_Lwc",
-            "х_L_hyp", "ш_hyp_B_trail", "ш_hyp_Lwc", "й_L_hyp",
-            "р_hyp_Lwc", "ш_hyp_wcL", "ш_L_hyp", "ё_L_hyp",
-            "у_hyp_Lwc", "щ_L_hyp", "н_L_hyp", "п_hyp_B_trail",
-            "п_hyp_wcL", "у_L_hyp", "ф_hyp_Lwc", "ф_hyp_B_trail",
-            "ф_hyp_wcL", "ж_hyp_wcL", "з_hyp_B_trail", "й_hyp_B_trail",
-            "к_hyp_Lwc", "к_hyp_B_trail", "н_hyp_B_trail", "с_hyp_wcL",
-            "ч_hyp_wcL", "ё_hyp_B_trail", "ё_hyp_wcL", "ё_hyp_Lwc",
-            "д_hyp_wcL", "н_hyp_Lwc", "р_hyp_B_trail", "р_L_hyp",
-            "т_L_hyp", "г_L_hyp", "з_hyp_wcL", "п_L_hyp",
-            "у_hyp_B_trail", "ф_L_hyp", "м_hyp_B_trail", "н_hyp_wcL",
-            "с_hyp_Lwc", "у_hyp_wcL", "о_hyp_B_trail", "о_hyp_Lwc",
-            "о_hyp_wcL", "ж_hyp_Lwc", "ж_L_hyp", "з_L_hyp",
-            "о_L_hyp", "р_hyp_wcL", "т_hyp_wcL", "ц_hyp_Lwc",
-            "с_hyp_B_trail", "г_hyp_Lwc", "л_L_hyp", "л_hyp_wcL",
-            "п_hyp_Lwc", "л_hyp_Lwc", "к_L_hyp",
-            "и_L_hyp", "а_hyp_B_trail", "а_hyp_Lwc",
-            "в_L_hyp", "е_hyp_Lwc", "э_L_hyp",
-
-            # ── П1: PA cp1 — 1 уник на 1 датасете ────────────────────────
-            # ── П1: PA wcB_cpMid — 1 уник ────────────────────────────────
-            "б_wcB_cpMid", "р_wcB_cpMid",            "х_wcB_cpMid", "ш_wcB_cpMid", "з_wcB_cpMid",
-            "с_wcB_cpMid",
-
-            # ── П1: PA Lwc — 1 уник ───────────────────────────────────────
-            "щ_hyp_wcL", "г_Lwc_cpBL", "е_L_hyp", "у_Lwc_cpBL",
-            "к_Lwc_cpAL", "г_Lwc_cpAL", "ф_Lwc_cpBL", "ф_Lwc_cpAL",
-            "о_Lwc_cpBL", "б_Lwc_cpBL",
-
-            # ── П1: PA hyp — 1 уник ──────────────────────────────────────
-            "и_hyp_Lwc", "в_hyp_wcL",
-
-            # ── П1: PA wcB_cpMid — 1 уник ────────────────────────────────
-            "э_wcB_cpMid", "й_wcB_cpMid", "м_wcB_cpMid",
-            "т_wcB_cpMid", "т_Lwc_cpBL",
-
-            # ── П1: PA cp0 — 1 уник ───────────────────────────────────────
-            "ё_cp0", "я_cp0",
-
-            # ── П1: PA — прочие 1 уник ────────────────────────────────────
-            "н_Lwc_cpAL", "ю_Lwc_cpAL",
-
-            # ── П1: G-группы — 1 уник ────────────────────────────────────
-            "vP2_onOP_end",
-
-            # ── П1: hyp по буквам — 1 уник ───────────────────────────────
-            "щ_hyp_B_trail", "щ_hyp_Lwc", "щ_hyp_wcL",
-            "з_hyp_Lwc", "т_hyp_B_trail", "ц_hyp_B_trail",
-            "ц_hyp_wcL", "г_hyp_B_trail", "г_hyp_wcL",
-            "т_hyp_Lwc", "ц_L_hyp", "ч_hyp_Lwc",
-            "с_L_hyp", "л_hyp_B_trail", "к_hyp_wcL",
-            "й_hyp_wcL",
-        }
+        # Firefox: все структуры активны, PREFIX_SKIP пуст
+        PREFIX_SKIP = set()
 
         filtered = [pq for pq in out if pq.struct not in PREFIX_SKIP]
         return filtered
