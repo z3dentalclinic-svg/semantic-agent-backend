@@ -126,7 +126,7 @@ class InfixParser:
         return re.sub(r'<[^>]+>', '', text).strip()
 
     async def fetch_suggestions(self, query, country, language, client,
-                                 google_client="chrome", cursor_position=None):
+                                 google_client="firefox", cursor_position=None):
         url = "https://www.google.com/complete/search"
         params = {"q": query, "client": google_client, "hl": language,
                   "gl": country, "ie": "utf-8", "oe": "utf-8"}
