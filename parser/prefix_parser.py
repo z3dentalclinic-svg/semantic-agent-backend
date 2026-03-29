@@ -205,7 +205,7 @@ class PrefixParser:
         country: str,
         language: str,
         client: httpx.AsyncClient,
-        google_client: str = "chrome",
+        google_client: str = "firefox",
         cursor_position: Optional[int] = None,
     ) -> List[str]:
         """
@@ -319,7 +319,7 @@ class PrefixParser:
         country: str = "ua",
         language: str = "ru",
         groups: Optional[List[str]] = None,
-        google_client: str = "chrome",  # оставлен для обратной совместимости (одиночный вызов)
+        google_client: str = "firefox",  # firefox-only (одиночный вызов)
         progress_callback=None,  # async callable(done, total, entry) for live updates
     ) -> PrefixParseResult:
         """
@@ -426,10 +426,9 @@ class PrefixParser:
                 tasks = [fetch_one(pq, agent, client, semaphore) for pq in agent_queries]
                 await asyncio.gather(*tasks)
 
-        # Запускаем только Chrome агента (Firefox ОТКЛЮЧЁН для лайт-серча)
+        # Firefox-only агент
         await asyncio.gather(
-            run_agent("chrome"),
-            # run_agent("firefox"),  # ОТКЛЮЧЕНО для лайт-серча
+            run_agent("firefox"),
         )
 
         total_time = (time.time() - total_start) * 1000
@@ -517,7 +516,7 @@ def register_prefix_endpoint(app):
         seed: str = FQuery(..., description="Полный query string (уже с оператором и структурой)"),
         country: str = FQuery("ua"),
         language: str = FQuery("ru"),
-        google_client: str = FQuery("chrome"),
+        google_client: str = FQuery("firefox"),
         cp: Optional[int] = FQuery(None, description="Cursor position (-1 = не передавать)"),
     ):
         """
@@ -542,7 +541,7 @@ def register_prefix_endpoint(app):
         groups: str = FQuery("all", description="Группы: all или G1,G2,PA,PC"),
         country: str = FQuery("ua"),
         language: str = FQuery("ru"),
-        google_client: str = FQuery("chrome"),
+        google_client: str = FQuery("firefox"),
     ):
         """
         Full prefix matrix run — server-side batch.
@@ -677,7 +676,7 @@ if __name__ == "__main__":
     parser_cli.add_argument("--groups",  default="all",               help="Groups: all or G1,G2,PA")
     parser_cli.add_argument("--country", default="ua",                help="Country code")
     parser_cli.add_argument("--lang",    default="ru",                help="Language code")
-    parser_cli.add_argument("--client",  default="chrome",            help="Google client")
+    parser_cli.add_argument("--client",  default="firefox",            help="Google client")
     parser_cli.add_argument("--out",     default=None,                help="Output JSON file")
     args = parser_cli.parse_args()
 
