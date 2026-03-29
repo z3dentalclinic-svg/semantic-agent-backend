@@ -383,8 +383,7 @@ class PrefixGenerator:
             "е_wcB_cpMid", "ю_wcB_cpMid", "ё_wcB_cpMid", "д_wcB_cpMid",
 
             # ── П0: PA — hyp_wcL для всех букв ───────────────────────────
-            "и_hyp_wcL", "а_hyp_wcL", "в_hyp_B_trail", "б_hyp_wcL",
-            "я_hyp_wcL", "ю_hyp_wcL", "э_hyp_wcL", "е_hyp_B_trail",
+            "и_hyp_wcL", "а_hyp_wcL",            "я_hyp_wcL", "ю_hyp_wcL", "э_hyp_wcL", "е_hyp_B_trail",
             "э_hyp_B_trail", "д_hyp_Lwc", "х_hyp_wcL", "х_hyp_Lwc",
             "х_L_hyp", "ш_hyp_B_trail", "ш_hyp_Lwc", "й_L_hyp",
             "р_hyp_Lwc", "ш_hyp_wcL", "ш_L_hyp", "ё_L_hyp",
@@ -406,8 +405,7 @@ class PrefixGenerator:
 
             # ── П1: PA cp1 — 1 уник на 1 датасете ────────────────────────
             # ── П1: PA wcB_cpMid — 1 уник ────────────────────────────────
-            "б_wcB_cpMid", "р_wcB_cpMid", "в_wcB_cpMid",
-            "х_wcB_cpMid", "ш_wcB_cpMid", "з_wcB_cpMid",
+            "б_wcB_cpMid", "р_wcB_cpMid",            "х_wcB_cpMid", "ш_wcB_cpMid", "з_wcB_cpMid",
             "с_wcB_cpMid",
 
             # ── П1: PA Lwc — 1 уник ───────────────────────────────────────
@@ -432,7 +430,6 @@ class PrefixGenerator:
             "vP2_onOP_end",
 
             # ── П1: hyp по буквам — 1 уник ───────────────────────────────
-            "в_hyp_B_trail",
             "щ_hyp_B_trail", "щ_hyp_Lwc", "щ_hyp_wcL",
             "з_hyp_Lwc", "т_hyp_B_trail", "ц_hyp_B_trail",
             "ц_hyp_wcL", "г_hyp_B_trail", "г_hyp_wcL",
