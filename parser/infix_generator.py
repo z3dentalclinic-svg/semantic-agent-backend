@@ -1,5 +1,17 @@
 """
-Infix Generator v2.6 — Chrome E: одна cpAL вместо десяти.
+Infix Generator v2.7 — GT-валидированная оптимизация П0.
+
+Changes vs v2.6:
+  - GT-анализ 3 датасетов (айфон, акб, имплантация): unique_contrib + real-loss проверка
+  - WC: удалена wc_nocp_chr (unique=0 на всех датасетах)
+  - B: удалён предлог "в" (unique=0); "с" оставлен (1 реальная потеря)
+  - C: "сколько" оставлен (11 реальных потерь; L+R парные → unique_contrib ложно=0)
+  - D: удалена D_L_и_cpAL (unique=0)
+  - E plain_nocp_chr: оставлены только и,в,д (остальные 26 unique=0)
+  - E Lstar_cpAS: оставлены только б,е,к,о,п,т,у,ш,ю (остальные 20 unique=0)
+  - Geo-in-gap fix: гэпы где w1 или w2 содержит гео-слово → skip
+    (_preprocess снимает гео только с краёв; гео внутри сида давало мусорные запросы)
+  - Итог: 104 → 55 запросов на gap (-47%), реальных GT потерь = 0
 
 Changes vs v2.4:
   - E Chrome: возвращена plain_cpAL (одна вместо десяти)
@@ -175,15 +187,30 @@ LETTERS_RU = list("абвгдежзийклмнопрстуфхцчшщэюя") 
 SYMBOL_UA = ":"
 SYMBOL_RU = "&"
 
-PREPS_RU = ["в", "на", "для", "с", "от", "под", "из", "без"]
+PREPS_RU = ["на", "для", "с", "от", "под", "из", "без"]
+# Удалён только "в" (unique=0 на всех 3 датасетах)
+# "с" возвращён: 1 infix-эксклюзив "как обновить айфон с 16 до 17 ios"
 
 # Только самые ценные по анализу дублей
-QUESTIONS_KEEP = ["как", "сколько"]  # остальные 95%+ дублей
+QUESTIONS_KEEP = ["как", "сколько"]
+# "сколько" возвращён: 10 infix-эксклюзивов на айфоне + 1 на имплантации
+# C_L + C_R всегда ходят парой → в unique_contrib оба давали 0 (len==2, не 1)
+# Реальная проверка потерь показала: сколько = настоящие эксклюзивы
 
-# Только финализаторы с <90% дублей
-FINALIZERS_KEEP = ["и", "или", "vs"]
+# Только финализаторы с unique > 0
+FINALIZERS_KEEP = ["или", "vs"]
+# Удалён: "и" (D_L_и_cpAL total=2/unique=0)
 
-ALL_GROUPS = ["WC", "A", "B", "C", "D", "E"]
+# Буквы E-группы: не все 29 букв дают unique вклад в nocp/Lstar
+# plain_cpAL — для всех 29 букв (все дают unique > 0)
+# plain_nocp_chr — только эти 3 буквы (остальные 26 unique=0)
+# "д" добавлен: 1 infix-эксклюзив "купить стекло для айфон 16 про"
+E_NOCP_LETTERS: frozenset = frozenset("ивд")
+# Lstar_cpAS — только эти 9 букв (остальные 20 unique=0)
+E_LSTAR_LETTERS: frozenset = frozenset("кушебюпот")
+
+ALL_GROUPS = ["A", "B", "C", "D", "E"]
+# WC удалена: wc_nocp_chr unique=0 на всех датасетах
 
 # Q-маркеры — gap где w1 = Q-маркер пропускается (Google игнорирует правый якорь)
 Q_MARKERS = {"как", "какой", "какая", "какое", "какие", "где", "сколько",
@@ -260,6 +287,14 @@ class InfixGenerator:
             # Q-маркер на w1 → пропускаем gap полностью
             if w1.lower() in Q_MARKERS:
                 continue
+            # Гео-маркер в w1 или w2 → пропускаем gap
+            # _preprocess снимает гео только с краёв — если гео внутри сида,
+            # оно остаётся токеном и становится якорем гэпа.
+            # "харьков X недорого" или "кондиционер X киев" — некорректные запросы.
+            # Проверяем каждое слово токена: PREP+NOUN ("в харькове") → "харькове" тоже проверяем.
+            if (any(_is_geo_word(w) for w in w1.lower().split()) or
+                    any(_is_geo_word(w) for w in w2.lower().split())):
+                continue
             # T-маркер на w2 → только WC
             if w2.lower().split()[0] in T_MARKERS:
                 active = grp & {"WC"}
@@ -281,7 +316,16 @@ class InfixGenerator:
             # Пример "установка кондиционера цена", gap[0]:
             #   с suffix:   "установка А кондиционера цена" → цена киев / цена минск ...
             #   без suffix: "установка А кондиционера"      → инверторного / настенного ...
+            w1_idx = tokens.index(w1)
             w2_idx = tokens.index(w2)
+
+            # left_prefix — все токены левее w1 (контекст для gap[N>0])
+            # Пример: "ремонт пылесосов самсунг", gap[1]:
+            #   left_prefix="ремонт" → "ремонт пылесосов [X] самсунг"
+            #   без left_prefix:     → "пылесосов [X] самсунг" — теряем контекст
+            left_prefix = " ".join(tokens[:w1_idx]) if w1_idx > 0 else ""
+
+            # right_suffix — все токены правее w2
             raw_suffix = " ".join(tokens[w2_idx + 1:]) if w2_idx + 1 < len(tokens) else ""
             suffix_first_word = raw_suffix.split()[0] if raw_suffix else ""
             if gap_idx == 0 and suffix_first_word in T_MARKERS:
@@ -290,7 +334,8 @@ class InfixGenerator:
                 right_suffix = raw_suffix
 
             out.extend(self._generate_gap(gap_idx, w1, w2, active, geo_tokens,
-                                          skip_cp=skip_cp, right_suffix=right_suffix))
+                                          skip_cp=skip_cp, right_suffix=right_suffix,
+                                          left_prefix=left_prefix))
 
         return out
 
@@ -418,25 +463,22 @@ class InfixGenerator:
     # ГЕНЕРАЦИЯ ОДНОГО GAP'А
     # ──────────────────────────────────────────
 
-    def _generate_gap(self, gap_idx, w1, w2, groups, geo_tokens="", skip_cp=False, right_suffix="") -> List[InfixQuery]:
+    def _generate_gap(self, gap_idx, w1, w2, groups, geo_tokens="", skip_cp=False, right_suffix="", left_prefix="") -> List[InfixQuery]:
         out = []
         CHR = ("chrome",)
 
         # ── Гео-контекст ─────────────────────────────────────────
-        # nocp: geo в конце  → "w1 [X] w2 geo"  (оба якоря + гео как правый контекст)
-        # cp:   geo в начале → "geo w1 [X] w2"  (гео в стабильном левом контексте)
+        # nocp: geo в конце  → "left_prefix w1 [X] w2 right_suffix geo"
+        # cp:   geo в начале → "left_prefix geo w1 [X] w2 right_suffix"
         geo = geo_tokens.strip()
-        geo_shift = len(geo) + 1 if geo else 0  # сдвиг cp-позиции при гео-префиксе
+        lp = left_prefix.strip()  # левый контекст (токены до w1)
 
-        # skip_cp передаётся из generate() — True только для атомарных токенов
-        # (latin/цифровые цепочки: samsung galaxy s21, iphone 16 pro max).
-        # PREP+NOUN токены (на скутер) НЕ триггерят skip_cp — cp там работает нормально.
+        # Сдвиги cp-позиции
+        lp_shift  = len(lp) + 1 if lp else 0   # сдвиг на left_prefix
+        geo_shift = len(geo) + 1 if geo else 0  # сдвиг на гео (только для cp)
 
         def _w2_nocp():
-            """w2 + right_suffix + гео в конце для nocp-структур.
-            right_suffix — токены после w2 в исходном сиде (правый контекст).
-            Пример: gap[0] "аренда|авто|без залога" → w2_nocp = "авто без залога"
-            """
+            """w2 + right_suffix + гео в конце для nocp-структур."""
             parts = [w2]
             if right_suffix:
                 parts.append(right_suffix)
@@ -448,9 +490,19 @@ class InfixGenerator:
             """w2 + right_suffix для cp-структур (гео уже в начале через _w1_cp)."""
             return f"{w2} {right_suffix}".strip() if right_suffix else w2
 
+        def _w1_nocp():
+            """left_prefix + w1 для nocp-структур."""
+            return f"{lp} {w1}".strip() if lp else w1
+
         def _w1_cp():
-            """w1 с гео-префиксом для cp-структур."""
-            return f"{geo} {w1}".strip() if geo else w1
+            """left_prefix + geo + w1 для cp-структур."""
+            parts = []
+            if lp:
+                parts.append(lp)
+            if geo:
+                parts.append(geo)
+            parts.append(w1)
+            return " ".join(parts)
 
         def q(group, struct, query, cp, cp_note, insert_val, insert_type,
               orientation, agents=CHR, letter=None):
@@ -464,109 +516,64 @@ class InfixGenerator:
 
         n1 = len(w1)
 
-        # ── WC: только nocp_chr ───────────────────────────────────
-        # wc_nocp_ff убран (v2.2): 0 эксклюзивных по датасетам
-        if "WC" in groups:
-            base = f"{w1} * {_w2_nocp()}"
-            out.append(q("WC", "wc_nocp_chr", base, -1, "без cp, chrome", "*", "wildcard", "N", CHR))
+        # ── WC: удалена (v2.7) — wc_nocp_chr unique=0 на всех датасетах
 
         # ── A: только nocp_chr ───────────────────────────────────
-        # A_*_nocp_ff убраны (v2.2): 0 эксклюзивных по датасетам
         if "A" in groups:
             for sym, cluster in [(SYMBOL_UA, "ua"), (SYMBOL_RU, "ru")]:
-                base = f"{w1} {sym} {_w2_nocp()}"
+                base = f"{_w1_nocp()} {sym} {_w2_nocp()}"
                 out.append(q("A", f"A_{cluster}_nocp_chr", base, -1, "без cp, chrome", sym, "symbol", "N", CHR))
 
         # ── B: только B_L_{prep}_cpAL ────────────────────────────
-        # cpAL = курсор после предлога (тяготеет влево к w1)
-        # Единственный вариант с <75% дублей по анализу
         if "B" in groups and not skip_cp:
             for prep in PREPS_RU:
                 bl = f"{_w1_cp()} {prep} * {_w2_cp()}"
-                cp_al = geo_shift + n1 + 1 + len(prep) + 1  # гео_сдвиг + w1 + space + prep + space
+                cp_al = lp_shift + geo_shift + n1 + 1 + len(prep) + 1
                 out.append(q("B", f"B_L_{prep}_cpAL", bl, cp_al, "после предлога", prep, "prep", "L", CHR))
 
-        # ── C: только 3 структуры с <80% дублей ──────────────────
+        # ── C: как_cpAL + сколько_nocp_chr ────────────────────────
         if "C" in groups and not skip_cp:
-            # как_cpAL (79% дублей но 51 уник) — cp структура → гео влево
             cl = f"{_w1_cp()} как * {_w2_cp()}"
-            cp_al = geo_shift + n1 + 1 + len("как") + 1
+            cp_al = lp_shift + geo_shift + n1 + 1 + len("как") + 1
             out.append(q("C", "C_L_как_cpAL", cl, cp_al, "после как", "как", "question", "L", CHR))
 
-            # сколько nocp_chr — оба направления → гео вправо
-            for qw in ["сколько"]:
-                cl2 = f"{w1} {qw} * {_w2_nocp()}"
-                out.append(q("C", f"C_L_{qw}_nocp_chr", cl2, -1, "без cp, chrome", qw, "question", "L", CHR))
-                cr2 = f"{w1} * {qw} {_w2_nocp()}"
-                out.append(q("C", f"C_R_{qw}_nocp_chr", cr2, -1, "без cp, chrome", qw, "question", "R", CHR))
+            cl2 = f"{_w1_nocp()} сколько * {_w2_nocp()}"
+            out.append(q("C", "C_L_сколько_nocp_chr", cl2, -1, "без cp, chrome", "сколько", "question", "L", CHR))
+            cr2 = f"{_w1_nocp()} * сколько {_w2_nocp()}"
+            out.append(q("C", "C_R_сколько_nocp_chr", cr2, -1, "без cp, chrome", "сколько", "question", "R", CHR))
 
-        # ── D: только 3 финализатора с <92% дублей ───────────────
+        # ── D: финализаторы с unique > 0 ─────────────────────────
         if "D" in groups and not skip_cp:
-            # D_L_и_cpAL: 28% дублей — лучший результат
-            # D_L_или_cpAL: 88%, D_L_vs_cpAL: 90%
             for fin in FINALIZERS_KEEP:
                 dl = f"{_w1_cp()} {fin} * {_w2_cp()}"
-                cp_al = geo_shift + n1 + 1 + len(fin) + 1
+                cp_al = lp_shift + geo_shift + n1 + 1 + len(fin) + 1
                 out.append(q("D", f"D_L_{fin}_cpAL", dl, cp_al, f"после {fin}", fin, "finalizer", "L", CHR))
 
-        # ── E: plain_nocp_chr + cpAL Chrome ──────────────────────
-        # Firefox E убран в v2.1 (ROI < 1%). Chrome only.
+        # ── E: plain_cpAL (все буквы) + nocp/Lstar (только с unique > 0) ──
         if "E" in groups and not skip_cp:
             for L in LETTERS_RU:
-                # nocp: гео в конце
                 w2n = _w2_nocp()
-                t_plain_n   = f"{w1} {L} {w2n}"
-                t_Lwc_n     = f"{w1} {L} * {w2n}"
-                t_wcL_n     = f"{w1} * {L} {w2n}"
-                t_sand_n    = f"{w1} * {L} * {w2n}"
-                t_Lstar_n   = f"{w1} {L}* {w2n}"
-                t_starL_n   = f"{w1} *{L} {w2n}"
-                t_L_hyp_n   = f"{w1} {L} - {w2n}"
-                t_hyp_L_n   = f"{w1} - {L} {w2n}"
-                t_hyp_Lwc_n = f"{w1} - {L} * {w2n}"
-
-                # cp: гео в начале (w1 → geo+w1)
+                w1n = _w1_nocp()
                 w1c = _w1_cp()
+
+                t_plain_n = f"{w1n} {L} {w2n}"
                 t_plain   = f"{w1c} {L} {_w2_cp()}"
-                t_Lwc     = f"{w1c} {L} * {_w2_cp()}"
-                t_wcL     = f"{w1c} * {L} {_w2_cp()}"
-                t_sand    = f"{w1c} * {L} * {_w2_cp()}"
                 t_Lstar   = f"{w1c} {L}* {_w2_cp()}"
-                t_starL   = f"{w1c} *{L} {_w2_cp()}"
-                t_L_hyp   = f"{w1c} {L} - {_w2_cp()}"
-                t_hyp_L   = f"{w1c} - {L} {_w2_cp()}"
-                t_hyp_Lwc = f"{w1c} - {L} * {_w2_cp()}"
-                t_L_col   = f"{w1c} {L} : {_w2_cp()}"
-                t_col_L   = f"{w1c} : {L} {_w2_cp()}"
 
-                n1c = len(w1c)  # длина w1 с гео-префиксом для сдвига cp
-                # cp позиции после буквы (cpAL) — сдвинуты на geo_shift
-                cp_plain   = n1c + 2
-                cp_Lwc     = n1c + 2
-                cp_wcL     = n1c + 4
-                cp_sand    = n1c + 4
-                cp_Lstar   = n1c + 3
-                cp_starL   = n1c + 3
-                cp_L_hyp   = n1c + 2
-                cp_hyp_L   = n1c + 4
-                cp_hyp_Lwc = n1c + 4
-                cp_L_col   = n1c + 2
-                cp_col_L   = n1c + 4
+                n1c = len(w1c)
+                cp_plain = n1c + 2
+                cp_Lstar = n1c + 3
 
-                # Chrome E: 3 структуры на букву = 78 запросов на gap (v2.5)
-                # Анализ показал: все 10 cpAL структур возвращают ~одни и те же ключи
-                # (300-327 каждая), но в СУММЕ дают 512 инфикс-расширений которых
-                # нет ни в nocp ни в Lstar → достаточно одной cpAL.
-                # Оставлены:
-                #   plain_nocp_chr — nocp базовый
-                #   plain_cpAL     — одна cpAL даёт все инфикс-расширения
-                #   Lstar_cpAS     — аномально высокий выход (345 эксклюзивных)
-                out.append(q("E", f"E_{L}_plain_nocp_chr", t_plain_n, -1,       "без cp",  L, "letter", "N", CHR, letter=L))
-                out.append(q("E", f"E_{L}_plain_cpAL",     t_plain,   cp_plain, "после L", L, "letter", "L", CHR, letter=L))
-                out.append(q("E", f"E_{L}_Lstar_cpAS",     t_Lstar,   cp_Lstar, "после *", L, "letter", "L", CHR, letter=L))
+                # plain_cpAL — для всех букв
+                out.append(q("E", f"E_{L}_plain_cpAL", t_plain, cp_plain, "после L", L, "letter", "L", CHR, letter=L))
 
-                # Firefox E — убран (v2.1): 9 структур × 26 букв = 234 запроса на gap
-                # даёт 1-10 эксклюзивных по датасетам (<1% на больших сидах), ROI слишком низкий
+                # plain_nocp_chr — только и, в, д
+                if L in E_NOCP_LETTERS:
+                    out.append(q("E", f"E_{L}_plain_nocp_chr", t_plain_n, -1, "без cp", L, "letter", "N", CHR, letter=L))
+
+                # Lstar_cpAS — только б,е,к,о,п,т,у,ш,ю
+                if L in E_LSTAR_LETTERS:
+                    out.append(q("E", f"E_{L}_Lstar_cpAS", t_Lstar, cp_Lstar, "после *", L, "letter", "L", CHR, letter=L))
 
         return out
 
