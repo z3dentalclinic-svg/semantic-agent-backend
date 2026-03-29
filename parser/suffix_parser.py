@@ -19,9 +19,9 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
 try:
-    from parser.suffix_generator_ff import SuffixGenerator, SuffixQuery, SeedAnalysis
+    from parser.suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis
 except ImportError:
-    from suffix_generator_ff import SuffixGenerator, SuffixQuery, SeedAnalysis
+    from suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis
 
 
 USER_AGENTS = [
