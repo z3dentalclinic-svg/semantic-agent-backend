@@ -197,11 +197,13 @@ QUESTIONS_KEEP = ["как", "сколько"]
 FINALIZERS_KEEP = ["и", "или", "vs"]
 # "и" восстановлена (v2.8): реальная потеря "17 айфон и 16 про сравнение"
 
-# Буквы E-группы
-# v2.8 оптимизация: E_NOCP_LETTERS="ивд", E_LSTAR_LETTERS="кушебюпот"
-# Сейчас восстановлено до v2.6 baseline — все 29 букв для сравнения
-E_NOCP_LETTERS: frozenset = frozenset(LETTERS_RU)
-E_LSTAR_LETTERS: frozenset = frozenset(LETTERS_RU)
+# Буквы E-группы: не все 29 букв дают unique вклад в nocp/Lstar
+# plain_cpAL — для всех 29 букв (все дают unique > 0)
+# plain_nocp_chr — только и,в,д (остальные 26 unique=0 по GT-анализу)
+# Lstar_cpAS — только б,е,к,о,п,т,у,ш,ю (остальные 20 unique=0)
+# Baseline сравнение (104 vs 58): потери одинаковые, +46 запросов дают 0 GT выгоды
+E_NOCP_LETTERS: frozenset = frozenset("ивд")
+E_LSTAR_LETTERS: frozenset = frozenset("кушебюпот")
 
 ALL_GROUPS = ["WC", "A", "B", "C", "D", "E"]
 # WC восстановлена (v2.8): wc_nocp_chr давала реальные потери на айфоне
