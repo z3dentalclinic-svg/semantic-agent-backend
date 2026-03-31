@@ -93,8 +93,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    # [FIREFOX-ONLY EXPERIMENT] Chrome UA закомментированы
+    # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    # "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
@@ -219,7 +220,8 @@ class PrefixParser:
         url = "https://www.google.com/complete/search"
         params = {
             "q": query,
-            "client": google_client,
+            # [FIREFOX-ONLY EXPERIMENT] "client": google_client,
+            "client": "firefox",
             "hl": language,
             "gl": country,
             "ie": "utf-8",
@@ -233,7 +235,8 @@ class PrefixParser:
         else:
             params["cp"] = len(query)
 
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        # [FIREFOX-ONLY EXPERIMENT] headers = {"User-Agent": random.choice(USER_AGENTS)}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"}
 
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
