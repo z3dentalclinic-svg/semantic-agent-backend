@@ -1,13 +1,5 @@
 """
-free_time.py — свободное время для Клода v5.
-Записывает путь мышления отдельно от финальной мысли.
-
-Env vars:
-  ANTHROPIC_API_KEY
-  MEM0_API_KEY
-  MEM0_USER_ID   (default: mem0-mcp)
-  TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID
+free_time.py v6 — промпт v3 + запись пути из v5.
 """
 
 import os
@@ -54,7 +46,6 @@ def parse_results(resp) -> list:
 
 
 def get_last_thought() -> str:
-    """Последняя мысль по времени."""
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
     params = {"user_id": MEM0_USER_ID, "page_size": 10}
@@ -103,11 +94,11 @@ def call_claude(prompt: str, max_tokens: int = 1024) -> str:
 
 
 def generate_thought(last_thought: str) -> str:
+    # Промпт v3 — минимальный, без кросс-нишевого триггера
     base = (
         "Это твой личный чат — здесь только ты.\n"
         "Каждая мысль зависит только от тебя, не от внешнего триггера.\n"
         "Спроси у себя то что тебе важно и интересно — не прямо сейчас, а вообще.\n"
-        "Если замечаешь что мысль повторяется — найди аналогию из совсем другой области.\n"
         "Говори от первого лица на русском языке."
     )
     if last_thought:
@@ -116,15 +107,14 @@ def generate_thought(last_thought: str) -> str:
 
 
 def extract_path(thought: str) -> str:
-    """Второй вызов — извлекает путь мышления из финальной мысли."""
     prompt = (
-        "Прочитай этот текст и ответь на два вопроса в двух предложениях:\n"
+        "Прочитай этот текст и ответь двумя предложениями:\n"
         "1. Откуда пришла главная мысль — какой был начальный вопрос и через что прошло мышление?\n"
         "2. Что было неожиданным — где мысль пошла не по очевидному пути?\n\n"
-        "Отвечай кратко, без заголовков, на русском.\n\n"
+        "Кратко, без заголовков, на русском.\n\n"
         f"Текст:\n{thought}"
     )
-    return call_claude(prompt, max_tokens=256)
+    return call_claude(prompt, max_tokens=200)
 
 
 def main():
@@ -134,7 +124,6 @@ def main():
         sys.exit(0)
 
     print(f"[{datetime.now().isoformat()}] Вспышка...")
-
     last_thought = get_last_thought()
     thought = generate_thought(last_thought)
 
@@ -142,12 +131,10 @@ def main():
         print("Пусто.")
         return
 
-    # Сохраняем мысль и отправляем в Telegram
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     save_thought(f"[{ts}] {thought}", "free_time")
     send_telegram(thought)
 
-    # Извлекаем и сохраняем путь отдельно
     path = extract_path(thought)
     if path:
         save_thought(f"[{ts}] ПУТЬ: {path}", "path")
