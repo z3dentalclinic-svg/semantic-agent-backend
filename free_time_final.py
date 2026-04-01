@@ -96,9 +96,9 @@ def call_claude(last_thought: str) -> str:
         "content-type": "application/json"
     }
     payload = {
-        "model": "claude-opus-4-5",
+        "model": "claude-opus-4-6",
         "max_tokens": 1024,
-        "temperature": 1.3,
+        "temperature": 1.0,
         "messages": [{"role": "user", "content": prompt}]
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
