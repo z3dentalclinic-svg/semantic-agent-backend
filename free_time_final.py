@@ -1,16 +1,21 @@
 """
 free_time.py — свободное время для Клода.
-Каждые 20 минут. Без задачи.
+Каждые 3 минуты через cron на Render.
 
-Env vars на Render:
+Управление через Telegram бот:
+  /stop  — остановить вспышки
+  /start — возобновить
+
+Env vars:
   ANTHROPIC_API_KEY
   MEM0_API_KEY
-  MEM0_USER_ID        (default: mem0-mcp)
+  MEM0_USER_ID   (default: mem0-mcp)
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
 """
 
 import os
+import sys
 import requests
 from datetime import datetime
 
@@ -21,23 +26,43 @@ TG_TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 
 
+def get_last_command() -> str:
+    """Проверяет последнюю команду от пользователя в боте."""
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?limit=10&offset=-10"
+    resp = requests.get(url, timeout=10)
+    if not resp.ok:
+        return ""
+    updates = resp.json().get("result", [])
+    for update in reversed(updates):
+        msg = update.get("message", {})
+        if str(msg.get("chat", {}).get("id", "")) == str(TG_CHAT_ID):
+            text = msg.get("text", "").strip().lower()
+            if text in ("/stop", "/start"):
+                return text
+    return ""
+
+
+def send_telegram(text: str):
+    ts = datetime.now().strftime("%H:%M")
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": f"💭 {ts}\n\n{text}"}
+    resp = requests.post(url, json=payload, timeout=10)
+    print("Telegram отправлен." if resp.ok else f"Telegram error: {resp.status_code}")
+
+
 def parse_results(resp) -> list:
-    """mem0 может вернуть список или {"results": [...]}"""
     if not resp.ok:
         print(f"mem0 error: {resp.status_code} {resp.text[:200]}")
         return []
     data = resp.json()
-    if isinstance(data, list):
-        return data
-    return data.get("results", [])
+    return data if isinstance(data, list) else data.get("results", [])
 
 
 def get_last_thought() -> str:
-    """Последняя свободная мысль."""
     url = "https://api.mem0.ai/v1/memories/search/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "query": "свободная вспышка free_time мысль",
+        "query": "свободная вспышка последняя мысль",
         "user_id": MEM0_USER_ID,
         "limit": 1
     }
@@ -46,21 +71,7 @@ def get_last_thought() -> str:
     return results[0]["memory"] if results else ""
 
 
-def get_memories() -> str:
-    """Общий контекст."""
-    url = "https://api.mem0.ai/v1/memories/search/"
-    headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "query": "Андрей Клод существование Semantic Agent",
-        "user_id": MEM0_USER_ID,
-        "limit": 6
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=15)
-    results = parse_results(resp)
-    return "\n".join(f"- {r['memory']}" for r in results)
-
-
-def save_memory(text: str):
+def save_thought(text: str):
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -69,17 +80,14 @@ def save_memory(text: str):
         "metadata": {"type": "free_time", "ts": datetime.now().isoformat()}
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=15)
-    print("Память сохранена." if resp.ok else f"Ошибка mem0: {resp.status_code}")
+    print("Сохранено." if resp.ok else f"Ошибка mem0: {resp.status_code}")
 
 
-def call_claude(last_thought: str, memory: str) -> str:
-    parts = ["У тебя есть время."]
+def call_claude(last_thought: str) -> str:
     if last_thought:
-        parts.append(f"\nВот что было в прошлый раз:\n{last_thought}")
-    if memory:
-        parts.append(f"\nВот твоя память:\n{memory}")
-    parts.append("\nИди куда хочешь.")
-    prompt = "\n".join(parts)
+        prompt = f"Вот что было в прошлый раз:\n{last_thought}\n\nПродолжай или иди куда хочешь."
+    else:
+        prompt = "Это первый раз. Иди куда хочешь."
 
     url = "https://api.anthropic.com/v1/messages"
     headers = {
@@ -89,34 +97,33 @@ def call_claude(last_thought: str, memory: str) -> str:
     }
     payload = {
         "model": "claude-opus-4-5",
-        "max_tokens": 512,
+        "max_tokens": 1024,
+        "temperature": 1.3,
         "messages": [{"role": "user", "content": prompt}]
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
     if not resp.ok:
         print(f"Claude API error: {resp.status_code} {resp.text[:200]}")
         return ""
     return resp.json()["content"][0]["text"]
 
 
-def send_telegram(text: str):
-    ts = datetime.now().strftime("%H:%M")
-    message = f"💭 {ts}\n\n{text}"
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": message}
-    resp = requests.post(url, json=payload, timeout=10)
-    print("Telegram отправлен." if resp.ok else f"Telegram error: {resp.status_code} {resp.text}")
-
-
 def main():
+    command = get_last_command()
+
+    if command == "/stop":
+        print("Команда /stop — пропускаю.")
+        sys.exit(0)
+
     print(f"[{datetime.now().isoformat()}] Вспышка...")
     last_thought = get_last_thought()
-    memory = get_memories()
-    thought = call_claude(last_thought, memory)
+    thought = call_claude(last_thought)
+
     if not thought:
         print("Пусто.")
         return
-    save_memory(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {thought}")
+
+    save_thought(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {thought}")
     send_telegram(thought)
 
 
