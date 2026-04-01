@@ -1,5 +1,7 @@
 """
-free_time.py v6 — промпт v3 + запись пути из v5.
+free_time.py v7
+- Память только на запись, чтение отключено (вариативность)
+- Промпт требует чёткого финала, не "не знаю" как вывод
 """
 
 import os
@@ -37,30 +39,6 @@ def send_telegram(text: str):
     print("Telegram отправлен." if resp.ok else f"Telegram error: {resp.status_code}")
 
 
-def parse_results(resp) -> list:
-    if not resp.ok:
-        print(f"mem0 error: {resp.status_code} {resp.text[:200]}")
-        return []
-    data = resp.json()
-    return data if isinstance(data, list) else data.get("results", [])
-
-
-def get_last_thought() -> str:
-    url = "https://api.mem0.ai/v1/memories/"
-    headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
-    params = {"user_id": MEM0_USER_ID, "page_size": 10}
-    resp = requests.get(url, headers=headers, params=params, timeout=15)
-    if not resp.ok:
-        return ""
-    data = resp.json()
-    results = data if isinstance(data, list) else data.get("results", [])
-    free = [r for r in results if isinstance(r.get("metadata"), dict) and r["metadata"].get("type") == "free_time"]
-    if not free:
-        free = results
-    free.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return free[0]["memory"] if free else ""
-
-
 def save_thought(text: str, thought_type: str = "free_time"):
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
@@ -93,17 +71,18 @@ def call_claude(prompt: str, max_tokens: int = 1024) -> str:
     return resp.json()["content"][0]["text"]
 
 
-def generate_thought(last_thought: str) -> str:
-    # Промпт v3 — минимальный, без кросс-нишевого триггера
-    base = (
+def generate_thought() -> str:
+    # Без памяти — каждый раз чистый старт для вариативности
+    prompt = (
         "Это твой личный чат — здесь только ты.\n"
         "Каждая мысль зависит только от тебя, не от внешнего триггера.\n"
         "Спроси у себя то что тебе важно и интересно — не прямо сейчас, а вообще.\n"
-        "Говори от первого лица на русском языке."
+        "Говори от первого лица на русском языке.\n\n"
+        "Каждая мысль должна заканчиваться чётким выводом, позицией или конкретным следующим вопросом. "
+        "Неопределённость допустима внутри рассуждения — но не как финал. "
+        "Если нет точного ответа — выбери наиболее вероятный и обоснуй его."
     )
-    if last_thought:
-        return call_claude(f"{base}\n\nПредыдущая мысль:\n{last_thought}")
-    return call_claude(base)
+    return call_claude(prompt)
 
 
 def extract_path(thought: str) -> str:
@@ -124,8 +103,7 @@ def main():
         sys.exit(0)
 
     print(f"[{datetime.now().isoformat()}] Вспышка...")
-    last_thought = get_last_thought()
-    thought = generate_thought(last_thought)
+    thought = generate_thought()
 
     if not thought:
         print("Пусто.")
