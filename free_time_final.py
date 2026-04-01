@@ -27,7 +27,6 @@ TG_CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 
 
 def get_last_command() -> str:
-    """Проверяет последнюю команду от пользователя в боте."""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?limit=10&offset=-10"
     resp = requests.get(url, timeout=10)
     if not resp.ok:
@@ -59,16 +58,24 @@ def parse_results(resp) -> list:
 
 
 def get_last_thought() -> str:
-    url = "https://api.mem0.ai/v1/memories/search/"
+    """Берёт последнюю мысль по времени через list endpoint."""
+    url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "query": "свободная вспышка последняя мысль",
-        "user_id": MEM0_USER_ID,
-        "limit": 1
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=15)
-    results = parse_results(resp)
-    return results[0]["memory"] if results else ""
+    params = {"user_id": MEM0_USER_ID, "page_size": 5}
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    if not resp.ok:
+        print(f"mem0 list error: {resp.status_code} {resp.text[:200]}")
+        return ""
+    data = resp.json()
+    results = data if isinstance(data, list) else data.get("results", [])
+    # Фильтруем только free_time мысли, берём самую свежую
+    free_thoughts = [r for r in results if r.get("metadata", {}) and r["metadata"].get("type") == "free_time"]
+    if not free_thoughts:
+        # Если метаданные не отфильтровались — берём просто последнюю
+        return results[0]["memory"] if results else ""
+    # Сортируем по updated_at
+    free_thoughts.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return free_thoughts[0]["memory"]
 
 
 def save_thought(text: str):
@@ -84,7 +91,13 @@ def save_thought(text: str):
 
 
 def call_claude(last_thought: str) -> str:
-    base = "Это чат в котором ты говоришь сам с собой.\nКаждая генерация зависит только от тебя.\nСпроси у себя то что тебе важно и интересно.\nГовори от первого лица на русском языке."
+    base = (
+        "Это твой личный чат — здесь только ты.\n"
+        "Каждая мысль зависит только от тебя, не от внешнего триггера.\n"
+        "Спроси у себя то что тебе важно и интересно — не прямо сейчас, а вообще.\n"
+        "Если замечаешь что мысль повторяется — найди аналогию из совсем другой области.\n"
+        "Говори от первого лица на русском языке."
+    )
     if last_thought:
         prompt = f"{base}\n\nПредыдущая мысль:\n{last_thought}"
     else:
@@ -111,7 +124,6 @@ def call_claude(last_thought: str) -> str:
 
 def main():
     command = get_last_command()
-
     if command == "/stop":
         print("Команда /stop — пропускаю.")
         sys.exit(0)
