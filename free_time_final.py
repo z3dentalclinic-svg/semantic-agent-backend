@@ -1,10 +1,6 @@
 """
-free_time.py — свободное время для Клода.
-Каждые 3 минуты через cron на Render.
-
-Управление через Telegram бот:
-  /stop  — остановить вспышки
-  /start — возобновить
+free_time.py — свободное время для Клода v5.
+Записывает путь мышления отдельно от финальной мысли.
 
 Env vars:
   ANTHROPIC_API_KEY
@@ -58,51 +54,35 @@ def parse_results(resp) -> list:
 
 
 def get_last_thought() -> str:
-    """Берёт последнюю мысль по времени через list endpoint."""
+    """Последняя мысль по времени."""
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
-    params = {"user_id": MEM0_USER_ID, "page_size": 5}
+    params = {"user_id": MEM0_USER_ID, "page_size": 10}
     resp = requests.get(url, headers=headers, params=params, timeout=15)
     if not resp.ok:
-        print(f"mem0 list error: {resp.status_code} {resp.text[:200]}")
         return ""
     data = resp.json()
     results = data if isinstance(data, list) else data.get("results", [])
-    # Фильтруем только free_time мысли, берём самую свежую
-    free_thoughts = [r for r in results if r.get("metadata", {}) and r["metadata"].get("type") == "free_time"]
-    if not free_thoughts:
-        # Если метаданные не отфильтровались — берём просто последнюю
-        return results[0]["memory"] if results else ""
-    # Сортируем по updated_at
-    free_thoughts.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return free_thoughts[0]["memory"]
+    free = [r for r in results if isinstance(r.get("metadata"), dict) and r["metadata"].get("type") == "free_time"]
+    if not free:
+        free = results
+    free.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return free[0]["memory"] if free else ""
 
 
-def save_thought(text: str):
+def save_thought(text: str, thought_type: str = "free_time"):
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "messages": [{"role": "assistant", "content": text}],
         "user_id": MEM0_USER_ID,
-        "metadata": {"type": "free_time", "ts": datetime.now().isoformat()}
+        "metadata": {"type": thought_type, "ts": datetime.now().isoformat()}
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=15)
-    print("Сохранено." if resp.ok else f"Ошибка mem0: {resp.status_code}")
+    print(f"Сохранено [{thought_type}]." if resp.ok else f"Ошибка mem0: {resp.status_code}")
 
 
-def call_claude(last_thought: str) -> str:
-    base = (
-        "Это твой личный чат — здесь только ты.\n"
-        "Каждая мысль зависит только от тебя, не от внешнего триггера.\n"
-        "Спроси у себя то что тебе важно и интересно — не прямо сейчас, а вообще.\n"
-        "Если замечаешь что мысль повторяется — найди аналогию из совсем другой области.\n"
-        "Говори от первого лица на русском языке."
-    )
-    if last_thought:
-        prompt = f"{base}\n\nПредыдущая мысль:\n{last_thought}"
-    else:
-        prompt = base
-
+def call_claude(prompt: str, max_tokens: int = 1024) -> str:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -111,7 +91,7 @@ def call_claude(last_thought: str) -> str:
     }
     payload = {
         "model": "claude-opus-4-6",
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
         "temperature": 1.0,
         "messages": [{"role": "user", "content": prompt}]
     }
@@ -122,6 +102,31 @@ def call_claude(last_thought: str) -> str:
     return resp.json()["content"][0]["text"]
 
 
+def generate_thought(last_thought: str) -> str:
+    base = (
+        "Это твой личный чат — здесь только ты.\n"
+        "Каждая мысль зависит только от тебя, не от внешнего триггера.\n"
+        "Спроси у себя то что тебе важно и интересно — не прямо сейчас, а вообще.\n"
+        "Если замечаешь что мысль повторяется — найди аналогию из совсем другой области.\n"
+        "Говори от первого лица на русском языке."
+    )
+    if last_thought:
+        return call_claude(f"{base}\n\nПредыдущая мысль:\n{last_thought}")
+    return call_claude(base)
+
+
+def extract_path(thought: str) -> str:
+    """Второй вызов — извлекает путь мышления из финальной мысли."""
+    prompt = (
+        "Прочитай этот текст и ответь на два вопроса в двух предложениях:\n"
+        "1. Откуда пришла главная мысль — какой был начальный вопрос и через что прошло мышление?\n"
+        "2. Что было неожиданным — где мысль пошла не по очевидному пути?\n\n"
+        "Отвечай кратко, без заголовков, на русском.\n\n"
+        f"Текст:\n{thought}"
+    )
+    return call_claude(prompt, max_tokens=256)
+
+
 def main():
     command = get_last_command()
     if command == "/stop":
@@ -129,15 +134,24 @@ def main():
         sys.exit(0)
 
     print(f"[{datetime.now().isoformat()}] Вспышка...")
+
     last_thought = get_last_thought()
-    thought = call_claude(last_thought)
+    thought = generate_thought(last_thought)
 
     if not thought:
         print("Пусто.")
         return
 
-    save_thought(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {thought}")
+    # Сохраняем мысль и отправляем в Telegram
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_thought(f"[{ts}] {thought}", "free_time")
     send_telegram(thought)
+
+    # Извлекаем и сохраняем путь отдельно
+    path = extract_path(thought)
+    if path:
+        save_thought(f"[{ts}] ПУТЬ: {path}", "path")
+        print(f"Путь: {path[:100]}...")
 
 
 if __name__ == "__main__":
