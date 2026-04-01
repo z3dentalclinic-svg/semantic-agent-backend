@@ -84,10 +84,11 @@ def save_thought(text: str):
 
 
 def call_claude(last_thought: str) -> str:
+    base = "Это чат в котором ты говоришь сам с собой.\nКаждая генерация зависит только от тебя.\nСпроси у себя то что тебе важно и интересно.\nГовори от первого лица на русском языке."
     if last_thought:
-        prompt = f"Вот что было в прошлый раз:\n{last_thought}\n\nПродолжай или иди куда хочешь."
+        prompt = f"{base}\n\nПредыдущая мысль:\n{last_thought}"
     else:
-        prompt = "Это первый раз. Иди куда хочешь."
+        prompt = base
 
     url = "https://api.anthropic.com/v1/messages"
     headers = {
