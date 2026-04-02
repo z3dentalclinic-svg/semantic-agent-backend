@@ -55,18 +55,13 @@ def save_memory(text: str, pauses: list):
         start = max(0, pos - 300)
         end = min(len(text), pos + 300)
         fragment = text[start:end].strip()
-        fragments.append(f"[пауза {p["sec"]}с поз.{pos}]
-{fragment}")
+        sec = p["sec"]
+        fragments.append(f"[пауза {sec}с поз.{pos}]\n{fragment}")
 
     if not fragments:
-        # Если пауз нет — берём последние 1500 символов
         fragments = [text[-1500:]]
 
-    content = "
-
----
-
-".join(fragments)
+    content = "\n\n---\n\n".join(fragments)
 
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
