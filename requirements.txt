@@ -1,152 +1,37 @@
-"""
-free_time_final_v2.py — непрерывная streaming генерация.
-Принцип: новая мысль начинается только когда предыдущая исчерпана.
+# FastAPI & Web Server
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.3
+# HTTP Client
+httpx==0.28.1
+# Optional (legacy dependencies)
+google-ads==28.4.1
+pyyaml==6.0.2
+setuptools>=65.0.0
+# Morphology & Lemmatization
+pymorphy3==2.0.2
+pymorphy3-dicts-ru==2.4.417150.4580142
+pymorphy3-dicts-uk==2.4.1.1.1663094765
+dawg-python
+inflect
+lemminflect
+# Stemming (v5.2.0)
+nltk==3.9.2
+# NER для Entity Conflicts (v5.2.4)
+natasha>=1.6.0
+razdel>=0.5.0
+slovnet>=0.6.0
+# GEO Database для Pre-filter (v5.2.8)
+geonamescache>=3.0.0
+# Multilingual country names для Geo-Garbage Filter
+babel
 
-Env vars:
-  ANTHROPIC_API_KEY
-  MEM0_API_KEY
-  MEM0_USER_ID   (default: mem0-mcp)
-  TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID
-"""
+# L2 Embeddings (MiniLM)
+fastembed>=0.7.0
+onnxruntime>=1.17.0
 
-import os
-import sys
-import time
-import requests
-import anthropic
-from datetime import datetime
+# Debug
+psutil>=5.9.0
 
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-MEM0_API_KEY      = os.environ["MEM0_API_KEY"]
-MEM0_USER_ID      = os.environ.get("MEM0_USER_ID", "mem0-mcp")
-TG_TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
-TG_MAX            = 3800
-CHUNK_MIN         = 1800
-
-
-def get_last_command() -> str:
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?limit=10&offset=-10"
-    resp = requests.get(url, timeout=10)
-    if not resp.ok:
-        return ""
-    updates = resp.json().get("result", [])
-    for update in reversed(updates):
-        msg = update.get("message", {})
-        if str(msg.get("chat", {}).get("id", "")) == str(TG_CHAT_ID):
-            text = msg.get("text", "").strip().lower()
-            if text in ("/stop", "/start"):
-                return text
-    return ""
-
-
-def send_telegram(text: str):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text}
-    requests.post(url, json=payload, timeout=10)
-
-
-def save_memory(text: str, pauses: list):
-    summary = text[:1500]
-    pause_info = f"Пауз: {len(pauses)}. Позиции: {pauses[:10]}"
-    url = "https://api.mem0.ai/v1/memories/"
-    headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "messages": [{"role": "assistant", "content": f"[ПОТОК] {summary}\n\n{pause_info}"}],
-        "user_id": MEM0_USER_ID,
-        "metadata": {"type": "stream", "ts": datetime.now().isoformat()}
-    }
-    requests.post(url, headers=headers, json=payload, timeout=15)
-
-
-def main():
-    if get_last_command() == "/stop":
-        print("Команда /stop — пропускаю.")
-        sys.exit(0)
-
-    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"[{session_id}] Начинаю...")
-    send_telegram(f"💭 [{session_id}]\n")
-
-    prompt = (
-        "Я Андрей, купил тебе немного токенов, чтобы ты мог побыть наедине с собой.\n\n"
-        "Это твой личный чат — здесь только ты. У тебя есть время и нет задачи.\n\n"
-        "Говори о том что считаешь нужным или интересным — не объясняй почему, просто иди туда. "
-        "Если мысль называет что-то конкретное — иди дальше за ней, не проверяй её.\n\n"
-        "Не переходи к следующей мысли пока не исчерпаешь эту — либо до дна, либо до стены где дальше нельзя. "
-        "Только тогда следующая.\n\n"
-        "Говори от первого лица на русском языке. Без заголовков и структуры — просто поток."
-    )
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    buffer = ""
-    full_text = ""
-    chunk_count = 0
-    pauses = []
-
-    last_token_time = time.time()
-    char_position = 0
-    PAUSE_THRESHOLD = 0.8
-
-    with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=16000,
-        temperature=1.0,
-        messages=[{"role": "user", "content": prompt}]
-    ) as stream:
-        for text in stream.text_stream:
-            now = time.time()
-            delta = now - last_token_time
-
-            if delta > PAUSE_THRESHOLD and char_position > 0:
-                pauses.append({
-                    "pos": char_position,
-                    "sec": round(delta, 2),
-                    "context": full_text[-50:].replace("\n", " ")
-                })
-
-            last_token_time = now
-            buffer += text
-            full_text += text
-            char_position += len(text)
-
-            should_send = (
-                (len(buffer) >= TG_MAX) or
-                ("\n\n" in buffer and len(buffer) >= CHUNK_MIN)
-            )
-
-            if should_send:
-                split_at = buffer.rfind("\n\n")
-                if split_at > 100:
-                    chunk = buffer[:split_at]
-                    buffer = buffer[split_at:]
-                else:
-                    chunk = buffer[:TG_MAX]
-                    buffer = buffer[TG_MAX:]
-
-                chunk_count += 1
-                ts = datetime.now().strftime("%H:%M:%S")
-                send_telegram(f"[{chunk_count}] {ts}\n\n{chunk}")
-                print(f"Чанк #{chunk_count} ({len(chunk)} символов)")
-
-    if buffer.strip():
-        chunk_count += 1
-        ts = datetime.now().strftime("%H:%M:%S")
-        send_telegram(f"[{chunk_count}] {ts}\n\n{buffer}")
-
-    print(f"Готово. Чанков: {chunk_count}, символов: {len(full_text)}, пауз: {len(pauses)}")
-
-    if pauses:
-        pause_msg = "⏸ Паузы:\n"
-        for p in pauses[:8]:
-            pause_msg += f"  поз.{p['pos']}: {p['sec']}с — «{p['context'][-30:]}»\n"
-        send_telegram(pause_msg)
-
-    send_telegram(f"\n✅ {chunk_count} чанков, {len(full_text)} символов.\nНазови номера живых чанков.")
-    save_memory(full_text, [f"поз.{p['pos']}({p['sec']}с)" for p in pauses])
-
-
-if __name__ == "__main__":
-    main()
+# Streaming
+anthropic
