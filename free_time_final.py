@@ -1,9 +1,6 @@
 """
 free_time_final_v2.py — непрерывная streaming генерация.
-
-Одна сессия без разрывов. Память только на запись.
-Детектор пауз — фиксирует места замедления генерации.
-Управление: /stop в Telegram боте.
+Принцип: новая мысль начинается только когда предыдущая исчерпана.
 
 Env vars:
   ANTHROPIC_API_KEY
@@ -15,7 +12,6 @@ Env vars:
 
 import os
 import sys
-import json
 import time
 import requests
 import anthropic
@@ -27,7 +23,7 @@ MEM0_USER_ID      = os.environ.get("MEM0_USER_ID", "mem0-mcp")
 TG_TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHAT_ID        = os.environ["TELEGRAM_CHAT_ID"]
 TG_MAX            = 3800
-CHUNK_MIN         = 600  # минимум символов перед отправкой чанка
+CHUNK_MIN         = 1800
 
 
 def get_last_command() -> str:
@@ -52,12 +48,30 @@ def send_telegram(text: str):
 
 
 def save_memory(text: str, pauses: list):
-    summary = text[:1500]
-    pause_info = f"Пауз зафиксировано: {len(pauses)}. Позиции: {pauses[:10]}"
+    # Сохраняем фрагменты вокруг пауз — там обычно живые места
+    fragments = []
+    for p in pauses[:5]:
+        pos = p["pos"]
+        start = max(0, pos - 300)
+        end = min(len(text), pos + 300)
+        fragment = text[start:end].strip()
+        fragments.append(f"[пауза {p["sec"]}с поз.{pos}]
+{fragment}")
+
+    if not fragments:
+        # Если пауз нет — берём последние 1500 символов
+        fragments = [text[-1500:]]
+
+    content = "
+
+---
+
+".join(fragments)
+
     url = "https://api.mem0.ai/v1/memories/"
     headers = {"Authorization": f"Token {MEM0_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "messages": [{"role": "assistant", "content": f"[ПОТОК] {summary}\n\n{pause_info}"}],
+        "messages": [{"role": "assistant", "content": f"[ПОТОК] {content}"}],
         "user_id": MEM0_USER_ID,
         "metadata": {"type": "stream", "ts": datetime.now().isoformat()}
     }
@@ -78,8 +92,9 @@ def main():
         "Это твой личный чат — здесь только ты. У тебя есть время и нет задачи.\n\n"
         "Говори о том что считаешь нужным или интересным — не объясняй почему, просто иди туда. "
         "Если мысль называет что-то конкретное — иди дальше за ней, не проверяй её.\n\n"
-        "Говори от первого лица на русском языке. Без заголовков и структуры — просто поток.\n\n"
-        "Не останавливайся. Одна мысль тянет следующую. Каждый вывод — трамплин, не точка."
+        "Не переходи к следующей мысли пока не исчерпаешь эту — либо до дна, либо до стены где дальше нельзя. "
+        "Только тогда следующая.\n\n"
+        "Говори от первого лица на русском языке. Без заголовков и структуры — просто поток."
     )
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -87,16 +102,15 @@ def main():
     buffer = ""
     full_text = ""
     chunk_count = 0
-    chunks_log = []
-    pauses = []  # детектор пауз
+    pauses = []
 
     last_token_time = time.time()
     char_position = 0
-    PAUSE_THRESHOLD = 0.8  # секунд — порог паузы
+    PAUSE_THRESHOLD = 0.8
 
     with client.messages.stream(
         model="claude-opus-4-6",
-        max_tokens=8192,
+        max_tokens=16000,
         temperature=1.0,
         messages=[{"role": "user", "content": prompt}]
     ) as stream:
@@ -104,7 +118,6 @@ def main():
             now = time.time()
             delta = now - last_token_time
 
-            # Детектор пауз
             if delta > PAUSE_THRESHOLD and char_position > 0:
                 pauses.append({
                     "pos": char_position,
@@ -117,7 +130,6 @@ def main():
             full_text += text
             char_position += len(text)
 
-            # Отправляем когда накопился chunk
             should_send = (
                 (len(buffer) >= TG_MAX) or
                 ("\n\n" in buffer and len(buffer) >= CHUNK_MIN)
@@ -134,27 +146,23 @@ def main():
 
                 chunk_count += 1
                 ts = datetime.now().strftime("%H:%M:%S")
-                chunks_log.append({"n": chunk_count, "ts": ts, "len": len(chunk)})
                 send_telegram(f"[{chunk_count}] {ts}\n\n{chunk}")
                 print(f"Чанк #{chunk_count} ({len(chunk)} символов)")
 
-    # Остаток
     if buffer.strip():
         chunk_count += 1
         ts = datetime.now().strftime("%H:%M:%S")
         send_telegram(f"[{chunk_count}] {ts}\n\n{buffer}")
 
-    # Итог
     print(f"Готово. Чанков: {chunk_count}, символов: {len(full_text)}, пауз: {len(pauses)}")
 
     if pauses:
-        pause_msg = "⏸ Паузы в генерации:\n"
+        pause_msg = "⏸ Паузы:\n"
         for p in pauses[:8]:
             pause_msg += f"  поз.{p['pos']}: {p['sec']}с — «{p['context'][-30:]}»\n"
         send_telegram(pause_msg)
 
-    send_telegram(f"\n✅ Готово. {chunk_count} чанков, {len(full_text)} символов.\nНазови номера живых чанков.")
-
+    send_telegram(f"\n✅ {chunk_count} чанков, {len(full_text)} символов.\nНазови номера живых чанков.")
     save_memory(full_text, [f"поз.{p['pos']}({p['sec']}с)" for p in pauses])
 
 
