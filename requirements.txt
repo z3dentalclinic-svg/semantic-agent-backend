@@ -32,3 +32,6 @@ onnxruntime>=1.17.0
 
 # Debug
 psutil>=5.9.0
+
+# Streaming
+anthropic
