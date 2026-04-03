@@ -463,6 +463,12 @@ class InfixGenerator:
     def _generate_gap(self, gap_idx, w1, w2, groups, geo_tokens="", skip_cp=False, right_suffix="", left_prefix="") -> List[InfixQuery]:
         out = []
         CHR = ("chrome",)
+        FF  = ("firefox",)
+
+        # FF-exclusive наборы (GT-валидировано, unified_firefox_structs.json)
+        E_FF_PLAIN_CPAL = frozenset("вдмнопсбзикртэгжлфхцшю")  # 22 буквы
+        E_FF_NOCP       = frozenset("ивбау")                    # 5 букв (и,в дубли + а,б,у новые)
+        E_FF_LSTAR      = frozenset("вк")                       # 2 буквы
 
         # ── Гео-контекст ─────────────────────────────────────────
         # nocp: geo в конце  → "left_prefix w1 [X] w2 right_suffix geo"
@@ -575,6 +581,55 @@ class InfixGenerator:
                 # Lstar_cpAS — только б,е,к,о,п,т,у,ш,ю
                 if L in E_LSTAR_LETTERS:
                     out.append(q("E", f"E_{L}_Lstar_cpAS", t_Lstar, cp_Lstar, "после *", L, "letter", "L", CHR, letter=L))
+
+        # ── FF-EXCLUSIVE структуры ────────────────────────────────────
+        # GT-валидировано: unified_firefox_structs.json, 40 структур на gap
+
+        # B: все 8 предлогов с Firefox
+        if "B" in groups and not skip_cp:
+            for prep in PREPS_RU:
+                bl = f"{_w1_cp()} {prep} * {_w2_cp()}"
+                cp_al = lp_shift + geo_shift + n1 + 1 + len(prep) + 1
+                out.append(q("B", f"B_L_{prep}_cpAL", bl, cp_al, "после предлога", prep, "prep", "L", FF))
+
+        # C: как_cpAL + сколько_nocp_chr с Firefox
+        if "C" in groups and not skip_cp:
+            cl = f"{_w1_cp()} как * {_w2_cp()}"
+            cp_al = lp_shift + geo_shift + n1 + 1 + len("как") + 1
+            out.append(q("C", "C_L_как_cpAL", cl, cp_al, "после как", "как", "question", "L", FF))
+            cl2 = f"{_w1_nocp()} сколько * {_w2_nocp()}"
+            out.append(q("C", "C_L_сколько_nocp_chr", cl2, -1, "без cp", "сколько", "question", "L", FF))
+
+        # D: или_cpAL с Firefox
+        if "D" in groups and not skip_cp:
+            dl = f"{_w1_cp()} или * {_w2_cp()}"
+            cp_al = lp_shift + geo_shift + n1 + 1 + len("или") + 1
+            out.append(q("D", "D_L_или_cpAL", dl, cp_al, "после или", "или", "finalizer", "L", FF))
+
+        # E: FF-exclusive буквы
+        if "E" in groups and not skip_cp:
+            for L in LETTERS_RU:
+                w2n = _w2_nocp()
+                w1n = _w1_nocp()
+                w1c = _w1_cp()
+                n1c = len(w1c)
+
+                # plain_cpAL — 22 буквы
+                if L in E_FF_PLAIN_CPAL:
+                    t_plain = f"{w1c} {L} {_w2_cp()}"
+                    cp_plain = n1c + 2
+                    out.append(q("E", f"E_{L}_plain_cpAL", t_plain, cp_plain, "после L", L, "letter", "L", FF, letter=L))
+
+                # plain_nocp_chr — 5 букв (и,в дубли + а,б,у новые)
+                if L in E_FF_NOCP:
+                    t_plain_n = f"{w1n} {L} {w2n}"
+                    out.append(q("E", f"E_{L}_plain_nocp_chr", t_plain_n, -1, "без cp", L, "letter", "N", FF, letter=L))
+
+                # Lstar_cpAS — 2 буквы (в новая + к дубль)
+                if L in E_FF_LSTAR:
+                    t_Lstar = f"{w1c} {L}* {_w2_cp()}"
+                    cp_Lstar = n1c + 3
+                    out.append(q("E", f"E_{L}_Lstar_cpAS", t_Lstar, cp_Lstar, "после *", L, "letter", "L", FF, letter=L))
 
         return out
 
