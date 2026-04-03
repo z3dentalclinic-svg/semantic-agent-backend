@@ -202,8 +202,8 @@ FINALIZERS_KEEP = ["и", "или", "vs"]
 # plain_nocp_chr — только и,в,д (остальные 26 unique=0 по GT-анализу)
 # Lstar_cpAS — только б,е,к,о,п,т,у,ш,ю (остальные 20 unique=0)
 # Baseline сравнение (104 vs 58): потери одинаковые, +46 запросов дают 0 GT выгоды
-E_NOCP_LETTERS: frozenset = frozenset(LETTERS_RU)   # все 29 букв
-E_LSTAR_LETTERS: frozenset = frozenset(LETTERS_RU)  # все 29 букв
+E_NOCP_LETTERS: frozenset = frozenset("ивд")        # plain_nocp_chr — только 3 буквы (GT-валидировано)
+E_LSTAR_LETTERS: frozenset = frozenset("кушебюпот") # Lstar_cpAS — только 9 букв (GT-валидировано)
 
 ALL_GROUPS = ["WC", "A", "B", "C", "D", "E"]
 # WC восстановлена (v2.8): wc_nocp_chr давала реальные потери на айфоне
@@ -462,7 +462,7 @@ class InfixGenerator:
 
     def _generate_gap(self, gap_idx, w1, w2, groups, geo_tokens="", skip_cp=False, right_suffix="", left_prefix="") -> List[InfixQuery]:
         out = []
-        CHR = ("firefox",)
+        CHR = ("chrome",)
 
         # ── Гео-контекст ─────────────────────────────────────────
         # nocp: geo в конце  → "left_prefix w1 [X] w2 right_suffix geo"
