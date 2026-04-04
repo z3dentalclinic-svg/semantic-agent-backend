@@ -480,7 +480,7 @@ class PrefixParser:
             all_keywords=kw_map,
             alt_seed_keywords=alt_seed_set,
             exclusive_keywords=exclusive_kw,
-            total_queries=len(matrix),
+            total_queries=len(trace_entries),
             with_results=sum(1 for e in trace_entries if e.status == "ok"),
             empty_queries=sum(1 for e in trace_entries if e.status == "empty"),
             error_queries=sum(1 for e in trace_entries if e.status == "error"),
