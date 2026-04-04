@@ -458,9 +458,9 @@ class SuffixGenerator:
             if p:
                 seed_lemmas.add(p[0].normal_form)
 
-        # [P0-FF-SKIP] Firefox: применяем список неиспользуемых вариантов
-        # При добавлении Chrome агента: передавать agent в generate() и выбирать нужный set
-        BCD_SKIP_VARIANTS = FF_BCD_SKIP_VARIANTS
+        # Фильтрация по агенту применяется в парсере (CHROME_BCD_SKIP / FF_BCD_SKIP_VARIANTS).
+        # Генератор отдаёт все варианты — парсер сам выбирает нужные per-agent.
+        BCD_SKIP_VARIANTS = set()
 
         results = []
 
