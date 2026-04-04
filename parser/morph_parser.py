@@ -1,696 +1,649 @@
 """
-Prefix Parser v2.01 — Dual-agent parallel execution (Chrome + Firefox).
+Morph Parser v2.0 — Fetch + 4-axis trace for full suffix map × case variants.
 
-Architecture mirrors suffix_parser.py:
-    - Shared fetch_suggestions() method (identical to suffix_parser)
-    - Parallel execution via asyncio.Semaphore (batch=10)
-    - Per-query tracer: hits, empty, timing, unique tracking
-    - PrefixParseResult dataclass → JSON-serialisable
+Fetch architecture:
+- Queries grouped by case_label (up to 12 groups)
+- All case groups run in PARALLEL via asyncio.gather
+- Within each case group:
+    - A/B/C/D queries: all in parallel (asyncio.gather, semaphore=10)
+    - E queries (letter sweep): letters are SEQUENTIAL, 0.4s delay per letter
+      Each letter: chrome + firefox fetched back-to-back
+- Two httpx clients per case group: chrome_client + firefox_client (isolated)
 
-LOCAL MODE (запуск без сервера):
-    python prefix_parser.py --seed "имплантация зубов" --op "купить"
-    → Прогоняет всю матрицу, сохраняет prefix_trace_<seed>_<ts>.json
+Trace structure (4 axes — for dataset analysis):
+  trace[case_label][suffix_label][ua_type] = {
+      "query": str,
+      "results": [str, ...],
+      "count": int,
+      "suffix_type": str,    # A/B/C/D/E
+      "suffix_val": str,
+      "variant": str,
+      "priority": int,
+  }
 
-SERVER INTEGRATION (FastAPI):
-    from parser.prefix_parser import PrefixParser, register_prefix_endpoint
-    register_prefix_endpoint(app)
-    → Добавляет GET /api/prefix-fetch и GET /api/prefix-map
+  Plus per-case aggregates:
+  trace[case_label]["_meta"] = {
+      "seed_variant": str,
+      "case_display": str,
+      "raw_count": int,            # unique raw keywords this case
+      "normalized_count": int,
+      "unique_count": int,         # exclusive to this case post cross-analysis
+      "by_type": { A: {raw, norm, unique}, ... }  # per suffix type breakdown
+  }
 
-ENDPOINT CONTRACT:
-    GET /api/prefix-fetch
-        ?seed=   — полный query string (уже содержит оператор и структуру)
-        &country=ua &language=ru
-        &google_client=chrome
-        &cp=     — cursor position (-1 = не передавать)
-    → {"results": ["keyword1", "keyword2", ...]}
-
-    GET /api/prefix-map
-        ?seed=   — базовый сид (без операторов)
-        &operator=купить &groups=G1,G2,PA
-        &country=ua &language=ru
-    → {"prefix_trace": {...}, "keywords": [...], ...}
+Post-run analysis fields (after 10 datasets):
+  Use trace[case_label][suffix_label][ua_type]["count"] to rank:
+    - Which cases add the most unique normalized keywords
+    - Which suffix_types per case are redundant (all dupes from other cases)
+    - Which UA (chrome vs firefox) adds exclusive results per structure
 """
 
 import asyncio
 import httpx
+import os
 import time
-import random
 import json
 import re
 import logging
-import argparse
-from typing import Set, List, Dict, Optional
-from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Set
+from dataclasses import dataclass, field
+from collections import defaultdict
 
+import pymorphy3
 
-def _brute_seed_variants(seed: str) -> List[str]:
-    """
-    Генерирует brute-suffix варианты сида для расширения префиксной карты.
-
-    Алгоритм:
-      - Находим первое кириллическое слово длиннее 3 букв
-      - Отрезаем последний символ (флексия верхнего уровня)
-      - Подставляем 8 окончаний: и, ы, а, е, у, ом, ей, о
-      - ей = творительный жен.р. (имплантацией), ом = творительный муж.р.
-
-    Пример: "имплантация зубов" → основа "имплантаци" →
-      имплантации, имплантациы, имплантациа, имплантацие,
-      имплантацию, имплантациом, имплантацией, имплантацио
-    """
-    ENDINGS = ['и', 'ы', 'а', 'е', 'у', 'ом', 'ей', 'о', 'ю']
-
-    words = seed.lower().strip().split()
-    target_idx = None
-    for i, w in enumerate(words):
-        if re.match(r'^[а-яёА-ЯЁ]{4,}$', w):
-            target_idx = i
-            break
-    if target_idx is None:
-        return []
-
-    word = words[target_idx]
-    stem = word[:-1]  # отрезаем последний символ
-    original_lower = seed.lower().strip()
-
-    variants = []
-    for ending in ENDINGS:
-        new_word = stem + ending
-        if new_word == word:
-            continue
-        w = words.copy()
-        w[target_idx] = new_word
-        variant = ' '.join(w)
-        if variant != original_lower:
-            variants.append(variant)
-    return variants
-
-try:
-    from parser.prefix_generator import PrefixGenerator, PrefixQuery, ALL_GROUPS
-except ImportError:
-    from prefix_generator import PrefixGenerator, PrefixQuery, ALL_GROUPS
-
+from parser.morph_generator import MorphGenerator, MorphQuery, MorphSeedAnalysis, CASES_RU
 
 logger = logging.getLogger(__name__)
 
-USER_AGENTS = [
-    # [FIREFOX-ONLY EXPERIMENT] Chrome UA закомментированы
-    # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-]
+# ── Constants ────────────────────────────────────────────────────────────────
 
-# Batch size for parallel execution
-BATCH_SIZE = 5
-DELAY_BETWEEN_REQUESTS = 0.3  # seconds
-
-# Proxy from env (same as suffix/morph parsers)
-import os as _os
-_PROXY_URL = _os.getenv("GOOGLE_PROXY_URL", "").strip() or None
+MORPH_DELAY = 0.3          # seconds between letter groups in E-type sweep
+ABCD_SEMAPHORE = 10        # max parallel A/B/C/D requests per case group
+CASE_PARALLEL = True       # run all case groups in parallel (asyncio.gather)
 
 
-# ══════════════════════════════════════════════
-# DATACLASSES
-# ══════════════════════════════════════════════
+def _load_proxy_pool() -> List[Optional[str]]:
+    """
+    Load proxy pool from env vars.
+
+    Priority:
+      1. MORPH_PROXY_1 / MORPH_PROXY_2 / MORPH_PROXY_3  — dedicated morph proxies
+      2. GOOGLE_PROXY_URL                                 — fallback (same as suffix_parser)
+      3. No proxy                                         — [None]
+
+    Format: "http://user:pass@host:port" or "http://host:port"
+
+    Each case batch gets a proxy by round-robin: proxy_pool[case_index % len(pool)]
+    With 3 proxies and 10 cases: each proxy handles ~3-4 cases.
+    Peak load per IP: ~90 concurrent requests instead of 280.
+    """
+    pool: List[Optional[str]] = []
+
+    for key in ["MORPH_PROXY_1", "MORPH_PROXY_2", "MORPH_PROXY_3"]:
+        val = os.getenv(key, "").strip()
+        if val:
+            pool.append(val)
+
+    if not pool:
+        fallback = os.getenv("GOOGLE_PROXY_URL", "").strip()
+        if fallback:
+            pool.append(fallback)
+            logger.info("[MORPH] No MORPH_PROXY_* found, using GOOGLE_PROXY_URL as single proxy")
+
+    if pool:
+        logger.info(f"[MORPH] Proxy pool: {len(pool)} proxies loaded")
+    else:
+        logger.warning("[MORPH] No proxies configured — all requests from server IP")
+
+    return pool if pool else [None]
+
+UA_STRINGS = {
+    "chrome":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
+               "Gecko/20100101 Firefox/121.0",
+    "youtube": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+GOOGLE_CLIENTS = {
+    "chrome":  "chrome",
+    "firefox": "firefox",
+    "youtube": "youtube",
+}
+
+
+def _ua_list(ua_filter):
+    """Возвращает список UA для фетча. None=оба, иначе только указанный."""
+    return ["chrome", "firefox"] if ua_filter is None else [ua_filter]
+
+
+# Однобуквенные предлоги/союзы — не мусор, пропускаем
+_VALID_SINGLE_LETTERS = {'в', 'к', 'с', 'у', 'о', 'и'}
+_SINGLE_CYR_LETTER = re.compile(r'^[а-яё]$')
+
+
+def _filter_letter_artifacts(results: List[str], seed_variant: str) -> List[str]:
+    """
+    Убивает мусор вида '[сид] [одна_буква] [слово]' прямо после фетча.
+    Также убивает '[сид] - [одна_буква] [слово]' (с дефисом).
+    Исключение: предлоги/союзы в, к, с, у, о, и — валидные ключи.
+    Мусор:  'курс английского языка киев д кларк'      → убить
+    Мусор:  'имплантации зубов - д симферополь'        → убить
+    Норма:  'аренда авто без залога у частных лиц'     → оставить
+    """
+    seed_len = len(seed_variant.lower().split())
+    clean = []
+    for r in results:
+        tokens = r.lower().split()
+        # Паттерн 1: [сид] [буква] [слово]
+        if (len(tokens) > seed_len + 1
+                and _SINGLE_CYR_LETTER.match(tokens[seed_len])
+                and tokens[seed_len] not in _VALID_SINGLE_LETTERS):
+            continue
+        # Паттерн 2: [сид] - [буква] [слово] — всегда мусор, предлогов не бывает
+        if (len(tokens) > seed_len + 2
+                and tokens[seed_len] == '-'
+                and _SINGLE_CYR_LETTER.match(tokens[seed_len + 1])):
+            continue
+        clean.append(r)
+    return clean
+
+
+# ── Data classes ─────────────────────────────────────────────────────────────
 
 @dataclass
-class PrefixTraceEntry:
-    """Trace data for a single prefix query — mirrors SuffixTraceEntry."""
-    group: str
-    struct: str
-    operator: str
-    op_type: str
-    query_sent: str
-    cp: int
-    cp_note: str
-    results_count: int = 0
-    results: List[str] = field(default_factory=list)
-    unique: List[str] = field(default_factory=list)  # ключи только в этой структуре
-    time_ms: float = 0.0
-    status: str = "pending"   # ok, empty, error
-    error: Optional[str] = None
-    letter: Optional[str] = None
-    agent: str = "chrome"           # "chrome" | "firefox"
-
-
-@dataclass
-class PrefixParseResult:
-    """Full result of prefix parse — mirrors SuffixParseResult."""
+class MorphParseResult:
+    """Full result of morphology parsing."""
     seed: str
-    operator: str
-    country: str
-    language: str
-    groups_used: List[str]
-    # Keywords
-    all_keywords: Dict[str, List[str]] = field(default_factory=dict)  # kw → [structs]
-    # Ключи где сид НЕ найден — семантические замены (купить зубной имплант и т.п.)
-    # Используется при интеграции с pipeline: bypass relevance_filter + l0_filter
-    alt_seed_keywords: Set[str] = field(default_factory=set)  # kw где seed не в строке
-    exclusive_keywords: Dict[str, str] = field(default_factory=dict)  # kw → struct (only 1)
-    # Stats
-    total_queries: int = 0
-    with_results: int = 0
-    empty_queries: int = 0
-    error_queries: int = 0
-    total_keywords: int = 0
-    exclusive_count: int = 0
-    total_time_ms: float = 0.0
-    # Trace
-    trace: List[Dict] = field(default_factory=list)
-    summary_by_group: Dict = field(default_factory=dict)
-    # Meta
-    timestamp: str = ""
+    analysis_summary: Dict
+    keywords: List[str] = field(default_factory=list)      # normalized, deduped across all cases
+    keywords_raw: List[str] = field(default_factory=list)  # raw pre-normalization, deduped
+    trace: Dict = field(default_factory=dict)              # 4-axis trace (see module docstring)
+    stats: Dict = field(default_factory=dict)
+    total_time_s: float = 0.0
 
 
-# ══════════════════════════════════════════════
-# ФИЛЬТР МУСОРА
-# ══════════════════════════════════════════════
+# ── Normalizer ───────────────────────────────────────────────────────────────
 
-# Предлоги и союзы — одиночные буквы из этого списка НЕ мусор
-_PREP_UNION = {"в","во","на","с","со","к","ко","о","у","и","а","б","я"}
-
-def _is_garbage_keyword(kw: str) -> bool:
+class MorphNormalizer:
     """
-    Возвращает True если ключ — мусор:
-    1. Содержит спецсимволы запроса (* : & | \\)
-    2. Содержит одиночную букву которая не предлог/союз
-    """
-    if re.search(r'[*:|&\\]', kw):
-        return True
-    for w in kw.lower().split():
-        if len(w) == 1 and w not in _PREP_UNION:
-            return True
-    return False
+    Normalizes raw autocomplete results to nominative case.
+    Algorithm: session_2026_03_15 §6 (final, agreed by 4 models).
 
-
-# ══════════════════════════════════════════════
-# PARSER
-# ══════════════════════════════════════════════
-
-class PrefixParser:
-    """
-    Orchestrates prefix generation + autocomplete fetching + tracing.
-    Drop-in parallel to SuffixParser.
+    1. First word must be cyrillic
+    2. Find parse: lemma == original_lemma AND POS=NOUN AND score>=0.3
+    3. Inflect to nominative, preserve sing/plur
+    4. Reconstruct: nom_form + rest_of_words
+    5. Dedup via set()
     """
 
     def __init__(self, lang: str = "ru"):
-        self.generator = PrefixGenerator()
-        self.lang = lang
+        self.morph = pymorphy3.MorphAnalyzer(lang=lang)
 
-    def _clean_suggestion(self, text: str) -> str:
-        """Strip HTML tags from autocomplete suggestions."""
+    def _is_cyrillic(self, word: str) -> bool:
+        return bool(re.match(r'^[а-яёА-ЯЁ]+$', word))
+
+    def normalize(self, raw_keywords: List[str], original_lemma: str) -> List[str]:
+        normalized: Set[str] = set()
+
+        for kw in raw_keywords:
+            kw = kw.strip()
+            if not kw:
+                continue
+            words = kw.split()
+            first_word = words[0]
+
+            if not self._is_cyrillic(first_word):
+                continue
+
+            best = None
+            for p in self.morph.parse(first_word):
+                if (p.normal_form == original_lemma and
+                        p.tag.POS == 'NOUN' and
+                        p.score >= 0.3):
+                    best = p
+                    break
+
+            if best is None:
+                continue
+
+            grammemes = {'nomn'}
+            if 'plur' in best.tag:
+                grammemes.add('plur')
+            elif 'sing' in best.tag:
+                grammemes.add('sing')
+
+            inflected = best.inflect(grammemes)
+            nom_form = inflected.word if inflected else best.normal_form
+
+            tail = ' '.join(words[1:])
+            normalized_key = f"{nom_form} {tail}".strip() if tail else nom_form
+            normalized.add(normalized_key)
+
+        return sorted(normalized)
+
+
+# ── Parser ───────────────────────────────────────────────────────────────────
+
+class MorphParser:
+    """
+    Orchestrates: morph generation → parallel fetch → 4-axis trace → normalization.
+    """
+
+    def __init__(self, lang: str = "ru"):
+        self.generator = MorphGenerator(lang=lang)
+        self.normalizer = MorphNormalizer(lang=lang)
+
+    # ── HTTP ───────────────────────────────────────────────────────────────
+
+    def _clean(self, text: str) -> str:
         return re.sub(r'<[^>]+>', '', text).strip()
 
-    async def fetch_suggestions(
+    async def _fetch(
         self,
         query: str,
+        ua_type: str,
+        cp: Optional[int],
         country: str,
         language: str,
         client: httpx.AsyncClient,
-        google_client: str = "firefox",
-        cursor_position: Optional[int] = None,
+        extra_params: dict = None,
+        client_override: str = None,
     ) -> List[str]:
-        """
-        Google Autocomplete fetch — identical to suffix_parser.fetch_suggestions().
-        Supports all client types and cp variants.
-
-        cp = -1  → не передаём cp вообще
-        cp = None → cp = len(query) (курсор в конце)
-        cp = 0+  → явное значение
-        """
-        url = "https://www.google.com/complete/search"
+        """Single Google Autocomplete fetch. Handles all known response formats."""
+        effective_client = client_override if client_override else GOOGLE_CLIENTS[ua_type]
         params = {
             "q": query,
-            # [FIREFOX-ONLY EXPERIMENT] "client": google_client,
-            "client": "firefox",
+            "client": effective_client,
             "hl": language,
             "gl": country,
             "ie": "utf-8",
             "oe": "utf-8",
         }
-
-        if cursor_position == -1:
-            pass  # не добавляем cp
-        elif cursor_position is not None:
-            params["cp"] = cursor_position
-        else:
+        if cp is not None and cp >= 0:
+            params["cp"] = cp
+        elif cp is None:
             params["cp"] = len(query)
+        # cp == -1 → don't send cp (plain_nocp variant)
 
-        # [FIREFOX-ONLY EXPERIMENT] headers = {"User-Agent": random.choice(USER_AGENTS)}
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"}
+        if extra_params:
+            params.update(extra_params)
+
+        headers = {"User-Agent": UA_STRINGS[ua_type]}
 
         try:
-            response = await client.get(url, params=params, headers=headers, timeout=10.0)
+            resp = await client.get(
+                "https://www.google.com/complete/search",
+                params=params, headers=headers, timeout=10.0
+            )
 
-            if response.status_code == 429:
+            if resp.status_code == 429:
+                logger.warning(f"[MORPH] 429 rate-limit q='{query}' ua={ua_type}")
+                return []
+            if resp.status_code != 200:
                 return []
 
-            if response.status_code == 200:
-                text = response.text.strip()
+            text = resp.text.strip()
 
-                # Clean JSON (firefox, chrome, chrome-omni)
+            # Format 1: clean JSON (firefox, chrome)
+            try:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                    return self._parse_suggestions(data[1])
+            except Exception:
+                pass
+
+            # Format 2: security prefix  )]}'
+            if text.startswith(")]}'"):
                 try:
-                    data = response.json()
-                    if isinstance(data, list) and len(data) > 1:
-                        raw = data[1]
-                        if isinstance(raw, list):
-                            result = []
-                            for item in raw:
-                                if isinstance(item, str):
-                                    result.append(self._clean_suggestion(item))
-                                elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                    result.append(self._clean_suggestion(item[0]))
-                                elif isinstance(item, dict):
-                                    s = item.get("suggestion") or item.get("value") or item.get("text", "")
-                                    if s:
-                                        result.append(self._clean_suggestion(str(s)))
-                            return result
+                    data = json.loads(text[4:].strip())
+                    if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                        return self._parse_suggestions(data[1])
                 except Exception:
                     pass
 
-                # Strip security prefix )]}'  (gws-wiz, psy-ab)
-                if text.startswith(")]}'"):
-                    text = text[4:].strip()
-                    try:
-                        data = json.loads(text)
-                        if isinstance(data, list) and len(data) > 1:
-                            raw = data[1]
-                            if isinstance(raw, list):
-                                result = []
-                                for item in raw:
-                                    if isinstance(item, str):
-                                        result.append(self._clean_suggestion(item))
-                                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                        result.append(self._clean_suggestion(item[0]))
-                                    elif isinstance(item, dict):
-                                        s = item.get("suggestion") or item.get("value") or item.get("text", "")
-                                        if s:
-                                            result.append(self._clean_suggestion(str(s)))
-                                return result
-                    except Exception:
-                        pass
+            # Format 3: JSONP callback
+            m = re.search(r'\((\[.+\])\)\s*;?\s*$', text, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(1))
+                    if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                        return self._parse_suggestions(data[1])
+                except Exception:
+                    pass
 
-                # JSONP callback
-                jsonp_match = re.search(r'\((\[.+\])\)\s*;?\s*$', text, re.DOTALL)
-                if jsonp_match:
-                    try:
-                        data = json.loads(jsonp_match.group(1))
-                        if isinstance(data, list) and len(data) > 1:
-                            suggestions = data[1]
-                            if isinstance(suggestions, list):
-                                result = []
-                                for item in suggestions:
-                                    if isinstance(item, str):
-                                        result.append(self._clean_suggestion(item))
-                                    elif isinstance(item, list) and len(item) > 0:
-                                        result.append(self._clean_suggestion(str(item[0])))
-                                    elif isinstance(item, dict):
-                                        s = item.get("suggestion") or item.get("value") or item.get("text", "")
-                                        if s:
-                                            result.append(self._clean_suggestion(str(s)))
-                                return result
-                    except Exception:
-                        pass
+        except Exception as e:
+            logger.debug(f"[MORPH] fetch error: {e}")
 
-        except Exception:
-            pass
         return []
+
+    def _parse_suggestions(self, raw: list) -> List[str]:
+        result = []
+        for item in raw:
+            if isinstance(item, str):
+                result.append(self._clean(item))
+            elif isinstance(item, list) and item and isinstance(item[0], str):
+                result.append(self._clean(item[0]))
+            elif isinstance(item, dict):
+                s = item.get("suggestion") or item.get("value") or item.get("text", "")
+                if s:
+                    result.append(self._clean(str(s)))
+        return [r for r in result if r]
+
+    # ── Case batch fetch ───────────────────────────────────────────────────
+
+    async def _fetch_case_batch(
+        self,
+        case_label: str,
+        case_queries: List[MorphQuery],
+        country: str,
+        language: str,
+        proxy: Optional[str] = None,
+    ) -> Dict:
+        """
+        Fetch all queries for one case variant and build the per-case trace.
+
+        Structure returned:
+        {
+          case_label: str,
+          raw_keywords: set[str],
+          trace: {
+            suffix_label: {
+              ua_type: {
+                query, results, count, suffix_type, suffix_val, variant, priority
+              }
+            }
+          },
+          blocked: [ {suffix_label, suffix_val, blocked_by}, ... ]
+        }
+        """
+        case_trace: Dict = {}   # suffix_label → {ua_type → entry}
+        blocked_list = []
+        all_raw: Set[str] = set()
+
+        # Separate blocked from active
+        active_queries = [q for q in case_queries if q.priority > 0]
+        blocked_queries = [q for q in case_queries if q.priority == 0]
+
+        for q in blocked_queries:
+            blocked_list.append({
+                "suffix_label": q.suffix_label,
+                "suffix_val": q.suffix_val,
+                "suffix_type": q.suffix_type,
+                "blocked_by": q.blocked_by,
+            })
+
+        # Split by type: A/B/C/D (parallel) vs E (sequential per letter)
+        abcd_queries = [q for q in active_queries if q.suffix_type != "E"]
+        e_queries    = [q for q in active_queries if q.suffix_type == "E"]
+
+        async with httpx.AsyncClient(proxy=proxy) as client:
+
+            # ── A/B/C/D: all parallel via semaphore ───────────────────────
+            sem = asyncio.Semaphore(ABCD_SEMAPHORE)
+
+            async def fetch_abcd(q: MorphQuery, ua_type: str) -> tuple:
+                async with sem:
+                    results = await self._fetch(
+                        q.query, ua_type, q.cp_override, country, language, client,
+                        extra_params=q.extra_params,
+                        client_override=q.client_override,
+                    )
+                    return q, ua_type, results
+
+            abcd_tasks = [
+                fetch_abcd(q, ua_type)
+                for q in abcd_queries
+                for ua_type in _ua_list(q.ua_filter)
+            ]
+            abcd_results = await asyncio.gather(*abcd_tasks, return_exceptions=True)
+
+            for item in abcd_results:
+                if isinstance(item, Exception):
+                    logger.error(f"[MORPH] ABCD fetch exception: {item}")
+                    continue
+                q, ua_type, results = item
+                results = _filter_letter_artifacts(results, q.seed_variant)
+                all_raw.update(r.lower() for r in results)
+                sl = q.suffix_label
+                if sl not in case_trace:
+                    case_trace[sl] = {}
+                case_trace[sl][ua_type] = {
+                    "query": q.query,
+                    "results": results,
+                    "count": len(results),
+                    "suffix_type": q.suffix_type,
+                    "suffix_val": q.suffix_val,
+                    "variant": q.variant,
+                    "priority": q.priority,
+                }
+
+            # ── E (letters): sequential, one delay per letter ─────────────
+            by_letter: Dict[str, List[MorphQuery]] = defaultdict(list)
+            for q in e_queries:
+                by_letter[q.suffix_val].append(q)
+
+            for letter_queries in by_letter.values():
+                for q in letter_queries:
+                    for ua_type in _ua_list(q.ua_filter):
+                        results = await self._fetch(
+                            q.query, ua_type, q.cp_override, country, language, client,
+                            extra_params=q.extra_params,
+                            client_override=q.client_override,
+                        )
+                        results = _filter_letter_artifacts(results, q.seed_variant)
+                        all_raw.update(r.lower() for r in results)
+                        sl = q.suffix_label
+                        if sl not in case_trace:
+                            case_trace[sl] = {}
+                        case_trace[sl][ua_type] = {
+                            "query": q.query,
+                            "results": results,
+                            "count": len(results),
+                            "suffix_type": q.suffix_type,
+                            "suffix_val": q.suffix_val,
+                            "variant": q.variant,
+                            "priority": q.priority,
+                        }
+                await asyncio.sleep(MORPH_DELAY)
+
+        return {
+            "case_label": case_label,
+            "raw_keywords": all_raw,
+            "trace": case_trace,
+            "blocked": blocked_list,
+        }
+
+    # ── Main parse ─────────────────────────────────────────────────────────
 
     async def parse(
         self,
         seed: str,
-        operator: str = "купить",
         country: str = "ua",
         language: str = "ru",
-        groups: Optional[List[str]] = None,
-        google_client: str = "firefox",  # firefox-only (одиночный вызов)
-        progress_callback=None,  # async callable(done, total, entry) for live updates
-    ) -> PrefixParseResult:
+        region: str = "ua",
+        include_numbers: bool = False,
+        methods: str = "all",
+    ) -> MorphParseResult:
         """
-        Main parse method — dual-agent parallel execution.
+        Main parse method.
 
-        Архитектура:
-            Chrome и Firefox стартуют одновременно (asyncio.gather на уровне агентов).
-            Внутри каждого агента запросы параллельны через asyncio.Semaphore(BATCH_SIZE).
-            PA группа → Chrome only (pq.agents = ("chrome",))
-            G1-G9, PC  → оба агента (pq.agents = ("chrome", "firefox"))
-
-        Результат: объединённый kw_map из обоих агентов.
-        Трейс: каждая запись содержит поле agent ("chrome" / "firefox").
+        Steps:
+        1. Analyze seed → MorphSeedAnalysis (noun + case variants)
+        2. Generate all MorphQuery objects (full suffix map × all cases)
+        3. Group by case_label → parallel asyncio.gather across all case groups
+        4. Build 4-axis trace per case
+        5. Normalize + cross-case unique analysis
+        6. Assemble stats
         """
-        from datetime import datetime
         total_start = time.time()
-        timestamp = datetime.utcnow().isoformat() + "Z"
 
-        # Generate matrix
-        matrix: List[PrefixQuery] = self.generator.generate(
-            seed=seed,
-            operator=operator,
-            groups=groups or ALL_GROUPS,
+        # ── Step 1: Seed analysis ──────────────────────────────────────────
+        analysis = self.generator.analyze_seed(seed)
+        if analysis is None:
+            return MorphParseResult(
+                seed=seed,
+                analysis_summary={"error": "No suitable noun found in seed"},
+                stats={"error": "no_noun"},
+            )
+
+        # ── Step 2: Generate all queries ───────────────────────────────────
+        all_queries = self.generator.generate_queries(
+            analysis,
+            region=region,
+            include_numbers=include_numbers,
+            include_letters=True,
+            methods=methods,
+        )
+        analysis_summary = self.generator.summary(analysis, all_queries)
+
+        logger.info(
+            f"[MORPH] seed='{seed}' noun='{analysis.original_noun}' "
+            f"lemma='{analysis.original_lemma}' "
+            f"cases={len(analysis.case_variants)} "
+            f"total_queries={len(all_queries)}"
         )
 
-        # Brute-suffix варианты — ОТКЛЮЧЕНО для лайт-серча
-        # for brute_seed in _brute_seed_variants(seed):
-        #     brute_matrix = self.generator.generate(
-        #         seed=brute_seed,
-        #         operator=operator,
-        #         groups=groups or ALL_GROUPS,
-        #     )
-        #     matrix.extend(brute_matrix)
+        # ── Step 3: Group by case → parallel fetch ─────────────────────────
+        by_case: Dict[str, List[MorphQuery]] = defaultdict(list)
+        for q in all_queries:
+            by_case[q.case_label].append(q)
 
-        # Shared state — защищена asyncio.Lock (оба агента пишут одновременно)
-        kw_map: Dict[str, List[str]] = {}
-        alt_seed_set: Set[str] = set()
-        trace_entries: List[PrefixTraceEntry] = []
-        lock = asyncio.Lock()
-        done = 0
-        total_tasks = sum(len(pq.agents) for pq in matrix)  # Chrome + Firefox запросы
+        # Proxy pool: each case gets a proxy by round-robin
+        proxy_pool = _load_proxy_pool()
+        case_tasks = [
+            self._fetch_case_batch(
+                case_label, case_queries, country, language,
+                proxy=proxy_pool[i % len(proxy_pool)],
+            )
+            for i, (case_label, case_queries) in enumerate(by_case.items())
+        ]
+        batch_results = await asyncio.gather(*case_tasks, return_exceptions=True)
 
-        async def fetch_one(pq: PrefixQuery, agent: str, client: httpx.AsyncClient,
-                            semaphore: asyncio.Semaphore):
-            nonlocal done
-            async with semaphore:
-                await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
-                t0 = time.time()
-                try:
-                    results = await self.fetch_suggestions(
-                        query=pq.query,
-                        country=country,
-                        language=language,
-                        client=client,
-                        google_client=agent,
-                        cursor_position=pq.cp,
-                    )
-                    elapsed = (time.time() - t0) * 1000
-                    # Фильтр мусора — убираем спецсимволы и нераскрытые буквы
-                    results = [kw for kw in results if not _is_garbage_keyword(kw)]
-                    status = "ok" if results else "empty"
-                    entry = PrefixTraceEntry(
-                        group=pq.group, struct=pq.struct,
-                        operator=pq.operator, op_type=pq.op_type,
-                        query_sent=pq.query, cp=pq.cp, cp_note=pq.cp_note,
-                        results=results, results_count=len(results),
-                        time_ms=round(elapsed, 1), status=status,
-                        letter=pq.letter,
-                        agent=agent,
-                    )
-                    async with lock:
-                        for kw in results:
-                            k = kw.lower().strip()
-                            if k not in kw_map:
-                                kw_map[k] = []
-                            kw_map[k].append(f"{agent}:{pq.struct}")
-                            if seed.lower() not in k:
-                                alt_seed_set.add(k)
+        # ── Step 4: Build trace + collect raw keywords ─────────────────────
+        # trace[case_label][suffix_label][ua_type] → entry
+        full_trace: Dict = {}
+        all_raw_keywords: Set[str] = set()
 
-                except Exception as e:
-                    elapsed = (time.time() - t0) * 1000
-                    entry = PrefixTraceEntry(
-                        group=pq.group, struct=pq.struct,
-                        operator=pq.operator, op_type=pq.op_type,
-                        query_sent=pq.query, cp=pq.cp, cp_note=pq.cp_note,
-                        time_ms=round(elapsed, 1), status="error",
-                        error=str(e), letter=pq.letter,
-                        agent=agent,
-                    )
+        case_raw_sets: Dict[str, Set[str]] = {}   # for cross-case unique analysis
 
-                async with lock:
-                    trace_entries.append(entry)
-                    done += 1
-                if progress_callback:
-                    await progress_callback(done, total_tasks, entry)
-
-        async def run_agent(agent: str):
-            """Запускает все запросы для одного агента в параллельных батчах."""
-            agent_queries = [pq for pq in matrix if agent in pq.agents]
-            if not agent_queries:
-                return
-            semaphore = asyncio.Semaphore(BATCH_SIZE)
-            async with httpx.AsyncClient(proxy=_PROXY_URL) as client:
-                tasks = [fetch_one(pq, agent, client, semaphore) for pq in agent_queries]
-                await asyncio.gather(*tasks)
-
-        # Firefox-only агент
-        await asyncio.gather(
-            run_agent("firefox"),
-        )
-
-        total_time = (time.time() - total_start) * 1000
-
-        # Post-process: mark unique per entry
-        for entry in trace_entries:
-            entry.unique = [
-                kw for kw in entry.results
-                if len(kw_map.get(kw.lower().strip(), [])) == 1
-            ]
-
-        # Summary by group
-        summary_by_group = {}
-        for g in ALL_GROUPS:
-            ge = [e for e in trace_entries if e.group == g]
-            if not ge:
+        for batch in batch_results:
+            if isinstance(batch, Exception):
+                logger.error(f"[MORPH] Case batch exception: {batch}")
                 continue
-            kws_in_group: set = set()
-            for e in ge:
-                kws_in_group.update(k.lower().strip() for k in e.results)
-            ge_chrome  = [e for e in ge if e.agent == "chrome"]
-            ge_firefox = [e for e in ge if e.agent == "firefox"]
-            summary_by_group[g] = {
-                "total_queries":   len(ge),
-                "with_results":    sum(1 for e in ge if e.status == "ok"),
-                "empty":           sum(1 for e in ge if e.status == "empty"),
-                "errors":          sum(1 for e in ge if e.status == "error"),
-                "unique_keywords": len(kws_in_group),
-                "exclusive":       sum(len(e.unique) for e in ge),
-                "avg_time_ms":     round(sum(e.time_ms for e in ge) / max(len(ge), 1), 1),
-                "by_agent": {
-                    "chrome":  {"queries": len(ge_chrome),  "hits": sum(1 for e in ge_chrome  if e.status == "ok")},
-                    "firefox": {"queries": len(ge_firefox), "hits": sum(1 for e in ge_firefox if e.status == "ok")},
+
+            cl = batch["case_label"]
+            raw_kws = batch["raw_keywords"]
+            all_raw_keywords.update(raw_kws)
+            case_raw_sets[cl] = raw_kws
+
+            _case_tag, _number_tag, case_display = CASES_RU[cl]
+            full_trace[cl] = {
+                "_meta": {
+                    "case_display": case_display,
+                    "seed_variant": analysis.case_variants.get(cl, ""),
+                    "raw_count": len(raw_kws),
+                    "blocked_count": len(batch["blocked"]),
+                    "blocked": batch["blocked"],
+                    # normalized_count + unique_count filled in Step 5
                 },
+                **batch["trace"],   # suffix_label → {ua_type → entry}
             }
 
-        # Build result
-        exclusive_kw = {kw: structs[0] for kw, structs in kw_map.items() if len(structs) == 1}
-
-        return PrefixParseResult(
-            seed=seed,
-            operator=operator,
-            country=country,
-            language=language,
-            groups_used=list({e.group for e in trace_entries}),
-            all_keywords=kw_map,
-            alt_seed_keywords=alt_seed_set,
-            exclusive_keywords=exclusive_kw,
-            total_queries=len(trace_entries),
-            with_results=sum(1 for e in trace_entries if e.status == "ok"),
-            empty_queries=sum(1 for e in trace_entries if e.status == "empty"),
-            error_queries=sum(1 for e in trace_entries if e.status == "error"),
-            total_keywords=len(kw_map),
-            exclusive_count=len(exclusive_kw),
-            total_time_ms=round(total_time, 1),
-            trace=[asdict(e) for e in trace_entries],
-            summary_by_group=summary_by_group,
-            timestamp=timestamp,
+        # ── Step 5: Normalization + cross-case unique analysis ─────────────
+        # Global normalization
+        all_normalized = self.normalizer.normalize(
+            list(all_raw_keywords), analysis.original_lemma
         )
 
+        # Per-case normalization
+        # stem_cut: пропускаем нормализацию — сохраняем сырой ответ Google для анализа
+        case_norm_sets: Dict[str, Set[str]] = {}
+        for cl, raw_set in case_raw_sets.items():
+            if cl == "stem_cut":
+                norm = sorted(raw_set)   # без нормализации — как вернул Google
+            else:
+                norm = self.normalizer.normalize(list(raw_set), analysis.original_lemma)
+            case_norm_sets[cl] = set(norm)
+            if cl in full_trace:
+                full_trace[cl]["_meta"]["normalized_count"] = len(norm)
+                full_trace[cl]["_meta"]["normalized_keywords"] = norm
 
-# ══════════════════════════════════════════════
-# FASTAPI INTEGRATION
-# Server-side: добавить в main.py:
-#   from parser.prefix_parser import register_prefix_endpoint
-#   register_prefix_endpoint(app)
-# ══════════════════════════════════════════════
+        # Per-case uniqueness: keywords exclusive to this case only
+        all_norm_union = set(all_normalized)
+        for cl, my_norm in case_norm_sets.items():
+            other_union: Set[str] = set()
+            for other_cl, other_norm in case_norm_sets.items():
+                if other_cl != cl:
+                    other_union.update(other_norm)
+            unique_to_case = my_norm - other_union
+            if cl in full_trace:
+                full_trace[cl]["_meta"]["unique_count"] = len(unique_to_case)
+                full_trace[cl]["_meta"]["unique_keywords"] = sorted(unique_to_case)
 
-def register_prefix_endpoint(app):
-    """
-    Register two endpoints on the FastAPI app.
+        # Per-suffix-label uniqueness within each case
+        # (which exact suffix_label added keywords not found by any other suffix_label in this case)
+        for cl in full_trace:
+            case_meta = full_trace[cl].get("_meta", {})
+            # Aggregate: per suffix_label → all results combined (chrome+firefox)
+            suffix_kw_sets: Dict[str, Set[str]] = {}
+            for key, val in full_trace[cl].items():
+                if key == "_meta":
+                    continue
+                # val = {ua_type → entry}
+                kws: Set[str] = set()
+                for ua_type, entry in val.items():
+                    for r in entry.get("results", []):
+                        kws.add(r.lower())
+                suffix_kw_sets[key] = kws
 
-    GET /api/prefix-fetch  — single query fetch (для HTML матричного прогона)
-    GET /api/prefix-map    — full matrix run (весь прогон с трейсером)
-    """
-    try:
-        from fastapi import Query as FQuery
-    except ImportError:
-        raise ImportError("fastapi not installed — for local testing use __main__ below")
+            for suffix_label, my_kws in suffix_kw_sets.items():
+                other_kws: Set[str] = set()
+                for other_sl, other_kws_set in suffix_kw_sets.items():
+                    if other_sl != suffix_label:
+                        other_kws.update(other_kws_set)
+                unique_for_suffix = my_kws - other_kws
+                # Add unique_count to each ua_type entry for this suffix
+                for ua_type in full_trace[cl].get(suffix_label, {}):
+                    full_trace[cl][suffix_label][ua_type]["unique_in_case"] = len(unique_for_suffix)
 
-    _parser = PrefixParser()
+        # ── Step 6: Stats ──────────────────────────────────────────────────
+        active_q = [q for q in all_queries if q.priority > 0]
+        blocked_q = [q for q in all_queries if q.priority == 0]
 
-    @app.get("/api/prefix-fetch")
-    async def prefix_fetch(
-        seed: str = FQuery(..., description="Полный query string (уже с оператором и структурой)"),
-        country: str = FQuery("ua"),
-        language: str = FQuery("ru"),
-        google_client: str = FQuery("firefox"),
-        cp: Optional[int] = FQuery(None, description="Cursor position (-1 = не передавать)"),
-    ):
-        """
-        Single Google Autocomplete fetch.
-        HTML-страница вызывает этот endpoint для каждой строки матрицы.
-        """
-        async with httpx.AsyncClient() as client:
-            results = await _parser.fetch_suggestions(
-                query=seed,
-                country=country,
-                language=language,
-                client=client,
-                google_client=google_client,
-                cursor_position=cp,
-            )
-        return {"query": seed, "cp": cp, "results": results}
-
-    @app.get("/api/prefix-map")
-    async def prefix_map(
-        seed: str = FQuery(..., description="Базовый сид"),
-        operator: str = FQuery("купить"),
-        groups: str = FQuery("all", description="Группы: all или G1,G2,PA,PC"),
-        country: str = FQuery("ua"),
-        language: str = FQuery("ru"),
-        google_client: str = FQuery("firefox"),
-    ):
-        """
-        Full prefix matrix run — server-side batch.
-        Возвращает полный трейсер + агрегированные ключи.
-        """
-        grp = None if groups == "all" else groups.split(",")
-        result = await _parser.parse(
-            seed=seed,
-            operator=operator,
-            country=country,
-            language=language,
-            groups=grp,
-            google_client=google_client,
-        )
-        return {
-            "method": "prefix-map",
-            "seed": result.seed,
-            "operator": result.operator,
-            "total_queries": result.total_queries,
-            "total_keywords": result.total_keywords,
-            "exclusive_count": result.exclusive_count,
-            "time": f"{result.total_time_ms:.0f}ms",
-            "prefix_trace": {
-                "summary_by_group": result.summary_by_group,
-                "all_keywords": result.all_keywords,
-                "exclusive_keywords": result.exclusive_keywords,
-                "trace": result.trace,
-                "total_time_ms": result.total_time_ms,
-                "timestamp": result.timestamp,
+        stats = {
+            "cases_active": len(analysis.case_variants),
+            "cases_skipped": len(analysis.skipped_cases),
+            "total_morph_queries_generated": len(all_queries),
+            "active_queries": len(active_q),
+            "blocked_queries": len(blocked_q),
+            "fetch_requests": len(active_q) * 2,   # chrome + firefox per query
+            "total_raw_keywords": len(all_raw_keywords),
+            "total_normalized": len(all_normalized),
+            "by_case": {
+                cl: {
+                    "raw": full_trace[cl]["_meta"].get("raw_count", 0),
+                    "normalized": full_trace[cl]["_meta"].get("normalized_count", 0),
+                    "unique": full_trace[cl]["_meta"].get("unique_count", 0),
+                }
+                for cl in full_trace
             },
         }
 
+        total_time = round(time.time() - total_start, 1)
+        logger.info(
+            f"[MORPH] Done | raw={len(all_raw_keywords)} "
+            f"normalized={len(all_normalized)} "
+            f"time={total_time}s"
+        )
 
-# ══════════════════════════════════════════════
-# LOCAL TEST MODE
-# python prefix_parser.py --seed "имплантация зубов" --op "купить" --groups G1,G7,PA
-# ══════════════════════════════════════════════
-
-async def _local_run(seed: str, operator: str, groups: Optional[List[str]],
-                     country: str, language: str, google_client: str,
-                     output_file: Optional[str] = None):
-    """Run prefix matrix locally and print results + save JSON."""
-    print(f"\n{'='*60}")
-    print(f"  Prefix Parser — LOCAL TEST")
-    print(f"  Seed:     {seed}")
-    print(f"  Operator: {operator}")
-    print(f"  Groups:   {groups or 'ALL'}")
-    print(f"  Country:  {country} | Lang: {language} | Client: {google_client}")
-    print(f"{'='*60}\n")
-
-    parser = PrefixParser()
-
-    # Progress callback
-    done_count = [0]
-    def make_progress():
-        async def cb(done, total, entry):
-            done_count[0] = done
-            icon = "✅" if entry.status == "ok" else ("○" if entry.status == "empty" else "❌")
-            cnt  = f"{entry.results_count} ключей" if entry.status == "ok" else entry.status
-            print(f"  [{done:>4}/{total}] {icon} {entry.group:<4} {entry.struct:<30} cp={entry.cp:<5} {cnt}")
-        return cb
-
-    result = await parser.parse(
-        seed=seed,
-        operator=operator,
-        country=country,
-        language=language,
-        groups=groups,
-        google_client=google_client,
-        progress_callback=make_progress(),
-    )
-
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"  РЕЗУЛЬТАТЫ")
-    print(f"{'='*60}")
-    print(f"  Запросов:        {result.total_queries}")
-    print(f"  С результатами:  {result.with_results}")
-    print(f"  Пустых:          {result.empty_queries}")
-    print(f"  Ошибок:          {result.error_queries}")
-    print(f"  Уникальных кл.:  {result.total_keywords}")
-    print(f"  Эксклюзивных:    {result.exclusive_count} (только 1 структура)")
-    print(f"  Время:           {result.total_time_ms:.0f}ms")
-    print(f"\n  По группам:")
-    for g, s in result.summary_by_group.items():
-        pct = round(s['with_results']/max(s['total_queries'],1)*100)
-        print(f"    {g:<6} {s['with_results']:>3}/{s['total_queries']:<4} ({pct:>3}%) "
-              f"| {s['unique_keywords']:>4} кл. | {s['exclusive']:>3} эксклюз.")
-
-    if result.exclusive_keywords:
-        print(f"\n  Топ-30 эксклюзивных ключей:")
-        for kw, struct in list(result.exclusive_keywords.items())[:30]:
-            print(f"    [{struct}] {kw}")
-
-    # Save JSON
-    from datetime import datetime
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fn = output_file or f"prefix_trace_{seed.replace(' ','_')}_{ts}.json"
-
-    export = {
-        "meta": {
-            "seed": result.seed, "operator": result.operator,
-            "country": result.country, "language": result.language,
-            "groups": result.groups_used, "timestamp": result.timestamp,
-            "total_time_ms": result.total_time_ms,
-        },
-        "summary": {
-            "total_queries": result.total_queries,
-            "with_results":  result.with_results,
-            "empty":         result.empty_queries,
-            "errors":        result.error_queries,
-            "total_keywords": result.total_keywords,
-            "exclusive_count": result.exclusive_count,
-        },
-        "summary_by_group": result.summary_by_group,
-        "kw_map":            result.all_keywords,
-        "exclusive_keywords": result.exclusive_keywords,
-        "trace": result.trace,
-    }
-
-    with open(fn, "w", encoding="utf-8") as f:
-        json.dump(export, f, ensure_ascii=False, indent=2)
-
-    print(f"\n  💾 Сохранено: {fn}")
-    print(f"{'='*60}\n")
-
-
-if __name__ == "__main__":
-    parser_cli = argparse.ArgumentParser(description="Prefix Parser — local test")
-    parser_cli.add_argument("--seed",    default="имплантация зубов", help="Base seed")
-    parser_cli.add_argument("--op",      default="купить",            help="Operator")
-    parser_cli.add_argument("--groups",  default="all",               help="Groups: all or G1,G2,PA")
-    parser_cli.add_argument("--country", default="ua",                help="Country code")
-    parser_cli.add_argument("--lang",    default="ru",                help="Language code")
-    parser_cli.add_argument("--client",  default="firefox",            help="Google client")
-    parser_cli.add_argument("--out",     default=None,                help="Output JSON file")
-    args = parser_cli.parse_args()
-
-    grp = None if args.groups == "all" else args.groups.split(",")
-
-    asyncio.run(_local_run(
-        seed=args.seed,
-        operator=args.op,
-        groups=grp,
-        country=args.country,
-        language=args.lang,
-        google_client=args.client,
-        output_file=args.out,
-    ))
+        return MorphParseResult(
+            seed=seed,
+            analysis_summary=analysis_summary,
+            keywords=all_normalized,
+            keywords_raw=sorted(all_raw_keywords),
+            trace=full_trace,
+            stats=stats,
+            total_time_s=total_time,
+        )
