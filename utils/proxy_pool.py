@@ -31,12 +31,15 @@ logger = logging.getLogger(__name__)
 # Размер батча и роли
 BATCH_SIZE = 10
 ROLE_MAP = {
-    "infix_chrome":  0,   # всегда первый IP в батче
-    "infix_firefox": 1,   # всегда второй IP в батче
-    # suffix/prefix берут IP с индекса 2 по 9 по round-robin
+    "infix_chrome":   0,   # всегда первый IP в батче
+    "infix_firefox":  1,   # всегда второй IP в батче
+    "prefix_chrome":  2,   # PA Chrome — letter-parallel треки
+    "prefix_firefox": 3,   # PA FF + G FF
+    "prefix_nonpa":   4,   # G+PC Chrome (небольшой semaphore)
+    # suffix/morph берут IP с индекса 5 по 9 по round-robin
 }
-GENERAL_ROLES = {"suffix", "prefix", "morph"}
-GENERAL_START = 2   # IP с этого индекса идут на общие парсеры
+GENERAL_ROLES = {"suffix", "morph"}
+GENERAL_START = 5   # IP с этого индекса идут на общие парсеры
 
 
 class ProxyPool:
