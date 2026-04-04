@@ -57,13 +57,13 @@ def register_suffix_endpoint(app: FastAPI):
         echelon: int = Query(0, description="0=все, 1=только P1, 2=только P2"),
         include_numbers: bool = Query(False, description="Числовые суффиксы 0-9"),
         filters: str = Query("none", description="Фильтры (для совместимости)"),
-        google_client: str = Query("firefox", description="Autocomplete client: firefox/chrome/chrome-omni/safari/psy-ab/gws-wiz"),
         cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
-        include_letters: bool = Query(True, description="Letter Sweep — буквенный перебор (а е и о у б в д к р)"),
+        include_letters: bool = Query(True, description="Letter Sweep — буквенный перебор"),
     ):
         """
         SUFFIX MAP: Smart suffix expansion with priority matrix + tracer.
-        Returns keywords + detailed suffix tracer data.
+        Dual-agent: Chrome + Firefox запускаются параллельно внутри парсера.
+        Параметр google_client удалён — агенты управляются внутренней логикой.
         """
         sp = get_suffix_parser()
         result = await sp.parse(
@@ -73,7 +73,6 @@ def register_suffix_endpoint(app: FastAPI):
             parallel_limit=parallel,
             include_numbers=include_numbers,
             echelon=echelon,
-            google_client=google_client,
             cursor_position=cp,
             include_letters=include_letters,
         )
@@ -93,7 +92,6 @@ def register_suffix_endpoint(app: FastAPI):
         return {
             "method": "suffix-map",
             "seed": seed,
-            "google_client": google_client,
             "cursor_position": cp,
             "keywords": keywords_for_html,
             "keywords_grey": [],
