@@ -19,17 +19,56 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
 try:
-    from parser.suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis
+    from parser.suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis, FF_BCD_SKIP_VARIANTS
 except ImportError:
-    from suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis
+    from suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis, FF_BCD_SKIP_VARIANTS
+
+# ══════════════════════════════════════════════
+# [P0-CHR-SKIP] Chrome BCD variant skip list (Порог 0, 4 датасета GT)
+# 11 вариантов — 100% дубли на всех датасетах, нулевой GT-эксклюзив.
+# НЕ удалять — при расширении датасетов или языков пересматривать.
+# ══════════════════════════════════════════════
+CHROME_BCD_SKIP: set = {
+    # Type B
+    "prep_bez_v3",   # v3 всегда дубль v1/v2 для предлога без
+    "prep_iz_v3",    # v3 всегда дубль
+    "prep_na_v3",    # v3 всегда дубль
+    "prep_ot_v2",    # v2 дублирует v1 для предлога от везде
+    "prep_pod_v3",   # v3 всегда дубль
+    # Type C
+    "q_gde_v1",      # v1 дублирует v2 для где на всех датасетах
+    "q_kakoy_v3",    # v3 всегда дубль
+    "q_pochemu_v3",  # v3 всегда дубль
+    # Type D
+    "fin_analogi_v3",   # v3 всегда дубль
+    "fin_i_v3",         # v3 всегда дубль
+    "fin_sravnenie_v3", # v3 всегда дубль
+}
+
+# [P0-CHR-SKIP] E_simple Chrome — только 9 букв с Chrome-exclusive GT ключами
+# Убраны: е ж к л м н о п т ф х ц ч ш э ю я (17 букв — 100% дубли + нулевой GT)
+CHROME_E_SIMPLE_LETTERS: set = set("идгёйсврз")
+
+# [P0-CHR-SKIP] Per-letter Chrome E exceptions (variant active для всех букв кроме указанных)
+# trail: буквы й п щ дают 0 GT — убираем только для них
+# wcB_cpMid: буква э даёт 0 GT — убираем только для неё
+CHROME_E_LETTER_SKIP: dict = {
+    "й": {"trail"},
+    "п": {"trail"},
+    "щ": {"trail"},
+    "э": {"wcB_cpMid"},
+}
 
 
-USER_AGENTS = [
-    # [FIREFOX-ONLY EXPERIMENT] Chrome UA закомментированы
-    # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+USER_AGENTS_CHROME = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+USER_AGENTS_FF = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
+# Backward compat
+USER_AGENTS = USER_AGENTS_FF
 
 
 class AdaptiveDelay:
@@ -175,8 +214,7 @@ class SuffixParser:
         url = "https://www.google.com/complete/search"
         params = {
             "q": query,
-            # [FIREFOX-ONLY EXPERIMENT] "client": google_client,
-            "client": "firefox",
+            "client": google_client,
             "hl": language,
             "gl": country,
             "ie": "utf-8",
@@ -192,8 +230,11 @@ class SuffixParser:
             params["cp"] = cursor_position
         else:
             params["cp"] = len(query)
-        # [FIREFOX-ONLY EXPERIMENT] headers = {"User-Agent": random.choice(USER_AGENTS)}
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"}
+        # Выбираем UA в зависимости от агента
+        if "chrome" in google_client:
+            headers = {"User-Agent": random.choice(USER_AGENTS_CHROME)}
+        else:
+            headers = {"User-Agent": random.choice(USER_AGENTS_FF)}
 
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
@@ -654,17 +695,114 @@ class SuffixParser:
         #         await asyncio.sleep(0.3)
         #         await fetch_one_firefox(sq, client)
 
-        async def run_google(client: httpx.AsyncClient):
-            # Phase 1: A/B/C/D + E_simple — параллельно (как раньше)
-            phase1_tasks = [fetch_with_semaphore(sq, client) for sq in other_queries]
-            phase1_tasks.append(run_e_simple(client))
-            await asyncio.gather(*phase1_tasks)
+        # ── Chrome E structured ──────────────────────────────────────────────
+        async def fetch_e_chr_one(sq: "SuffixQuery", client: httpx.AsyncClient):
+            """Chrome E запрос: CHROME_E_SKIP (variant-level) + CHROME_E_LETTER_SKIP (per-letter)."""
+            if sq.variant in CHROME_E_SKIP:
+                return
+            letter_skip = CHROME_E_LETTER_SKIP.get(sq.suffix_val, set())
+            if sq.variant in letter_skip:
+                return
+            async with e_chrome_sem:
+                await asyncio.sleep(random.uniform(0.3, 0.5))
+                await fetch_one_tracked(sq, client, force_client="chrome")
 
-            # Phase 2: E chrome — только буквы где E_simple дал >= 3 результатов
+        async def run_e_chr_with_novelty(client: httpx.AsyncClient):
+            """Chrome E structured с novelty threshold — аналог FF версии."""
+            e_simple_counts: Dict[str, int] = {}
+            for t in trace_entries:
+                if t.suffix_type in ("E_simple", "E_simple_chr") and t.suffix_val:
+                    e_simple_counts[t.suffix_val] = max(
+                        e_simple_counts.get(t.suffix_val, 0), t.results_count
+                    )
+
+            letters = list(e_queries_by_letter.keys())
+            active_letters = [L for L in letters if e_simple_counts.get(L, 0) >= E_SIMPLE_MIN_RESULTS]
+
+            if self.morph:
+                seed_lemmas_e = {self.morph.parse(w)[0].normal_form
+                                 for w in re.findall(r'[а-яёa-z0-9]+', seed.lower())}
+            else:
+                seed_lemmas_e = set(seed.lower().split())
+
+            def current_fps():
+                return {self.get_intent_fingerprint(kw, seed_lemmas_e) for kw in all_keywords.keys()}
+
+            for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
+                batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
+                fps_before = current_fps()
+                tasks = [fetch_e_chr_one(sq, client)
+                         for L in batch for sq in e_queries_by_letter.get(L, [])]
+                await asyncio.gather(*tasks)
+                if len(current_fps() - fps_before) < E_NOVELTY_MIN_NEW:
+                    break
+
+        # ── E_simple Chrome ───────────────────────────────────────────────
+        async def run_e_simple_chrome(client: httpx.AsyncClient):
+            """E_simple Chrome: только 9 букв с Chrome-exclusive GT ключами."""
+            e_chr_sem = asyncio.Semaphore(5)
+
+            async def fetch_chr_char(char: str):
+                async with e_chr_sem:
+                    await asyncio.sleep(0.3)
+                    q = f"{seed} {char}"
+                    sq_chr = SuffixQuery(
+                        query=q, suffix_val=char, suffix_label=f"simple_{char}_chr",
+                        suffix_type="E_simple_chr", priority=1, markers=["e_simple_chr"], cp_override=-1,
+                    )
+                    t0 = time.time()
+                    results = await self.fetch_suggestions(q, country, language, client, "chrome", -1)
+                    elapsed = (time.time() - t0) * 1000
+                    _record_results(sq_chr, results, elapsed)
+
+            await asyncio.gather(*[fetch_chr_char(c) for c in ALPHABET if c in CHROME_E_SIMPLE_LETTERS])
+
+        # ── Agent runners ─────────────────────────────────────────────────
+        chr_sem = asyncio.Semaphore(5)
+        ff_sem  = asyncio.Semaphore(5)
+
+        async def fetch_chr_abcd(sq: "SuffixQuery", client: httpx.AsyncClient):
+            """Chrome A/B/C/D с CHROME_BCD_SKIP."""
+            if sq.suffix_label in CHROME_BCD_SKIP:
+                return
+            async with chr_sem:
+                await asyncio.sleep(0.3)
+                await fetch_one_tracked(sq, client, force_client="chrome")
+
+        async def fetch_ff_abcd(sq: "SuffixQuery", client: httpx.AsyncClient):
+            """Firefox A/B/C/D с FF_BCD_SKIP_VARIANTS."""
+            if sq.suffix_label in FF_BCD_SKIP_VARIANTS:
+                return
+            async with ff_sem:
+                await asyncio.sleep(0.3)
+                await fetch_one_tracked(sq, client, force_client="firefox")
+
+        async def run_chrome(client: httpx.AsyncClient):
+            """Chrome agent: A/B/C/D + E_simple + E structured."""
+            phase1 = [fetch_chr_abcd(sq, client) for sq in other_queries]
+            phase1.append(run_e_simple_chrome(client))
+            await asyncio.gather(*phase1)
+            try:
+                await run_e_chr_with_novelty(client)
+            except Exception as e:
+                print(f"[ChromeE Error] seed={seed!r}: {e!r}")
+
+        async def run_firefox(client: httpx.AsyncClient):
+            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist)."""
+            phase1 = [fetch_ff_abcd(sq, client) for sq in other_queries]
+            phase1.append(run_e_simple(client))
+            await asyncio.gather(*phase1)
             try:
                 await run_e_chrome_with_novelty(client)
             except Exception as e:
-                print(f"[Phase2Error] seed={seed!r} error in run_e_chrome_with_novelty: {e!r}")
+                print(f"[FirefoxE Error] seed={seed!r}: {e!r}")
+
+        async def run_google(client: httpx.AsyncClient):
+            """Dual-agent: Chrome + Firefox параллельно."""
+            await asyncio.gather(
+                run_chrome(client),
+                run_firefox(client),
+            )
 
         async def run_yandex(client: httpx.AsyncClient):
             ya_sem = asyncio.Semaphore(5)
