@@ -33,8 +33,23 @@ DELAY_LOCAL  = 0.3
 DELAY_SERVER = 0.3
 BATCH_SIZE   = 5
 
-_google_proxy = os.getenv("GOOGLE_PROXY_URL") or None
-DELAY = DELAY_SERVER if _google_proxy else DELAY_LOCAL
+# Два отдельных IP: Chrome и Firefox идут на разные прокси
+# Если INFIX_PROXY_CHROME/FF не заданы — fallback на GOOGLE_PROXY_URL
+try:
+    from utils.proxy_pool import ProxyPool
+    _proxy_chrome  = ProxyPool.get("infix_chrome")
+    _proxy_firefox = ProxyPool.get("infix_firefox")
+except ImportError:
+    try:
+        from proxy_pool import ProxyPool
+        _proxy_chrome  = ProxyPool.get("infix_chrome")
+        _proxy_firefox = ProxyPool.get("infix_firefox")
+    except ImportError:
+        _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
+        _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
+
+_google_proxy = _proxy_chrome  # для обратной совместимости
+DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
 
 # Предлоги и союзы — одиночные буквы из этого списка НЕ мусор
 PREP_UNION = {"в","во","на","с","со","к","ко","о","у","и","а","б","я"}
@@ -258,22 +273,39 @@ class InfixParser:
             async with non_e_sem:
                 await fetch_one(iq, client)
 
-        async with httpx.AsyncClient(proxy=_google_proxy) as client:
+        async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
+                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
             from collections import defaultdict
-            e_by_letter = defaultdict(list)
-            non_e = []
+            e_by_letter_chr = defaultdict(list)
+            e_by_letter_ff  = defaultdict(list)
+            non_e_chr = []
+            non_e_ff  = []
             for iq in matrix:
+                is_ff = "firefox" in iq.agents
                 if iq.group == "E" and iq.letter:
-                    e_by_letter[iq.letter].append(iq)
+                    (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
                 else:
-                    non_e.append(iq)
+                    (non_e_ff if is_ff else non_e_chr).append(iq)
 
             await asyncio.gather(
-                *[run_letter(qs, client) for qs in e_by_letter.values()],
-                *[run_non_e(iq, client) for iq in non_e],
+                *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
+                *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
+                *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
+                *[run_non_e(iq, ff_client)      for iq in non_e_ff],
             )
 
         total_time = (time.time() - total_start) * 1000
+
+        # Ротируем батч IP после каждого прогона
+        try:
+            from utils.proxy_pool import ProxyPool
+            ProxyPool.rotate()
+        except ImportError:
+            try:
+                from proxy_pool import ProxyPool
+                ProxyPool.rotate()
+            except ImportError:
+                pass
 
         for entry in trace_entries:
             entry.unique = [
