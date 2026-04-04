@@ -142,6 +142,70 @@ PRIORITY_MATRIX = {
 }
 
 
+# ══════════════════════════════════════════════
+# [P0-FF-SKIP] Firefox BCD variant skip list
+# Собраны вручную по 4 датасетам (айфон, кондиционер, акб_скутер, имплантация).
+# Оставлены только варианты которые дают FF-exclusive ключи (не пересекаются с Chrome).
+# 50 вариантов комментируется → экономия ~49% запросов для B/C/D групп.
+# НЕ удалять — при добавлении новых языков/рынков структуры могут быть полезны.
+# ══════════════════════════════════════════════
+FF_BCD_SKIP_VARIANTS: set = {
+    # ── Type B: предлоги ──────────────────────────────────────────────────
+    # prep_v: только v3 даёт FF-exclusive
+    "prep_v_v1", "prep_v_v2",
+    # prep_na: v1+v3 даёт; v2 — дубль хрома
+    "prep_na_v2",
+    # prep_dlya: v2+v3 даёт; v1 — дубль хрома
+    "prep_dlya_v1",
+    # prep_s: только v1 даёт
+    "prep_s_v2", "prep_s_v3",
+    # prep_ot: v1+v3 даёт; v2 — дубль хрома
+    "prep_ot_v2",
+    # prep_pod: только v1 даёт
+    "prep_pod_v2", "prep_pod_v3",
+    # prep_iz: только v2 даёт
+    "prep_iz_v1", "prep_iz_v3",
+    # prep_bez: только v2 даёт
+    "prep_bez_v1", "prep_bez_v3",
+
+    # ── Type C: вопросы ───────────────────────────────────────────────────
+    # q_kak: v1+v2+v3 все нужны → ничего не пропускаем
+    # q_kakoy: только v3 даёт
+    "q_kakoy_v1", "q_kakoy_v2",
+    # q_gde: 0 FF-exclusive на всех 4 датасетах → убираем все варианты
+    "q_gde_v1", "q_gde_v2", "q_gde_v3",
+    # q_skolko: v1+v2+v3 все нужны → ничего не пропускаем
+    # q_pochemu: v1+v3 даёт; v2 — дубль хрома
+    "q_pochemu_v2",
+
+    # ── Type D: финализаторы ─────────────────────────────────────────────
+    # fin_kupit: только v2 даёт
+    "fin_kupit_v1", "fin_kupit_v3",
+    # fin_tsena: только v1 даёт
+    "fin_tsena_v2", "fin_tsena_v3",
+    # fin_otzyvy: 0 FF-exclusive на всех датасетах → убираем все
+    "fin_otzyvy_v1", "fin_otzyvy_v2", "fin_otzyvy_v3",
+    # fin_obzor: 0 FF-exclusive → убираем все
+    "fin_obzor_v1", "fin_obzor_v2", "fin_obzor_v3",
+    # fin_sravnenie: 0 FF-exclusive → убираем все
+    "fin_sravnenie_v1", "fin_sravnenie_v2", "fin_sravnenie_v3",
+    # fin_harakteristiki: 0 FF-exclusive → убираем все
+    "fin_harakteristiki_v1", "fin_harakteristiki_v2", "fin_harakteristiki_v3",
+    # fin_analogi: 0 FF-exclusive → убираем все
+    "fin_analogi_v1", "fin_analogi_v2", "fin_analogi_v3",
+    # fin_ili: v2+v3 даёт; только v1 — дубль хрома
+    "fin_ili_v1",
+    # fin_i: только v3 даёт
+    "fin_i_v1", "fin_i_v2",
+    # fin_vs: 0 FF-exclusive → убираем все
+    "fin_vs_v1", "fin_vs_v2", "fin_vs_v3",
+    # fin_vmesto: 0 FF-exclusive → убираем все
+    "fin_vmesto_v1", "fin_vmesto_v2", "fin_vmesto_v3",
+    # fin_forum: только v3 даёт
+    "fin_forum_v1", "fin_forum_v2",
+}
+
+
 @dataclass
 class SeedAnalysis:
     """Result of seed marker detection"""
@@ -394,8 +458,9 @@ class SuffixGenerator:
             if p:
                 seed_lemmas.add(p[0].normal_form)
 
-        # Firefox: все структуры активны, BCD_SKIP пуст
-        BCD_SKIP_VARIANTS = set()
+        # [P0-FF-SKIP] Firefox: применяем список неиспользуемых вариантов
+        # При добавлении Chrome агента: передавать agent в generate() и выбирать нужный set
+        BCD_SKIP_VARIANTS = FF_BCD_SKIP_VARIANTS
 
         results = []
 
