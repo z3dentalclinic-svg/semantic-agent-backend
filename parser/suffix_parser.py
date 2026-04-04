@@ -23,6 +23,14 @@ try:
 except ImportError:
     from suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis, FF_BCD_SKIP_VARIANTS
 
+try:
+    from utils.proxy_pool import ProxyPool
+except ImportError:
+    try:
+        from proxy_pool import ProxyPool
+    except ImportError:
+        ProxyPool = None
+
 # ══════════════════════════════════════════════
 # [P0-CHR-SKIP] Chrome BCD variant skip list (Порог 0, 4 датасета GT)
 # 11 вариантов — 100% дубли на всех датасетах, нулевой GT-эксклюзив.
@@ -758,8 +766,10 @@ class SuffixParser:
             await asyncio.gather(*[fetch_chr_char(c) for c in ALPHABET if c in CHROME_E_SIMPLE_LETTERS])
 
         # ── Agent runners ─────────────────────────────────────────────────
-        chr_sem = asyncio.Semaphore(5)
-        ff_sem  = asyncio.Semaphore(5)
+        # Semaphore(8): 8 concurrent per agent × 2 агента = 16 total
+        # При 5 IP (indices 5-9): ~3 req/IP → безопасно, ~3-4с на прогон
+        chr_sem = asyncio.Semaphore(8)
+        ff_sem  = asyncio.Semaphore(8)
 
         async def fetch_chr_abcd(sq: "SuffixQuery", client: httpx.AsyncClient):
             """Chrome A/B/C/D с CHROME_BCD_SKIP."""
@@ -797,11 +807,11 @@ class SuffixParser:
             except Exception as e:
                 print(f"[FirefoxE Error] seed={seed!r}: {e!r}")
 
-        async def run_google(client: httpx.AsyncClient):
-            """Dual-agent: Chrome + Firefox параллельно."""
+        async def run_google(chr_client: httpx.AsyncClient, ff_client: httpx.AsyncClient):
+            """Dual-agent: Chrome + Firefox параллельно на раздельных IP."""
             await asyncio.gather(
-                run_chrome(client),
-                run_firefox(client),
+                run_chrome(chr_client),
+                run_firefox(ff_client),
             )
 
         async def run_yandex(client: httpx.AsyncClient):
@@ -870,13 +880,25 @@ class SuffixParser:
 
             await asyncio.gather(*bi_tasks)
 
-        _google_proxy = os.getenv("GOOGLE_PROXY_URL") or None
-        async with httpx.AsyncClient(proxy=_google_proxy) as g_http:
+        # Прокси из ProxyPool — round-robin по 5 IP (индексы 5-9)
+        # Fallback: GOOGLE_PROXY_URL из env
+        if ProxyPool:
+            proxy_chr = ProxyPool.get("suffix")
+            proxy_ff  = ProxyPool.get("suffix")
+        else:
+            _fb = os.getenv("GOOGLE_PROXY_URL") or None
+            proxy_chr = proxy_ff = _fb
+
+        async with httpx.AsyncClient(proxy=proxy_chr) as chr_http,                    httpx.AsyncClient(proxy=proxy_ff)  as ff_http:
             await asyncio.gather(
-                run_google(g_http),
+                run_google(chr_http, ff_http),
                 # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
                 # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
             )
+
+        # Ротация батча после прогона
+        if ProxyPool:
+            ProxyPool.rotate()
             # ── Phase 2: candidate expansion (как в старом парсере) ──────
             # Собираем слова которые встречаются 2+ раз в результатах
             # Исключаем слова сида, делаем запрос сид + кандидат без cp
