@@ -93,9 +93,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 USER_AGENTS = [
-    # [FIREFOX-ONLY EXPERIMENT] Chrome UA закомментированы
-    # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
@@ -221,7 +220,7 @@ class PrefixParser:
         params = {
             "q": query,
             # [FIREFOX-ONLY EXPERIMENT] "client": google_client,
-            "client": "firefox",
+            "client": google_client,
             "hl": language,
             "gl": country,
             "ie": "utf-8",
@@ -429,8 +428,9 @@ class PrefixParser:
                 tasks = [fetch_one(pq, agent, client, semaphore) for pq in agent_queries]
                 await asyncio.gather(*tasks)
 
-        # Firefox-only агент
+        # Dual-agent: Chrome + Firefox параллельно
         await asyncio.gather(
+            run_agent("chrome"),
             run_agent("firefox"),
         )
 
