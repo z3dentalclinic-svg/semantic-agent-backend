@@ -98,12 +98,11 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
-# Batch size for parallel execution
+# Batch size для non-PA запросов (G+PC через semaphore)
 BATCH_SIZE = 5
-DELAY_SERVER = 0.3
-DELAY_LOCAL  = 0.3
+DELAY = 0.3  # seconds — задержка между запросами
 
-# Proxy — три выделенных IP для prefix (как у infix)
+# Proxy — берём из ProxyPool (те же батчи что и infix)
 import os as _os
 try:
     from utils.proxy_pool import ProxyPool
@@ -117,11 +116,11 @@ except ImportError:
         _proxy_firefox = ProxyPool.get("prefix_firefox")
         _proxy_nonpa   = ProxyPool.get("prefix_nonpa")
     except ImportError:
-        _proxy_chrome  = _os.getenv("PREFIX_PROXY_CHROME")  or _os.getenv("GOOGLE_PROXY_URL", "").strip() or None
-        _proxy_firefox = _os.getenv("PREFIX_PROXY_FF")      or _os.getenv("GOOGLE_PROXY_URL", "").strip() or None
-        _proxy_nonpa   = _os.getenv("PREFIX_PROXY_NONPA")   or _os.getenv("GOOGLE_PROXY_URL", "").strip() or None
-
-DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
+        ProxyPool = None
+        _fallback = _os.getenv("GOOGLE_PROXY_URL", "").strip() or None
+        _proxy_chrome  = _fallback
+        _proxy_firefox = _fallback
+        _proxy_nonpa   = _fallback
 
 
 # ══════════════════════════════════════════════
@@ -338,24 +337,43 @@ class PrefixParser:
         country: str = "ua",
         language: str = "ru",
         groups: Optional[List[str]] = None,
-        google_client: str = "firefox",  # firefox-only (одиночный вызов)
-        progress_callback=None,  # async callable(done, total, entry) for live updates
+        google_client: str = "firefox",
+        progress_callback=None,
     ) -> PrefixParseResult:
         """
-        Main parse method — letter-parallel execution (архитектура как у infix).
+        Main parse method — letter-parallel dual-agent execution.
 
-        Три клиента на трёх IP:
-            prefix_chrome  — PA Chrome: 30 буквенных треков параллельно,
-                             внутри каждой буквы запросы последовательные.
-            prefix_nonpa   — G1-G9 + PC Chrome: через asyncio.Semaphore(BATCH_SIZE).
-            prefix_firefox — PA FF + G FF: через asyncio.Semaphore(BATCH_SIZE).
+        Архитектура (зеркалит infix_parser):
+            PA-группа разбивается по буквам — каждая буква отдельный параллельный трек.
+            Внутри трека запросы последовательные с DELAY (безопасно для Google).
+            Non-PA (G1-G9, PC) через asyncio.Semaphore на отдельном IP.
 
-        Все три клиента стартуют одновременно через asyncio.gather.
-        Целевое время: ~5 секунд при 165 запросах.
+            Chrome: prefix_chrome IP  (PA letter-tracks)
+            FF:     prefix_firefox IP (PA FF letter-tracks)
+            NonPA:  prefix_nonpa IP   (G+PC semaphore)
+
+        Скорость: ~3-4 секунды (как infix) вместо 17+ секунд.
+        Ротация: ProxyPool.rotate() вызывается после каждого прогона.
         """
         from datetime import datetime
         total_start = time.time()
         timestamp = datetime.utcnow().isoformat() + "Z"
+
+        # Обновляем прокси из ProxyPool на момент вызова
+        try:
+            from utils.proxy_pool import ProxyPool as _PP
+        except ImportError:
+            try:
+                from proxy_pool import ProxyPool as _PP
+            except ImportError:
+                _PP = None
+
+        if _PP:
+            proxy_chr = _PP.get("prefix_chrome")
+            proxy_ff  = _PP.get("prefix_firefox")
+            proxy_npa = _PP.get("prefix_nonpa")
+        else:
+            proxy_chr = proxy_ff = proxy_npa = _proxy_chrome
 
         # Generate matrix
         matrix: List[PrefixQuery] = self.generator.generate(
@@ -419,66 +437,70 @@ class PrefixParser:
             if progress_callback:
                 await progress_callback(done, total_tasks, entry)
 
-        async def run_pa_letter(letter_queries: List[PrefixQuery],
-                                client: httpx.AsyncClient, agent: str):
-            """Буквенный трек — запросы одной буквы последовательно (как run_letter в infix)."""
-            for pq in letter_queries:
+        async def run_letter(queries: List[PrefixQuery], agent: str,
+                             client: httpx.AsyncClient):
+            """Один буквенный трек — запросы последовательно."""
+            for pq in queries:
                 await fetch_one(pq, agent, client)
 
-        async def run_semaphore(queries: List[PrefixQuery],
-                                client: httpx.AsyncClient, agent: str,
-                                sem: asyncio.Semaphore):
-            """Non-PA запросы через semaphore."""
-            async def _one(pq):
-                async with sem:
-                    await fetch_one(pq, agent, client)
-            await asyncio.gather(*[_one(pq) for pq in queries])
+        async def run_nonpa(pq: PrefixQuery, agent: str, client: httpx.AsyncClient,
+                            sem: asyncio.Semaphore):
+            """G+PC запросы через semaphore."""
+            async with sem:
+                await fetch_one(pq, agent, client)
 
-        # Разбиваем матрицу на три группы
-        from collections import defaultdict
-        pa_chr_by_letter: Dict = defaultdict(list)
-        pa_ff_by_letter:  Dict = defaultdict(list)
+        # Разбиваем матрицу
+        pa_chr_by_letter: Dict[str, List[PrefixQuery]] = {}
+        pa_ff_by_letter:  Dict[str, List[PrefixQuery]] = {}
         nonpa_chr: List[PrefixQuery] = []
         nonpa_ff:  List[PrefixQuery] = []
 
         for pq in matrix:
             is_ff = "firefox" in pq.agents and "chrome" not in pq.agents
             if pq.group == "PA" and pq.letter:
-                (pa_ff_by_letter if is_ff else pa_chr_by_letter)[pq.letter].append(pq)
+                if is_ff:
+                    pa_ff_by_letter.setdefault(pq.letter, []).append(pq)
+                else:
+                    pa_chr_by_letter.setdefault(pq.letter, []).append(pq)
             else:
-                (nonpa_ff if is_ff else nonpa_chr).append(pq)
+                if is_ff:
+                    nonpa_ff.append(pq)
+                else:
+                    nonpa_chr.append(pq)
 
         nonpa_sem = asyncio.Semaphore(BATCH_SIZE)
-        ff_sem    = asyncio.Semaphore(BATCH_SIZE)
 
-        async with httpx.AsyncClient(proxy=_proxy_chrome)  as chrome_client, \
-                   httpx.AsyncClient(proxy=_proxy_nonpa)   as nonpa_client,  \
-                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
+        async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
+                   httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
+                   httpx.AsyncClient(proxy=proxy_npa) as npa_client:
 
             await asyncio.gather(
-                # PA Chrome: каждая буква = отдельный параллельный трек
-                *[run_pa_letter(qs, chrome_client, "chrome")
+                # PA Chrome — все буквы параллельно, внутри буквы последовательно
+                *[run_letter(qs, "chrome", chr_client)
                   for qs in pa_chr_by_letter.values()],
-                # G+PC Chrome: через semaphore на отдельном IP
-                run_semaphore(nonpa_chr, nonpa_client, "chrome", nonpa_sem),
-                # FF (PA + G): через semaphore на третьем IP
-                *[run_pa_letter(qs, ff_client, "firefox")
+                # PA FF — аналогично
+                *[run_letter(qs, "firefox", ff_client)
                   for qs in pa_ff_by_letter.values()],
-                run_semaphore(nonpa_ff, ff_client, "firefox", ff_sem),
+                # Non-PA Chrome (G+PC) — через semaphore на отдельном IP
+                *[run_nonpa(pq, "chrome", npa_client, nonpa_sem)
+                  for pq in nonpa_chr],
+                # Non-PA FF
+                *[run_nonpa(pq, "firefox", ff_client, nonpa_sem)
+                  for pq in nonpa_ff],
             )
 
-        total_time = (time.time() - total_start) * 1000
-
-        # Ротируем батч IP после каждого прогона (как в infix)
+        # Ротация батча после прогона
         try:
-            from utils.proxy_pool import ProxyPool as _PP
-            _PP.rotate()
+            from utils.proxy_pool import ProxyPool as _PP2
+            _PP2.rotate()
         except ImportError:
             try:
-                from proxy_pool import ProxyPool as _PP
-                _PP.rotate()
+                from proxy_pool import ProxyPool as _PP2
+                _PP2.rotate()
             except ImportError:
                 pass
+
+        total_time = (time.time() - total_start) * 1000
 
         # Post-process: mark unique per entry
         for entry in trace_entries:
