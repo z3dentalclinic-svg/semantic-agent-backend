@@ -518,7 +518,9 @@ class SuffixParser:
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_simple, results, elapsed)
 
-            await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET])
+            # [P0-FF-ALLOW] Только буквы с FF-exclusive ключами по all_70 GT анализу (27 из 30).
+            FF_E_SIMPLE_LETTERS = set("агдежзиклмнопрстуфхцчшщэюяё")
+            await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET if c in FF_E_SIMPLE_LETTERS])
 
         async def fetch_with_semaphore(sq, client):
             async with semaphore:
@@ -533,14 +535,14 @@ class SuffixParser:
             'L_col', 'hyp_B_trail', 'hyp_Lwc', 'hyp_wcL',
             'Lwc_cpBL', 'L_hyp', 'col_B_trail', 'plain_nocp', 'Lwc_cpAL',
         }
-        # [P0-FF-SKIP] E структуры без FF-exclusive ключей по 4 датасетам.
-        # Оставлены активными: plain_nocp, trail, wcB_cpMid, Lwc_cpAL, col_B_trail (5 на букву).
-        # НЕ удалять — при добавлении новых рынков/языков могут быть полезны.
-        FF_E_SKIP = {
-            # Убраны ранее (Chrome анализ):
-            "L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain",
-            # [P0-FF-SKIP] Убраны по FF GT анализу (0 FF-exclusive на 4 датасетах):
-            "Lwc_cpBL", "hyp_B_trail", "hyp_wcL",  # col_B_trail активен: б_col_B_trail и у_col_B_trail в all_70
+        # [P0-FF-ALLOW] Точный allowlist пар (буква, вариант) из all_70 GT анализа (4 датасета).
+        # 12 E structured запросов вместо (5 вариантов × 26 букв = 130).
+        # НЕ удалять — при добавлении Chrome агента или новых датасетов пересматривать.
+        FF_E_STRUCT_ALLOW = {
+            ("а", "wcB_cpMid"), ("б", "col_B_trail"), ("б", "trail"),
+            ("з", "wcB_cpMid"), ("к", "trail"),       ("н", "wcB_cpMid"),
+            ("о", "trail"),     ("у", "Lwc_cpAL"),    ("у", "col_B_trail"),
+            ("у", "trail"),     ("ф", "plain_nocp"),  ("э", "wcB_cpMid"),
         }
 
         # Novelty Threshold — параметры
@@ -558,8 +560,10 @@ class SuffixParser:
         e_chrome_sem = asyncio.Semaphore(5)
 
         async def fetch_e_chrome_one(sq: "SuffixQuery", client: httpx.AsyncClient):
-            """Один E firefox запрос через семафор с джиттером."""
-            if sq.variant in FF_E_SKIP:
+            """Один E firefox запрос через семафор с джиттером.
+            [P0-FF-ALLOW] Только пары (буква, вариант) из FF_E_STRUCT_ALLOW — 12 запросов вместо 130.
+            """
+            if (sq.suffix_val, sq.variant) not in FF_E_STRUCT_ALLOW:
                 return
             async with e_chrome_sem:
                 await asyncio.sleep(random.uniform(0.3, 0.5))
