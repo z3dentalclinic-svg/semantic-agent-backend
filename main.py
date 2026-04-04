@@ -83,6 +83,14 @@ app.add_middleware(
 async def preflight_handler():
     return {}
 
+@app.get("/debug/proxy-status")
+async def proxy_status():
+    try:
+        from utils.proxy_pool import ProxyPool
+        return ProxyPool.status()
+    except ImportError:
+        return {"status": "disabled", "reason": "proxy_pool не найден"}
+
 # ═══ SUFFIX MAP PARSER v1.0 ═══
 register_suffix_endpoint(app)
 
