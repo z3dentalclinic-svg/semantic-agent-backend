@@ -127,13 +127,30 @@ class PrefixGenerator:
         ot  = op_type or self._detect_op_type(OP)
         out: List[PrefixQuery] = []
 
-        BOTH   = ("firefox",)
-        CHROME = ("firefox",)
+        BOTH   = ("chrome", "firefox")  # не используется — маршрутизация через FF_SET
+        CHROME = ("chrome",)
+        FF     = ("firefox",)
+
+        # FF-exclusive структуры prefix — дают GT-ключи которые Chrome не находит.
+        # Источник: unified_firefox_structs.json (31 структура по 4 датасетам).
+        # Всё что НЕ в этом сете → Chrome only.
+        PA_FF_STRUCTS = {
+            # cp1 — 21 буква
+            "а_cp1", "б_cp1", "в_cp1", "г_cp1", "д_cp1", "е_cp1", "и_cp1",
+            "к_cp1", "л_cp1", "м_cp1", "н_cp1", "о_cp1", "п_cp1", "р_cp1",
+            "с_cp1", "т_cp1", "ф_cp1", "ц_cp1", "ч_cp1", "ш_cp1", "э_cp1",
+            # прочие PA структуры
+            "в_cp0", "с_cp0",
+            "в_Lwc_cpBL",
+            "в_hyp_B_trail", "в_hyp_Lwc",
+            "и_hyp_B_trail",
+            "к_hyp_Lwc",
+        }
 
         def q(group: str, struct: str, query: str, cp: int,
               cp_note: str, op_val: str = OP, op_t: str = ot,
               is_alpha: bool = False, is_q: bool = False,
-              letter: str = None, agents: tuple = BOTH) -> PrefixQuery:
+              letter: str = None, agents: tuple = CHROME) -> PrefixQuery:
             return PrefixQuery(
                 query=query, group=group, struct=struct,
                 operator=op_val, op_type=op_t, cp=cp, cp_note=cp_note,
@@ -206,13 +223,13 @@ class PrefixGenerator:
             b_star  = f"* {S} *"
             b_trail = f"* {S} "
             out.append(q("G5", "pxwc_afterStar", b_star,  2, "после *, перед S",
-                         op_val="*", op_t="symbol"))
+                         op_val="*", op_t="symbol", agents=FF))
             out.append(q("G5", "pxwc_afterS",    b_star,
                          2 + len(S) + 1, "после S, перед конечным *",
-                         op_val="*", op_t="symbol"))
+                         op_val="*", op_t="symbol", agents=CHROME))
             out.append(q("G5", "pxwc_trail",     b_trail,
                          len(b_trail), "trailing space (без конечного *)",
-                         op_val="*", op_t="symbol"))
+                         op_val="*", op_t="symbol", agents=CHROME))
 
         # ─────────────────────────────────────────────────────────────
         # G6 — [OP]<двойной пробел>[S] *  — нормализует ли Google?
@@ -272,69 +289,74 @@ class PrefixGenerator:
             for L in LETTERS_RU:
                 qstr = f"{L} {S}"
 
-                # 1. cp0 — L S  cp=0 (курсор в начале строки)
-                # По аналогии с kard_cp0: даёт слова ДО буквы (префиксы)
+                # 1. cp0
                 out.append(q("PA", f"{L}_cp0", qstr,
                              0, "cp=0, начало строки",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_cp0" in PA_FF_STRUCTS else CHROME))
 
-                # 2. cp1 — L S  cp=1 (курсор после буквы)
-                # По аналогии с kard_cp1: Google раскрывает букву в полное слово
+                # 2. cp1
                 out.append(q("PA", f"{L}_cp1", qstr,
                              1, "cp=1, после буквы",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_cp1" in PA_FF_STRUCTS else CHROME))
 
-                # 3. wcB_cpMid — L * S  cp между * и S
-                # (nocp, trail, sandwich удалены — 0 уникальных на 7 датасетах)
+                # 3. wcB_cpMid
                 qstr = f"{L} * {S}"
-                # cp = после "L * " = len(L) + 3
                 out.append(q("PA", f"{L}_wcB_cpMid", qstr,
                              len(L) + 3, "cp между * и S",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_wcB_cpMid" in PA_FF_STRUCTS else CHROME))
 
-                # 6. Lwc_cpAL — L S *  cp после "L S " перед *
+                # 6. Lwc_cpAL
                 qstr = f"{L} {S} *"
                 out.append(q("PA", f"{L}_Lwc_cpAL", qstr,
                              len(L) + 1 + len(S) + 1, "cp после S, перед *",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_Lwc_cpAL" in PA_FF_STRUCTS else CHROME))
 
-                # 7. Lwc_cpBL — L S *  cp после "L " перед S
+                # 7. Lwc_cpBL
                 out.append(q("PA", f"{L}_Lwc_cpBL", qstr,
                              len(L) + 1, "cp после L, перед S",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_Lwc_cpBL" in PA_FF_STRUCTS else CHROME))
 
-                # 8. hyp_B_trail — L - S <space>  (col_B_trail и L_col удалены — нестабильны)
+                # 8. hyp_B_trail
                 qstr = f"{L} - {S} "
                 out.append(q("PA", f"{L}_hyp_B_trail", qstr,
                              len(qstr), "дефис + буква, trailing space",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_hyp_B_trail" in PA_FF_STRUCTS else CHROME))
 
-                # 9.  hyp_Lwc — L - S *
+                # 9. hyp_Lwc
                 qstr = f"{L} - {S} *"
                 out.append(q("PA", f"{L}_hyp_Lwc", qstr,
                              len(qstr), "дефис + буква + *",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_hyp_Lwc" in PA_FF_STRUCTS else CHROME))
 
-                # 10. hyp_wcL — L - * S
+                # 10. hyp_wcL
                 qstr = f"{L} - * {S}"
                 out.append(q("PA", f"{L}_hyp_wcL", qstr,
                              len(qstr), "дефис + * + S",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_hyp_wcL" in PA_FF_STRUCTS else CHROME))
 
-                # 11. L_hyp — L S -
+                # 11. L_hyp
                 qstr = f"{L} {S} -"
                 out.append(q("PA", f"{L}_L_hyp", qstr,
                              len(qstr), "буква + S + дефис",
                              op_val=L, op_t="letter",
-                             is_alpha=True, letter=L, agents=CHROME))
+                             is_alpha=True, letter=L,
+                             agents=FF if f"{L}_L_hyp" in PA_FF_STRUCTS else CHROME))
 
         # ─────────────────────────────────────────────────────────────
         # PC — Вопросы: 5 вопросов × 2-3 cp = 11 запросов
@@ -347,12 +369,14 @@ class PrefixGenerator:
                 out.append(q("PC", f"{qw}_vP1", base,
                              len(qw) + 1, "после вопроса, перед S",
                              op_val=qw, op_t="question",
-                             is_q=True))
+                             is_q=True,
+                             agents=FF if f"{qw}_vP1" in {"как_vP1", "как_vP2"} else CHROME))
                 # vP2: cp на конце слова вопроса
                 out.append(q("PC", f"{qw}_vP2", base,
                              len(qw), "на конце вопроса",
                              op_val=qw, op_t="question",
-                             is_q=True))
+                             is_q=True,
+                             agents=FF if f"{qw}_vP2" in {"как_vP1", "как_vP2"} else CHROME))
                 # vP3: только для "почему" — в суффиксе v1/v2 всегда empty, v3 даёт 6
                 if qw == "почему":
                     out.append(q("PC", f"{qw}_vP3", base,
