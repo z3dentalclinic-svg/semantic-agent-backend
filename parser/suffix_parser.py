@@ -533,7 +533,15 @@ class SuffixParser:
             'L_col', 'hyp_B_trail', 'hyp_Lwc', 'hyp_wcL',
             'Lwc_cpBL', 'L_hyp', 'col_B_trail', 'plain_nocp', 'Lwc_cpAL',
         }
-        FF_E_SKIP     = {"L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain"}
+        # [P0-FF-SKIP] E структуры без FF-exclusive ключей по 4 датасетам.
+        # Оставлены активными: plain_nocp, trail, wcB_cpMid, Lwc_cpAL, col_B_trail (5 на букву).
+        # НЕ удалять — при добавлении новых рынков/языков могут быть полезны.
+        FF_E_SKIP = {
+            # Убраны ранее (Chrome анализ):
+            "L_col", "L_hyp", "hyp_Lwc", "sandwich", "plain",
+            # [P0-FF-SKIP] Убраны по FF GT анализу (0 FF-exclusive на 4 датасетах):
+            "Lwc_cpBL", "hyp_B_trail", "hyp_wcL",  # col_B_trail активен: б_col_B_trail и у_col_B_trail в all_70
+        }
 
         # Novelty Threshold — параметры
         # E_simple per-letter threshold:
