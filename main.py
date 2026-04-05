@@ -5,7 +5,8 @@ FGS Parser API - Semantic keyword research with geo-filtering
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from typing import List, Dict
+from pydantic import BaseModel
+from typing import List, Dict, Optional
 import os
 import httpx
 import asyncio
@@ -1224,6 +1225,50 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["_trace"] = parser.tracer.finish_request()
     result["_filter_timings"] = _timings  # ← реальные замеры времени
     result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l2": run_l2, "l3": run_l3, "rel": not parser.skip_relevance_filter}
+    return result
+
+
+class ApplyFiltersRequest(BaseModel):
+    keywords: List[str]
+    seed: str
+    country: str = "ua"
+    language: str = "ru"
+    filters: str = "pre,geo,bpf,l0,l2"
+    l2_pmi_valid: float = None
+    l2_centroid_valid: float = None
+    l2_centroid_trash: float = None
+
+
+@app.post("/api/apply-filters")
+async def apply_filters_endpoint(req: ApplyFiltersRequest):
+    """
+    Применяет цепочку фильтров к готовому списку ключей без повторного парсинга.
+    Принимает: keywords[], seed, country, language, filters, L2 пороги.
+    Возвращает: keywords (VALID), keywords_grey (GREY), anchors (TRASH), trace, timings.
+    """
+    result = {
+        "seed": req.seed,
+        "method": "apply-filters",
+        "keywords": req.keywords,
+        "anchors": [],
+        "count": len(req.keywords),
+        "anchors_count": 0,
+    }
+
+    l2_config = _build_l2_config(req.l2_pmi_valid, req.l2_centroid_valid, req.l2_centroid_trash)
+    l3_config = _build_l3_config()
+
+    result = apply_filters_traced(
+        result,
+        seed=req.seed,
+        country=req.country,
+        method="apply-filters",
+        language=req.language,
+        enabled_filters=req.filters,
+        l2_config=l2_config,
+        l3_config=l3_config,
+    )
+
     return result
 
 
