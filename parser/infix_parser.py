@@ -51,6 +51,14 @@ except ImportError:
 _google_proxy = _proxy_chrome  # для обратной совместимости
 DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
 
+try:
+    from utils.geo_uule import get_uule
+except ImportError:
+    try:
+        from geo_uule import get_uule
+    except ImportError:
+        get_uule = lambda cc, city=None: None
+
 # Предлоги и союзы — одиночные буквы из этого списка НЕ мусор
 PREP_UNION = {"в","во","на","с","со","к","ко","о","у","и","а","б","я"}
 
@@ -138,10 +146,13 @@ class InfixParser:
         return re.sub(r'<[^>]+>', '', text).strip()
 
     async def fetch_suggestions(self, query, country, language, client,
-                                 google_client="firefox", cursor_position=None):
+                                 google_client="firefox", cursor_position=None,
+                                 uule=None):
         url = "https://www.google.com/complete/search"
         params = {"q": query, "client": google_client,
                   "gl": country, "ie": "utf-8", "oe": "utf-8", "hl": language}
+        if uule:
+            params["uule"] = uule
         if cursor_position == -1:
             pass
         elif cursor_position is not None:
@@ -196,10 +207,14 @@ class InfixParser:
         return []
 
     async def parse(self, seed, country="ua", language="ru",
-                    groups=None, progress_callback=None) -> InfixParseResult:
+                    groups=None, progress_callback=None,
+                    city=None) -> InfixParseResult:
         from datetime import datetime
         total_start = time.time()
         timestamp = datetime.utcnow().isoformat() + "Z"
+
+        # uule: city=None → столица страны, city="Lviv" → конкретный город
+        _uule = get_uule(country, city)
 
         matrix: List[InfixQuery] = self.generator.generate(seed=seed, groups=groups or ALL_GROUPS)
 
@@ -219,6 +234,7 @@ class InfixParser:
                 raw_results = await self.fetch_suggestions(
                     query=iq.query, country=country, language=language,
                     client=client, google_client=agent, cursor_position=iq.cp,
+                    uule=_uule,
                 )
                 elapsed = (time.time() - t0) * 1000
 
