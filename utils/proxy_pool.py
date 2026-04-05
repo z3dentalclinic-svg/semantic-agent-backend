@@ -108,19 +108,37 @@ class ProxyPool:
             logger.warning(f"[ProxyPool] Неизвестная роль: {role}")
             return None
 
+    # Минимальный интервал между ротациями — защита от тройного вызова
+    # при параллельном запуске suffix+prefix+infix.
+    MIN_ROTATION_INTERVAL: float = 7.0
+
     @classmethod
     def rotate(cls):
         """
         Ротирует батч — текущий уходит в конец очереди.
         Вызывается после завершения каждого полного прогона сида.
+
+        Защита: при параллельном запуске suffix+prefix+infix все три
+        вызывают rotate() почти одновременно. MIN_ROTATION_INTERVAL
+        гарантирует что реальная ротация происходит только один раз
+        на весь комбинированный прогон (~4-6с).
         """
         with cls._lock:
             cls._init()
             if not cls._batches:
                 return
+
+            now = time.time()
+            if now - cls._last_rotation < cls.MIN_ROTATION_INTERVAL:
+                logger.debug(
+                    f"[ProxyPool] rotate() пропущен — "
+                    f"прошло {now - cls._last_rotation:.1f}с < {cls.MIN_ROTATION_INTERVAL}с"
+                )
+                return
+
             prev = cls._current_batch
             cls._current_batch = (cls._current_batch + 1) % len(cls._batches)
-            cls._last_rotation = time.time()
+            cls._last_rotation = now
             cls._general_counter = 0
             logger.info(
                 f"[ProxyPool] Ротация: батч {prev} → {cls._current_batch} "
