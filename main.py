@@ -31,10 +31,10 @@ from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
 from utils.normalizer import normalize_keywords
 from utils.tracer import FilterTracer
-from parser.suffix_endpoint import register_suffix_endpoint  # ← Suffix Map парсер v1.0
-from parser.prefix_endpoint import register_prefix_endpoint  # ← Prefix Map парсер v1.0
-from parser.infix_endpoint import register_infix_endpoint    # ← Infix Map парсер v2.6
-from parser.morph_endpoint import register_morph_endpoint    # ← Morph Map Parser v1.0
+from parser.suffix_endpoint import register_suffix_endpoint, get_suffix_parser  # ← Suffix Map парсер v1.0
+from parser.prefix_endpoint import register_prefix_endpoint, get_prefix_parser  # ← Prefix Map парсер v1.0
+from parser.infix_endpoint import register_infix_endpoint, get_infix_parser    # ← Infix Map парсер v2.6
+from parser.morph_endpoint import register_morph_endpoint                       # ← Morph Map Parser v1.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1311,15 +1311,102 @@ async def light_search_endpoint(
     region_id: int = Query(143, description="ID региона для Yandex"),
     language: str = Query("auto", description="Язык"),
     use_numbers: bool = Query(False, description="Добавить цифры"),
-    parallel_limit: int = Query(10, description="Параллельных запросов"),
-    source: str = Query("google", description="Источник: google/yandex/bing"),
+    parallel_limit: int = Query(5, description="Параллельных запросов (suffix)"),
+    source: str = Query("google", description="Источник (для совместимости)"),
     filters: str = Query("all", description="Фильтры: all / none / pre,geo,bpf,rel,l0,l2"),
+    operator: str = Query("купить", description="Оператор для prefix парсера"),
     l2_pmi_valid: float = Query(None, description="L2: PMI VALID threshold"),
     l2_centroid_valid: float = Query(None, description="L2: Centroid VALID threshold"),
     l2_centroid_trash: float = Query(None, description="L2: Centroid TRASH threshold"),
 ):
-    """LIGHT SEARCH: быстрый поиск (новые PREFIX + SUFFIX + INFIX) — этап 2"""
-    return {"status": "not_implemented", "message": "Light Search будет подключён на этапе 2 (новые парсеры)", "seed": seed}
+    """LIGHT SEARCH: Suffix Map + Prefix Map + Infix Map (новые парсеры v2)"""
+    if language == "auto":
+        language = parser.detect_seed_language(seed)
+
+    ef = filters.lower().strip()
+    parser.skip_relevance_filter = ("rel" not in ef) and (ef != "all")
+
+    correction = await parser.autocorrect_text(seed, language)
+    if correction.get("has_errors"):
+        seed = correction["corrected"]
+
+    start_time = time.time()
+
+    # ── Запускаем 3 парсера параллельно ───────────────────────────────
+    sp = get_suffix_parser()
+    pp = get_prefix_parser()
+    ip = get_infix_parser()
+
+    suffix_res, prefix_res, infix_res = await asyncio.gather(
+        sp.parse(seed=seed, country=country, language=language,
+                 parallel_limit=parallel_limit, include_numbers=use_numbers),
+        pp.parse(seed=seed, operator=operator, country=country, language=language),
+        ip.parse(seed=seed, country=country, language=language),
+        return_exceptions=True,
+    )
+
+    # ── Merge keywords (dedup by lowercase) ───────────────────────────
+    combined = {}  # lower → display
+
+    suffix_count = 0
+    if not isinstance(suffix_res, Exception) and suffix_res is not None:
+        for kw_data in (suffix_res.all_keywords or []):
+            kw = kw_data.get("keyword", "")
+            if kw:
+                combined[kw.lower().strip()] = kw
+        suffix_count = len(suffix_res.all_keywords or [])
+    elif isinstance(suffix_res, Exception):
+        logger.error(f"[LIGHT] suffix parser error: {suffix_res}")
+
+    prefix_count = 0
+    if not isinstance(prefix_res, Exception) and prefix_res is not None:
+        for kw in (prefix_res.all_keywords or {}):
+            combined[kw.lower().strip()] = kw
+        prefix_count = len(prefix_res.all_keywords or {})
+    elif isinstance(prefix_res, Exception):
+        logger.error(f"[LIGHT] prefix parser error: {prefix_res}")
+
+    infix_count = 0
+    if not isinstance(infix_res, Exception) and infix_res is not None:
+        for kw in (infix_res.all_keywords or {}):
+            combined[kw.lower().strip()] = kw
+        infix_count = len(infix_res.all_keywords or {})
+    elif isinstance(infix_res, Exception):
+        logger.error(f"[LIGHT] infix parser error: {infix_res}")
+
+    elapsed = time.time() - start_time
+
+    logger.info(
+        f"[LIGHT] seed='{seed}' | suffix={suffix_count} prefix={prefix_count} "
+        f"infix={infix_count} | merged={len(combined)} | {round(elapsed,2)}s"
+    )
+
+    result = {
+        "seed": seed,
+        "method": "light_search",
+        "keywords": sorted(combined.values()),
+        "anchors": [],
+        "count": len(combined),
+        "anchors_count": 0,
+        "suffix_count": suffix_count,
+        "prefix_count": prefix_count,
+        "infix_count": infix_count,
+        "elapsed_time": round(elapsed, 2),
+    }
+
+    l2_config = _build_l2_config(l2_pmi_valid, l2_centroid_valid, l2_centroid_trash)
+    l3_config = _build_l3_config()
+    result = apply_filters_traced(
+        result, seed, country, method="light-search",
+        language=language, enabled_filters=filters,
+        l2_config=l2_config, l3_config=l3_config,
+    )
+
+    if correction.get("has_errors"):
+        result["original_seed"] = correction["original"]
+        result["corrections"] = correction.get("corrections", [])
+
+    return apply_smart_fix(result, seed, language)
 
 
 @app.get("/api/deep-search")
