@@ -230,30 +230,29 @@ class BatchPostFilter:
     def _find_in_country(self, word: str, target_country: str) -> bool:
         """
         PRIORITY 1: Проверка - является ли слово городом ЦЕЛЕВОЙ страны.
-        Результат кэшируется в self._request_cache на весь filter_batch запрос.
+        Кэш: _request_cache (весь filter_batch).
+        Лемму берём из _lemmas_map (уже готов) — без повторного morph.parse.
         """
         word_lower = word.lower()
         cache_key = (word_lower, target_country)
         if cache_key in self._request_cache:
             return self._request_cache[cache_key]
 
+        target = target_country.lower()
+
         # Прямой поиск в базе
         found_country = self.all_cities_global.get(word_lower)
-        if found_country and found_country == target_country.lower():
+        if found_country and found_country == target:
             self._request_cache[cache_key] = True
             return True
 
-        # Поиск с лемматизацией (на случай падежей)
-        if self._has_morph:
-            lemma_ru = self._get_lemma(word_lower, 'ru')
-            lemma_uk = self._get_lemma(word_lower, 'uk')
-
-            for lemma in [lemma_ru, lemma_uk]:
-                if lemma != word_lower:
-                    found_country = self.all_cities_global.get(lemma)
-                    if found_country and found_country == target_country.lower():
-                        self._request_cache[cache_key] = True
-                        return True
+        # Лемма: сначала из готового batch-словаря, иначе через _lemma_cache
+        lemma = self._lemmas_map.get(word_lower) or self._get_lemma(word_lower, 'ru')
+        if lemma and lemma != word_lower:
+            found_country = self.all_cities_global.get(lemma)
+            if found_country and found_country == target:
+                self._request_cache[cache_key] = True
+                return True
 
         self._request_cache[cache_key] = False
         return False
@@ -368,6 +367,7 @@ class BatchPostFilter:
         self._skip_geo_cache = {}
         self._common_noun_cache = {}
         self._lemma_cache = {}
+        self._lemmas_map = {}  # batch lemmas для текущего запроса
 
         logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
         
@@ -381,6 +381,7 @@ class BatchPostFilter:
             all_words.update(re.findall(r'[а-яёa-z0-9-]+', kw))
         
         lemmas_map = self._batch_lemmatize(all_words, language)
+        self._lemmas_map = lemmas_map  # сохраняем для _find_in_country
         
         final_keywords = []
         final_anchors = []
