@@ -552,23 +552,22 @@ class SuffixParser:
         ALPHABET = list("ксрпмнадтбвгзеиёжлоуфхцчшйщэюя")
 
         async def run_e_simple(client: httpx.AsyncClient):
-            e_simple_sem = asyncio.Semaphore(5)
+            """FF E_simple: все буквы параллельно (prefix-style), без inner semaphore.
+            [P0-FF-ALLOW] Только 27 букв с FF-exclusive ключами."""
+            FF_E_SIMPLE_LETTERS = set("агдежзиклмнопрстуфхцчшщэюяё")
 
             async def fetch_simple_char(char: str):
-                async with e_simple_sem:
-                    await asyncio.sleep(0.3)
-                    q = f"{seed} {char}"
-                    sq_simple = SuffixQuery(
-                        query=q, suffix_val=char, suffix_label=f"simple_{char}",
-                        suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
-                    )
-                    t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, client, "firefox", -1)
-                    elapsed = (time.time() - t0) * 1000
-                    _record_results(sq_simple, results, elapsed)
+                await asyncio.sleep(random.uniform(0.05, 0.15))  # jitter
+                q = f"{seed} {char}"
+                sq_simple = SuffixQuery(
+                    query=q, suffix_val=char, suffix_label=f"simple_{char}",
+                    suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
+                )
+                t0 = time.time()
+                results = await self.fetch_suggestions(q, country, language, client, "firefox", -1)
+                elapsed = (time.time() - t0) * 1000
+                _record_results(sq_simple, results, elapsed)
 
-            # [P0-FF-ALLOW] Только буквы с FF-exclusive ключами по all_70 GT анализу (27 из 30).
-            FF_E_SIMPLE_LETTERS = set("агдежзиклмнопрстуфхцчшщэюяё")
             await asyncio.gather(*[fetch_simple_char(c) for c in ALPHABET if c in FF_E_SIMPLE_LETTERS])
 
         async def fetch_with_semaphore(sq, client):
@@ -703,115 +702,102 @@ class SuffixParser:
         #         await asyncio.sleep(0.3)
         #         await fetch_one_firefox(sq, client)
 
-        # ── Chrome E structured ──────────────────────────────────────────────
-        async def fetch_e_chr_one(sq: "SuffixQuery", client: httpx.AsyncClient):
-            """Chrome E запрос: CHROME_E_SKIP (variant-level) + CHROME_E_LETTER_SKIP (per-letter)."""
-            if sq.variant in CHROME_E_SKIP:
-                return
-            letter_skip = CHROME_E_LETTER_SKIP.get(sq.suffix_val, set())
-            if sq.variant in letter_skip:
-                return
-            async with e_chrome_sem:
-                await asyncio.sleep(random.uniform(0.3, 0.5))
+        # ── Chrome E structured: prefix-style letter-parallel ──────────────────
+        async def run_e_chr_letter(letter: str, queries: list, client: httpx.AsyncClient):
+            """Один Chrome E буквенный трек — запросы последовательно (как prefix PA).
+            Все буквы запускаются параллельно через asyncio.gather.
+            """
+            for sq in queries:
+                if sq.variant in CHROME_E_SKIP:
+                    continue
+                letter_skip = CHROME_E_LETTER_SKIP.get(sq.suffix_val, set())
+                if sq.variant in letter_skip:
+                    continue
+                await asyncio.sleep(0.3)
                 await fetch_one_tracked(sq, client, force_client="chrome")
 
-        async def run_e_chr_with_novelty(client: httpx.AsyncClient):
-            """Chrome E structured с novelty threshold — аналог FF версии."""
-            e_simple_counts: Dict[str, int] = {}
-            for t in trace_entries:
-                if t.suffix_type in ("E_simple", "E_simple_chr") and t.suffix_val:
-                    e_simple_counts[t.suffix_val] = max(
-                        e_simple_counts.get(t.suffix_val, 0), t.results_count
-                    )
-
-            letters = list(e_queries_by_letter.keys())
-            active_letters = [L for L in letters if e_simple_counts.get(L, 0) >= E_SIMPLE_MIN_RESULTS]
-
-            if self.morph:
-                seed_lemmas_e = {self.morph.parse(w)[0].normal_form
-                                 for w in re.findall(r'[а-яёa-z0-9]+', seed.lower())}
-            else:
-                seed_lemmas_e = set(seed.lower().split())
-
-            def current_fps():
-                return {self.get_intent_fingerprint(kw, seed_lemmas_e) for kw in all_keywords.keys()}
-
-            for batch_start in range(0, len(active_letters), E_NOVELTY_BATCH):
-                batch = active_letters[batch_start:batch_start + E_NOVELTY_BATCH]
-                fps_before = current_fps()
-                tasks = [fetch_e_chr_one(sq, client)
-                         for L in batch for sq in e_queries_by_letter.get(L, [])]
-                await asyncio.gather(*tasks)
-                if len(current_fps() - fps_before) < E_NOVELTY_MIN_NEW:
-                    break
+        async def run_e_chr_parallel(client: httpx.AsyncClient):
+            """Chrome E: все буквы параллельно, внутри буквы последовательно.
+            ~26 букв × 4 варианта × 0.3с = max(track) ≈ 1.2с вместо 5-6с батчами.
+            """
+            tasks = [run_e_chr_letter(L, qs, client)
+                     for L, qs in e_queries_by_letter.items()]
+            await asyncio.gather(*tasks)
 
         # ── E_simple Chrome ───────────────────────────────────────────────
         async def run_e_simple_chrome(client: httpx.AsyncClient):
-            """E_simple Chrome: только 9 букв с Chrome-exclusive GT ключами."""
-            e_chr_sem = asyncio.Semaphore(5)
-
+            """Chrome E_simple: все 9 букв параллельно (prefix-style), без inner semaphore."""
             async def fetch_chr_char(char: str):
-                async with e_chr_sem:
-                    await asyncio.sleep(0.3)
-                    q = f"{seed} {char}"
-                    sq_chr = SuffixQuery(
-                        query=q, suffix_val=char, suffix_label=f"simple_{char}_chr",
-                        suffix_type="E_simple_chr", priority=1, markers=["e_simple_chr"], cp_override=-1,
-                    )
-                    t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, client, "chrome", -1)
-                    elapsed = (time.time() - t0) * 1000
-                    _record_results(sq_chr, results, elapsed)
+                await asyncio.sleep(random.uniform(0.05, 0.15))  # jitter
+                q = f"{seed} {char}"
+                sq_chr = SuffixQuery(
+                    query=q, suffix_val=char, suffix_label=f"simple_{char}_chr",
+                    suffix_type="E_simple_chr", priority=1, markers=["e_simple_chr"], cp_override=-1,
+                )
+                t0 = time.time()
+                results = await self.fetch_suggestions(q, country, language, client, "chrome", -1)
+                elapsed = (time.time() - t0) * 1000
+                _record_results(sq_chr, results, elapsed)
 
             await asyncio.gather(*[fetch_chr_char(c) for c in ALPHABET if c in CHROME_E_SIMPLE_LETTERS])
 
         # ── Agent runners ─────────────────────────────────────────────────
-        # Semaphore(8): 8 concurrent per agent × 2 агента = 16 total
-        # При 5 IP (indices 5-9): ~3 req/IP → безопасно, ~3-4с на прогон
-        chr_sem = asyncio.Semaphore(8)
-        ff_sem  = asyncio.Semaphore(8)
+        # 3 Chrome IP × Semaphore(5) = 15 concurrent Chrome ABCD
+        # 2 FF IP    × Semaphore(5) = 10 concurrent FF ABCD
+        # 68 Chrome ABCD / 15 = 4.5 раунда × 0.65с = ~2.9с
+        # 30 FF ABCD    / 10 = 3.0 раунда × 0.65с = ~1.9с
+        chr_sems = [asyncio.Semaphore(5) for _ in range(3)]
+        ff_sems  = [asyncio.Semaphore(5) for _ in range(2)]
 
-        async def fetch_chr_abcd(sq: "SuffixQuery", client: httpx.AsyncClient):
-            """Chrome A/B/C/D с CHROME_BCD_SKIP."""
+        async def fetch_chr_abcd(sq: "SuffixQuery", idx: int, clients: list):
+            """Chrome A/B/C/D — round-robin по 3 IP, Semaphore(5) каждый."""
             if sq.suffix_label in CHROME_BCD_SKIP:
                 return
-            async with chr_sem:
-                await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client="chrome")
+            slot = idx % 3
+            async with chr_sems[slot]:
+                await asyncio.sleep(0.15)
+                await fetch_one_tracked(sq, clients[slot], force_client="chrome")
 
-        async def fetch_ff_abcd(sq: "SuffixQuery", client: httpx.AsyncClient):
-            """Firefox A/B/C/D с FF_BCD_SKIP_VARIANTS."""
+        async def fetch_ff_abcd(sq: "SuffixQuery", idx: int, clients: list):
+            """Firefox A/B/C/D — round-robin по 2 IP, Semaphore(5) каждый."""
             if sq.suffix_label in FF_BCD_SKIP_VARIANTS:
                 return
-            async with ff_sem:
-                await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client="firefox")
+            slot = idx % 2
+            async with ff_sems[slot]:
+                await asyncio.sleep(0.15)
+                await fetch_one_tracked(sq, clients[slot], force_client="firefox")
 
-        async def run_chrome(client: httpx.AsyncClient):
-            """Chrome agent: A/B/C/D + E_simple + E structured."""
-            phase1 = [fetch_chr_abcd(sq, client) for sq in other_queries]
-            phase1.append(run_e_simple_chrome(client))
+        async def run_chrome(clients: list):
+            """Chrome agent: A/B/C/D + E_simple + E structured.
+            clients[0] = ABCD slot 0, clients[1] = ABCD slot 1,
+            clients[2] = ABCD slot 2 + E_simple + E structured.
+            """
+            phase1 = [fetch_chr_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
+            phase1.append(run_e_simple_chrome(clients[2]))
             await asyncio.gather(*phase1)
             try:
-                await run_e_chr_with_novelty(client)
+                await run_e_chr_parallel(clients[2])
             except Exception as e:
                 print(f"[ChromeE Error] seed={seed!r}: {e!r}")
 
-        async def run_firefox(client: httpx.AsyncClient):
-            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist)."""
-            phase1 = [fetch_ff_abcd(sq, client) for sq in other_queries]
-            phase1.append(run_e_simple(client))
+        async def run_firefox(clients: list):
+            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist).
+            clients[0] = ABCD slot 0 + E_simple + E structured,
+            clients[1] = ABCD slot 1.
+            """
+            phase1 = [fetch_ff_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
+            phase1.append(run_e_simple(clients[0]))
             await asyncio.gather(*phase1)
             try:
-                await run_e_chrome_with_novelty(client)
+                await run_e_chrome_with_novelty(clients[0])
             except Exception as e:
                 print(f"[FirefoxE Error] seed={seed!r}: {e!r}")
 
-        async def run_google(chr_client: httpx.AsyncClient, ff_client: httpx.AsyncClient):
-            """Dual-agent: Chrome + Firefox параллельно на раздельных IP."""
+        async def run_google(chr_clients: list, ff_clients: list):
+            """Dual-agent: Chrome (3 IP) + Firefox (2 IP) параллельно."""
             await asyncio.gather(
-                run_chrome(chr_client),
-                run_firefox(ff_client),
+                run_chrome(chr_clients),
+                run_firefox(ff_clients),
             )
 
         async def run_yandex(client: httpx.AsyncClient):
@@ -880,18 +866,21 @@ class SuffixParser:
 
             await asyncio.gather(*bi_tasks)
 
-        # Прокси из ProxyPool — round-robin по 5 IP (индексы 5-9)
-        # Fallback: GOOGLE_PROXY_URL из env
+        # Прокси из ProxyPool — 3 Chrome IP + 2 FF IP из round-robin пула (indices 5-9)
+        # 3×Semaphore(5)=15 concurrent Chrome, 2×Semaphore(5)=10 concurrent FF
+        # Fallback: GOOGLE_PROXY_URL из env (один IP для всех)
         if ProxyPool:
-            proxy_chr = ProxyPool.get("suffix")
-            proxy_ff  = ProxyPool.get("suffix")
+            proxies = [ProxyPool.get("suffix") for _ in range(5)]
         else:
             _fb = os.getenv("GOOGLE_PROXY_URL") or None
-            proxy_chr = proxy_ff = _fb
+            proxies = [_fb] * 5
 
-        async with httpx.AsyncClient(proxy=proxy_chr) as chr_http,                    httpx.AsyncClient(proxy=proxy_ff)  as ff_http:
+        proxy_chr1, proxy_chr2, proxy_chr3 = proxies[0], proxies[1], proxies[2]
+        proxy_ff1,  proxy_ff2              = proxies[3], proxies[4]
+
+        async with httpx.AsyncClient(proxy=proxy_chr1) as chr_c1,                    httpx.AsyncClient(proxy=proxy_chr2) as chr_c2,                    httpx.AsyncClient(proxy=proxy_chr3) as chr_c3,                    httpx.AsyncClient(proxy=proxy_ff1)  as ff_c1,                     httpx.AsyncClient(proxy=proxy_ff2)  as ff_c2:
             await asyncio.gather(
-                run_google(chr_http, ff_http),
+                run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
                 # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
                 # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
             )
