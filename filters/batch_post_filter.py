@@ -350,14 +350,12 @@ class BatchPostFilter:
                      language: str = 'ru') -> Dict:
         start_time = time.time()
         
-        logger.info(f"[BPF] START filter_batch | country={country} | lang={language}")
-        logger.info(f"[BPF] RAW keywords ({len(keywords)}): {keywords}")
+        logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
         
         unique_raw = sorted(list(set([k.lower().strip() for k in keywords if k.strip()])))
-        logger.info(f"[BPF] UNIQUE_RAW ({len(unique_raw)}): {unique_raw}")
         
         seed_cities = self._extract_cities_from_seed(seed, country, language)
-        logger.info(f"[BPF] SEED='{seed}' | seed_cities={seed_cities}")
+        logger.debug("[BPF] SEED='%s' | seed_cities=%s", seed, seed_cities)
         
         all_words = set()
         for kw in unique_raw:
@@ -386,11 +384,11 @@ class BatchPostFilter:
                 final_anchors.append(kw)
                 stats['blocked'] += 1
                 stats['reasons'][category] += 1
+                logger.warning("BPF block: '%s' → %s (%s)", kw, reason, category)
 
         elapsed = time.time() - start_time
-        logger.info(f"[BPF] FINISH {elapsed:.2f}s | "
-                    f"allowed={len(final_keywords)} | anchors={len(final_anchors)} | "
-                    f"reasons={dict(stats['reasons'])}")
+        logger.info("[BPF] FINISH %.2fs | allowed=%d | anchors=%d | reasons=%s",
+                    elapsed, len(final_keywords), len(final_anchors), dict(stats['reasons']))
 
         return {
             'keywords': final_keywords,
@@ -410,8 +408,7 @@ class BatchPostFilter:
         # Проверяем наличие корней сида в ключе (ПРИОРИТЕТ СИДА)
         has_seed = self._has_seed_cores(keyword, seed) if seed else False
         
-        logger.debug(f"[BPF] CHECK keyword='{keyword}' | country={country} | "
-                     f"has_seed={has_seed} | seed_cities={seed_cities}")
+        logger.debug("[BPF] CHECK keyword='%s' | country=%s | has_seed=%s", keyword, country, has_seed)
         
         words = re.findall(r'[а-яёa-z0-9-]+', keyword)
         if not words:
@@ -421,7 +418,7 @@ class BatchPostFilter:
         
         words_set = set(words + keyword_lemmas)
         if any(city in words_set for city in seed_cities):
-            logger.debug(f"[BPF] ALLOW by seed_cities | keyword='{keyword}'")
+            logger.debug("[BPF] ALLOW by seed_cities | keyword='%s'", keyword)
             return True, "", ""
         
         for check_val in words + keyword_lemmas:
@@ -443,38 +440,21 @@ class BatchPostFilter:
             if w in self.districts:
                 dist_country = self.districts[w]
                 if dist_country != country.lower():
-                    # FIX 1: Слово входит в составной город НАШЕЙ страны?
-                    # "белая" ∈ "белая церковь"(UA) → не блокировать
                     if w in our_city_bigrams:
-                        logger.debug(f"[BPF] ALLOW district '{w}' — part of compound city in {country.upper()}")
                         continue
-                    
-                    # FIX 2: Слово само является городом НАШЕЙ страны?
-                    # "черкассы" = UA city → не блокировать как RU район
                     if self._find_in_country(w, country):
-                        logger.debug(f"[BPF] ALLOW district '{w}' — is a city in target {country.upper()}")
                         continue
-                    
-                    # FIX 3: Это обычное слово? ("центр", "рог")
-                    # Доверяем только словам из реального словаря (DictionaryAnalyzer),
-                    # НЕ угаданным по суффиксу (FakeDictionary)
                     if self._is_common_noun(w, language):
                         morph = self.morph_ru if language != 'uk' else self.morph_uk
                         parsed = morph.parse(w)[0]
                         is_real_dict = parsed.methods_stack[0][0].__class__.__name__ == 'DictionaryAnalyzer'
                         if is_real_dict and parsed.score >= 0.65:
-                            logger.debug(f"[BPF] ALLOW district '{w}' — real dictionary word (score={parsed.score:.2f})")
                             continue
-                    
-                    # Проверяем: есть ли в запросе город ЦЕЛЕВОЙ страны?
-                    # "харьков алексеевка" → "харьков" = UA → не блокируем "алексеевка" (RU)
                     has_target_city = any(
                         self.all_cities_global.get(other_w) == country.lower()
                         for other_w in set(words + keyword_lemmas) - {w}
                     )
                     if has_target_city:
-                        logger.debug(f"[BPF] ALLOW district '{w}' ({dist_country}) — "
-                                     f"keyword has target city ({country})")
                         continue
                     return False, f"район '{w}' ({dist_country})", "districts"
         
@@ -521,140 +501,86 @@ class BatchPostFilter:
         search_items.extend(trigrams)
         search_items.extend([tg.replace(' ', '-') for tg in trigrams])
 
-        # FIX: Собираем леммы слов которые являются городами НАШЕЙ страны
-        # "львов" → UA → лемма "лев" → не блокировать "лев" как город BF
+        # ОПТИМИЗАЦИЯ: убираем дубли (words==lemmas, bigrams==lemma_bigrams и т.д.)
+        search_items = list(dict.fromkeys(search_items))
+
+        # ОПТИМИЗАЦИЯ: один проход вместо двух — строим our_city_lemmas
+        # и keyword_has_target_city одновременно, без дублирующих _find_in_country
         our_city_lemmas = set()
-        for w in words:
+        keyword_has_target_city = False
+
+        for w in set(words + keyword_lemmas):  # set убирает дубли если word==lemma
             if self._find_in_country(w, country):
+                keyword_has_target_city = True
                 lemma = self._get_lemma(w, language)
                 if lemma != w:
                     our_city_lemmas.add(lemma)
-                    logger.debug(f"[BPF] our_city_lemma: '{w}' → '{lemma}'")
-
-        # FIX: Если в запросе есть город НАШЕЙ страны — не блокировать другие гео-слова
-        # "одесса черемушки" → "одесса" = UA → "черемушки" не блокируем
-        keyword_has_target_city = any(
-            self._find_in_country(w, country) for w in words + keyword_lemmas
-        )
+                    logger.debug("[BPF] our_city_lemma: '%s' → '%s'", w, lemma)
 
         for item in search_items:
             # ШАГ 0: Пропускаем короткие слова и ignored_words
             if len(item) < 3 or item in self.ignored_words:
-                if item in self.ignored_words:
-                    logger.info(f"[GEO_SKIP] Слово '{item}' в ignored_words")
                 continue
             
             # ШАГ 0.5: Geox guard — пропускаем слова, которые точно НЕ города
-            # "боли" → NOUN без Geox → skip (не город Боли в Китае)
-            # "или" → CONJ → skip (не город Или в GB)
-            # Только для одиночных слов (биграмы/триграмы проверяем как есть)
             if ' ' not in item and '-' not in item:
                 if self._should_skip_geo_check(item, language):
-                    logger.debug(f"[GEO_SKIP] Geox guard: '{item}' — не географическое слово")
                     continue
             
             item_normalized = self._get_lemma(item, language)
             
-            # ═══════════════════════════════════════════════════════════
-            # ЖЕСТКАЯ ИЕРАРХИЯ ПРИОРИТЕТОВ (v11)
-            # ═══════════════════════════════════════════════════════════
-            
-            # ┌─────────────────────────────────────────────────────────┐
-            # │ PRIORITY 1: СВОЙ ГОРОД (целевая страна)                 │
-            # │ Проверяем ПЕРВЫМ делом - это наш город?                 │
-            # └─────────────────────────────────────────────────────────┘
-            
-            is_our_city = self._find_in_country(item, country)
-            if not is_our_city:
-                # Проверяем также нормализованную форму
-                is_our_city = self._find_in_country(item_normalized, country)
-            
+            # PRIORITY 1: СВОЙ ГОРОД (целевая страна) — пропускаем
+            is_our_city = self._find_in_country(item, country) or self._find_in_country(item_normalized, country)
             if is_our_city:
-                logger.info(f"[GEO_ALLOW] ✓ PRIORITY 1: Город '{item}' найден в целевой стране {country.upper()}")
-                continue  # Львов спасен!
+                continue
             
-            # ┌─────────────────────────────────────────────────────────┐
-            # │ PRIORITY 2: ЧУЖОЙ ГОРОД (другая страна)                 │
-            # │ Если город найден в другой стране - блокируем           │
-            # └─────────────────────────────────────────────────────────┘
-            
+            # PRIORITY 2: ЧУЖОЙ ГОРОД (другая страна)
             found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
             
-            if found_country:
-                logger.info(f"[GEO_DEBUG] Слово '{item}' опознано как город страны: {found_country.upper()}")
+            if found_country and found_country != country.lower():
                 
-                # Это город ДРУГОЙ страны (мы уже проверили нашу выше)
-                if found_country != country.lower():
-                    
-                    # FIX: Это лемма нашего города? "лев" ← "львов" (UA)
-                    if item in our_city_lemmas or item_normalized in our_city_lemmas:
-                        logger.info(f"[GEO_ALLOW] ✓ Слово '{item}' — лемма города нашей страны, пропускаем")
+                # Лемма нашего города? "лев" ← "львов" (UA)
+                if item in our_city_lemmas or item_normalized in our_city_lemmas:
+                    continue
+                
+                # Обычное слово языка? "дом", "белая", "гора"
+                if self._is_common_noun(item, language):
+                    continue
+                
+                # Город из сида — всегда разрешён
+                if item_normalized in seed_cities or item in seed_cities:
+                    continue
+                
+                # В запросе есть город НАШЕЙ страны — проверяем районы и бренды
+                if keyword_has_target_city:
+                    item_no_yo = item.replace('ё', 'е')
+                    dist_variants = [
+                        self.districts.get(item),
+                        self.districts.get(item_normalized),
+                        self.districts.get(item_no_yo),
+                    ]
+                    if country.lower() in dist_variants:
                         continue
-                    
-                    # FIX: Это обычное слово языка? "дом", "белая", "гора"
-                    if self._is_common_noun(item, language):
-                        logger.info(f"[GEO_ALLOW] ✓ Слово '{item}' — обычное существительное, не город")
+                    if any(d is not None for d in dist_variants):
                         continue
-                    
-                    # Проверка seed_cities (города из сида всегда разрешены)
-                    if item_normalized in seed_cities or item in seed_cities:
-                        logger.info(f"[GEO_ALLOW] Город '{item}' разрешен (есть в сиде)")
+                    if not self._is_real_city_not_brand(item, found_country):
                         continue
-                    
-                    # FIX: Если в запросе есть город НАШЕЙ страны — не блокировать
-                    # "одесса черемушки" → одесса=UA, черемушки=UA district → пропускаем
-                    # "харьков алексеевка" → харьков=UA → пропускаем (контекст UA)
-                    # НО: "минск первомайский" → минск=BY, минск не район UA → блок
-                    if keyword_has_target_city:
-                        # Слово = район нашей страны? → точно пропускаем
-                        # Проверяем ВСЕ варианты написания (ё/е) — любой может быть наш район
-                        item_no_yo = item.replace('ё', 'е')
-                        dist_variants = [
-                            self.districts.get(item),
-                            self.districts.get(item_normalized),
-                            self.districts.get(item_no_yo),
-                        ]
-                        if country.lower() in dist_variants:
-                            logger.info(f"[GEO_ALLOW] ✓ '{item}' = район {country.upper()} + keyword has target city")
-                            continue
-                        # Слово = район в ЛЮБОЙ стране → типичное название микрорайона/посёлка
-                        # "алексеевка" = район в RU, но рядом с "харьков" = наш район
-                        # "минск" = нигде не район → не пропускаем
-                        if any(d is not None for d in dist_variants):
-                            logger.info(f"[GEO_ALLOW] ✓ '{item}' = район (generic name) + keyword has target city")
-                            continue
-                        # Слово НЕ является реальным городом? → пропускаем (бренд/аббревиатура)
-                        if not self._is_real_city_not_brand(item, found_country):
-                            logger.info(f"[GEO_ALLOW] ✓ Ключ содержит город {country.upper()}, "
-                                        f"пропускаем '{item}' ({found_country.upper()}) — не реальный город")
-                            continue
-                    
-                    # Проверяем - это РЕАЛЬНЫЙ город или возможный бренд?
-                    is_real_city = self._is_real_city_not_brand(item, found_country)
-                    
-                    if is_real_city:
-                        # Это явно РЕАЛЬНЫЙ город (Рига, Ейск, Ишим)
-                        # БЛОКИРУЕМ даже если есть seed!
-                        reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
-                        logger.warning(f"!!! [GEO_ANCHOR] ✗ PRIORITY 2: Ключ отправлен в якоря: '{keyword}' | Причина: {reason} (реальный чужой город)")
-                        return False, reason, f"{found_country}_cities"
-                    
-                    # ┌─────────────────────────────────────────────────────┐
-                    # │ PRIORITY 3: СПОРНОЕ СЛОВО (возможный бренд)         │
-                    # │ Короткое слово или латиница - может быть брендом   │
-                    # └─────────────────────────────────────────────────────┘
-                    
-                    if has_seed:
-                        # Слово похоже на бренд И есть seed - разрешаем
-                        logger.info(f"[GEO_ALLOW] ✓ PRIORITY 3: Город '{item}' ({found_country.upper()}) разрешен (спорное слово + есть seed)")
-                        continue
-                    else:
-                        # Нет seed - блокируем даже спорные слова
-                        reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
-                        logger.warning(f"!!! [GEO_ANCHOR] Ключ отправлен в якоря: '{keyword}' | Причина: {reason}")
-                        return False, reason, f"{found_country}_cities"
+                
+                # PRIORITY 3: реальный город или спорное слово (бренд)?
+                is_real_city = self._is_real_city_not_brand(item, found_country)
+                
+                if is_real_city:
+                    reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
+                    return False, reason, f"{found_country}_cities"
+                
+                # Спорное слово
+                if has_seed:
+                    continue  # Есть seed — разрешаем
+                else:
+                    reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
+                    return False, reason, f"{found_country}_cities"
             
-            # Если город не найден нигде - проверяем на обычное существительное
+            # Город не найден — проверяем на обычное существительное
             if self._is_common_noun(item_normalized, language):
                 continue
         
