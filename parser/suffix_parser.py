@@ -428,7 +428,6 @@ class SuffixParser:
         # city=None → столица страны по умолчанию (Kyiv для ua, Moscow для ru, ...)
         # city="Lviv" → конкретный город из geo_uule.json
         _uule = get_uule(country, city)
-        print(f"[UULE] country={country} city={city!r} → uule={_uule}")
 
         # Step 1: Generate queries
         analysis, all_queries = self.generator.generate(
@@ -751,8 +750,12 @@ class SuffixParser:
 
         # ── E_simple Chrome ───────────────────────────────────────────────
         async def run_e_simple_chrome(clients: list, sems: list):
-            """Chrome E_simple: 9 букв распределены по Chrome клиентам через shared sems."""
+            """Chrome E_simple: буквы + цифры 0-9 параллельно через shared sems.
+            Цифры всегда включены (находят ключи типа "ремонт пылесосов в радиусе 800 м").
+            """
             letters = [c for c in ALPHABET if c in CHROME_E_SIMPLE_LETTERS]
+            digits = list("0123456789")
+            chars = letters + digits  # 9 букв + 10 цифр = 19 запросов
 
             async def fetch_chr_char(char: str, idx: int):
                 slot = idx % len(clients)
@@ -768,7 +771,7 @@ class SuffixParser:
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_chr, results, elapsed)
 
-            await asyncio.gather(*[fetch_chr_char(c, i) for i, c in enumerate(letters)])
+            await asyncio.gather(*[fetch_chr_char(c, i) for i, c in enumerate(chars)])
 
         # ── Agent runners ─────────────────────────────────────────────────
         # 3 Chrome IP × Semaphore(5) = 15 concurrent Chrome ABCD
