@@ -1060,12 +1060,17 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     if "anchors" not in result:
         result["anchors"] = []
     
+    # Словарь реальных замеров: filter_name → секунды
+    _timings: dict = {}
+
     before_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
     
     # PRE-ФИЛЬТР
     if run_pre:
         parser.tracer.before_filter("pre_filter", result.get("keywords", []))
+        _t0 = time.time()
         result = apply_pre_filter(result, seed=seed)
+        _timings["pre_filter"] = round(time.time() - _t0, 4)
         parser.tracer.after_filter("pre_filter", result.get("keywords", []))
         
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
@@ -1076,7 +1081,9 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     # ГЕО-ФИЛЬТР
     if run_geo:
         parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
+        _t0 = time.time()
         result = filter_geo_garbage(result, seed=seed, target_country=country)
+        _timings["geo_garbage_filter"] = round(time.time() - _t0, 4)
         parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
         
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
@@ -1087,6 +1094,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     # BATCH POST-FILTER
     if run_bpf:
         parser.tracer.before_filter("batch_post_filter", result.get("keywords", []))
+        _t0 = time.time()
         bpf_result = parser.post_filter.filter_batch(
             keywords=result.get("keywords", []),
             seed=seed,
@@ -1094,6 +1102,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             language=language
         )
         result["keywords"] = bpf_result["keywords"]
+        _timings["batch_post_filter"] = round(time.time() - _t0, 4)
         parser.tracer.after_filter("batch_post_filter", result.get("keywords", []))
         
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
@@ -1103,13 +1112,15 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     # ДЕДУПЛИКАЦИЯ (опционально)
     if deduplicate:
         parser.tracer.before_filter("deduplicate", result.get("keywords", []))
+        _t0 = time.time()
         result = deduplicate_final_results(result)
+        _timings["deduplicate"] = round(time.time() - _t0, 4)
         parser.tracer.after_filter("deduplicate", result.get("keywords", []))
     
-    # L0 КЛАССИФИКАТОР (последний в цепочке)
+    # L0 КЛАССИФИКАТОР
     if run_l0:
         parser.tracer.before_filter("l0_filter", result.get("keywords", []))
-        
+        _t0 = time.time()
         result = apply_l0_filter(
             result,
             seed=seed,
@@ -1117,8 +1128,8 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             geo_db=GEO_DB,
             brand_db=BRAND_DB,
         )
+        _timings["l0_filter"] = round(time.time() - _t0, 4)
         
-        # Трейсер L0 — три исхода
         l0_trace = result.get("_l0_trace", [])
         l0_trash = [r["keyword"] for r in l0_trace if r.get("label") == "TRASH"]
         
@@ -1129,18 +1140,18 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             l0_trace=l0_trace,
         )
     
-    # L2 СЕМАНТИЧЕСКИЙ КЛАССИФИКАТОР (после L0, обрабатывает GREY)
+    # L2 СЕМАНТИЧЕСКИЙ КЛАССИФИКАТОР
     if run_l2 and result.get("keywords_grey"):
         parser.tracer.before_filter("l2_filter", result.get("keywords_grey", []))
-        
+        _t0 = time.time()
         result = apply_l2_filter(
             result,
             seed=seed,
             enable_l2=True,
             config=l2_config,
         )
+        _timings["l2_filter"] = round(time.time() - _t0, 4)
         
-        # Логируем результаты L2
         l2_stats = result.get("l2_stats", {})
         l2_trace = result.get("_l2_trace", [])
         
@@ -1151,7 +1162,6 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             f"({l2_stats.get('reduction_pct', 0)}% reduction)"
         )
         
-        # Трейсер L2 — три исхода
         parser.tracer.after_l2_filter(
             valid=result.get("keywords", []),
             trash=[a for a in result.get("anchors", []) if isinstance(a, dict) and a.get("anchor_reason") == "L2_TRASH"],
@@ -1160,20 +1170,19 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             l2_trace=l2_trace,
         )
     
-    # L3 DEEPSEEK LLM КЛАССИФИКАТОР (после L2, обрабатывает оставшиеся GREY)
+    # L3 DEEPSEEK LLM КЛАССИФИКАТОР
     if run_l3 and result.get("keywords_grey"):
         parser.tracer.before_filter("l3_filter", result.get("keywords_grey", []))
-        
+        _t0 = time.time()
         cfg = l3_config or _build_l3_config()
-        
         result = apply_l3_filter(
             result,
             seed=seed,
             enable_l3=True,
             config=cfg,
         )
+        _timings["l3_filter"] = round(time.time() - _t0, 4)
         
-        # Логируем результаты L3
         l3_stats = result.get("l3_stats", {})
         l3_trace = result.get("_l3_trace", [])
         
@@ -1184,7 +1193,6 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             f"(API: {l3_stats.get('api_time', 0)}s)"
         )
         
-        # Трейсер L3
         l3_valid_kws = [t["keyword"] for t in l3_trace if t.get("label") == "VALID"]
         l3_trash_kws = [t["keyword"] for t in l3_trace if t.get("label") == "TRASH"]
         l3_error_kws = [t["keyword"] for t in l3_trace if t.get("label") == "ERROR"]
@@ -1210,10 +1218,11 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         if key and key not in seen:
             seen.add(key)
             unique_anchors.append(a)
-    result["anchors"] = unique_anchors  # НЕ сортируем — dict'ы не сортируются
+    result["anchors"] = unique_anchors
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
+    result["_filter_timings"] = _timings  # ← реальные замеры времени
     result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l2": run_l2, "l3": run_l3, "rel": not parser.skip_relevance_filter}
     return result
 
