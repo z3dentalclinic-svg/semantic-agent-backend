@@ -428,6 +428,7 @@ class SuffixParser:
         # city=None → столица страны по умолчанию (Kyiv для ua, Moscow для ru, ...)
         # city="Lviv" → конкретный город из geo_uule.json
         _uule = get_uule(country, city)
+        print(f"[UULE] country={country} city={city!r} → uule={_uule}")
 
         # Step 1: Generate queries
         analysis, all_queries = self.generator.generate(
