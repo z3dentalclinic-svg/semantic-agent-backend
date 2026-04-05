@@ -59,11 +59,12 @@ def register_suffix_endpoint(app: FastAPI):
         filters: str = Query("none", description="Фильтры (для совместимости)"),
         cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
         include_letters: bool = Query(True, description="Letter Sweep — буквенный перебор"),
+        city: str = Query(None, description="Город для uule гео-таргетинга (по-английски). None = столица страны."),
     ):
         """
         SUFFIX MAP: Smart suffix expansion with priority matrix + tracer.
         Dual-agent: Chrome + Firefox запускаются параллельно внутри парсера.
-        Параметр google_client удалён — агенты управляются внутренней логикой.
+        uule гео-таргетинг: по умолчанию столица страны, опционально конкретный город.
         """
         sp = get_suffix_parser()
         result = await sp.parse(
@@ -75,6 +76,7 @@ def register_suffix_endpoint(app: FastAPI):
             echelon=echelon,
             cursor_position=cp,
             include_letters=include_letters,
+            city=city,
         )
 
         # Format response compatible with existing HTML displayResults
