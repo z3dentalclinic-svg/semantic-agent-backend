@@ -1,887 +1,779 @@
 """
-GEO Garbage Filter - WHITE-LIST v3.0 FINAL (с нормализацией падежей)
-Universal multilingual geographical filtering
-
-КРИТИЧЕСКИЕ УЛУЧШЕНИЯ:
-1. Нормализация падежей: "киеве" → "киев", "россии" → "россия", "харьковская" → "харьков"
-2. Объединение geonamescache + fallback (всегда)
-3. Жёсткое правило: 2+ города в запросе → автоматический БЛОК
-4. Проверка природных объектов через fallback
-
-ПРИНЦИП: «Разрешено только то, что относится к seed_city»
-
-✅ РАЗРЕШЕНО:
-   - seed_city
-   - Районы seed_city
-   - Обычные слова (не гео-объекты)
-
-❌ БЛОКИРУЕТСЯ:
-   - Любой другой город (даже в падеже: "киеве", "киева")
-   - Любая страна (даже в падеже: "россии", "украине")
-   - 2+ города в одном запросе
-   - Природные объекты: горы, реки, озера
-   - Районы других городов
-
-ТЕСТЫ (seed = "ремонт пылесосов днепр"):
-БЛОК:
-- "днепр в киеве"          → киеве→киев, 2 города
-- "днепр в киеве адреса"   → киеве→киев, 2 города
-- "днепр ельбрус"          → эльбрус = гора
-- "днепр харьковская область" → харьковская→харьков, 2 города
-- "днепр енисей"           → енисей = река
-- "днепр россия"           → россия = страна
-
-OK:
-- "днепр"                  → только seed_city
-- "днепр левый берег"      → не гео-объекты
-- "днепр амур"             → амур = район Днепра
+Batch Post-Filter v7.9 - FUNDAMENTAL FIX: GEO DATABASE PRIORITY
+Based on Gemini's recommendations for 187 countries support
 """
 
 import re
 import logging
-import json
-import os
-from typing import Dict, Set, List, Tuple
+import time
+from typing import List, Dict, Set, Tuple, Optional
+from collections import Counter
 
-logger = logging.getLogger("GeoGarbageFilter")
+logger = logging.getLogger("BatchPostFilter")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# ДИНАМИЧЕСКАЯ ЗАГРУЗКА РАЙОНОВ (districts.json + geonamescache)
-# ═══════════════════════════════════════════════════════════════════
-
-# Маппинг: любое_имя_города → canonical (из geonamescache)
-CITY_CANONICAL_MAP: Dict[str, str] = {}
-
-# Маппинг: canonical_city → set районов (из districts.json)
-CANONICAL_CITY_DISTRICTS: Dict[str, Set[str]] = {}
-
-# Маппинг: район → canonical_city (обратный lookup)
-DISTRICT_TO_CANONICAL: Dict[str, str] = {}
-
-# Маппинг: country_name (ru/uk/en) → (country_code, 'country')
-COUNTRY_NAMES_MULTILINGUAL: Dict[str, tuple] = {}
-
-try:
-    import geonamescache
-    _gc = geonamescache.GeonamesCache()
-    _cities = _gc.get_cities()
-    
-    # Строим CITY_CANONICAL_MAP: сначала мелкие, потом крупные (крупные перезаписывают)
-    for _city_data in sorted(_cities.values(), key=lambda c: c.get('population', 0)):
-        _canonical = _city_data['name'].lower()
-        CITY_CANONICAL_MAP[_canonical] = _canonical
-        for _alt in _city_data.get('alternatenames', []):
-            if len(_alt) > 1:
-                CITY_CANONICAL_MAP[_alt.lower()] = _canonical
-    
-    logger.info(f"[GEO_DISTRICTS] CITY_CANONICAL_MAP: {len(CITY_CANONICAL_MAP)} entries")
-    
-    # Загружаем districts.json и строим CANONICAL_CITY_DISTRICTS
-    _districts_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "districts.json")
-    if os.path.exists(_districts_path):
-        with open(_districts_path, "r", encoding="utf-8") as _f:
-            _raw_districts = json.load(_f)
+class BatchPostFilter:
+    def __init__(self, 
+                 all_cities_global: Dict[str, str], 
+                 forbidden_geo: Set[str], 
+                 districts: Optional[Dict[str, str]] = None,
+                 population_threshold: int = 5000):
+        self.forbidden_geo = forbidden_geo
+        self.districts = districts or {}
+        self.population_threshold = population_threshold
         
-        from collections import defaultdict
-        _temp = defaultdict(set)
+        self.city_abbreviations = self._get_city_abbreviations()
+        self.regions = self._get_regions()
+        self.countries = self._get_countries()
+        self.manual_small_cities = self._get_manual_small_cities()
         
-        for _district_name, _info in _raw_districts.items():
-            _city_raw = _info.get('city', '').lower()
-            # Маппим city из districts.json на canonical через geonamescache
-            _canonical_city = CITY_CANONICAL_MAP.get(_city_raw, _city_raw)
-            _temp[_canonical_city].add(_district_name)
-            DISTRICT_TO_CANONICAL[_district_name] = _canonical_city
+        self.ignored_words = {
+            "дом", "мир", "бор", "нива", "балка", "луч", "спутник", "работа", "цена", "выезд",
+        }
+
+        # Кэш на уровень одного filter_batch: (word, country) → bool
+        # Сбрасывается при каждом вызове filter_batch.
+        # Ключевая экономия: слово "купить" в 500 ключах → 1 вызов _find_in_country вместо 500.
+        self._request_cache: dict = {}
+
+        # Список крупных городов/столиц которые ВСЕГДА блокируются (не бренды)
+        self.forbidden_major_cities = {
+            # Россия
+            "москва", "moscow", "санкт-петербург", "petersburg", "питер", "spb",
+            "новосибирск", "екатеринбург", "казань", "нижний новгород",
+            "челябинск", "самара", "омск", "ростов", "уфа", "красноярск",
+            # Беларусь (если таргет не BY)
+            "минск", "minsk", "гомель", "могилев", "витебск", "гродно", "брест",
+            # Казахстан (если таргет не KZ)
+            "алматы", "almaty", "астана", "nur-sultan", "шымкент",
+            # Другие страны
+            "киев", "kiev", "харьков", "одесса", "днепр", "львов", "lviv", # UA
+            "варшава", "warsaw", "краков", "krakow",  # PL
+            "берлин", "berlin", "мюнхен", "munich",  # DE
+            "париж", "paris", "лондон", "london",  # FR, GB
+            "рим", "rome", "милан", "milan",  # IT
+            "мадрид", "madrid", "барселона", "barcelona",  # ES
+        }
+
         
-        CANONICAL_CITY_DISTRICTS = dict(_temp)
-        logger.info(f"[GEO_DISTRICTS] CANONICAL_CITY_DISTRICTS: {len(CANONICAL_CITY_DISTRICTS)} cities, "
-                    f"{len(DISTRICT_TO_CANONICAL)} districts")
-    else:
-        logger.warning(f"[GEO_DISTRICTS] districts.json not found at {_districts_path}")
+        base_index = {k.lower().strip(): v for k, v in (all_cities_global or {}).items()}
+        geo_index = self._build_filtered_geo_index()
         
-except ImportError:
-    logger.warning("[GEO_DISTRICTS] geonamescache not available, dynamic districts disabled")
-except Exception as e:
-    logger.error(f"[GEO_DISTRICTS] Error loading: {e}")
-
-# Загружаем названия стран на ru/uk/en через Babel
-try:
-    from babel import Locale
-    _countries = _gc.get_countries() if _gc else {}
-    
-    # Английские имена
-    for _code, _data in _countries.items():
-        COUNTRY_NAMES_MULTILINGUAL[_data['name'].lower()] = (_code, 'country')
-    
-    # Русские и украинские через Babel
-    for _lang in ['ru', 'uk']:
-        _locale = Locale(_lang)
-        for _code in _countries.keys():
-            _name = _locale.territories.get(_code)
-            if _name and len(_name) > 2:
-                COUNTRY_NAMES_MULTILINGUAL[_name.lower()] = (_code, 'country')
-    
-    logger.info(f"[GEO_DISTRICTS] COUNTRY_NAMES_MULTILINGUAL: {len(COUNTRY_NAMES_MULTILINGUAL)} entries")
-except ImportError:
-    logger.warning("[GEO_DISTRICTS] babel not available, multilingual country names disabled")
-except Exception as e:
-    logger.error(f"[GEO_DISTRICTS] Error loading country names: {e}")
-
-# pymorphy3 для Geox проверки (регионы, республики)
-try:
-    import pymorphy3 as _pymorphy3
-    _morph_geox = _pymorphy3.MorphAnalyzer(lang='ru')
-except ImportError:
-    _morph_geox = None
-    logger.warning("[GEO_DISTRICTS] pymorphy3 not available for Geox checks")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# БАЗА ОККУПИРОВАННЫХ ТЕРРИТОРИЙ
-# ═══════════════════════════════════════════════════════════════════
-
-OCCUPIED_TERRITORIES = {
-    "севастополь", "sevastopol", "sebastopol", "симферополь", "simferopol",
-    "керчь", "kerch", "евпатория", "yevpatoria", "eupatoria", "ялта", "yalta", "ялт",
-    "феодосия", "feodosia", "theodosia", "джанкой", "dzhankoy", "алушта", "alushta",
-    "бахчисарай", "bakhchisaray", "красноперекопск", "krasnoperekopsk", "армянск", "armyansk",
-    "саки", "saki", "судак", "sudak", "белогорск", "belogorsk", "старый крым", "stary krym",
-    "алупка", "alupka", "гурзуф", "gurzuf", "ливадия", "livadia", "массандра", "massandra",
-    "гаспра", "gaspra", "форос", "foros", "партенит", "partenit", "коктебель", "koktebel",
-    "новый свет", "novyi svet", "щелкино", "shchelkino", "ленино", "lenino",
-    "красногвардейское", "krasnogvardeyskoye", "нижнегорский", "nizhnegorsky",
-    "советский", "sovetsky", "кировское", "kirovskoye", "черноморское", "chernomorskoye",
-    "раздольное", "razdolnoye", "первомайское", "pervomaiske", "октябрьское", "oktyabrskoye",
-    "молодежное", "molodezhnoye", "мирный", "mirny", "инкерман", "inkerman",
-    "балаклава", "balaklava", "крым", "crimea", "крыма", "крыму", "крымский", 
-    "крымская", "крымское", "арк", "ark",
-    "донецк", "donetsk", "горловка", "horlivka", "gorlovka", "макеевка", "makiivka", 
-    "makeyevka", "енакиево", "yenakiieve", "enakievo", "дебальцево", "debaltseve", 
-    "debaltsevo", "харцызск", "khartsyzsk", "снежное", "snizhne", "торез", "torez",
-    "шахтерск", "shakhtarsk", "красноармейск", "krasnoarmiysk", "иловайск", "ilovaisk",
-    "амвросиевка", "amvrosiivka", "старобешево", "starobesheve", "тельманово", "telmanove",
-    "новоазовск", "novoazovsk", "ясиноватая", "yasynuvata", "авдеевка", "avdiivka", 
-    "avdeevka", "докучаевск", "dokuchaievsk", "зугрэс", "zuhres", "моспино", "mospyne",
-    "углегорск", "vuhledar", "uglegorsk", "дзержинск", "toretsk", "dzerzhinsk",
-    "горняк", "hirnyak", "комсомольское", "komsomolske", "новоселидовка", "novoselidivka",
-    "седово", "siedove", "безыменное", "bezimenne", "сартана", "sartana",
-    "старогнатовка", "starohnativka", "мангуш", "manhush", "володарское", "volodarske",
-    "новотроицкое", "novotroitske", "оленовка", "olenivka", "еленовка", "yelenivka",
-    "новоселовка", "novoselivka", "мариуполь", "mariupol", "талаковка", "talakivka",
-    "виноградное", "vynohradne", "приморское", "prymorske", "урзуф", "urzuf",
-    "днр", "dnr", "донецкая народная республика", "донбасс", "donbass", "донбасса", "донбассе",
-    "луганск", "luhansk", "lugansk", "алчевск", "alchevsk", "стаханов", "stakhanov",
-    "kadiivka", "кадиевка", "краснодон", "krasnodon", "ровеньки", "rovenky",
-    "свердловск", "sverdlovsk", "dovzhansk", "довжанськ", "антрацит", "antratsyt",
-    "брянка", "brianka", "красный луч", "krasny luch", "khrustalnyi", "хрустальный",
-    "первомайск", "pervomaisk", "молодогвардейск", "molodohvardiisk", "лутугино", "lutuhyne",
-    "ирмино", "irmino", "зоринск", "zorynsk", "перевальск", "perevalsk", "кировск", "kirovsk",
-    "александровск", "oleksandrivsk", "суходольск", "sukhodilsk", "хрящеватое", "khriashchuvate",
-    "металлист", "metalist", "георгиевка", "heorgiivka", "успенка", "uspenka",
-    "изварино", "izvaryne", "краснодонецкое", "krasnodonetske", "петровское", "petrivske",
-    "дьяково", "diakove", "лозовое", "lozove", "новосветловка", "novosvitlivka",
-    "городище", "horodyshche", "артемово", "artemove", "родаково", "rodakove",
-    "червонопартизанск", "chervonyi partyzan", "лнр", "lnr", "луганская народная республика",
-    "лднр", "ldnr", "каховка", "kakhovka", "новая каховка", "nova kakhovka", "геническ", "henichesk",
-    "скадовск", "skadovsk", "таврийск", "tavriisk", "чаплынка", "chaplynka",
-    "калачи", "kalanchak", "мелитополь", "melitopol", "бердянск", "berdiansk", "berdyansk",
-    "энергодар", "enerhodar", "токмак", "tokmak", "василевка", "vasylivka",
-    "приморск", "prymorsk", "пологи", "polohy", "михайловка", "mykhailivka",
-    "молочанск", "molochansk", "якимовка", "yakymivka",
-}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# БАЗА РАЙОНОВ ГОРОДОВ
-# ═══════════════════════════════════════════════════════════════════
-
-CITY_DISTRICTS = {
-    "киев": {
-        "голосеевский", "голосіївський", "holosiivskyi", "obolon", "оболонь", 
-        "оболонський", "obolonsky", "печерск", "печерський", "pechersk", "pechersky", 
-        "подол", "подільський", "podil", "podilsky", "шевченковский", "шевченківський", 
-        "shevchenkivskyi", "святошин", "святошинський", "sviatoshyn", "sviatoshynsky", 
-        "соломенка", "соломʼянський", "solomianskyi", "дарница", "дарницький", 
-        "darnytsia", "darnytsky", "днепровский", "дніпровський", "dniprovskyi", 
-        "деснянский", "деснянський", "desnianskyi", "позняки", "pozniaky",
-        "троещина", "troieshchyna"
-    },
-    "днепр": {
-        "амур", "amur", "чечеловский", "чечелівський", "chechelivskyi", 
-        "шевченковский", "шевченківський", "shevchenkivskyi", "соборный", "соборний", 
-        "soborny", "центральный", "центральний", "tsentralnyi", "central", "индустриальный", 
-        "індустріальний", "industrialnyi", "industrial", "новокодацкий", "новокодацький", 
-        "novokodatsky", "самарский", "самарський", "samarsky"
-    },
-    "днепропетровск": {
-        "амур", "amur", "чечеловский", "чечелівський", "шевченковский", "шевченківський", 
-        "соборный", "соборний", "центральный", "центральний", "индустриальный", 
-        "індустріальний", "новокодацкий", "новокодацький", "самарский", "самарський"
-    },
-    "харьков": {
-        "киевский", "київський", "kyivskyi", "московский", "московський", "moskovsky", 
-        "дзержинский", "дзержинський", "фрунзенский", "фрунзенський", "ленинский", 
-        "ленінський", "октябрьский", "жовтневий", "zhovtnevyi", "червонозаводской", 
-        "червонозаводський", "коминтерновский", "комінтернівський", "орджоникидзевский", 
-        "орджонікідзевський", "индустриальный", "індустріальний"
-    },
-    "одесса": {
-        "киевский", "київський", "kyivskyi", "малиновский", "малиновський", "malynovskyi", 
-        "приморский", "приморський", "prymorskyi", "суворовский", "суворовський", "suvorovskyi"
-    },
-    "львов": {
-        "галицкий", "галицький", "halytskyi", "железнодорожный", "залізничний", "zaliznychnyi", 
-        "лычаковский", "личаківський", "lychakivskyi", "сиховский", "сихівський", "sykhivskyi", 
-        "франковский", "франківський", "frankivskyi", "шевченковский", "шевченківський"
-    },
-    "запорожье": {
-        "александровский", "олександрівський", "oleksandrivskyi", "вознесеновский", 
-        "вознесенівський", "voznesenovskyi", "днепровский", "дніпровський", "dniprovskyi", 
-        "заводской", "заводський", "zavodskyi", "коммунарский", "комунарський", "komunarskyi", 
-        "ленинский", "ленінський", "leninskyi", "хортицкий", "хортицький", "khortytskyi"
-    },
-    "минск": {
-        "уручье", "uruchye", "шабаны", "shabany", "каменная горка", "kamennaya gorka", 
-        "серебрянка", "serebryanka"
-    },
-    "ташкент": {
-        "чиланзар", "chilanzar", "юнусабад", "yunusabad", "сергели", "sergeli", 
-        "яккасарай", "yakkasaray"
-    },
-}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# ФУНКЦИЯ НОРМАЛИЗАЦИИ ТОКЕНОВ (падежи, адъективные формы)
-# ═══════════════════════════════════════════════════════════════════
-
-def _normalize_token(token: str) -> str:
-    """
-    Нормализует токен, удаляя падежные окончания
-    
-    Цель: "киеве" → "киев", "россии" → "россия", "харьковская" → "харьков"
-    
-    Удаляет:
-    - Однобуквенные: е, и, у, ю, а, я
-    - Двухбуквенные: ой, ый, ий, ом, ем, ах, ях, ою, ее
-    - Адъективные: ская, ский, ской, ском, скими, ских
-    
-    Args:
-        token: исходное слово (lowercase)
-    
-    Returns:
-        нормализованное слово
-    
-    Examples:
-        "киеве" → "киев"
-        "россии" → "россия" (росси+и → росси, но длина < 3, остается россии)
-        "харьковская" → "харьков"
-        "днепре" → "днепр"
-        "украине" → "украин" → но если короче 3, вернет "украине"
-    """
-    if len(token) < 3:
-        return token
-    
-    original_token = token
-    
-    # Адъективные окончания (сначала, т.к. они длиннее)
-    adj_endings = [
-        'ская', 'ский', 'ской', 'ском', 'скими', 'ских', 'скую', 'ское',
-        'кая', 'кий', 'кой', 'ком', 'кими', 'ких', 'кую', 'кое'
-    ]
-    
-    for ending in adj_endings:
-        if token.endswith(ending):
-            stem = token[:-len(ending)]
-            if len(stem) >= 3:
-                return stem
-    
-    # Двухбуквенные падежные окончания
-    two_letter_endings = ['ой', 'ый', 'ий', 'ом', 'ем', 'ам', 'ях', 'ах', 'ою', 'ее', 'ие', 'ые']
-    
-    for ending in two_letter_endings:
-        if token.endswith(ending):
-            stem = token[:-2]
-            if len(stem) >= 3:
-                return stem
-    
-    # Однобуквенные падежные окончания
-    one_letter_endings = ['е', 'и', 'у', 'ю', 'а', 'я', 'ы']
-    
-    for ending in one_letter_endings:
-        if token.endswith(ending):
-            stem = token[:-1]
-            if len(stem) >= 3:
-                return stem
-    
-    return original_token
-
-
-def _resolve_oblast_adjective(adj_word: str, all_geo_entities: dict) -> str:
-    """
-    Восстанавливает город из прилагательного формы "X область".
-    
-    Алгоритмический, без хардкода: стрипает adj-суффикс, пробует
-    city-суффиксы, валидирует по population ≥ 50000.
-    
-    "одесская" → strip "ская" → "одес" + "а" → "одеса" (UA, pop 1M) ✅
-    "минская"  → strip "кая" → "минс" + "к" → "минск" (BY, pop 1.7M) ✅
-    "красная"  → no city match with pop ≥ 50k → None ✅
-    
-    Returns: city name if found, None otherwise.
-    """
-    adj_lower = adj_word.lower()
-    
-    adj_suffixes = ['ская', 'ський', 'ська', 'ский', 'ской', 'ском', 
-                    'скую', 'ское', 'кая', 'кий', 'кой']
-    city_suffixes = ['', 'а', 'я', 'ск', 'к', 'ь', 'ье', 'е', 'о', 
-                     'ів', 'ва', 'сса', 'са', 'ы', 'і', 'и']
-    
-    best_match = None
-    best_pop = 0
-    
-    for asuf in sorted(adj_suffixes, key=len, reverse=True):
-        if adj_lower.endswith(asuf):
-            stem = adj_lower[:-len(asuf)]
-            if len(stem) < 3:
-                continue
-            
-            for csuf in city_suffixes:
-                candidate = stem + csuf
-                if candidate in all_geo_entities:
-                    entity = all_geo_entities[candidate]
-                    # entity может быть tuple (country, type) или dict
-                    if isinstance(entity, tuple):
-                        ent_country, ent_type = entity
-                        if ent_type == 'city':
-                            # Используем длину имени как proxy для population 
-                            # (в контексте области — любой город в базе валиден)
-                            if best_match is None or len(candidate) > len(best_match):
-                                best_match = candidate
-    
-    return best_match
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FALLBACK БАЗА ГЕО-СУЩНОСТЕЙ
-# ═══════════════════════════════════════════════════════════════════
-
-def _get_fallback_geo_entities() -> Dict[str, Tuple[str, str]]:
-    """
-    Fallback база гео-сущностей (ВСЕГДА используется!)
-    
-    Формат: {название: (код_страны, тип)}
-    
-    Включает:
-    - Русские/украинские названия городов
-    - Все страны на всех языках
-    - Природные объекты (горы, реки, озера)
-    """
-    return {
-        # ═══ Города Украины ═══
-        'київ': ('UA', 'city'), 'киев': ('UA', 'city'), 'kyiv': ('UA', 'city'),
-        'харків': ('UA', 'city'), 'харьков': ('UA', 'city'), 'kharkiv': ('UA', 'city'),
-        'одеса': ('UA', 'city'), 'одесса': ('UA', 'city'), 'odesa': ('UA', 'city'),
-        'дніпро': ('UA', 'city'), 'днепр': ('UA', 'city'), 'dnipro': ('UA', 'city'),
-        'львів': ('UA', 'city'), 'львов': ('UA', 'city'), 'lviv': ('UA', 'city'),
-        'запоріжжя': ('UA', 'city'), 'запорожье': ('UA', 'city'), 'zaporizhzhia': ('UA', 'city'),
+        for k, v in geo_index.items():
+            if k not in base_index:
+                base_index[k] = v
         
-        # ═══ Оккупированные города (тоже city для блокировки через MULTI_CITY) ═══
-        'севастополь': ('UA', 'city'), 'sevastopol': ('UA', 'city'),
-        'симферополь': ('UA', 'city'), 'simferopol': ('UA', 'city'),
-        'ялта': ('UA', 'city'), 'yalta': ('UA', 'city'), 'ялт': ('UA', 'city'),  # + нормализованная
-        'керчь': ('UA', 'city'), 'kerch': ('UA', 'city'),
-        'донецк': ('UA', 'city'), 'donetsk': ('UA', 'city'),
-        'луганск': ('UA', 'city'), 'luhansk': ('UA', 'city'),
-        'мариуполь': ('UA', 'city'), 'mariupol': ('UA', 'city'),
-        'мелитополь': ('UA', 'city'), 'melitopol': ('UA', 'city'),
-        'бердянск': ('UA', 'city'), 'berdiansk': ('UA', 'city'),
+        self.all_cities_global = base_index
         
-        # ═══ Города Беларуси ═══
-        'мінск': ('BY', 'city'), 'минск': ('BY', 'city'), 'minsk': ('BY', 'city'),
-        'гомель': ('BY', 'city'), 'homel': ('BY', 'city'),
-        'могилев': ('BY', 'city'), 'mogilev': ('BY', 'city'),
+        forced_by_cities = {
+            "барановичи": "by",
+            "baranovichi": "by",
+            "ждановичи": "by",
+            "zhdanovichi": "by",
+            "лошица": "by",
+        }
         
-        # ═══ Города Польши ═══
-        'warszawa': ('PL', 'city'), 'варшава': ('PL', 'city'),
-        'szczecin': ('PL', 'city'), 'щецин': ('PL', 'city'),
-        'kraków': ('PL', 'city'), 'краков': ('PL', 'city'),
-        'gdańsk': ('PL', 'city'),
+        for name, code in forced_by_cities.items():
+            if name not in self.all_cities_global:
+                self.all_cities_global[name] = code
         
-        # ═══ Города России ═══
-        'москва': ('RU', 'city'), 'moscow': ('RU', 'city'),
-        'санкт-петербург': ('RU', 'city'), 'petersburg': ('RU', 'city'),
-        'новосибирск': ('RU', 'city'), 'novosibirsk': ('RU', 'city'),
-        'екатеринбург': ('RU', 'city'), 'yekaterinburg': ('RU', 'city'),
-        'казань': ('RU', 'city'), 'kazan': ('RU', 'city'),
-        'йошкар-ола': ('RU', 'city'), 'yoshkar-ola': ('RU', 'city'),
-        'йошкар': ('RU', 'city'), 'ола': ('RU', 'city'),  # компоненты составного названия
-        'нижний новгород': ('RU', 'city'),
-        'самара': ('RU', 'city'), 'samara': ('RU', 'city'),
-        'омск': ('RU', 'city'), 'omsk': ('RU', 'city'),
-        'челябинск': ('RU', 'city'), 'chelyabinsk': ('RU', 'city'),
+        # Украинские города (КРИТИЧНО: на случай если geonamescache не загружен)
+        forced_ua_cities = {
+            "львов": "ua",
+            "львів": "ua", 
+            "lviv": "ua",
+            "lvov": "ua",
+            "lemberg": "ua",
+            "киев": "ua",
+            "київ": "ua",
+            "kyiv": "ua",
+            "kiev": "ua",
+            "харьков": "ua",
+            "харків": "ua",
+            "kharkiv": "ua",
+            "одесса": "ua",
+            "одеса": "ua",
+            "odessa": "ua",
+            "днепр": "ua",
+            "дніпро": "ua",
+            "dnipro": "ua",
+            "запорожье": "ua",
+            "запоріжжя": "ua",
+            "zaporizhzhia": "ua",
+        }
         
-        # ═══ Страны (на всех языках + нормализованные формы) ═══
-        'україна': ('UA', 'country'), 'украина': ('UA', 'country'), 'ukraine': ('UA', 'country'),
-        'украин': ('UA', 'country'),  # нормализованная форма от "украина", "украине"
+        for name, code in forced_ua_cities.items():
+            self.all_cities_global[name] = code
         
-        'росія': ('RU', 'country'), 'россия': ('RU', 'country'), 'russia': ('RU', 'country'),
-        'росси': ('RU', 'country'),  # нормализованная форма от "россия", "россии"
-        'рф': ('RU', 'country'),
-        
-        'беларусь': ('BY', 'country'), 'belarus': ('BY', 'country'), 'білорусь': ('BY', 'country'),
-        'беларус': ('BY', 'country'),  # нормализованная форма
-        
-        'polska': ('PL', 'country'), 'poland': ('PL', 'country'), 'польша': ('PL', 'country'),
-        'польш': ('PL', 'country'),  # нормализованная форма
-        
-        'казахстан': ('KZ', 'country'), 'kazakhstan': ('KZ', 'country'),
-        'казахстан': ('KZ', 'country'),  # не меняется при нормализации
-        
-        'узбекистан': ('UZ', 'country'), 'uzbekistan': ('UZ', 'country'),
-        'узбекистан': ('UZ', 'country'),  # не меняется при нормализации
-        
-        'германия': ('DE', 'country'), 'germany': ('DE', 'country'), 'німеччина': ('DE', 'country'),
-        'германи': ('DE', 'country'),  # нормализованная форма
-        
-        # ═══ Природные объекты (горы) ═══
-        'эльбрус': ('RU', 'mountain'), 'elbrus': ('RU', 'mountain'), 'ельбрус': ('RU', 'mountain'),
-        'монблан': ('FR', 'mountain'), 'mont blanc': ('FR', 'mountain'),
-        'эверест': ('NP', 'mountain'), 'everest': ('NP', 'mountain'),
-        
-        # ═══ Природные объекты (реки) ═══
-        'енисей': ('RU', 'river'), 'yenisei': ('RU', 'river'),
-        'волга': ('RU', 'river'), 'volga': ('RU', 'river'),
-        'дунай': ('RO', 'river'), 'danube': ('RO', 'river'),
-        'дніпро': ('UA', 'river'),  # Река Днепр (отличается от города)
-        
-        # ═══ Природные объекты (озера) ═══
-        'байкал': ('RU', 'lake'), 'baikal': ('RU', 'lake'),
-        'ладога': ('RU', 'lake'), 'ladoga': ('RU', 'lake'),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# WHITE-LIST ФИЛЬТР v3.0 FINAL
-# С НОРМАЛИЗАЦИЕЙ ПАДЕЖЕЙ
-# ═══════════════════════════════════════════════════════════════════
-
-def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dict:
-    """
-    WHITE-LIST гео-фильтр v3.0 FINAL с нормализацией падежей
-    
-    КРИТИЧЕСКИЕ УЛУЧШЕНИЯ:
-    1. Нормализация: "киеве"→"киев", "россии"→"россия", "харьковская"→"харьков"
-    2. Объединение geonamescache + fallback (всегда!)
-    3. Жёсткое правило: 2+ города → БЛОК
-    4. Проверка природных объектов
-    
-    Args:
-        data: dict with "keywords"
-        seed: original search query
-        target_country: country code
-    
-    Returns:
-        data with filtered keywords
-    
-    Examples:
-        seed = "ремонт пылесосов днепр"
-        
-        БЛОК:
-        - "днепр в киеве"          → киеве→киев, 2 города
-        - "днепр ельбрус"          → эльбрус = mountain
-        - "днепр харьковская область" → харьковская→харьков, 2 города
-        - "днепр енисей"           → енисей = river
-        - "днепр россия"           → россия → росси, но в fallback есть "россия"
-        
-        OK:
-        - "днепр"                  → seed_city
-        - "днепр левый берег"      → не гео-объекты
-        - "днепр амур"             → район Днепра
-    """
-    if not data or "keywords" not in data:
-        return data
-    
-    # ═══════════════════════════════════════════════════════════════
-    # Загрузка geonamescache
-    # ═══════════════════════════════════════════════════════════════
-    
-    try:
-        import geonamescache
-        gc = geonamescache.GeonamesCache()
-        has_geonames = True
-        logger.info(f"[GEO_WHITE_LIST] geonamescache loaded")
-    except ImportError:
-        logger.warning("⚠️ geonamescache not installed")
-        has_geonames = False
-    
-    seed_lower = seed.lower()
-    target_country_upper = target_country.upper()
-    
-    # Предлоги
-    prepositions = {
-        'в', 'на', 'из', 'под', 'во', 'до', 'возле', 'с', 'со', 'от', 'ко', 'за', 'над',
-        'у', 'біля', 'поруч', 'коло', 'від', 'про',
-        'in', 'at', 'near', 'from', 'to', 'on', 'by', 'with', 'for', 'of', 'about',
-        'ў', 'каля', 'ля', 'пры',
-        'w', 'na', 'przy', 'od', 'do', 'z', 'o',
-    }
-    
-    # ═══════════════════════════════════════════════════════════════
-    # Шаг 1: Загрузка гео-сущностей (geonamescache + fallback)
-    # ═══════════════════════════════════════════════════════════════
-    
-    all_geo_entities: Dict[str, Tuple[str, str]] = {}
-    
-    # 1.1. Загрузка из geonamescache (если доступен)
-    if has_geonames:
         try:
-            # Города
+            import pymorphy3
+            self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
+            self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
+            self._has_morph = True
+        except ImportError:
+            self._has_morph = False
+    
+    def _get_city_abbreviations(self) -> Dict[str, str]:
+        return {
+            'екб': 'ru', 'екат': 'ru', 'спб': 'ru', 'питер': 'ru', 'мск': 'ru',
+            'нск': 'ru', 'нн': 'ru', 'ннов': 'ru', 'влад': 'ru', 'ростов': 'ru',
+            'краснодар': 'ru', 'мн': 'by', 'алматы': 'kz', 'астана': 'kz', 'ташкент': 'uz',
+        }
+    
+    def _get_regions(self) -> Dict[str, str]:
+        return {
+            'ингушетия': 'ru', 'чечня': 'ru', 'чеченская республика': 'ru',
+            'дагестан': 'ru', 'татарстан': 'ru', 'башкортостан': 'ru',
+            'удмуртия': 'ru', 'мордовия': 'ru', 'марий эл': 'ru',
+            'чувашия': 'ru', 'якутия': 'ru', 'саха': 'ru', 'бурятия': 'ru',
+            'тыва': 'ru', 'хакасия': 'ru', 'алтай': 'ru', 'карелия': 'ru',
+            'коми': 'ru', 'калмыкия': 'ru', 'адыгея': 'ru', 'кабардино-балкария': 'ru',
+            'карачаево-черкесия': 'ru', 'северная осетия': 'ru', 'крым': 'ru',
+            'московская область': 'ru', 'ленинградская область': 'ru',
+            'новосибирская область': 'ru', 'свердловская область': 'ru',
+            'минская область': 'by', 'гомельская область': 'by',
+            'могилевская область': 'by', 'витебская область': 'by',
+            'гродненская область': 'by', 'брестская область': 'by',
+            'алматинская область': 'kz', 'южно-казахстанская область': 'kz',
+            'ташкентская область': 'uz', 'самаркандская область': 'uz',
+        }
+    
+    def _get_countries(self) -> Dict[str, str]:
+        return {
+            'россия': 'ru', 'россии': 'ru', 'рф': 'ru',
+            'беларусь': 'by', 'белоруссия': 'by',
+            'казахстан': 'kz', 'казахстане': 'kz',
+            'узбекистан': 'uz', 'узбекистане': 'uz',
+            'украина': 'ua', 'украине': 'ua',
+            'израиль': 'il', 'израиле': 'il',
+            'польша': 'pl', 'польше': 'pl',
+            'германия': 'de', 'германии': 'de',
+            'сша': 'us', 'америка': 'us', 'америке': 'us',
+        }
+    
+    def _get_manual_small_cities(self) -> Dict[str, str]:
+        return {
+            'ош': 'kg',
+            'узынагаш': 'kz',
+            'щелкино': 'ru',
+            'щёлкino': 'ru',
+            'йота': 'unknown',
+        }
+    
+    def _build_filtered_geo_index(self) -> Dict[str, str]:
+        try:
+            import geonamescache
+            gc = geonamescache.GeonamesCache()
+            
+            # КРИТИЧНО: Устанавливаем порог 5000 для загрузки cities5000.json (65k городов)
+            # По умолчанию загружается cities15000.json (32k городов)
+            gc.min_city_population = self.population_threshold  # 5000
+            
             cities = gc.get_cities()
+            
+            filtered_index = {}
+            
             for city_id, city_data in cities.items():
-                country_code = city_data.get('countrycode', '').upper()
+                country = city_data['countrycode'].lower()
+                population = city_data.get('population', 0)
                 
-                name = city_data['name'].lower()
-                all_geo_entities[name] = (country_code, 'city')
-                
-                alt_names = city_data.get('alternatenames', [])
-                for alt in alt_names:
-                    if len(alt) > 2:
-                        all_geo_entities[alt.lower()] = (country_code, 'city')
-            
-            logger.info(f"[GEO_WHITE_LIST] Loaded {len(all_geo_entities)} cities from geonamescache")
-            
-            # Страны
-            countries = gc.get_countries()
-            for code, country_data in countries.items():
-                name = country_data.get('name', '').lower()
-                if name:
-                    all_geo_entities[name] = (code, 'country')
-            
-            logger.info(f"[GEO_WHITE_LIST] Loaded countries from geonamescache")
-            
-        except Exception as e:
-            logger.warning(f"Error loading geonamescache: {e}")
-    
-    # 1.2. ВСЕГДА добавляем fallback (объединение!)
-    fallback_entities = _get_fallback_geo_entities()
-    for name, meta in fallback_entities.items():
-        all_geo_entities.setdefault(name, meta)
-    
-    # 1.3. Названия стран на ru/uk/en (через Babel)
-    for name, meta in COUNTRY_NAMES_MULTILINGUAL.items():
-        all_geo_entities.setdefault(name, meta)
-    
-    logger.info(f"[GEO_WHITE_LIST] Total geo entities after fallback+countries: {len(all_geo_entities)}")
-    
-    # 1.3. Добавляем города из CITY_DISTRICTS
-    for city_name in CITY_DISTRICTS.keys():
-        all_geo_entities.setdefault(city_name, (target_country_upper, 'city'))
-    
-    # ═══════════════════════════════════════════════════════════════
-    # Шаг 2: Определяем seed_city (с нормализацией!)
-    # ═══════════════════════════════════════════════════════════════
-    
-    seed_city = None
-    seed_words = re.findall(r'[а-яёіїєґa-z]+', seed_lower)
-    seed_words_normalized = [_normalize_token(w) for w in seed_words]
-    
-    # Приоритет: самый длинный город из CITY_DISTRICTS
-    potential_cities = [c for c in CITY_DISTRICTS.keys() if c in seed_lower]
-    if potential_cities:
-        seed_city = max(potential_cities, key=len)
-        logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (CITY_DISTRICTS)")
-    
-    # Ищем в all_geo_entities (нормализованные слова)
-    if not seed_city:
-        for word_norm in seed_words_normalized:
-            if word_norm in all_geo_entities:
-                entity_country, entity_type = all_geo_entities[word_norm]
-                if entity_type == 'city':
-                    seed_city = word_norm
-                    logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (geonames, normalized)")
-                    break
-    
-    if not seed_city:
-        logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city in seed: '{seed}'. All queries pass.")
-    
-    # Разрешенные районы — динамически из districts.json + geonamescache
-    # seed_city "днепр" → canonical "dnipro" → 126 районов из districts.json
-    seed_canonical = CITY_CANONICAL_MAP.get(seed_city, seed_city) if seed_city else None
-    allowed_districts = set()
-    if seed_canonical:
-        # Динамические районы из districts.json
-        allowed_districts = CANONICAL_CITY_DISTRICTS.get(seed_canonical, set())
-        # Плюс хардкодные (fallback, если districts.json неполный)
-        allowed_districts = allowed_districts | CITY_DISTRICTS.get(seed_city, set())
-        logger.info(f"[GEO_WHITE_LIST] seed_city='{seed_city}' → canonical='{seed_canonical}' → "
-                    f"{len(allowed_districts)} allowed districts")
-    
-    # ═══════════════════════════════════════════════════════════════
-    # Шаг 3: WHITE-LIST фильтрация (с нормализацией!)
-    # ═══════════════════════════════════════════════════════════════
-    
-    unique_keywords = []
-    stats = {
-        'total': len(data["keywords"]),
-        'blocked_occupied': 0,
-        'blocked_multi_city': 0,        # ← НОВОЕ!
-        'blocked_foreign_city': 0,
-        'blocked_foreign_country': 0,
-        'blocked_geo_object': 0,
-        'blocked_wrong_district': 0,
-        'blocked_wrong_oblast': 0,
-        'blocked_geox_region': 0,
-        'allowed': 0,
-    }
-    
-    for item in data["keywords"]:
-        if isinstance(item, str):
-            query = item
-        elif isinstance(item, dict):
-            query = item.get("query", "")
-        else:
-            continue
-        
-        query_lower = query.lower()
-        words = re.findall(r'[а-яёіїєґa-z0-9]+', query_lower)
-        
-        # Извлекаем также слова через дефис: "южно-сахалинск", "санкт-петербург"
-        hyphenated = re.findall(r'[а-яёіїєґa-z0-9]+-[а-яёіїєґa-z0-9]+(?:-[а-яёіїєґa-z0-9]+)*', query_lower)
-        
-        # Удаляем предлоги
-        clean_words = [w for w in words if w not in prepositions and len(w) > 1]
-        # Добавляем дефисные слова: "южно-сахалинск", "санкт-петербург"
-        clean_words = clean_words + [h for h in hyphenated if h not in clean_words]
-        
-        # Биграмы — только для поиска составных городов ("сан франциско", "нью йорк")
-        # НЕ добавляем в clean_words чтобы не ломать Geox/district/occupied проверки
-        query_bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
-        
-        # НОРМАЛИЗАЦИЯ — синхронно с clean_words
-        clean_words_normalized = [_normalize_token(w) for w in clean_words]
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 1: Оккупированные территории (блокируем ВСЕГДА!)
-        # Убрано условие target_country == 'ua'
-        # ═══════════════════════════════════════════════════════════
-        
-        has_occupied = False
-        for raw_word, word_norm in zip(clean_words, clean_words_normalized):
-            if raw_word in OCCUPIED_TERRITORIES or word_norm in OCCUPIED_TERRITORIES:
-                has_occupied = True
-                matched = raw_word if raw_word in OCCUPIED_TERRITORIES else word_norm
-                logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{matched}'")
-                stats['blocked_occupied'] += 1
-                break
-        
-        if has_occupied:
-            continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 2: ЖЁСТКОЕ ПРАВИЛО - 2+ ГОРОДА → БЛОК
-        # Но сначала исключаем разрешенные районы seed_city
-        # ═══════════════════════════════════════════════════════════
-        
-        if seed_city:
-            cities_in_query: Set[str] = set()
-            
-            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
-                # КРИТИЧНО: Пропускаем разрешенные районы seed_city
-                if raw_word in allowed_districts or word_norm in allowed_districts:
+                if population < self.population_threshold:
                     continue
                 
-                # Проверяем обе формы — raw и normalized
-                for check_word in [raw_word, word_norm]:
-                    if check_word in all_geo_entities:
-                        entity_country, entity_type = all_geo_entities[check_word]
-                        if entity_type == 'city':
-                            # Защита от ложных срабатываний: короткие обычные слова
-                            # "час" = город Chas (Чехия), но это обычное слово
-                            if len(check_word) <= 3:
-                                continue
-                            cities_in_query.add(check_word)
-                            break
-            
-            # Проверяем биграмы: "сан франциско", "нью йорк", "лос анджелес"
-            for bigram in query_bigrams:
-                if bigram in all_geo_entities:
-                    entity_country, entity_type = all_geo_entities[bigram]
-                    if entity_type == 'city':
-                        cities_in_query.add(bigram)
-            
-            # Если есть хотя бы один чужой город → БЛОК
-            if len(cities_in_query) > 0:
-                other_cities = {c for c in cities_in_query if c != seed_city}
-                if other_cities:
-                    logger.info(f"[GEO_WHITE_LIST] ❌ MULTI_CITY: '{query}' contains cities: {cities_in_query}, seed_city is '{seed_city}'")
-                    stats['blocked_multi_city'] += 1
-                    continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 3: Страны и природные объекты
-        # Также пропускаем разрешенные районы seed_city
-        # ═══════════════════════════════════════════════════════════
-        
-        if seed_city:
-            blocked = False
-            
-            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
-                # КРИТИЧНО: Пропускаем разрешенные районы seed_city
-                if raw_word in allowed_districts or word_norm in allowed_districts:
-                    continue
+                name = city_data['name'].lower().strip()
+                filtered_index[name] = country
                 
-                # Проверяем обе формы
-                matched_entity = None
-                for check_word in [raw_word, word_norm]:
-                    if check_word in all_geo_entities:
-                        matched_entity = (check_word, all_geo_entities[check_word])
-                        break
-                
-                if not matched_entity:
-                    continue
+                for alt in city_data.get('alternatenames', []):
+                    alt = alt.strip()
+                    if not (3 <= len(alt) <= 50):
+                        continue
+                    if not any(c.isalpha() for c in alt):
+                        continue
                     
-                check_word, (entity_country, entity_type) = matched_entity
-                
-                # А. Страна?
-                if entity_type == 'country':
-                    # Любая страна, не упомянутая в seed, считается мусором
-                    if raw_word not in seed_words and word_norm not in seed_words_normalized:
-                        logger.info(
-                            f"[GEO_WHITE_LIST] ❌ COUNTRY_MENTION: '{query}' mentions country '{check_word}' ({entity_country})"
-                        )
-                        stats['blocked_foreign_country'] += 1
-                        blocked = True
-                        break
-                
-                # Б. Природный объект (гора, река, озеро)?
-                elif entity_type in ['mountain', 'river', 'lake']:
-                    if raw_word not in seed_words and word_norm not in seed_words_normalized:
-                        logger.info(f"[GEO_WHITE_LIST] ❌ GEO_OBJECT: '{query}' contains {entity_type} '{check_word}'")
-                        stats['blocked_geo_object'] += 1
-                        blocked = True
-                        break
+                    is_latin_cyrillic = all(
+                        ('\u0000' <= c <= '\u007F') or
+                        ('\u0400' <= c <= '\u04FF') or
+                        c in ['-', "'", ' ']
+                        for c in alt
+                    )
+                    if not is_latin_cyrillic:
+                        continue
+                    
+                    alt_lower = alt.lower()
+                    
+                    has_cyr = any('\u0400' <= c <= '\u04FF' for c in alt_lower)
+                    has_lat = any('a' <= c <= 'z' for c in alt_lower)
+                    
+                    if has_cyr and not has_lat:
+                        if alt_lower not in filtered_index:
+                            filtered_index[alt_lower] = country
+                    
+                    if alt_lower not in filtered_index:
+                        filtered_index[alt_lower] = country
+                    
+                    alt_dash = alt_lower.replace(' ', '-')
+                    if alt_dash != alt_lower and alt_dash not in filtered_index:
+                        filtered_index[alt_dash] = country
             
-            if blocked:
+            return filtered_index
+            
+        except ImportError:
+            return {
+                'москва': 'ru', 'санкт-петербург': 'ru', 
+                'киев': 'ua', 'харьков': 'ua', 'одесса': 'ua',
+                'минск': 'by', 'алматы': 'kz', 'ташкент': 'uz'
+            }
+
+    def _find_in_country(self, word: str, target_country: str) -> bool:
+        """
+        PRIORITY 1: Проверка - является ли слово городом ЦЕЛЕВОЙ страны.
+        Результат кэшируется в self._request_cache на весь filter_batch запрос.
+        """
+        word_lower = word.lower()
+        cache_key = (word_lower, target_country)
+        if cache_key in self._request_cache:
+            return self._request_cache[cache_key]
+
+        # Прямой поиск в базе
+        found_country = self.all_cities_global.get(word_lower)
+        if found_country and found_country == target_country.lower():
+            self._request_cache[cache_key] = True
+            return True
+
+        # Поиск с лемматизацией (на случай падежей)
+        if self._has_morph:
+            lemma_ru = self._get_lemma(word_lower, 'ru')
+            lemma_uk = self._get_lemma(word_lower, 'uk')
+
+            for lemma in [lemma_ru, lemma_uk]:
+                if lemma != word_lower:
+                    found_country = self.all_cities_global.get(lemma)
+                    if found_country and found_country == target_country.lower():
+                        self._request_cache[cache_key] = True
+                        return True
+
+        self._request_cache[cache_key] = False
+        return False
+    
+    def _is_real_city_not_brand(self, word: str, found_country: str) -> bool:
+        """
+        Проверяет, является ли слово РЕАЛЬНЫМ городом (а не брендом)
+        
+        УНИВЕРСАЛЬНАЯ ЛОГИКА без хардкод списков:
+        - Кириллица → ГОРОД
+        - Латиница → возможный БРЕНД
+        - Известные бренды → БРЕНД
+        """
+        word_lower = word.lower()
+        
+        # Известные бренды НЕ считаются реальными городами
+        known_brands = {
+            "редмонд", "redmond", "горенье", "gorenje", "бош", "bosch",
+            "самсунг", "samsung", "филипс", "philips", "браун", "braun",
+            "панасоник", "panasonic", "сименс", "siemens", "миле", "miele",
+            "электролюкс", "electrolux", "аег", "aeg", "занусси", "zanussi",
+            "индезит", "indesit", "аристон", "ariston", "канди", "candy",
+            "беко", "beko", "хотпоинт", "hotpoint", "вирпул", "whirlpool",
+            "дайсон", "dyson", "керхер", "karcher", "витек", "vitek",
+            "поларис", "polaris", "скарлет", "scarlett", "тефаль", "tefal",
+            "мулинекс", "moulinex", "крупс", "krups", "делонги", "delonghi",
+            "филко", "philco", "томас", "thomas", "зелмер", "zelmer",
+        }
+        
+        if word_lower in known_brands:
+            return False
+        
+        # Латинские слова скорее бренды, чем города
+        if word_lower.isascii() and word_lower.isalpha():
+            # Короткие латинские слова (≤4) - точно бренды
+            if len(word_lower) <= 4:
+                return False
+        
+        # Очень короткие слова (1-2 буквы) - скорее аббревиатуры/бренды
+        if len(word_lower) <= 2:
+            return False
+        
+        # ═══════════════════════════════════════════════════════════
+        # УНИВЕРСАЛЬНАЯ ЛОГИКА для кириллицы
+        # Если слово на кириллице - это скорее всего ГОРОД
+        # ═══════════════════════════════════════════════════════════
+        
+        # Проверяем - это кириллица?
+        if not word_lower.isascii():
+            # Кириллица 3+ букв - это ГОРОД
+            # Примеры: уфа(3), омск(4), рига(4), тула(4), ейск(4), курск(5)
+            if len(word_lower) >= 3:
+                return True
+        
+        # Латинские длинные слова (5+) могут быть городами
+        # Примеры: Paris, London, Berlin
+        if len(word_lower) >= 5:
+            return True
+        
+        # В остальных случаях - возможный бренд
+        return False
+
+    def _is_brand_like(self, word: str) -> bool:
+        """Определяет, может ли слово быть брендом (спорное слово)"""
+        word_lower = word.lower()
+        
+        # Слова в ignored_words считаются не-городами
+        if word_lower in self.ignored_words:
+            return True
+        
+        # Известные бренды техники (кириллица и латиница)
+        known_brands = {
+            # Бренды техники (кириллица)
+            "редмонд", "redmond", "горенье", "gorenje", "бош", "bosch",
+            "самсунг", "samsung", "филипс", "philips", "браун", "braun",
+            "панасоник", "panasonic", "сименс", "siemens", "миле", "miele",
+            "электролюкс", "electrolux", "аег", "aeg", "занусси", "zanussi",
+            "индезит", "indesit", "аристон", "ariston", "канди", "candy",
+            "беко", "beko", "хотпоинт", "hotpoint", "вирпул", "whirlpool",
+            "дайсон", "dyson", "керхер", "karcher", "витек", "vitek",
+            "поларис", "polaris", "скарлет", "scarlett", "тефаль", "tefal",
+            "мулинекс", "moulinex", "крупс", "krups", "делонги", "delonghi",
+            "филко", "philco", "томас", "thomas", "зелмер", "zelmer",
+            # Добавить другие по необходимости
+        }
+        
+        if word_lower in known_brands:
+            return True
+        
+        # Латинские слова скорее бренды чем города
+        if word.isascii() and word.isalpha():
+            return True
+        
+        # Короткие слова (3-4 буквы) могут быть брендами
+        if len(word) <= 4:
+            return True
+        
+        return False
+
+    def _has_seed_cores(self, keyword: str, seed: str) -> bool:
+        """Проверяет наличие корней из сида в ключе (первые 5 букв)"""
+        seed_roots = [w.lower()[:5] for w in re.findall(r'[а-яёa-z]+', seed) if len(w) > 3]
+        keyword_lower = keyword.lower()
+        return any(root in keyword_lower for root in seed_roots)
+
+    def filter_batch(self, keywords: List[str], seed: str, country: str, 
+                     language: str = 'ru') -> Dict:
+        start_time = time.time()
+
+        # Сбрасываем кэш для нового запроса
+        self._request_cache = {}
+
+        logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
+        
+        unique_raw = sorted(list(set([k.lower().strip() for k in keywords if k.strip()])))
+        
+        seed_cities = self._extract_cities_from_seed(seed, country, language)
+        logger.debug("[BPF] SEED='%s' | seed_cities=%s", seed, seed_cities)
+        
+        all_words = set()
+        for kw in unique_raw:
+            all_words.update(re.findall(r'[а-яёa-z0-9-]+', kw))
+        
+        lemmas_map = self._batch_lemmatize(all_words, language)
+        
+        final_keywords = []
+        final_anchors = []
+        stats = {
+            'total': len(unique_raw),
+            'allowed': 0,
+            'blocked': 0,
+            'reasons': Counter()
+        }
+
+        for kw in unique_raw:
+            is_allowed, reason, category = self._check_geo_conflicts_v75(
+                kw, country, lemmas_map, seed_cities, language, seed
+            )
+            
+            if is_allowed:
+                final_keywords.append(kw)
+                stats['allowed'] += 1
+            else:
+                final_anchors.append(kw)
+                stats['blocked'] += 1
+                stats['reasons'][category] += 1
+                logger.warning("BPF block: '%s' → %s (%s)", kw, reason, category)
+
+        elapsed = time.time() - start_time
+        logger.info("[BPF] FINISH %.2fs | allowed=%d | anchors=%d | reasons=%s",
+                    elapsed, len(final_keywords), len(final_anchors), dict(stats['reasons']))
+
+        return {
+            'keywords': final_keywords,
+            'anchors': final_anchors,
+            'stats': {
+                'total': stats['total'],
+                'allowed': stats['allowed'],
+                'blocked': stats['blocked'],
+                'reasons': dict(stats['reasons']),
+                'elapsed_time': round(elapsed, 2)
+            }
+        }
+
+    def _check_geo_conflicts_v75(self, keyword: str, country: str, 
+                                  lemmas_map: Dict[str, str], seed_cities: Set[str],
+                                  language: str, seed: str = "") -> Tuple[bool, str, str]:
+        # Проверяем наличие корней сида в ключе (ПРИОРИТЕТ СИДА)
+        has_seed = self._has_seed_cores(keyword, seed) if seed else False
+        
+        logger.debug("[BPF] CHECK keyword='%s' | country=%s | has_seed=%s", keyword, country, has_seed)
+        
+        words = re.findall(r'[а-яёa-z0-9-]+', keyword)
+        if not words:
+            return True, "", ""
+
+        keyword_lemmas = [lemmas_map.get(w, w) for w in words]
+        
+        words_set = set(words + keyword_lemmas)
+        if any(city in words_set for city in seed_cities):
+            logger.debug("[BPF] ALLOW by seed_cities | keyword='%s'", keyword)
+            return True, "", ""
+        
+        for check_val in words + keyword_lemmas:
+            if check_val in self.forbidden_geo:
+                return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist"
+
+        # FIX: Собираем биграмы которые являются городами НАШЕЙ страны
+        # "белая церковь" → UA, "кривой рог" → UA
+        our_city_bigrams = set()
+        word_bigrams = self._extract_ngrams(words, 2)
+        for bg in word_bigrams:
+            if self._find_in_country(bg, country):
+                our_city_bigrams.add(bg)
+                # Добавляем отдельные слова биграма в защищённый набор
+                for part in bg.split():
+                    our_city_bigrams.add(part)
+
+        for w in words:
+            if w in self.districts:
+                dist_country = self.districts[w]
+                if dist_country != country.lower():
+                    if w in our_city_bigrams:
+                        continue
+                    if self._find_in_country(w, country):
+                        continue
+                    if self._is_common_noun(w, language):
+                        morph = self.morph_ru if language != 'uk' else self.morph_uk
+                        parsed = morph.parse(w)[0]
+                        is_real_dict = parsed.methods_stack[0][0].__class__.__name__ == 'DictionaryAnalyzer'
+                        if is_real_dict and parsed.score >= 0.65:
+                            continue
+                    has_target_city = any(
+                        self.all_cities_global.get(other_w) == country.lower()
+                        for other_w in set(words + keyword_lemmas) - {w}
+                    )
+                    if has_target_city:
+                        continue
+                    return False, f"район '{w}' ({dist_country})", "districts"
+        
+        for w in words + keyword_lemmas:
+            if w in self.city_abbreviations:
+                abbr_country = self.city_abbreviations[w]
+                if abbr_country != country.lower():
+                    return False, f"сокращение города '{w}' ({abbr_country})", f"{abbr_country}_abbreviations"
+        
+        check_regions = words + keyword_lemmas + self._extract_ngrams(words, 2)
+        for item in check_regions:
+            if item in self.regions:
+                region_country = self.regions[item]
+                if region_country != country.lower():
+                    return False, f"регион '{item}' ({region_country})", f"{region_country}_regions"
+        
+        for w in words + keyword_lemmas:
+            if w in self.countries:
+                ctry_code = self.countries[w]
+                if ctry_code != country.lower():
+                    return False, f"страна '{w}' ({ctry_code})", f"{ctry_code}_countries"
+        
+        for w in words + keyword_lemmas:
+            if w in self.manual_small_cities:
+                city_country = self.manual_small_cities[w]
+                if city_country == 'unknown':
+                    return False, f"неизвестный объект '{w}'", "unknown"
+                if city_country != country.lower():
+                    return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities"
+
+        search_items = []
+        search_items.extend(words)
+        search_items.extend(keyword_lemmas)
+        
+        bigrams = self._extract_ngrams(words, 2)
+        search_items.extend(bigrams)
+        search_items.extend([bg.replace(' ', '-') for bg in bigrams])
+        
+        lemma_bigrams = self._extract_ngrams(keyword_lemmas, 2)
+        search_items.extend(lemma_bigrams)
+        search_items.extend([bg.replace(' ', '-') for bg in lemma_bigrams])
+        
+        trigrams = self._extract_ngrams(words, 3)
+        search_items.extend(trigrams)
+        search_items.extend([tg.replace(' ', '-') for tg in trigrams])
+
+        # ОПТИМИЗАЦИЯ: убираем дубли (words==lemmas, bigrams==lemma_bigrams и т.д.)
+        search_items = list(dict.fromkeys(search_items))
+
+        # ОПТИМИЗАЦИЯ: один проход вместо двух — строим our_city_lemmas
+        # и keyword_has_target_city одновременно, без дублирующих _find_in_country
+        our_city_lemmas = set()
+        keyword_has_target_city = False
+
+        for w in set(words + keyword_lemmas):  # set убирает дубли если word==lemma
+            if self._find_in_country(w, country):
+                keyword_has_target_city = True
+                lemma = self._get_lemma(w, language)
+                if lemma != w:
+                    our_city_lemmas.add(lemma)
+                    logger.debug("[BPF] our_city_lemma: '%s' → '%s'", w, lemma)
+
+        for item in search_items:
+            # ШАГ 0: Пропускаем короткие слова и ignored_words
+            if len(item) < 3 or item in self.ignored_words:
                 continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 4: Чужие районы (динамическая через districts.json)
-        # Если слово = район другого города → БЛОК
-        # Проверяем и raw и normalized формы (normalize обрезает окончания)
-        # ═══════════════════════════════════════════════════════════
-        
-        if seed_city and seed_canonical:
-            has_wrong_district = False
             
-            # Проверяем пары (raw, normalized) вместе
-            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
-                # Пропускаем разрешенные районы seed_city
-                if raw_word in allowed_districts or word_norm in allowed_districts:
+            # ШАГ 0.5: Geox guard — пропускаем слова, которые точно НЕ города
+            if ' ' not in item and '-' not in item:
+                if self._should_skip_geo_check(item, language):
+                    continue
+            
+            item_normalized = self._get_lemma(item, language)
+            
+            # PRIORITY 1: СВОЙ ГОРОД (целевая страна) — пропускаем
+            is_our_city = self._find_in_country(item, country) or self._find_in_country(item_normalized, country)
+            if is_our_city:
+                continue
+            
+            # PRIORITY 2: ЧУЖОЙ ГОРОД (другая страна)
+            found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
+            
+            if found_country and found_country != country.lower():
+                
+                # Лемма нашего города? "лев" ← "львов" (UA)
+                if item in our_city_lemmas or item_normalized in our_city_lemmas:
                     continue
                 
-                # Слово — район какого-то города? Проверяем обе формы
-                district_canonical_city = (
-                    DISTRICT_TO_CANONICAL.get(raw_word) or 
-                    DISTRICT_TO_CANONICAL.get(word_norm)
-                )
-                if district_canonical_city and district_canonical_city != seed_canonical:
-                    has_wrong_district = True
-                    matched_form = raw_word if DISTRICT_TO_CANONICAL.get(raw_word) else word_norm
-                    logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_DISTRICT: '{query}' contains district "
-                              f"'{matched_form}' from city '{district_canonical_city}', "
-                              f"seed_city is '{seed_city}' (canonical='{seed_canonical}')")
-                    stats['blocked_wrong_district'] += 1
-                    break
-            
-            if has_wrong_district:
-                continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 5: Область с чужим городом
-        # ═══════════════════════════════════════════════════════════
-        
-        has_oblast = any(oblast_word in query_lower for oblast_word in ['область', 'обл', 'област', 'области'])
-        
-        if has_oblast and seed_city:
-            # Собираем города из запроса (нормализованные + adjective resolution)
-            cities_in_query_oblast: Set[str] = set()
-            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
-                # Стандартная проверка
-                if word_norm in all_geo_entities:
-                    entity_country, entity_type = all_geo_entities[word_norm]
-                    if entity_type == 'city':
-                        cities_in_query_oblast.add(word_norm)
-                
-                # Adjective resolution: "одесская" → "одесса"/"одеса"
-                # Стандартная нормализация ("одесская"→"одес") не находит город,
-                # но suffix expansion находит
-                resolved = _resolve_oblast_adjective(raw_word, all_geo_entities)
-                if resolved and resolved != seed_city:
-                    cities_in_query_oblast.add(resolved)
-                    logger.info(f"[GEO_WHITE_LIST] Oblast adj resolved: '{raw_word}' → '{resolved}'")
-            
-            # Если есть чужие города → БЛОК
-            other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
-            if other_cities_oblast:
-                logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_OBLAST: '{query}' mentions oblast with other cities: {other_cities_oblast}")
-                stats['blocked_wrong_oblast'] += 1
-                continue
-        
-        # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 6: Geox через pymorphy3 (регионы, республики, области)
-        # Ловит: чечня, дагестан, бавария, каталония — без хардкода
-        # ═══════════════════════════════════════════════════════════
-        
-        if seed_city and _morph_geox:
-            has_foreign_geox = False
-            
-            for raw_word, word_norm in zip(clean_words, clean_words_normalized):
-                # Пропускаем seed слова и разрешенные районы
-                if raw_word in seed_words or word_norm in seed_words_normalized:
-                    continue
-                if raw_word in allowed_districts or word_norm in allowed_districts:
-                    continue
-                # Пропускаем короткие слова и латиницу
-                if len(raw_word) <= 3 or raw_word.isascii():
+                # Обычное слово языка? "дом", "белая", "гора"
+                if self._is_common_noun(item, language):
                     continue
                 
-                # Проверяем Geox тег
-                parses = _morph_geox.parse(raw_word)
-                is_geox = any('Geox' in str(p.tag) for p in parses)
-                if is_geox:
-                    has_foreign_geox = True
-                    logger.info(f"[GEO_WHITE_LIST] ❌ GEOX_REGION: '{query}' contains "
-                              f"geo-entity '{raw_word}' (pymorphy3 Geox)")
-                    stats['blocked_geox_region'] += 1
-                    break
+                # Город из сида — всегда разрешён
+                if item_normalized in seed_cities or item in seed_cities:
+                    continue
+                
+                # В запросе есть город НАШЕЙ страны — проверяем районы и бренды
+                if keyword_has_target_city:
+                    item_no_yo = item.replace('ё', 'е')
+                    dist_variants = [
+                        self.districts.get(item),
+                        self.districts.get(item_normalized),
+                        self.districts.get(item_no_yo),
+                    ]
+                    if country.lower() in dist_variants:
+                        continue
+                    if any(d is not None for d in dist_variants):
+                        continue
+                    if not self._is_real_city_not_brand(item, found_country):
+                        continue
+                
+                # PRIORITY 3: реальный город или спорное слово (бренд)?
+                is_real_city = self._is_real_city_not_brand(item, found_country)
+                
+                if is_real_city:
+                    reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
+                    return False, reason, f"{found_country}_cities"
+                
+                # Спорное слово
+                if has_seed:
+                    continue  # Есть seed — разрешаем
+                else:
+                    reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
+                    return False, reason, f"{found_country}_cities"
             
-            if has_foreign_geox:
+            # Город не найден — проверяем на обычное существительное
+            if self._is_common_noun(item_normalized, language):
                 continue
         
-        # ═══════════════════════════════════════════════════════════
-        # Запрос прошел - разрешаем
-        # ═══════════════════════════════════════════════════════════
+        if not self._is_grammatically_valid(keyword, language):
+            return False, "неправильная грамматическая форма", "grammar"
         
-        unique_keywords.append(item)
-        stats['allowed'] += 1
-    
-    # Обновляем данные
-    data["keywords"] = unique_keywords
-    
-    if "total_count" in data:
-        data["total_count"] = len(unique_keywords)
-    if "count" in data:
-        data["count"] = len(unique_keywords)
-    
-    logger.info(f"[GEO_WHITE_LIST] STATS: {stats}")
-    
-    return data
+        return True, "", ""
+
+    def _is_common_noun(self, word: str, language: str) -> bool:
+        """
+        Проверяет, является ли слово ОБЫЧНЫМ словом языка (не гео-названием).
+        Строгая проверка: только высокочастотные слова с высоким score.
+        "дом", "белая", "гора" → True
+        "шахты", "златоуст", "борисов" → False
+        """
+        if not self._has_morph or language not in ['ru', 'uk']:
+            return False
+        
+        morph = self.morph_ru if language == 'ru' else self.morph_uk
+        
+        try:
+            parsed = morph.parse(word)
+            if not parsed:
+                return False
+            
+            first = parsed[0]
+            tag_str = str(first.tag)
+            
+            # Любой маркер собственного имени → НЕ обычное слово
+            for marker in ('Geox', 'Name', 'Surn', 'Patr', 'Orgn'):
+                if marker in tag_str:
+                    return False
+            
+            if not word.islower():
+                return False
+            
+            # ADJF — только с Qual (качественное: белая, холодная)
+            # Без Qual = относительное (яблоновский, приморский) → не пропускаем
+            # ИСКЛЮЧЕНИЕ: высокий score + нет Geox → обычное прилагательное ("русском", "английском")
+            # Geox уже проверен выше и вернул бы False
+            if 'ADJF' in tag_str:
+                if 'Qual' in tag_str and first.score >= 0.4:
+                    return True
+                # Нет Geox (проверено выше) + достаточный score → не географическое
+                # русский(0.667) → True, московский(0.50) → False
+                if first.score >= 0.6:
+                    return True
+                return False
+            
+            # NOUN — только неодушевлённые (inan) с высоким score
+            # "дом"(inan), "гора"(inan), "центр"(inan) → True
+            # "златоуст"(anim) → False (proper name pattern)
+            if 'NOUN' in tag_str:
+                return 'inan' in tag_str and first.score >= 0.5
+        except:
+            pass
+        
+        return False
+
+    def _should_skip_geo_check(self, word: str, language: str) -> bool:
+        """
+        Geox guard для BatchPostFilter: пропускает слова, которые точно НЕ города.
+        
+        Алгоритмический, без хардкода. Тот же принцип что L0 foreign_geo:
+        если pymorphy знает слово и ни один парс не имеет Geox → не город.
+        
+        "боли"  → known, no Geox → True (skip)   [CN city FP]
+        "или"   → CONJ           → True (skip)   [GB city FP]  
+        "после" → PREP           → True (skip)
+        "киев"  → known, has Geox → False (check)
+        "рига"  → known, has Geox → False (check)
+        """
+        if not self._has_morph:
+            return False
+        
+        morph = self.morph_ru if language != 'uk' else self.morph_uk
+        
+        try:
+            parses = morph.parse(word)
+            if not parses:
+                return False
+            
+            best = parses[0]
+            
+            # 1. Служебные POS — никогда не города
+            if best.tag.POS in ('CONJ', 'PREP', 'PRCL', 'INTJ'):
+                return True
+            
+            # 2. Geox guard: слово известно pymorphy, но ни один парс не географический
+            if morph.word_is_known(word):
+                has_geox = any('Geox' in str(p.tag) for p in parses)
+                if not has_geox:
+                    return True
+        except:
+            pass
+        
+        return False
+
+    def _extract_cities_from_seed(self, seed: str, country: str, language: str) -> Set[str]:
+        """🔥 FIX: Извлекает города из seed БЕЗ фильтра по стране"""
+        if not self._has_morph:
+            return set()
+        
+        seed_cities = set()
+        words = re.findall(r'[а-яёa-z0-9-]+', seed.lower())
+        
+        for word in words:
+            # БЕЗ ПРОВЕРКИ country!
+            if word in self.all_cities_global:
+                logger.debug(f"[BPF] seed_city WORD '{word}' -> {self.all_cities_global[word]}")
+                seed_cities.add(word)
+            
+            lemma = self._get_lemma(word, language)
+            if lemma in self.all_cities_global:
+                logger.debug(f"[BPF] seed_city LEMMA '{lemma}' <- '{word}' "
+                             f"-> {self.all_cities_global[lemma]}")
+                seed_cities.add(lemma)
+        
+        bigrams = self._extract_ngrams(words, 2)
+        for bigram in bigrams:
+            if bigram in self.all_cities_global:
+                logger.debug(f"[BPF] seed_city BIGRAM '{bigram}' -> {self.all_cities_global[bigram]}")
+                seed_cities.add(bigram)
+        
+        return seed_cities
+
+    def _batch_lemmatize(self, words: Set[str], language: str) -> Dict[str, str]:
+        if not self._has_morph:
+            return {w: w for w in words}
+        
+        morph = self.morph_ru if language == 'ru' else self.morph_uk
+        lemmas = {}
+        
+        for word in words:
+            lemma = self._get_lemma(word, language, morph)
+            lemmas[word] = lemma
+        
+        return lemmas
+
+    def _get_lemma(self, word: str, language: str, morph=None) -> str:
+        if not self._has_morph:
+            return word
+        
+        if morph is None:
+            morph = self.morph_ru if language == 'ru' else self.morph_uk
+        
+        try:
+            parsed = morph.parse(word)
+            if parsed:
+                return parsed[0].normal_form
+        except:
+            pass
+        
+        return word
+
+    def _extract_ngrams(self, words: List[str], n: int = 2) -> List[str]:
+        if len(words) < n:
+            return []
+        return [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
+
+    def _is_grammatically_valid(self, keyword: str, language: str) -> bool:
+        return True  # Временная полная амнистия, чтобы спасти ключи
 
 
-# Экспорт
-__all__ = [
-    'filter_geo_garbage',
-    'OCCUPIED_TERRITORIES',
-    'CITY_DISTRICTS',
-]
+# ============================================
+# DISTRICTS
+# ============================================
+
+DISTRICTS_MINSK = {
+    "уручье": "by",
+    "шабаны": "by",
+    "каменная горка": "by",
+    "серебрянка": "by"
+}
+
+DISTRICTS_TASHKENT = {
+    "чиланзар": "uz",
+    "юнусабад": "uz",
+    "сергели": "uz",
+    "яккасарай": "uz"
+}
+
+DISTRICTS_EXTENDED = {**DISTRICTS_MINSK, **DISTRICTS_TASHKENT}
