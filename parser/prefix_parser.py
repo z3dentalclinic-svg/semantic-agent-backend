@@ -122,6 +122,14 @@ except ImportError:
         _proxy_firefox = _fallback
         _proxy_nonpa   = _fallback
 
+try:
+    from utils.geo_uule import get_uule
+except ImportError:
+    try:
+        from geo_uule import get_uule
+    except ImportError:
+        get_uule = lambda cc, city=None: None
+
 
 # ══════════════════════════════════════════════
 # DATACLASSES
@@ -223,6 +231,7 @@ class PrefixParser:
         client: httpx.AsyncClient,
         google_client: str = "firefox",
         cursor_position: Optional[int] = None,
+        uule: str = None,
     ) -> List[str]:
         """
         Google Autocomplete fetch — identical to suffix_parser.fetch_suggestions().
@@ -235,13 +244,14 @@ class PrefixParser:
         url = "https://www.google.com/complete/search"
         params = {
             "q": query,
-            # [FIREFOX-ONLY EXPERIMENT] "client": google_client,
             "client": google_client,
             "hl": language,
             "gl": country,
             "ie": "utf-8",
             "oe": "utf-8",
         }
+        if uule:
+            params["uule"] = uule
 
         if cursor_position == -1:
             pass  # не добавляем cp
@@ -339,6 +349,7 @@ class PrefixParser:
         groups: Optional[List[str]] = None,
         google_client: str = "firefox",
         progress_callback=None,
+        city: str = None,
     ) -> PrefixParseResult:
         """
         Main parse method — letter-parallel dual-agent execution.
@@ -375,6 +386,9 @@ class PrefixParser:
         else:
             proxy_chr = proxy_ff = proxy_npa = _proxy_chrome
 
+        # uule: city=None → столица страны, city="Lviv" → конкретный город
+        _uule = get_uule(country, city)
+
         # Generate matrix
         matrix: List[PrefixQuery] = self.generator.generate(
             seed=seed,
@@ -402,6 +416,7 @@ class PrefixParser:
                     client=client,
                     google_client=agent,
                     cursor_position=pq.cp,
+                    uule=_uule,
                 )
                 elapsed = (time.time() - t0) * 1000
                 results = [kw for kw in results if not _is_garbage_keyword(kw)]
