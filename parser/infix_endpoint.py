@@ -34,6 +34,7 @@ def register_infix_endpoint(app: FastAPI):
         country: str = Query("ua", description="Код страны"),
         language: str = Query("ru", description="Язык"),
         groups: Optional[str] = Query(None, description="Группы через запятую: WC,A,B,C,D,E. None = все"),
+        city: str = Query(None, description="Город для uule гео-таргетинга (по-английски). None = столица страны."),
     ):
         """
         INFIX MAP: Full infix matrix run (Chrome only).
@@ -53,6 +54,7 @@ def register_infix_endpoint(app: FastAPI):
             country=country,
             language=language,
             groups=selected_groups,
+            city=city,
         )
 
         keywords_for_html = []
