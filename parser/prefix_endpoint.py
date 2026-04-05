@@ -37,6 +37,7 @@ def register_prefix_endpoint(app: FastAPI):
         language: str = Query("ru", description="Язык"),
         groups: Optional[str] = Query(None, description="Группы через запятую: G1,G2,PA,PC. None = все"),
         parallel: int = Query(10, description="Параллельных запросов на агента"),
+        city: str = Query(None, description="Город для uule гео-таргетинга (по-английски). None = столица страны."),
     ):
         """
         PREFIX MAP: Full prefix matrix run with dual-agent (Chrome + Firefox).
@@ -56,6 +57,7 @@ def register_prefix_endpoint(app: FastAPI):
             country=country,
             language=language,
             groups=selected_groups,
+            city=city,
         )
 
         # Формируем keywords для HTML — аналог suffix_endpoint keywords_for_html
