@@ -31,6 +31,14 @@ except ImportError:
     except ImportError:
         ProxyPool = None
 
+try:
+    from utils.geo_uule import get_uule
+except ImportError:
+    try:
+        from geo_uule import get_uule
+    except ImportError:
+        get_uule = lambda cc, city=None: None
+
 # ══════════════════════════════════════════════
 # [P0-CHR-SKIP] Chrome BCD variant skip list (Порог 0, 4 датасета GT)
 # 11 вариантов — 100% дубли на всех датасетах, нулевой GT-эксклюзив.
@@ -217,8 +225,9 @@ class SuffixParser:
 
     async def fetch_suggestions(self, query: str, country: str, language: str,
                                  client: httpx.AsyncClient, google_client: str = "firefox",
-                                 cursor_position: int = None) -> List[str]:
-        """Google Autocomplete with multi-client support."""
+                                 cursor_position: int = None,
+                                 uule: str = None) -> List[str]:
+        """Google Autocomplete with multi-client support + uule geo-targeting."""
         url = "https://www.google.com/complete/search"
         params = {
             "q": query,
@@ -228,6 +237,9 @@ class SuffixParser:
             "ie": "utf-8",
             "oe": "utf-8",
         }
+        # uule: гео-таргетинг на уровне города (синхронизирован с gl)
+        if uule:
+            params["uule"] = uule
         # cp = cursor position
         # None → auto: cp=len(query) — tells Google "cursor is at the end"
         # -1 → don't send cp at all (old behavior)
@@ -392,7 +404,8 @@ class SuffixParser:
                     parallel_limit: int = 5, include_numbers: bool = False,
                     echelon: int = 0, google_client: str = "firefox",
                     cursor_position: int = None,
-                    include_letters: bool = False) -> SuffixParseResult:
+                    include_letters: bool = False,
+                    city: str = None) -> SuffixParseResult:
         """
         Main parse method.
 
@@ -410,6 +423,11 @@ class SuffixParser:
             region = "ru"
         else:
             region = "ua"  # default to UA for non-RU markets
+
+        # uule: гео-таргетинг на уровне города
+        # city=None → столица страны по умолчанию (Kyiv для ua, Moscow для ru, ...)
+        # city="Lviv" → конкретный город из geo_uule.json
+        _uule = get_uule(country, city)
 
         # Step 1: Generate queries
         analysis, all_queries = self.generator.generate(
@@ -527,7 +545,7 @@ class SuffixParser:
 
             gc = force_client or google_client
             t0 = time.time()
-            results = await self.fetch_suggestions(sq.query, country, language, client, gc, cp)
+            results = await self.fetch_suggestions(sq.query, country, language, client, gc, cp, uule=_uule)
             elapsed = (time.time() - t0) * 1000
             _record_results(sq, results, elapsed)
 
@@ -568,7 +586,7 @@ class SuffixParser:
                         suffix_type="E_simple", priority=1, markers=["e_simple"], cp_override=-1,
                     )
                     t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, clients[slot], "firefox", -1)
+                    results = await self.fetch_suggestions(q, country, language, clients[slot], "firefox", -1, uule=_uule)
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_simple, results, elapsed)
 
@@ -745,7 +763,7 @@ class SuffixParser:
                         suffix_type="E_simple_chr", priority=1, markers=["e_simple_chr"], cp_override=-1,
                     )
                     t0 = time.time()
-                    results = await self.fetch_suggestions(q, country, language, clients[slot], "chrome", -1)
+                    results = await self.fetch_suggestions(q, country, language, clients[slot], "chrome", -1, uule=_uule)
                     elapsed = (time.time() - t0) * 1000
                     _record_results(sq_chr, results, elapsed)
 
