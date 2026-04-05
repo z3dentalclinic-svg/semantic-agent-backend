@@ -30,7 +30,15 @@ class BatchPostFilter:
         self.ignored_words = {
             "дом", "мир", "бор", "нива", "балка", "луч", "спутник", "работа", "цена", "выезд",
         }
-        
+
+        # Кэш на уровень одного filter_batch: (word, country) → bool
+        # Сбрасывается при каждом вызове filter_batch.
+        # Ключевая экономия: слово "купить" в 500 ключах → 1 вызов _find_in_country вместо 500.
+        self._request_cache: dict = {}
+        self._skip_geo_cache: dict = {}   # (word, lang) → bool
+        self._common_noun_cache: dict = {}  # (word, lang) → bool
+        self._lemma_cache: dict = {}        # (word, lang) → str
+
         # Список крупных городов/столиц которые ВСЕГДА блокируются (не бренды)
         self.forbidden_major_cities = {
             # Россия
@@ -221,28 +229,33 @@ class BatchPostFilter:
 
     def _find_in_country(self, word: str, target_country: str) -> bool:
         """
-        PRIORITY 1: Проверка - является ли слово городом ЦЕЛЕВОЙ страны
-        
-        Возвращает True, если слово найдено в базе именно как город target_country
+        PRIORITY 1: Проверка - является ли слово городом ЦЕЛЕВОЙ страны.
+        Результат кэшируется в self._request_cache на весь filter_batch запрос.
         """
         word_lower = word.lower()
-        
+        cache_key = (word_lower, target_country)
+        if cache_key in self._request_cache:
+            return self._request_cache[cache_key]
+
         # Прямой поиск в базе
         found_country = self.all_cities_global.get(word_lower)
         if found_country and found_country == target_country.lower():
+            self._request_cache[cache_key] = True
             return True
-        
+
         # Поиск с лемматизацией (на случай падежей)
         if self._has_morph:
             lemma_ru = self._get_lemma(word_lower, 'ru')
             lemma_uk = self._get_lemma(word_lower, 'uk')
-            
+
             for lemma in [lemma_ru, lemma_uk]:
                 if lemma != word_lower:
                     found_country = self.all_cities_global.get(lemma)
                     if found_country and found_country == target_country.lower():
+                        self._request_cache[cache_key] = True
                         return True
-        
+
+        self._request_cache[cache_key] = False
         return False
     
     def _is_real_city_not_brand(self, word: str, found_country: str) -> bool:
@@ -349,7 +362,13 @@ class BatchPostFilter:
     def filter_batch(self, keywords: List[str], seed: str, country: str, 
                      language: str = 'ru') -> Dict:
         start_time = time.time()
-        
+
+        # Сбрасываем кэш для нового запроса
+        self._request_cache = {}
+        self._skip_geo_cache = {}
+        self._common_noun_cache = {}
+        self._lemma_cache = {}
+
         logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
         
         unique_raw = sorted(list(set([k.lower().strip() for k in keywords if k.strip()])))
@@ -592,92 +611,66 @@ class BatchPostFilter:
     def _is_common_noun(self, word: str, language: str) -> bool:
         """
         Проверяет, является ли слово ОБЫЧНЫМ словом языка (не гео-названием).
-        Строгая проверка: только высокочастотные слова с высоким score.
-        "дом", "белая", "гора" → True
-        "шахты", "златоуст", "борисов" → False
+        Результат кэшируется в self._common_noun_cache на весь filter_batch.
         """
         if not self._has_morph or language not in ['ru', 'uk']:
             return False
-        
+
+        cache_key = (word, language)
+        if cache_key in self._common_noun_cache:
+            return self._common_noun_cache[cache_key]
+
         morph = self.morph_ru if language == 'ru' else self.morph_uk
-        
+        result = False
         try:
             parsed = morph.parse(word)
-            if not parsed:
-                return False
-            
-            first = parsed[0]
-            tag_str = str(first.tag)
-            
-            # Любой маркер собственного имени → НЕ обычное слово
-            for marker in ('Geox', 'Name', 'Surn', 'Patr', 'Orgn'):
-                if marker in tag_str:
-                    return False
-            
-            if not word.islower():
-                return False
-            
-            # ADJF — только с Qual (качественное: белая, холодная)
-            # Без Qual = относительное (яблоновский, приморский) → не пропускаем
-            # ИСКЛЮЧЕНИЕ: высокий score + нет Geox → обычное прилагательное ("русском", "английском")
-            # Geox уже проверен выше и вернул бы False
-            if 'ADJF' in tag_str:
-                if 'Qual' in tag_str and first.score >= 0.4:
-                    return True
-                # Нет Geox (проверено выше) + достаточный score → не географическое
-                # русский(0.667) → True, московский(0.50) → False
-                if first.score >= 0.6:
-                    return True
-                return False
-            
-            # NOUN — только неодушевлённые (inan) с высоким score
-            # "дом"(inan), "гора"(inan), "центр"(inan) → True
-            # "златоуст"(anim) → False (proper name pattern)
-            if 'NOUN' in tag_str:
-                return 'inan' in tag_str and first.score >= 0.5
+            if parsed:
+                first = parsed[0]
+                tag_str = str(first.tag)
+
+                # Любой маркер собственного имени → НЕ обычное слово
+                if not any(m in tag_str for m in ('Geox', 'Name', 'Surn', 'Patr', 'Orgn')):
+                    if word.islower():
+                        if 'ADJF' in tag_str:
+                            if ('Qual' in tag_str and first.score >= 0.4) or first.score >= 0.6:
+                                result = True
+                        elif 'NOUN' in tag_str:
+                            result = 'inan' in tag_str and first.score >= 0.5
         except:
             pass
-        
-        return False
+
+        self._common_noun_cache[cache_key] = result
+        return result
 
     def _should_skip_geo_check(self, word: str, language: str) -> bool:
         """
-        Geox guard для BatchPostFilter: пропускает слова, которые точно НЕ города.
-        
-        Алгоритмический, без хардкода. Тот же принцип что L0 foreign_geo:
-        если pymorphy знает слово и ни один парс не имеет Geox → не город.
-        
-        "боли"  → known, no Geox → True (skip)   [CN city FP]
-        "или"   → CONJ           → True (skip)   [GB city FP]  
-        "после" → PREP           → True (skip)
-        "киев"  → known, has Geox → False (check)
-        "рига"  → known, has Geox → False (check)
+        Geox guard: пропускает слова которые точно НЕ города.
+        Результат кэшируется в self._skip_geo_cache на весь filter_batch.
         """
         if not self._has_morph:
             return False
-        
+
+        cache_key = (word, language)
+        if cache_key in self._skip_geo_cache:
+            return self._skip_geo_cache[cache_key]
+
         morph = self.morph_ru if language != 'uk' else self.morph_uk
-        
+        result = False
         try:
             parses = morph.parse(word)
-            if not parses:
-                return False
-            
-            best = parses[0]
-            
-            # 1. Служебные POS — никогда не города
-            if best.tag.POS in ('CONJ', 'PREP', 'PRCL', 'INTJ'):
-                return True
-            
-            # 2. Geox guard: слово известно pymorphy, но ни один парс не географический
-            if morph.word_is_known(word):
-                has_geox = any('Geox' in str(p.tag) for p in parses)
-                if not has_geox:
-                    return True
+            if parses:
+                best = parses[0]
+                if best.tag.POS in ('CONJ', 'PREP', 'PRCL', 'INTJ'):
+                    result = True
+                elif morph.word_is_known(word):
+                    has_geox = any('Geox' in str(p.tag) for p in parses)
+                    if not has_geox:
+                        result = True
         except:
             pass
-        
-        return False
+
+        self._skip_geo_cache[cache_key] = result
+        return result
 
     def _extract_cities_from_seed(self, seed: str, country: str, language: str) -> Set[str]:
         """🔥 FIX: Извлекает города из seed БЕЗ фильтра по стране"""
@@ -723,18 +716,24 @@ class BatchPostFilter:
     def _get_lemma(self, word: str, language: str, morph=None) -> str:
         if not self._has_morph:
             return word
-        
+
+        cache_key = (word, language)
+        if cache_key in self._lemma_cache:
+            return self._lemma_cache[cache_key]
+
         if morph is None:
             morph = self.morph_ru if language == 'ru' else self.morph_uk
-        
+
+        result = word
         try:
             parsed = morph.parse(word)
             if parsed:
-                return parsed[0].normal_form
+                result = parsed[0].normal_form
         except:
             pass
-        
-        return word
+
+        self._lemma_cache[cache_key] = result
+        return result
 
     def _extract_ngrams(self, words: List[str], n: int = 2) -> List[str]:
         if len(words) < n:
