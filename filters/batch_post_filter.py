@@ -445,14 +445,14 @@ class BatchPostFilter:
             if check_val in self.forbidden_geo:
                 return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist"
 
-        # FIX: Собираем биграмы которые являются городами НАШЕЙ страны
-        # "белая церковь" → UA, "кривой рог" → UA
-        our_city_bigrams = set()
+        # Биграмы вычисляем один раз — используем везде ниже
         word_bigrams = self._extract_ngrams(words, 2)
+
+        # Собираем биграмы которые являются городами НАШЕЙ страны
+        our_city_bigrams = set()
         for bg in word_bigrams:
             if self._find_in_country(bg, country):
                 our_city_bigrams.add(bg)
-                # Добавляем отдельные слова биграма в защищённый набор
                 for part in bg.split():
                     our_city_bigrams.add(part)
 
@@ -465,11 +465,8 @@ class BatchPostFilter:
                     if self._find_in_country(w, country):
                         continue
                     if self._is_common_noun(w, language):
-                        morph = self.morph_ru if language != 'uk' else self.morph_uk
-                        parsed = morph.parse(w)[0]
-                        is_real_dict = parsed.methods_stack[0][0].__class__.__name__ == 'DictionaryAnalyzer'
-                        if is_real_dict and parsed.score >= 0.65:
-                            continue
+                        # _is_common_noun уже кэширован и проверил score — доверяем ему
+                        continue
                     has_target_city = any(
                         self.all_cities_global.get(other_w) == country.lower()
                         for other_w in set(words + keyword_lemmas) - {w}
@@ -484,7 +481,7 @@ class BatchPostFilter:
                 if abbr_country != country.lower():
                     return False, f"сокращение города '{w}' ({abbr_country})", f"{abbr_country}_abbreviations"
         
-        check_regions = words + keyword_lemmas + self._extract_ngrams(words, 2)
+        check_regions = words + keyword_lemmas + word_bigrams
         for item in check_regions:
             if item in self.regions:
                 region_country = self.regions[item]
@@ -505,24 +502,16 @@ class BatchPostFilter:
                 if city_country != country.lower():
                     return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities"
 
-        search_items = []
-        search_items.extend(words)
-        search_items.extend(keyword_lemmas)
-        
-        bigrams = self._extract_ngrams(words, 2)
-        search_items.extend(bigrams)
-        search_items.extend([bg.replace(' ', '-') for bg in bigrams])
-        
+        # word_bigrams уже вычислен выше — переиспользуем
         lemma_bigrams = self._extract_ngrams(keyword_lemmas, 2)
-        search_items.extend(lemma_bigrams)
-        search_items.extend([bg.replace(' ', '-') for bg in lemma_bigrams])
-        
         trigrams = self._extract_ngrams(words, 3)
-        search_items.extend(trigrams)
-        search_items.extend([tg.replace(' ', '-') for tg in trigrams])
 
-        # ОПТИМИЗАЦИЯ: убираем дубли (words==lemmas, bigrams==lemma_bigrams и т.д.)
-        search_items = list(dict.fromkeys(search_items))
+        search_items = list(dict.fromkeys(
+            words + keyword_lemmas
+            + word_bigrams + [bg.replace(' ', '-') for bg in word_bigrams]
+            + lemma_bigrams + [bg.replace(' ', '-') for bg in lemma_bigrams]
+            + trigrams + [tg.replace(' ', '-') for tg in trigrams]
+        ))
 
         # ОПТИМИЗАЦИЯ: один проход вместо двух — строим our_city_lemmas
         # и keyword_has_target_city одновременно, без дублирующих _find_in_country
@@ -548,9 +537,11 @@ class BatchPostFilter:
                     continue
             
             item_normalized = self._get_lemma(item, language)
-            
+
             # PRIORITY 1: СВОЙ ГОРОД (целевая страна) — пропускаем
-            is_our_city = self._find_in_country(item, country) or self._find_in_country(item_normalized, country)
+            is_our_city = self._find_in_country(item, country)
+            if not is_our_city and item_normalized != item:
+                is_our_city = self._find_in_country(item_normalized, country)
             if is_our_city:
                 continue
             
