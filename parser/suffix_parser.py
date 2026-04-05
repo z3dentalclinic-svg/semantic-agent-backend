@@ -607,21 +607,20 @@ class SuffixParser:
         E_NOVELTY_BATCH = 5
         E_NOVELTY_MIN_NEW = 2
 
-        async def fetch_e_chrome_one(sq: "SuffixQuery", client: httpx.AsyncClient,
-                                     sem: asyncio.Semaphore):
+        async def fetch_e_chrome_one(sq: "SuffixQuery", client: httpx.AsyncClient):
             """FF E structured — только пары из FF_E_STRUCT_ALLOW (12 запросов).
-            sem = shared per-client Semaphore(5) → не превышает 5 req/IP суммарно с ABCD.
+            Phase 2 стартует после ABCD → sems свободны, semaphore не нужен.
             """
             if (sq.suffix_val, sq.variant) not in FF_E_STRUCT_ALLOW:
                 return
-            async with sem:
-                await asyncio.sleep(random.uniform(0.3, 0.5))
-                await fetch_one_tracked(sq, client, force_client="firefox")
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            await fetch_one_tracked(sq, client, force_client="firefox")
 
         # Step 5b2: E chrome с per-letter skip + fingerprint novelty threshold
-        async def run_e_chrome_with_novelty(client: httpx.AsyncClient,
-                                              sem: asyncio.Semaphore):
-            """FF E structured с novelty threshold. sem = shared per-client Semaphore(5)."""
+        async def run_e_chrome_with_novelty(client: httpx.AsyncClient):
+            """FF E structured с novelty threshold.
+            Phase 2 — ABCD уже завершён, semaphore не нужен.
+            """
 
             # Debug: что лежит в e_queries_by_letter и trace_entries
             e_simple_in_trace = [t for t in trace_entries if t.suffix_type == "E_simple"]
@@ -678,7 +677,7 @@ class SuffixParser:
                 tasks = []
                 for L in batch:
                     for sq in e_queries_by_letter.get(L, []):
-                        tasks.append(fetch_e_chrome_one(sq, client, sem))
+                        tasks.append(fetch_e_chrome_one(sq, client))
                 await asyncio.gather(*tasks)
 
                 new_intents = len(current_fps() - fps_before)
@@ -705,28 +704,29 @@ class SuffixParser:
         #         await asyncio.sleep(0.3)
         #         await fetch_one_firefox(sq, client)
 
-        # ── Chrome E structured: prefix-style letter-parallel ──────────────────
-        async def run_e_chr_letter(letter: str, queries: list,
-                                   client: httpx.AsyncClient, sem: asyncio.Semaphore):
-            """Один Chrome E буквенный трек — запросы последовательно (как prefix PA).
-            sem = shared per-client Semaphore(5) → суммарно с ABCD не превышает 5 req/IP.
+        # ── Chrome E structured: prefix-style letter-parallel (без semaphore) ─────
+        async def run_e_chr_letter(letter: str, queries: list, client: httpx.AsyncClient):
+            """Один Chrome E буквенный трек — как prefix PA.
+            Startup jitter 0-1с стаггирует старт букв.
+            Запросы sequential внутри трека с 0.3с delay как натуральный ограничитель.
+            Нет semaphore — 9 треков/IP = ~9 concurrent max, как prefix (30 треков/IP).
             """
+            await asyncio.sleep(random.uniform(0, 1.0))  # startup jitter
             for sq in queries:
                 if sq.variant in CHROME_E_SKIP:
                     continue
                 letter_skip = CHROME_E_LETTER_SKIP.get(sq.suffix_val, set())
                 if sq.variant in letter_skip:
                     continue
-                async with sem:
-                    await asyncio.sleep(0.3)
-                    await fetch_one_tracked(sq, client, force_client="chrome")
+                await asyncio.sleep(0.3)
+                await fetch_one_tracked(sq, client, force_client="chrome")
 
-        async def run_e_chr_parallel(clients: list, sems: list):
-            """Chrome E: все буквы параллельно, round-robin по Chrome клиентам.
-            26 букв / 3 IP = ~9 букв на IP, Semaphore(5) shared с ABCD → безопасно.
+        async def run_e_chr_parallel(clients: list):
+            """Chrome E: все буквы параллельно, round-robin по 3 Chrome IP.
+            26 букв / 3 IP = ~9 букв/IP с jitter → пиковая нагрузка ~3 req/IP.
             """
             letters = list(e_queries_by_letter.items())
-            tasks = [run_e_chr_letter(L, qs, clients[i % len(clients)], sems[i % len(sems)])
+            tasks = [run_e_chr_letter(L, qs, clients[i % len(clients)])
                      for i, (L, qs) in enumerate(letters)]
             await asyncio.gather(*tasks)
 
@@ -778,16 +778,16 @@ class SuffixParser:
                 await fetch_one_tracked(sq, clients[slot], force_client="firefox")
 
         async def run_chrome(clients: list, sems: list):
-            """Chrome agent: A/B/C/D + E_simple + E structured.
-            Один Semaphore(5) на клиент shared между ABCD, E_simple и E structured.
+            """Chrome agent: ABCD + E_simple + E structured — все параллельно.
+            ABCD: Semaphore(5)/клиент (безопасно).
+            E_simple: jitter, без semaphore.
+            E structured: startup jitter + sequential 0.3с внутри трека, без semaphore.
+            Chrome E стартует вместе с ABCD — нет зависимости от E_simple (нет novelty threshold).
             """
-            phase1 = [fetch_chr_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
-            phase1.append(run_e_simple_chrome(clients, sems))
-            await asyncio.gather(*phase1)
-            try:
-                await run_e_chr_parallel(clients, sems)
-            except Exception as e:
-                print(f"[ChromeE Error] seed={seed!r}: {e!r}")
+            tasks = [fetch_chr_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
+            tasks.append(run_e_simple_chrome(clients, sems))
+            tasks.append(run_e_chr_parallel(clients))
+            await asyncio.gather(*tasks)
 
         async def run_firefox(clients: list, sems: list):
             """Firefox agent: A/B/C/D + E_simple + E structured (allowlist).
@@ -797,7 +797,7 @@ class SuffixParser:
             phase1.append(run_e_simple(clients, sems))
             await asyncio.gather(*phase1)
             try:
-                await run_e_chrome_with_novelty(clients[0], sems[0])
+                await run_e_chrome_with_novelty(clients[0])
             except Exception as e:
                 print(f"[FirefoxE Error] seed={seed!r}: {e!r}")
 
