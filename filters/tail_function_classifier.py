@@ -24,7 +24,7 @@ from .function_detectors import (
     detect_verb_modifier, detect_conjunctive_extension,
     detect_prepositional_modifier,
     # Новые мягкие детекторы
-    detect_truncated_geo, detect_orphan_genitive, detect_single_infinitive,
+    detect_truncated_geo, detect_truncated_geo_fast, detect_orphan_genitive, detect_single_infinitive,
     detect_foreign_geo,
 )
 
@@ -197,6 +197,9 @@ class TailFunctionClassifier:
         self._seed_first_in_commerce_incompatible = self._seed_first_word in _COMMERCE_INCOMPATIBLE
         # Тайминги детекторов — накапливаются за батч, сбрасываются из l0_filter
         self.detector_timings: Dict[str, float] = {}
+        # Индекс для truncated_geo — строится один раз при создании классификатора
+        from .function_detectors import _build_truncated_geo_index
+        self._truncated_geo_index = _build_truncated_geo_index(geo_db) if geo_db else {}
     
     def classify(self, tail: str, tail_parses: dict = None) -> Dict:
         """
@@ -276,7 +279,7 @@ class TailFunctionClassifier:
             ('mixed_alpha',     lambda: detect_mixed_alphabet(tail, tp=tp)),
             ('standalone_num',  lambda: detect_standalone_number(tail, self.seed, tp=tp)),
             ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
-            ('truncated_geo',   lambda: detect_truncated_geo(tail, self.geo_db, tp=tp)),
+            ('truncated_geo',   lambda: detect_truncated_geo_fast(tail, self.geo_db, self._truncated_geo_index, tp=tp)),
             ('foreign_geo',     lambda: detect_foreign_geo(tail, self.geo_db, self.target_country, tp=tp)),
             ('orphan_genitive', lambda: detect_orphan_genitive(tail, self.seed, tp=tp)),
             ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp)),
