@@ -560,18 +560,7 @@ class BatchPostFilter:
             + trigrams + [tg.replace(' ', '-') for tg in trigrams]
         ))
 
-        # PRE-FILTER search_items: оставляем только те что есть в гео-базах.
-        # Слова которых нет нигде — заведомо не города, весь цикл для них впустую.
-        # Исключение: оставляем биграмы/триграмы (могут быть составными городами).
-        geo_dicts = (self.all_cities_global, self.districts, self.regions,
-                     self.countries, self.city_abbreviations, self.manual_small_cities)
-        search_items = [
-            item for item in search_items
-            if len(item) >= 3 and item not in self.ignored_words and (
-                ' ' in item or '-' in item or  # биграмы/триграмы — всегда проверяем
-                any(item in d for d in geo_dicts)  # unigrams — только если в базе
-            )
-        ]
+        # search_items готов
 
         # Строим our_city_lemmas и keyword_has_target_city за один проход
         our_city_lemmas = set()
@@ -584,10 +573,22 @@ class BatchPostFilter:
                 if lemma != w:
                     our_city_lemmas.add(lemma)
 
+        _cnt_total = len(search_items)
+        _cnt_skip_short = 0
+        _cnt_skip_geo = 0
+        _cnt_not_in_db = 0
+        _cnt_checked = 0
+        _t_skip_geo_total = 0.0
+        _t_common_noun_total = 0.0
+
         for item in search_items:
             # Geox guard — только для unigrams
             if ' ' not in item and '-' not in item:
-                if self._should_skip_geo_check(item, language):
+                _tsg = time.perf_counter()
+                _skip = self._should_skip_geo_check(item, language)
+                _t_skip_geo_total += time.perf_counter() - _tsg
+                if _skip:
+                    _cnt_skip_geo += 1
                     continue
             
             item_normalized = self._get_lemma(item, language)
@@ -601,15 +602,22 @@ class BatchPostFilter:
             
             # PRIORITY 2: ЧУЖОЙ ГОРОД (другая страна)
             found_country = self.all_cities_global.get(item_normalized) or self.all_cities_global.get(item)
-            
+
+            if not found_country:
+                _cnt_not_in_db += 1
+
             if found_country and found_country != country.lower():
+                _cnt_checked += 1
                 
                 # Лемма нашего города? "лев" ← "львов" (UA)
                 if item in our_city_lemmas or item_normalized in our_city_lemmas:
                     continue
                 
                 # Обычное слово языка? "дом", "белая", "гора"
-                if self._is_common_noun(item, language):
+                _tcn = time.perf_counter()
+                _cn = self._is_common_noun(item, language)
+                _t_common_noun_total += time.perf_counter() - _tcn
+                if _cn:
                     continue
                 
                 # Город из сида — всегда разрешён
@@ -656,6 +664,10 @@ class BatchPostFilter:
             return False, "неправильная грамматическая форма", "grammar", _p
 
         _p['search'] = time.perf_counter() - _t2
+        logger.debug("[BPF_SEARCH] kw='%s' total=%d skip_geo=%d not_in_db=%d checked=%d "
+                     "skip_geo_t=%.4f common_noun_t=%.4f",
+                     keyword[:60], _cnt_total, _cnt_skip_geo, _cnt_not_in_db, _cnt_checked,
+                     _t_skip_geo_total, _t_common_noun_total)
         return True, "", "", _p
 
     def _get_word_features(self, word: str, language: str) -> dict:
