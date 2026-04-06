@@ -136,6 +136,42 @@ except ImportError:
     logger.warning("[GEO_DISTRICTS] pymorphy3 not available for Geox checks")
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# МОДУЛЬНЫЙ КЭШ GEO-СУЩНОСТЕЙ (строится один раз при импорте)
+# Раньше geonamescache читался при каждом вызове filter_geo_garbage
+# ═══════════════════════════════════════════════════════════════════
+def _build_geo_entities_cache() -> Dict[str, tuple]:
+    """Строим all_geo_entities один раз при старте сервера."""
+    result: Dict[str, tuple] = {}
+    try:
+        import geonamescache
+        gc = geonamescache.GeonamesCache()
+        cities = gc.get_cities()
+        for city_data in cities.values():
+            country_code = city_data.get('countrycode', '').upper()
+            name = city_data['name'].lower()
+            result[name] = (country_code, 'city')
+            for alt in city_data.get('alternatenames', []):
+                if len(alt) > 2:
+                    result[alt.lower()] = (country_code, 'city')
+        countries = gc.get_countries()
+        for code, country_data in countries.items():
+            name = country_data.get('name', '').lower()
+            if name:
+                result[name] = (code, 'country')
+        logger.info("[GEO_CACHE] Built geo entities cache: %d entries", len(result))
+    except Exception as e:
+        logger.warning("[GEO_CACHE] geonamescache unavailable: %s", e)
+    # Добавляем fallback
+    for name, meta in _get_fallback_geo_entities().items():
+        result.setdefault(name, meta)
+    return result
+
+# Инициализируем при импорте — один раз на весь lifetime процесса
+_GEO_ENTITIES_CACHE: Dict[str, tuple] = {}
+_GEOX_WORD_CACHE: Dict[str, bool] = {}  # кэш для _morph_geox.parse per-process
+
 # ═══════════════════════════════════════════════════════════════════
 # БАЗА ОККУПИРОВАННЫХ ТЕРРИТОРИЙ
 # ═══════════════════════════════════════════════════════════════════
@@ -466,6 +502,20 @@ def _get_fallback_geo_entities() -> Dict[str, Tuple[str, str]]:
 # С НОРМАЛИЗАЦИЕЙ ПАДЕЖЕЙ
 # ═══════════════════════════════════════════════════════════════════
 
+# Инициализируем кэш здесь — после того как _get_fallback_geo_entities определена
+_GEO_ENTITIES_CACHE = _build_geo_entities_cache()
+
+# Предлоги — константа на уровне модуля (не пересоздавать при каждом запросе)
+_PREPOSITIONS = {
+    'в', 'на', 'из', 'под', 'во', 'до', 'возле', 'с', 'со', 'от', 'ко', 'за', 'над',
+    'у', 'біля', 'поруч', 'коло', 'від', 'про',
+    'in', 'at', 'near', 'from', 'to', 'on', 'by', 'with', 'for', 'of', 'about',
+    'ў', 'каля', 'ля', 'пры',
+    'w', 'na', 'przy', 'od', 'do', 'z', 'o',
+}
+# Кэш нормализации токенов — накапливается между запросами
+_NORMALIZE_CACHE: Dict[str, str] = {}
+
 def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dict:
     """
     WHITE-LIST гео-фильтр v3.0 FINAL с нормализацией падежей
@@ -502,79 +552,20 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     if not data or "keywords" not in data:
         return data
     
-    # ═══════════════════════════════════════════════════════════════
-    # Загрузка geonamescache
-    # ═══════════════════════════════════════════════════════════════
-    
-    try:
-        import geonamescache
-        gc = geonamescache.GeonamesCache()
-        has_geonames = True
-        logger.info(f"[GEO_WHITE_LIST] geonamescache loaded")
-    except ImportError:
-        logger.warning("⚠️ geonamescache not installed")
-        has_geonames = False
+    # Используем модульный кэш — построен один раз при импорте
+    has_geonames = bool(_GEO_ENTITIES_CACHE)
     
     seed_lower = seed.lower()
     target_country_upper = target_country.upper()
-    
-    # Предлоги
-    prepositions = {
-        'в', 'на', 'из', 'под', 'во', 'до', 'возле', 'с', 'со', 'от', 'ко', 'за', 'над',
-        'у', 'біля', 'поруч', 'коло', 'від', 'про',
-        'in', 'at', 'near', 'from', 'to', 'on', 'by', 'with', 'for', 'of', 'about',
-        'ў', 'каля', 'ля', 'пры',
-        'w', 'na', 'przy', 'od', 'do', 'z', 'o',
-    }
     
     # ═══════════════════════════════════════════════════════════════
     # Шаг 1: Загрузка гео-сущностей (geonamescache + fallback)
     # ═══════════════════════════════════════════════════════════════
     
-    all_geo_entities: Dict[str, Tuple[str, str]] = {}
-    
-    # 1.1. Загрузка из geonamescache (если доступен)
-    if has_geonames:
-        try:
-            # Города
-            cities = gc.get_cities()
-            for city_id, city_data in cities.items():
-                country_code = city_data.get('countrycode', '').upper()
-                
-                name = city_data['name'].lower()
-                all_geo_entities[name] = (country_code, 'city')
-                
-                alt_names = city_data.get('alternatenames', [])
-                for alt in alt_names:
-                    if len(alt) > 2:
-                        all_geo_entities[alt.lower()] = (country_code, 'city')
-            
-            logger.info(f"[GEO_WHITE_LIST] Loaded {len(all_geo_entities)} cities from geonamescache")
-            
-            # Страны
-            countries = gc.get_countries()
-            for code, country_data in countries.items():
-                name = country_data.get('name', '').lower()
-                if name:
-                    all_geo_entities[name] = (code, 'country')
-            
-            logger.info(f"[GEO_WHITE_LIST] Loaded countries from geonamescache")
-            
-        except Exception as e:
-            logger.warning(f"Error loading geonamescache: {e}")
-    
-    # 1.2. ВСЕГДА добавляем fallback (объединение!)
-    fallback_entities = _get_fallback_geo_entities()
-    for name, meta in fallback_entities.items():
-        all_geo_entities.setdefault(name, meta)
-    
-    # 1.3. Названия стран на ru/uk/en (через Babel)
+    # Используем модульный кэш + добавляем COUNTRY_NAMES и CITY_DISTRICTS
+    all_geo_entities = dict(_GEO_ENTITIES_CACHE)
     for name, meta in COUNTRY_NAMES_MULTILINGUAL.items():
         all_geo_entities.setdefault(name, meta)
-    
-    logger.info(f"[GEO_WHITE_LIST] Total geo entities after fallback+countries: {len(all_geo_entities)}")
-    
-    # 1.3. Добавляем города из CITY_DISTRICTS
     for city_name in CITY_DISTRICTS.keys():
         all_geo_entities.setdefault(city_name, (target_country_upper, 'city'))
     
@@ -650,7 +641,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         hyphenated = re.findall(r'[а-яёіїєґa-z0-9]+-[а-яёіїєґa-z0-9]+(?:-[а-яёіїєґa-z0-9]+)*', query_lower)
         
         # Удаляем предлоги
-        clean_words = [w for w in words if w not in prepositions and len(w) > 1]
+        clean_words = [w for w in words if w not in _PREPOSITIONS and len(w) > 1]
         # Добавляем дефисные слова: "южно-сахалинск", "санкт-петербург"
         clean_words = clean_words + [h for h in hyphenated if h not in clean_words]
         
@@ -658,8 +649,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
         # НЕ добавляем в clean_words чтобы не ломать Geox/district/occupied проверки
         query_bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
         
-        # НОРМАЛИЗАЦИЯ — синхронно с clean_words
-        clean_words_normalized = [_normalize_token(w) for w in clean_words]
+        # НОРМАЛИЗАЦИЯ — синхронно с clean_words (с кэшем)
+        clean_words_normalized = []
+        for w in clean_words:
+            if w not in _NORMALIZE_CACHE:
+                _NORMALIZE_CACHE[w] = _normalize_token(w)
+            clean_words_normalized.append(_NORMALIZE_CACHE[w])
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 1: Оккупированные территории (блокируем ВСЕГДА!)
@@ -671,7 +666,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
             if raw_word in OCCUPIED_TERRITORIES or word_norm in OCCUPIED_TERRITORIES:
                 has_occupied = True
                 matched = raw_word if raw_word in OCCUPIED_TERRITORIES else word_norm
-                logger.info(f"[GEO_WHITE_LIST] ❌ OCCUPIED: '{query}' contains '{matched}'")
                 stats['blocked_occupied'] += 1
                 break
         
@@ -714,7 +708,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
             if len(cities_in_query) > 0:
                 other_cities = {c for c in cities_in_query if c != seed_city}
                 if other_cities:
-                    logger.info(f"[GEO_WHITE_LIST] ❌ MULTI_CITY: '{query}' contains cities: {cities_in_query}, seed_city is '{seed_city}'")
                     stats['blocked_multi_city'] += 1
                     continue
         
@@ -757,7 +750,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 # Б. Природный объект (гора, река, озеро)?
                 elif entity_type in ['mountain', 'river', 'lake']:
                     if raw_word not in seed_words and word_norm not in seed_words_normalized:
-                        logger.info(f"[GEO_WHITE_LIST] ❌ GEO_OBJECT: '{query}' contains {entity_type} '{check_word}'")
                         stats['blocked_geo_object'] += 1
                         blocked = True
                         break
@@ -787,10 +779,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 )
                 if district_canonical_city and district_canonical_city != seed_canonical:
                     has_wrong_district = True
-                    matched_form = raw_word if DISTRICT_TO_CANONICAL.get(raw_word) else word_norm
-                    logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_DISTRICT: '{query}' contains district "
-                              f"'{matched_form}' from city '{district_canonical_city}', "
-                              f"seed_city is '{seed_city}' (canonical='{seed_canonical}')")
                     stats['blocked_wrong_district'] += 1
                     break
             
@@ -819,12 +807,10 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 resolved = _resolve_oblast_adjective(raw_word, all_geo_entities)
                 if resolved and resolved != seed_city:
                     cities_in_query_oblast.add(resolved)
-                    logger.info(f"[GEO_WHITE_LIST] Oblast adj resolved: '{raw_word}' → '{resolved}'")
             
             # Если есть чужие города → БЛОК
             other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
             if other_cities_oblast:
-                logger.info(f"[GEO_WHITE_LIST] ❌ WRONG_OBLAST: '{query}' mentions oblast with other cities: {other_cities_oblast}")
                 stats['blocked_wrong_oblast'] += 1
                 continue
         
@@ -846,13 +832,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                 if len(raw_word) <= 3 or raw_word.isascii():
                     continue
                 
-                # Проверяем Geox тег
-                parses = _morph_geox.parse(raw_word)
-                is_geox = any('Geox' in str(p.tag) for p in parses)
-                if is_geox:
+                # Проверяем Geox тег (с кэшем per-process)
+                if raw_word not in _GEOX_WORD_CACHE:
+                    parses = _morph_geox.parse(raw_word)
+                    _GEOX_WORD_CACHE[raw_word] = any('Geox' in str(p.tag) for p in parses)
+                if _GEOX_WORD_CACHE[raw_word]:
                     has_foreign_geox = True
-                    logger.info(f"[GEO_WHITE_LIST] ❌ GEOX_REGION: '{query}' contains "
-                              f"geo-entity '{raw_word}' (pymorphy3 Geox)")
                     stats['blocked_geox_region'] += 1
                     break
             
