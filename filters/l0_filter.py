@@ -1,10 +1,10 @@
 """
-l0_filter.py — Серверная обёртка L0 классификатора1.
+l0_filter.py — Серверная обёртка L0 классификатора.
 
 Встраивается в пайплайн ПОСЛЕ всех существующих фильтров:
     pre_filter → geo_garbage → batch_post → deduplicate → L0
 
-Принимает result dict с keywords → классифицирует каждый ключ → 
+Принимает result dict с keywords → классифицирует каждый ключ →
 разделяет на VALID / TRASH / GREY.
 
 Результат:
@@ -12,15 +12,58 @@ l0_filter.py — Серверная обёртка L0 классификатор
     result["keywords_grey"]  → GREY ключи (для будущего perplexity)
     result["anchors"]       += TRASH ключи с пометкой [L0]
     result["_l0_trace"]      → детальный трейсинг каждого ключа
+    result["_filter_timings"]["l0"] → тайминги L0 (extract_tail / classify / total)
+
+ОПТИМИЗАЦИИ:
+1. Персистентный кэш TailFunctionClassifier — не пересоздаётся на каждый батч.
+   Кэш по ключу (seed, target_country). geo_db/brand_db загружаются один раз.
+2. build_seed_ctx() вызывается один раз до цикла — seed одинаков для всего батча.
+3. _filter_timings добавляется к result — для профилирования горячих точек.
 """
 
 import logging
+import time
 from typing import Dict, List, Set, Any
 
-from .tail_extractor import extract_tail
+from .tail_extractor import extract_tail, build_seed_ctx
 from .tail_function_classifier import TailFunctionClassifier
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Персистентный кэш классификатора.
+# TailFunctionClassifier создаётся ОДИН РАЗ на (seed, target_country)
+# и переиспользуется во всех последующих запросах с тем же seed.
+#
+# ВАЖНО: кэш хранит ссылку на geo_db / brand_db.
+# Если эти базы пересоздаются при каждом запросе (новый dict) —
+# кэш теряет смысл. Убедитесь что bases загружаются при старте сервера
+# и передаются одним и тем же объектом.
+# ============================================================
+_CLASSIFIER_CACHE: Dict[tuple, TailFunctionClassifier] = {}
+
+
+def _get_classifier(
+    seed: str,
+    target_country: str,
+    geo_db: Dict,
+    brand_db: Set,
+) -> TailFunctionClassifier:
+    """
+    Возвращает персистентный классификатор для данного (seed, target_country).
+    Создаёт новый только при первом вызове или при смене seed/country.
+    """
+    key = (seed.lower().strip(), target_country.lower())
+    if key not in _CLASSIFIER_CACHE:
+        logger.info("[L0] Creating new classifier for seed='%s' country='%s'", seed, target_country)
+        _CLASSIFIER_CACHE[key] = TailFunctionClassifier(
+            geo_db=geo_db,
+            brand_db=brand_db,
+            seed=seed,
+            target_country=target_country,
+        )
+    return _CLASSIFIER_CACHE[key]
 
 
 def apply_l0_filter(
@@ -32,40 +75,47 @@ def apply_l0_filter(
 ) -> Dict[str, Any]:
     """
     Применяет L0 классификатор к списку ключевых слов.
-    
+
     Args:
         result: dict с ключами "keywords", "anchors"
         seed: базовый запрос
         target_country: целевая страна
         geo_db: база городов Dict[str, Set[str]] (название → {коды_стран})
         brand_db: база брендов (set). Если None — пустой set
-    
+
     Returns:
-        result с обновлёнными keywords, keywords_grey, anchors, _l0_trace
+        result с обновлёнными keywords, keywords_grey, anchors, _l0_trace, _filter_timings
     """
+    t_l0_start = time.perf_counter()
+
     keywords = result.get("keywords", [])
     if not keywords:
         result.setdefault("keywords_grey", [])
         result.setdefault("_l0_trace", [])
+        _add_timings(result, 0.0, 0.0, 0.0)
         return result
-    
+
     if geo_db is None:
         geo_db = {}
     if brand_db is None:
         brand_db = set()
-    
-    clf = TailFunctionClassifier(
-        geo_db=geo_db,
-        brand_db=brand_db,
-        seed=seed,
-        target_country=target_country,
-    )
-    
+
+    # ── Pre-compute seed_ctx ОДИН РАЗ для всего батча ──────────────────────
+    # Seed одинаков для всех ключей → лематизация seed не повторяется N раз.
+    seed_lower = seed.lower().strip()
+    seed_ctx = build_seed_ctx(seed_lower)
+
+    # ── Персистентный классификатор ─────────────────────────────────────────
+    clf = _get_classifier(seed, target_country, geo_db, brand_db)
+
     valid_keywords = []
     grey_keywords = []
     trash_keywords = []
     trace_records = []
-    
+
+    t_extract_total = 0.0
+    t_classify_total = 0.0
+
     for kw_item in keywords:
         # Поддержка str и dict форматов
         if isinstance(kw_item, str):
@@ -75,14 +125,16 @@ def apply_l0_filter(
         else:
             valid_keywords.append(kw_item)
             continue
-        
+
         if not kw:
             continue
-        
-        # Извлекаем хвост
-        tail = extract_tail(kw, seed)
-        
-        # NO_SEED → GREY (не можем классифицировать, пусть perplexity решит)
+
+        # ── extract_tail с pre-computed seed_ctx ───────────────────────────
+        t0 = time.perf_counter()
+        tail = extract_tail(kw, seed, seed_ctx=seed_ctx)
+        t_extract_total += time.perf_counter() - t0
+
+        # NO_SEED → GREY
         if tail is None:
             grey_keywords.append(kw_item)
             trace_records.append({
@@ -94,7 +146,7 @@ def apply_l0_filter(
                 "signals": [],
             })
             continue
-        
+
         # Пустой хвост = запрос совпадает с seed → VALID
         if not tail:
             valid_keywords.append(kw_item)
@@ -107,12 +159,15 @@ def apply_l0_filter(
                 "signals": ["exact_seed"],
             })
             continue
-        
-        # Классификация хвоста
+
+        # ── classify ────────────────────────────────────────────────────────
+        t0 = time.perf_counter()
         r = clf.classify(tail)
+        t_classify_total += time.perf_counter() - t0
+
         label = r["label"]
         all_signals = r["positive_signals"] + [f"-{s}" for s in r["negative_signals"]]
-        
+
         trace_record = {
             "keyword": kw,
             "tail": tail,
@@ -123,36 +178,33 @@ def apply_l0_filter(
             "confidence": r["confidence"],
         }
         trace_records.append(trace_record)
-        
+
         if label == "VALID":
             valid_keywords.append(kw_item)
         elif label == "TRASH":
             trash_keywords.append(kw_item)
         else:  # GREY
             grey_keywords.append(kw_item)
-    
-    # --- Обновляем result ---
-    
-    # keywords = только VALID
+
+    # ── Обновляем result ─────────────────────────────────────────────────────
+
     result["keywords"] = valid_keywords
     result["count"] = len(valid_keywords)
-    
-    # keywords_grey = для будущего perplexity
+
     result["keywords_grey"] = grey_keywords
     result["keywords_grey_count"] = len(grey_keywords)
-    
-    # TRASH → якоря с пометкой [L0]
+
+    # TRASH → якоря
     existing_anchors = result.get("anchors", [])
     for kw_item in trash_keywords:
         kw = kw_item if isinstance(kw_item, str) else kw_item.get("query", "")
         existing_anchors.append(kw)
     result["anchors"] = existing_anchors
     result["anchors_count"] = len(existing_anchors)
-    
-    # Трейсинг
+
     result["_l0_trace"] = trace_records
-    
-    # Сохраняем диагностику в файл (аналогично l2_diagnostic.json)
+
+    # ── Сохраняем диагностику ────────────────────────────────────────────────
     try:
         import json as _json
         diag = {
@@ -170,19 +222,39 @@ def apply_l0_filter(
         with open("l0_diagnostic.json", "w", encoding="utf-8") as f:
             _json.dump(diag, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f"[L0] Failed to save diagnostic: {e}")
-    
-    # Статистика для лога
+        logger.warning("[L0] Failed to save diagnostic: %s", e)
+
+    # ── Тайминги ─────────────────────────────────────────────────────────────
+    t_l0_total = time.perf_counter() - t_l0_start
+    _add_timings(result, t_extract_total, t_classify_total, t_l0_total)
+
+    # ── Лог итогов ──────────────────────────────────────────────────────────
     total = len(trace_records)
     v = len(valid_keywords)
     t = len(trash_keywords)
     g = len(grey_keywords)
-    
+
     logger.info(
-        f"[L0] seed='{seed}' | total={total} | "
-        f"VALID={v} ({v*100//total if total else 0}%) | "
-        f"TRASH={t} ({t*100//total if total else 0}%) | "
-        f"GREY={g} ({g*100//total if total else 0}%)"
+        "[L0] seed='%s' | total=%d | VALID=%d (%d%%) | TRASH=%d (%d%%) | GREY=%d (%d%%)",
+        seed, total,
+        v, v * 100 // total if total else 0,
+        t, t * 100 // total if total else 0,
+        g, g * 100 // total if total else 0,
     )
-    
+    logger.info(
+        "[L0_PROFILE] n=%d | extract_tail=%.3fs | classify=%.3fs | total=%.3fs",
+        total, t_extract_total, t_classify_total, t_l0_total,
+    )
+
     return result
+
+
+def _add_timings(result: dict, t_extract: float, t_classify: float, t_total: float):
+    """Добавляет L0-тайминги к _filter_timings result'а."""
+    if "_filter_timings" not in result:
+        result["_filter_timings"] = {}
+    result["_filter_timings"]["l0"] = {
+        "extract_tail": round(t_extract, 4),
+        "classify": round(t_classify, 4),
+        "total": round(t_total, 4),
+    }
