@@ -25,7 +25,7 @@ def _get_parses(word: str, tp: dict = None):
     """
     if tp is not None and word in tp:
         return tp[word]
-    return _get_parses(word, tp)
+    return morph.parse(word)
 
 # ── Индекс для detect_truncated_geo ─────────────────────────────────────────
 # Строится ОДИН РАЗ при первом вызове detect_truncated_geo с конкретным geo_db.
