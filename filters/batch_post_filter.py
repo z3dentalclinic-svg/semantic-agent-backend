@@ -424,23 +424,36 @@ class BatchPostFilter:
     def _check_geo_conflicts_v75(self, keyword: str, country: str, 
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
                                   language: str, seed: str = "") -> Tuple[bool, str, str]:
-        # Проверяем наличие корней сида в ключе (ПРИОРИТЕТ СИДА)
-        has_seed = self._has_seed_cores(keyword, seed) if seed else False
-        
-        logger.debug("[BPF] CHECK keyword='%s' | country=%s | has_seed=%s", keyword, country, has_seed)
-        
         words = re.findall(r'[а-яёa-z0-9-]+', keyword)
         if not words:
             return True, "", ""
 
         keyword_lemmas = [lemmas_map.get(w, w) for w in words]
-        
         words_set = set(words + keyword_lemmas)
+
+        # FAST PRE-CHECK: если ни одно слово не попадает ни в один гео-словарь
+        # и нет forbidden_geo — пропускаем ВСЕ тяжёлые проверки сразу.
+        # Для большинства ключей типа "ремонт цена выезд" это даёт мгновенный return.
+        if not (words_set & self.forbidden_geo):
+            has_any_geo = any(
+                w in self.all_cities_global or
+                w in self.districts or
+                w in self.regions or
+                w in self.countries or
+                w in self.city_abbreviations or
+                w in self.manual_small_cities
+                for w in words_set
+            )
+            if not has_any_geo:
+                return True, "", ""
+
+        # Проверяем наличие корней сида в ключе (ПРИОРИТЕТ СИДА)
+        has_seed = self._has_seed_cores(keyword, seed) if seed else False
+
         if any(city in words_set for city in seed_cities):
-            logger.debug("[BPF] ALLOW by seed_cities | keyword='%s'", keyword)
             return True, "", ""
-        
-        for check_val in words + keyword_lemmas:
+
+        for check_val in words_set:
             if check_val in self.forbidden_geo:
                 return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist"
 
