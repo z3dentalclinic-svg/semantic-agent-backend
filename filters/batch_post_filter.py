@@ -560,25 +560,32 @@ class BatchPostFilter:
             + trigrams + [tg.replace(' ', '-') for tg in trigrams]
         ))
 
-        # ОПТИМИЗАЦИЯ: один проход вместо двух — строим our_city_lemmas
-        # и keyword_has_target_city одновременно, без дублирующих _find_in_country
+        # PRE-FILTER search_items: оставляем только те что есть в гео-базах.
+        # Слова которых нет нигде — заведомо не города, весь цикл для них впустую.
+        # Исключение: оставляем биграмы/триграмы (могут быть составными городами).
+        geo_dicts = (self.all_cities_global, self.districts, self.regions,
+                     self.countries, self.city_abbreviations, self.manual_small_cities)
+        search_items = [
+            item for item in search_items
+            if len(item) >= 3 and item not in self.ignored_words and (
+                ' ' in item or '-' in item or  # биграмы/триграмы — всегда проверяем
+                any(item in d for d in geo_dicts)  # unigrams — только если в базе
+            )
+        ]
+
+        # Строим our_city_lemmas и keyword_has_target_city за один проход
         our_city_lemmas = set()
         keyword_has_target_city = False
 
         for w in words_set:
             if self._find_in_country(w, country):
                 keyword_has_target_city = True
-                # Берём лемму из готового lemmas_map — без повторного morph.parse
                 lemma = lemmas_map.get(w, w)
                 if lemma != w:
                     our_city_lemmas.add(lemma)
 
         for item in search_items:
-            # ШАГ 0: Пропускаем короткие слова и ignored_words
-            if len(item) < 3 or item in self.ignored_words:
-                continue
-            
-            # ШАГ 0.5: Geox guard — пропускаем слова, которые точно НЕ города
+            # Geox guard — только для unigrams
             if ' ' not in item and '-' not in item:
                 if self._should_skip_geo_check(item, language):
                     continue
