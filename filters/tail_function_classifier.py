@@ -41,7 +41,7 @@ from .shared_morph import morph
 
 # Накопленные тайминги по детекторам — суммируются за весь батч.
 # Читается и сбрасывается из l0_filter после каждого батча.
-_detector_timings: Dict[str, float] = {}
+
 
 # Веса сигналов: чем выше, тем сильнее влияние на решение
 SIGNAL_WEIGHTS = {
@@ -187,6 +187,8 @@ class TailFunctionClassifier:
         self._seed_first_word = self._seed_words_lower[0] if self._seed_words_lower else ''
         self._seed_first_in_geo_incompatible = self._seed_first_word in _GEO_INCOMPATIBLE_INTERROGATIVES
         self._seed_first_in_commerce_incompatible = self._seed_first_word in _COMMERCE_INCOMPATIBLE
+        # Тайминги детекторов — накапливаются за батч, сбрасываются из l0_filter
+        self.detector_timings: Dict[str, float] = {}
     
     def classify(self, tail: str) -> Dict:
         """
@@ -238,7 +240,7 @@ class TailFunctionClassifier:
         for signal_name, detector in detectors_positive:
             _t0 = time.perf_counter()
             detected, reason = detector()
-            _detector_timings[signal_name] = _detector_timings.get(signal_name, 0.0) + (time.perf_counter() - _t0)
+            self.detector_timings[signal_name] = self.detector_timings.get(signal_name, 0.0) + (time.perf_counter() - _t0)
             if detected:
                 positive_signals.append(signal_name)
                 reasons.append(f"✅ {reason}")
@@ -270,7 +272,7 @@ class TailFunctionClassifier:
         for signal_name, detector in detectors_negative:
             _t0 = time.perf_counter()
             detected, reason = detector()
-            _detector_timings[signal_name] = _detector_timings.get(signal_name, 0.0) + (time.perf_counter() - _t0)
+            self.detector_timings[signal_name] = self.detector_timings.get(signal_name, 0.0) + (time.perf_counter() - _t0)
             if detected:
                 negative_signals.append(signal_name)
                 reasons.append(f"❌ {reason}")
