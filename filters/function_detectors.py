@@ -44,24 +44,28 @@ def _build_truncated_geo_index(geo_db: dict) -> Dict[str, str]:
     return index
 
 
+_seed_has_verb_cache: Dict[str, bool] = {}
+
+
 def _seed_has_verb(seed: str) -> bool:
     """
     Проверяет наличие глагола в seed.
-    
-    Guard: word_is_known() — неизвестные слова (бренды, транслитерация)
-    НЕ считаются глаголами, даже если pymorphy угадывает VERB.
-    
-    "как принимать нимесил" → True  (принимать = INFN, known)
-    "нимесил таблетки"     → False (нимесил = VERB guess, NOT known)
-    "ремонт пылесосов"     → False (нет глаголов)
+    Результат кэшируется — seed одинаков для всего батча (282 ключа),
+    поэтому morph.parse для seed-слов вызывается только один раз.
     """
+    if seed in _seed_has_verb_cache:
+        return _seed_has_verb_cache[seed]
     if not seed:
+        _seed_has_verb_cache[seed] = False
         return False
+    result = False
     for sw in seed.lower().split():
         sp = morph.parse(sw)[0]
         if sp.tag.POS in ('INFN', 'VERB') and morph.word_is_known(sw):
-            return True
-    return False
+            result = True
+            break
+    _seed_has_verb_cache[seed] = result
+    return result
 
 
 # ============================================================
@@ -180,22 +184,21 @@ def detect_commerce(tail: str) -> Tuple[bool, str]:
     
     tail_lower = tail.lower()
     words = tail_lower.split()
-    
-    # Считаем контентные слова (не предлоги/союзы/частицы/наречия)
-    # "на заказ" → "на" предлог, "заказ" единственное → single content
-    # "где купить" → "где" наречие, "купить" единственное → single content
+
+    # Один проход — парсим каждое слово один раз, получаем и POS и лемму
     skip_pos_commerce = {'PREP', 'CONJ', 'PRCL', 'INTJ', 'ADVB', 'PRED'}
-    content_count = sum(1 for w in words if morph.parse(w)[0].tag.POS not in skip_pos_commerce)
+    parses = [morph.parse(w)[0] for w in words]
+    content_count = sum(1 for p in parses if p.tag.POS not in skip_pos_commerce)
     is_single_content = content_count <= 1
-    
+
     # Проверка паттернов (всегда strong)
     for pattern in commerce_patterns:
         if pattern in tail_lower:
             return True, f"Коммерция (паттерн): '{pattern}'"
-    
-    # Проверка по леммам
-    for word in words:
-        lemma = morph.parse(word)[0].normal_form
+
+    # Проверка по леммам — используем уже готовые parses
+    for word, p in zip(words, parses):
+        lemma = p.normal_form
         
         # Strong — работает даже одним словом
         if lemma in commerce_lemmas_strong:
@@ -778,17 +781,19 @@ def detect_dangling(tail: str, seed: str = "ремонт пылесосов", ge
     words = tail.lower().split()
     if not words:
         return False, ""
-    
-    parsed_first = [morph.parse(w)[0] for w in words]
-    
+
+    # Один вызов morph.parse на слово — получаем сразу все парсы и первый парс
+    all_parses_list = [morph.parse(w) for w in words]
+    parsed_first = [p[0] for p in all_parses_list]
+
     has_adj = False
     has_noun = False
     adj_words_info = []
-    
-    for w, p in zip(words, parsed_first):
+
+    for i, (w, p) in enumerate(zip(words, parsed_first)):
         if p.tag.POS in ('ADJF', 'ADJS'):
             has_adj = True
-            adj_words_info.append((w, morph.parse(w)))
+            adj_words_info.append((w, all_parses_list[i]))  # уже готовые полные парсы
         if p.tag.POS == 'NOUN':
             has_noun = True
     
@@ -802,21 +807,21 @@ def detect_dangling(tail: str, seed: str = "ремонт пылесосов", ge
     # "Волжский", "Жуковский", "Раменское" — pymorphy видит ADJF,
     # но это города. Проверяем geo_db ДО dangling.
     if geo_db:
-        for w in words:
+        for w, p in zip(words, parsed_first):
             if w in geo_db:
                 return False, ""
-            lemma = morph.parse(w)[0].normal_form
+            lemma = p.normal_form  # уже готово из parsed_first
             if lemma in geo_db:
                 return False, ""
-    
+
     # === ПРОВЕРКА 2: Согласование с seed ===
     seed_words = seed.lower().split()
     seed_noun_parses = None
-    
+
     for sw in reversed(seed_words):
-        sp = morph.parse(sw)[0]
-        if sp.tag.POS == 'NOUN':
-            seed_noun_parses = morph.parse(sw)
+        sw_all = morph.parse(sw)  # нужны все парсы для падежей
+        if sw_all[0].tag.POS == 'NOUN':
+            seed_noun_parses = sw_all
             break
     
     # Если в seed НЕТ существительного (напр. "купить гтх 3060") — 
@@ -1759,25 +1764,21 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
     
     # === Основная проверка ===
     for word in words:
-        parsed = morph.parse(word)[0]
-        
+        # Один вызов — получаем и первый парс и все парсы для Geox check
+        all_parses = morph.parse(word)
+        parsed = all_parses[0]
+
         if parsed.tag.POS in skip_pos:
             continue
-        
+
         lemma = parsed.normal_form
-        
+
         # Собираем все формы для проверки: слово, лемма, номинатив
         check_forms = {word, lemma}
-        # Приводим к номинативу (барановичах → барановичи, киеву → киев)
         nomn_form = parsed.inflect({'nomn'})
         if nomn_form:
             check_forms.add(nomn_form.word)
-        
-        # === GUARD: проверяем geo_db только если pymorphy считает слово географическим ===
-        # "болях" → все парсы без Geox → common word → skip geo_db
-        # "барановичах" → 2й парс имеет Geox → реальный город → check geo_db
-        # Это предотвращает FP типа "боли" = город в Китае
-        all_parses = morph.parse(word)
+
         has_geox = any('Geox' in str(p.tag) for p in all_parses)
         
         # Проверка 1: чужой город (geo_db) — только для географических слов
