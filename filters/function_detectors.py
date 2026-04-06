@@ -8,10 +8,40 @@ function_detectors.py — 11 детекторов функции хвоста.
 Каждый детектор возвращает: (bool, str) — (сработал?, причина)
 """
 
-import pymorphy3  # noqa: F401 — оставлен для обратной совместимости (type hints)
+import pymorphy3  # noqa: F401
 from typing import Tuple, Set, Dict
 
 from .shared_morph import morph
+
+# ── Индекс для detect_truncated_geo ─────────────────────────────────────────
+# Строится ОДИН РАЗ при первом вызове detect_truncated_geo с конкретным geo_db.
+# Ключ: id(geo_db) — при смене базы индекс перестраивается автоматически.
+# Структура: {первая_часть_города → полное_название}
+# Пример: "ханты" → "ханты-мансийск", "санкт" → "санкт-петербург"
+# Заменяет O(65k) перебор на O(1) lookup.
+_truncated_geo_index: Dict[str, str] = {}
+_truncated_geo_index_for: int = -1  # id последнего geo_db
+
+
+def _build_truncated_geo_index(geo_db: dict) -> Dict[str, str]:
+    """Строит индекс первых частей составных городов."""
+    global _truncated_geo_index, _truncated_geo_index_for
+    db_id = id(geo_db)
+    if db_id == _truncated_geo_index_for:
+        return _truncated_geo_index
+    index = {}
+    for city_name in geo_db:
+        if '-' in city_name:
+            first_part = city_name.split('-')[0]
+            if first_part and first_part not in index:
+                index[first_part] = city_name
+        elif ' ' in city_name:
+            first_part = city_name.split(' ')[0]
+            if first_part and first_part not in index:
+                index[first_part] = city_name
+    _truncated_geo_index = index
+    _truncated_geo_index_for = db_id
+    return index
 
 
 def _seed_has_verb(seed: str) -> bool:
@@ -1593,59 +1623,47 @@ def detect_standalone_number(tail: str, seed: str = "") -> Tuple[bool, str]:
 def detect_truncated_geo(tail: str, geo_db: dict = None) -> Tuple[bool, str]:
     """
     Детектор обрезанного составного города.
-    
+
     "ханты" → первая часть "ханты-мансийск" → TRASH
     "санкт" → первая часть "санкт-петербург" → TRASH
     "южно" → первая часть "южно-сахалинск" → TRASH
-    
-    Алгоритм: проверяем geo_db — есть ли составной город,
-    начинающийся с этого слова. Если слово само НЕ город,
-    но является началом составного города → обрезанное название.
-    
-    Cross-niche: работает для любого seed, любой страны.
-    Хардкода ноль — всё из geo_db.
+
+    ОПТИМИЗАЦИЯ: O(65k) перебор geo_db заменён на O(1) lookup
+    через _build_truncated_geo_index — индекс {первая_часть → город}.
+    Строится один раз при первом вызове, переиспользуется для всего батча.
+    Логика детектора не изменена.
     """
     if not tail or not geo_db:
         return False, ""
-    
+
     words = tail.lower().split()
     if len(words) != 1:
         return False, ""
-    
+
     word = words[0]
-    
-    # Числа не могут быть обрезанными городами ("12" ≠ "12 de octubre")
+
     if word.isdigit():
         return False, ""
-    
-    # Минимальная длина: 1-2 символа слишком коротки для надёжного матча
-    # "ти" → "ти-хуа"? Абсурд. "за" → "за калуською"? Абсурд.
-    # Реальные кейсы: "ханты" (5), "санкт" (5), "южно" (4) — все 3+
+
     if len(word) < 3:
         return False, ""
-    
+
     # Если слово само является полноценным городом — не обрезанное
     if word in geo_db:
         return False, ""
-    
+
     # Лемма — тоже полноценный город?
     lemma = morph.parse(word)[0].normal_form
     if lemma in geo_db:
         return False, ""
-    
-    # Ищем составные города, начинающиеся с этого слова
-    # Составные = содержат дефис или пробел
-    # Проверяем: word == первая часть до дефиса/пробела
-    for city_name in geo_db:
-        if '-' in city_name:
-            first_part = city_name.split('-')[0]
-            if first_part == word or first_part == lemma:
-                return True, f"Обрезанный город: '{word}' → '{city_name}'"
-        elif ' ' in city_name:
-            first_part = city_name.split(' ')[0]
-            if first_part == word or first_part == lemma:
-                return True, f"Обрезанный город: '{word}' → '{city_name}'"
-    
+
+    # O(1) lookup через pre-built индекс вместо O(65k) перебора
+    index = _build_truncated_geo_index(geo_db)
+
+    city = index.get(word) or index.get(lemma)
+    if city:
+        return True, f"Обрезанный город: '{word}' → '{city}'"
+
     return False, ""
 
 
