@@ -117,6 +117,31 @@ class BatchPostFilter:
             self._has_morph = True
         except ImportError:
             self._has_morph = False
+
+        # ═══ ИНДЕКСЫ для candidate generation (строятся один раз) ═══
+
+        # explicit_geo_index: маленькие точные словари — всегда кандидат
+        self.explicit_geo_index: Set[str] = (
+            set(self.countries.keys()) |
+            set(self.regions.keys()) |
+            set(self.districts.keys()) |
+            set(self.city_abbreviations.keys()) |
+            set(self.manual_small_cities.keys()) |
+            set(self.forbidden_geo)
+        )
+
+        # Разделяем all_cities_global на unigram и multiword
+        self.city_unigram_index: Set[str] = set()   # однословные города
+        self.city_multi_index: Set[str] = set()      # составные "нижний новгород"
+
+        for name in self.all_cities_global:
+            if ' ' in name or '-' in name:
+                self.city_multi_index.add(name)
+            else:
+                self.city_unigram_index.add(name)
+
+        # geo_hit_cache: слова которые реально сработали как город в текущем батче
+        self._geo_hit_cache: Set[str] = set()
     
     def _get_city_abbreviations(self) -> Dict[str, str]:
         return {
@@ -370,6 +395,7 @@ class BatchPostFilter:
         self._request_cache = {}
         self._lemmas_map = {}  # batch lemmas для текущего запроса
         self._last_search_stats = {}  # суммарная статистика search_items цикла
+        self._geo_hit_cache = set()   # города реально найденные в этом батче
 
         logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
         
@@ -560,17 +586,8 @@ class BatchPostFilter:
         _p['static'] = time.perf_counter() - _t1
         _t2 = time.perf_counter()
 
-        # word_bigrams уже вычислен выше — переиспользуем
-        lemma_bigrams = self._extract_ngrams(keyword_lemmas, 2)
-        # Триграммы только если 3+ слов — иначе пусто и лишние итерации
-        trigrams = self._extract_ngrams(words, 3) if len(words) >= 3 else []
-
-        search_items = list(dict.fromkeys(
-            words + keyword_lemmas
-            + word_bigrams + [bg.replace(' ', '-') for bg in word_bigrams]
-            + lemma_bigrams + [bg.replace(' ', '-') for bg in lemma_bigrams]
-            + trigrams + [tg.replace(' ', '-') for tg in trigrams]
-        ))
+        # Позитивный гейтинг: только токены с гео-признаком + биграмы рядом с ними
+        search_items = self._build_geo_candidates(words, lemmas_map, seed_cities)
 
         # search_items готов
 
@@ -659,6 +676,7 @@ class BatchPostFilter:
                 
                 if is_real_city:
                     reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
+                    self._geo_hit_cache.add(item)  # следующие ключи батча сразу увидят этот город
                     _p['search'] = time.perf_counter() - _t2
                     return False, reason, f"{found_country}_cities", _p
                 
@@ -687,6 +705,65 @@ class BatchPostFilter:
         self._last_search_stats['skip_geo_t'] = self._last_search_stats.get('skip_geo_t', 0) + _t_skip_geo_total
         self._last_search_stats['common_noun_t'] = self._last_search_stats.get('common_noun_t', 0) + _t_common_noun_total
         return True, "", "", _p
+
+    def _build_geo_candidates(self, words: List[str], lemmas_map: Dict[str, str],
+                               seed_cities: Set[str]) -> List[str]:
+        """
+        Позитивный гейтинг: строим кандидатов на гео только из подозрительных токенов.
+        Биграмы строятся только рядом с unigram-кандидатом или если целиком в geo-индексе.
+        Это заменяет search_items из ВСЕХ токенов — убирает мусор без риска потерять
+        составные города ("нижний новгород", "белая церковь").
+        """
+        candidates = []
+        unigram_flags = []  # True если words[i] является кандидатом
+
+        for w in words:
+            lemma = lemmas_map.get(w, w)
+            is_candidate = (
+                w in self.explicit_geo_index or
+                lemma in self.explicit_geo_index or
+                w in self.city_unigram_index or
+                lemma in self.city_unigram_index or
+                w in seed_cities or
+                lemma in seed_cities or
+                w in self._geo_hit_cache or
+                lemma in self._geo_hit_cache
+            )
+            unigram_flags.append(is_candidate)
+            if is_candidate:
+                candidates.append(w)
+                if lemma != w:
+                    candidates.append(lemma)
+
+        # Биграмы: только если хотя бы один компонент кандидат ИЛИ биграмма в multi-индексе
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            bg = f"{w1} {w2}"
+            bg_dash = bg.replace(' ', '-')
+            l1 = lemmas_map.get(w1, w1)
+            l2 = lemmas_map.get(w2, w2)
+            bg_lemma = f"{l1} {l2}"
+
+            if (
+                bg in self.city_multi_index or
+                bg_lemma in self.city_multi_index or
+                bg in self.explicit_geo_index or
+                bg_lemma in self.explicit_geo_index or
+                unigram_flags[i] or unigram_flags[i + 1]
+            ):
+                candidates.append(bg)
+                candidates.append(bg_dash)
+                if bg_lemma != bg:
+                    candidates.append(bg_lemma)
+                    candidates.append(bg_lemma.replace(' ', '-'))
+
+        # Триграмы: только если биграмма уже кандидат (крайне редко нужны)
+        for i in range(len(words) - 2):
+            tg = f"{words[i]} {words[i+1]} {words[i+2]}"
+            if tg in self.city_multi_index or tg in self.explicit_geo_index:
+                candidates.append(tg)
+
+        return list(dict.fromkeys(candidates))
 
     def _get_word_features(self, word: str, language: str) -> dict:
         """
