@@ -198,10 +198,14 @@ class TailFunctionClassifier:
         # Тайминги детекторов — накапливаются за батч, сбрасываются из l0_filter
         self.detector_timings: Dict[str, float] = {}
     
-    def classify(self, tail: str) -> Dict:
+    def classify(self, tail: str, tail_parses: dict = None) -> Dict:
         """
         Классифицирует хвост запроса.
-        
+
+        tail_parses: глобальный словарь {слово → morph.parse(слово)} для всего батча.
+        Строится один раз в l0_filter.py и передаётся сюда.
+        Детекторы используют его вместо независимых вызовов morph.parse.
+
         Returns:
             {
                 'label': 'VALID' | 'TRASH' | 'GREY',
@@ -224,27 +228,30 @@ class TailFunctionClassifier:
                 'positive_score': 1.0,
                 'negative_score': 0.0,
             }
-        
+
+        # tp — ссылка на глобальный словарь батча (или None → детекторы сами парсят)
+        tp = tail_parses
+
         positive_signals = []
         negative_signals = []
         reasons = []
-        
+
         # ===== ПОЗИТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_positive = [
-            ('geo',        lambda: detect_geo(tail, self.geo_db, self.target_country)),
-            ('brand',      lambda: detect_brand(tail, self.brand_db)),
-            ('commerce',   lambda: detect_commerce(tail)),
-            ('reputation', lambda: detect_reputation(tail)),
-            ('location',   lambda: detect_location(tail)),
-            ('action',     lambda: detect_action(tail)),
-            ('time',       lambda: detect_time(tail)),
-            ('type_spec',  lambda: detect_type_specifier(tail, self.seed)),
-            ('contacts',   lambda: detect_contacts(tail)),
-            ('verb_modifier', lambda: detect_verb_modifier(tail, self.seed)),
-            ('conjunctive', lambda: detect_conjunctive_extension(tail, self.seed)),
-            ('prep_modifier', lambda: detect_prepositional_modifier(tail, self.seed)),
+            ('geo',           lambda: detect_geo(tail, self.geo_db, self.target_country, tp=tp)),
+            ('brand',         lambda: detect_brand(tail, self.brand_db, tp=tp)),
+            ('commerce',      lambda: detect_commerce(tail, tp=tp)),
+            ('reputation',    lambda: detect_reputation(tail, tp=tp)),
+            ('location',      lambda: detect_location(tail, tp=tp)),
+            ('action',        lambda: detect_action(tail, tp=tp)),
+            ('time',          lambda: detect_time(tail, tp=tp)),
+            ('type_spec',     lambda: detect_type_specifier(tail, self.seed, tp=tp)),
+            ('contacts',      lambda: detect_contacts(tail, tp=tp)),
+            ('verb_modifier', lambda: detect_verb_modifier(tail, self.seed, tp=tp)),
+            ('conjunctive',   lambda: detect_conjunctive_extension(tail, self.seed, tp=tp)),
+            ('prep_modifier', lambda: detect_prepositional_modifier(tail, self.seed, tp=tp)),
         ]
-        
+
         for signal_name, detector in detectors_positive:
             _t0 = time.perf_counter()
             detected, reason = detector()
@@ -252,29 +259,27 @@ class TailFunctionClassifier:
             if detected:
                 positive_signals.append(signal_name)
                 reasons.append(f"✅ {reason}")
-        
+
         # ===== НЕГАТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_negative = [
-            ('fragment',        lambda: detect_fragment(tail, self.seed)),
-            ('meta',            lambda: detect_meta(tail, self.seed)),
-            ('dangling',        lambda: detect_dangling(tail, self.seed, self.geo_db)),
-            ('duplicate',       lambda: detect_duplicate_words(tail)),
-            ('brand_collision', lambda: detect_brand_collision(tail, self.brand_db)),
-            ('noise_suffix',    lambda: detect_noise_suffix(tail)),
-            ('seed_echo',       lambda: detect_seed_echo(tail, self.seed)),
-            ('broken_grammar',  lambda: detect_broken_grammar(tail)),
-            ('number_hijack',   lambda: detect_number_hijack(tail, self.seed)),
-            ('short_garbage',   lambda: detect_short_garbage(tail)),
-            ('tech_garbage',    lambda: detect_technical_garbage(tail)),
-            ('mixed_alpha',     lambda: detect_mixed_alphabet(tail)),
-            ('standalone_num',  lambda: detect_standalone_number(tail, self.seed)),
-            # Детектор несовместимых категорий (использует embeddings)
+            ('fragment',        lambda: detect_fragment(tail, self.seed, tp=tp)),
+            ('meta',            lambda: detect_meta(tail, self.seed, tp=tp)),
+            ('dangling',        lambda: detect_dangling(tail, self.seed, self.geo_db, tp=tp)),
+            ('duplicate',       lambda: detect_duplicate_words(tail, tp=tp)),
+            ('brand_collision', lambda: detect_brand_collision(tail, self.brand_db, tp=tp)),
+            ('noise_suffix',    lambda: detect_noise_suffix(tail, tp=tp)),
+            ('seed_echo',       lambda: detect_seed_echo(tail, self.seed, tp=tp)),
+            ('broken_grammar',  lambda: detect_broken_grammar(tail, tp=tp)),
+            ('number_hijack',   lambda: detect_number_hijack(tail, self.seed, tp=tp)),
+            ('short_garbage',   lambda: detect_short_garbage(tail, tp=tp)),
+            ('tech_garbage',    lambda: detect_technical_garbage(tail, tp=tp)),
+            ('mixed_alpha',     lambda: detect_mixed_alphabet(tail, tp=tp)),
+            ('standalone_num',  lambda: detect_standalone_number(tail, self.seed, tp=tp)),
             ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
-            # Новые мягкие детекторы
-            ('truncated_geo',     lambda: detect_truncated_geo(tail, self.geo_db)),
-            ('foreign_geo',       lambda: detect_foreign_geo(tail, self.geo_db, self.target_country)),
-            ('orphan_genitive',   lambda: detect_orphan_genitive(tail, self.seed)),
-            ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed)),
+            ('truncated_geo',   lambda: detect_truncated_geo(tail, self.geo_db, tp=tp)),
+            ('foreign_geo',     lambda: detect_foreign_geo(tail, self.geo_db, self.target_country, tp=tp)),
+            ('orphan_genitive', lambda: detect_orphan_genitive(tail, self.seed, tp=tp)),
+            ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp)),
         ]
         
         for signal_name, detector in detectors_negative:
