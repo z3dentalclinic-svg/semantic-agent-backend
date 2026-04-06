@@ -1,5 +1,5 @@
 """
-l0_filter.py — Серверная обёртка L0 классификатора11.
+l0_filter.py — Серверная обёртка L0 классификатора.
 
 Встраивается в пайплайн ПОСЛЕ всех существующих фильтров:
     pre_filter → geo_garbage → batch_post → deduplicate → L0
@@ -245,6 +245,19 @@ def apply_l0_filter(
         "[L0_PROFILE] n=%d | extract_tail=%.3fs | classify=%.3fs | total=%.3fs",
         total, t_extract_total, t_classify_total, t_l0_total,
     )
+
+    # ── Per-detector тайминги (топ по убыванию) ─────────────────────────────
+    try:
+        from .tail_function_classifier import _detector_timings
+        if _detector_timings:
+            sorted_det = sorted(_detector_timings.items(), key=lambda x: -x[1])
+            logger.info(
+                "[L0_DETECTORS] %s",
+                " | ".join(f"{k}={v:.3f}s" for k, v in sorted_det)
+            )
+            _detector_timings.clear()  # сброс после батча
+    except Exception:
+        pass
 
     return result
 
