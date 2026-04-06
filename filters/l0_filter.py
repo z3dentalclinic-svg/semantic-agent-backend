@@ -108,24 +108,6 @@ def apply_l0_filter(
     # ── Персистентный классификатор ─────────────────────────────────────────
     clf = _get_classifier(seed, target_country, geo_db, brand_db)
 
-    # ── Pre-batch embeddings для category_mismatch ──────────────────────────
-    # Собираем все хвосты батча и вычисляем их embeddings ОДНИМ вызовом модели.
-    # После этого detect_category_mismatch() работает через cache lookup — O(1).
-    try:
-        from .category_mismatch_detector import get_category_detector
-        _detector = get_category_detector()
-        # Первый проход: вычислить все хвосты чтобы передать в pre_batch
-        _all_tails = []
-        for kw_item in keywords:
-            kw = kw_item.strip() if isinstance(kw_item, str) else kw_item.get("query", "").strip()
-            if kw:
-                t = extract_tail(kw, seed, seed_ctx=seed_ctx)
-                if t:
-                    _all_tails.append(t)
-        _detector.pre_batch(_all_tails)
-    except Exception as e:
-        logger.warning("[L0] pre_batch failed: %s", e)
-
     valid_keywords = []
     grey_keywords = []
     trash_keywords = []
