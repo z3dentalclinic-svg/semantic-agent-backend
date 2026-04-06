@@ -8,10 +8,10 @@ function_detectors.py — 11 детекторов функции хвоста.
 Каждый детектор возвращает: (bool, str) — (сработал?, причина)
 """
 
-import pymorphy3
+import pymorphy3  # noqa: F401 — оставлен для обратной совместимости (type hints)
 from typing import Tuple, Set, Dict
 
-morph = pymorphy3.MorphAnalyzer()
+from .shared_morph import morph
 
 
 def _seed_has_verb(seed: str) -> bool:
