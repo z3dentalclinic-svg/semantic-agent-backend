@@ -735,27 +735,32 @@ class BatchPostFilter:
                 if lemma != w:
                     candidates.append(lemma)
 
-        # Биграмы: только если хотя бы один компонент кандидат ИЛИ биграмма в multi-индексе
+        # Биграмы: оба компонента кандидаты ИЛИ биграмма целиком в geo-индексе.
+        # "нижний новгород" → в city_multi_index → OK даже если компоненты не кандидаты.
+        # "ремонт харьков" → харьков=кандидат, ремонт=нет → НЕ строим биграмму.
         for i in range(len(words) - 1):
             w1, w2 = words[i], words[i + 1]
-            bg = f"{w1} {w2}"
-            bg_dash = bg.replace(' ', '-')
             l1 = lemmas_map.get(w1, w1)
             l2 = lemmas_map.get(w2, w2)
+            bg = f"{w1} {w2}"
             bg_lemma = f"{l1} {l2}"
 
-            if (
+            in_multi = (
                 bg in self.city_multi_index or
                 bg_lemma in self.city_multi_index or
                 bg in self.explicit_geo_index or
-                bg_lemma in self.explicit_geo_index or
-                unigram_flags[i] or unigram_flags[i + 1]
-            ):
+                bg_lemma in self.explicit_geo_index
+            )
+            both_candidates = unigram_flags[i] and unigram_flags[i + 1]
+
+            if in_multi or both_candidates:
                 candidates.append(bg)
-                candidates.append(bg_dash)
+                if '-' not in bg:
+                    candidates.append(bg.replace(' ', '-'))
                 if bg_lemma != bg:
                     candidates.append(bg_lemma)
-                    candidates.append(bg_lemma.replace(' ', '-'))
+                    if '-' not in bg_lemma:
+                        candidates.append(bg_lemma.replace(' ', '-'))
 
         # Триграмы: только если биграмма уже кандидат (крайне редко нужны)
         for i in range(len(words) - 2):
