@@ -393,11 +393,23 @@ class BatchPostFilter:
             'reasons': Counter()
         }
 
+        # ПРОФИЛИРОВАНИЕ: суммируем время по блокам за весь батч
+        _t_precheck = 0.0
+        _t_static = 0.0   # districts/abbr/regions/countries
+        _t_search = 0.0   # основной цикл search_items
+        _t_other = 0.0    # остальное внутри _check_geo_conflicts_v75
+
         for kw in unique_raw:
-            is_allowed, reason, category = self._check_geo_conflicts_v75(
+            _t0 = time.perf_counter()
+            is_allowed, reason, category, _prof = self._check_geo_conflicts_v75(
                 kw, country, lemmas_map, seed_cities, language, seed
             )
-            
+            _dt = time.perf_counter() - _t0
+            _t_precheck += _prof.get('precheck', 0)
+            _t_static   += _prof.get('static', 0)
+            _t_search   += _prof.get('search', 0)
+            _t_other    += _dt - _prof.get('precheck', 0) - _prof.get('static', 0) - _prof.get('search', 0)
+
             if is_allowed:
                 final_keywords.append(kw)
                 stats['allowed'] += 1
@@ -410,6 +422,9 @@ class BatchPostFilter:
         elapsed = time.time() - start_time
         logger.info("[BPF] FINISH %.2fs | allowed=%d | anchors=%d | reasons=%s",
                     elapsed, len(final_keywords), len(final_anchors), dict(stats['reasons']))
+        logger.info("[BPF_PROFILE] precheck=%.3fs static=%.3fs search=%.3fs other=%.3fs | lemmatize=%.3fs",
+                    _t_precheck, _t_static, _t_search, _t_other,
+                    elapsed - _t_precheck - _t_static - _t_search - _t_other)
 
         return {
             'keywords': final_keywords,
@@ -423,19 +438,20 @@ class BatchPostFilter:
             }
         }
 
-    def _check_geo_conflicts_v75(self, keyword: str, country: str, 
+    def _check_geo_conflicts_v75(self, keyword: str, country: str,
                                   lemmas_map: Dict[str, str], seed_cities: Set[str],
-                                  language: str, seed: str = "") -> Tuple[bool, str, str]:
+                                  language: str, seed: str = "") -> Tuple:
+        _p = {}  # профиль времён блоков
+        _t0 = time.perf_counter()
+
         words = re.findall(r'[а-яёa-z0-9-]+', keyword)
         if not words:
-            return True, "", ""
+            return True, "", "", _p
 
         keyword_lemmas = [lemmas_map.get(w, w) for w in words]
         words_set = set(words + keyword_lemmas)
 
-        # FAST PRE-CHECK: если ни одно слово не попадает ни в один гео-словарь
-        # и нет forbidden_geo — пропускаем ВСЕ тяжёлые проверки сразу.
-        # Для большинства ключей типа "ремонт цена выезд" это даёт мгновенный return.
+        # FAST PRE-CHECK
         if not (words_set & self.forbidden_geo):
             has_any_geo = any(
                 w in self.all_cities_global or
@@ -447,17 +463,23 @@ class BatchPostFilter:
                 for w in words_set
             )
             if not has_any_geo:
-                return True, "", ""
+                _p['precheck'] = time.perf_counter() - _t0
+                return True, "", "", _p
 
-        # Проверяем наличие корней сида в ключе (ПРИОРИТЕТ СИДА)
+        _p['precheck'] = time.perf_counter() - _t0
+        _t1 = time.perf_counter()
+
+        # Проверяем наличие корней сида в ключе
         has_seed = self._has_seed_cores(keyword, seed) if seed else False
 
         if any(city in words_set for city in seed_cities):
-            return True, "", ""
+            _p['static'] = time.perf_counter() - _t1
+            return True, "", "", _p
 
         for check_val in words_set:
             if check_val in self.forbidden_geo:
-                return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist"
+                _p['static'] = time.perf_counter() - _t1
+                return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist", _p
 
         # Биграмы вычисляем один раз — используем везде ниже
         word_bigrams = self._extract_ngrams(words, 2)
@@ -470,51 +492,61 @@ class BatchPostFilter:
                 for part in bg.split():
                     our_city_bigrams.add(part)
 
+        country_l = country.lower()
+
         for w in words:
             if w in self.districts:
                 dist_country = self.districts[w]
-                if dist_country != country.lower():
+                if dist_country != country_l:
                     if w in our_city_bigrams:
                         continue
                     if self._find_in_country(w, country):
                         continue
                     if self._is_common_noun(w, language):
-                        # _is_common_noun уже кэширован и проверил score — доверяем ему
                         continue
                     has_target_city = any(
-                        self.all_cities_global.get(other_w) == country.lower()
-                        for other_w in set(words + keyword_lemmas) - {w}
+                        self.all_cities_global.get(other_w) == country_l
+                        for other_w in words_set - {w}
                     )
                     if has_target_city:
                         continue
-                    return False, f"район '{w}' ({dist_country})", "districts"
-        
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"район '{w}' ({dist_country})", "districts", _p
+
         for w in words + keyword_lemmas:
             if w in self.city_abbreviations:
                 abbr_country = self.city_abbreviations[w]
-                if abbr_country != country.lower():
-                    return False, f"сокращение города '{w}' ({abbr_country})", f"{abbr_country}_abbreviations"
-        
+                if abbr_country != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"сокращение города '{w}' ({abbr_country})", f"{abbr_country}_abbreviations", _p
+
         check_regions = words + keyword_lemmas + word_bigrams
         for item in check_regions:
             if item in self.regions:
                 region_country = self.regions[item]
-                if region_country != country.lower():
-                    return False, f"регион '{item}' ({region_country})", f"{region_country}_regions"
-        
+                if region_country != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"регион '{item}' ({region_country})", f"{region_country}_regions", _p
+
         for w in words + keyword_lemmas:
             if w in self.countries:
                 ctry_code = self.countries[w]
-                if ctry_code != country.lower():
-                    return False, f"страна '{w}' ({ctry_code})", f"{ctry_code}_countries"
-        
+                if ctry_code != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"страна '{w}' ({ctry_code})", f"{ctry_code}_countries", _p
+
         for w in words + keyword_lemmas:
             if w in self.manual_small_cities:
                 city_country = self.manual_small_cities[w]
                 if city_country == 'unknown':
-                    return False, f"неизвестный объект '{w}'", "unknown"
-                if city_country != country.lower():
-                    return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities"
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"неизвестный объект '{w}'", "unknown", _p
+                if city_country != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities", _p
+
+        _p['static'] = time.perf_counter() - _t1
+        _t2 = time.perf_counter()
 
         # word_bigrams уже вычислен выше — переиспользуем
         lemma_bigrams = self._extract_ngrams(keyword_lemmas, 2)
@@ -611,9 +643,11 @@ class BatchPostFilter:
                 continue
         
         if not self._is_grammatically_valid(keyword, language):
-            return False, "неправильная грамматическая форма", "grammar"
-        
-        return True, "", ""
+            _p['search'] = time.perf_counter() - _t2
+            return False, "неправильная грамматическая форма", "grammar", _p
+
+        _p['search'] = time.perf_counter() - _t2
+        return True, "", "", _p
 
     def _get_word_features(self, word: str, language: str) -> dict:
         """
