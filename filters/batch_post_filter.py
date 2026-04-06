@@ -521,19 +521,7 @@ class BatchPostFilter:
 
         country_l = country.lower()
 
-        # Биграмы вычисляем один раз — нужны для districts и _build_geo_candidates
-        word_bigrams = self._extract_ngrams(words, 2)
-
-        # Собираем биграмы городов НАШЕЙ страны
-        our_city_bigrams = set()
-        for bg in word_bigrams:
-            if self._find_in_country(bg, country):
-                our_city_bigrams.add(bg)
-                for part in bg.split():
-                    our_city_bigrams.add(part)
-
-        # ОДИН проход по words_set вместо 4 отдельных циклов
-        # Проверяем abbreviations, countries, manual_small_cities
+        # ОДИН проход по words_set: abbreviations, countries, manual_small_cities, regions
         for w in words_set:
             if w in self.city_abbreviations:
                 if self.city_abbreviations[w] != country_l:
@@ -554,32 +542,49 @@ class BatchPostFilter:
                     _p['static'] = time.perf_counter() - _t1
                     return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities", _p
 
-        # Districts — только words (не леммы), нужен our_city_bigrams
-        for w in words:
-            if w in self.districts:
-                dist_country = self.districts[w]
-                if dist_country != country_l:
-                    if w in our_city_bigrams:
-                        continue
-                    if self._find_in_country(w, country):
-                        continue
-                    if self._is_common_noun(w, language):
-                        continue
-                    has_target_city = any(
-                        self.all_cities_global.get(other_w) == country_l
-                        for other_w in words_set - {w}
-                    )
-                    if has_target_city:
-                        continue
+            if w in self.regions:
+                if self.regions[w] != country_l:
                     _p['static'] = time.perf_counter() - _t1
-                    return False, f"район '{w}' ({dist_country})", "districts", _p
+                    return False, f"регион '{w}' ({self.regions[w]})", f"{self.regions[w]}_regions", _p
 
-        # Регионы — words_set + биграмы
-        for item in list(words_set) + word_bigrams:
-            if item in self.regions:
-                if self.regions[item] != country_l:
+        # Districts и биграмы регионов — только если в ключе есть потенциальный district/region
+        words_in_districts = [w for w in words if w in self.districts]
+        has_region_bigram = any(w in self.regions for w in words_set)
+
+        word_bigrams = []
+        our_city_bigrams = set()
+
+        if words_in_districts or has_region_bigram:
+            # Биграмы нужны — строим лениво
+            word_bigrams = self._extract_ngrams(words, 2)
+            for bg in word_bigrams:
+                if self._find_in_country(bg, country):
+                    our_city_bigrams.add(bg)
+                    for part in bg.split():
+                        our_city_bigrams.add(part)
+            # Биграмы регионов
+            for bg in word_bigrams:
+                if bg in self.regions and self.regions[bg] != country_l:
                     _p['static'] = time.perf_counter() - _t1
-                    return False, f"регион '{item}' ({self.regions[item]})", f"{self.regions[item]}_regions", _p
+                    return False, f"регион '{bg}' ({self.regions[bg]})", f"{self.regions[bg]}_regions", _p
+
+        for w in words_in_districts:
+            dist_country = self.districts[w]
+            if dist_country != country_l:
+                if w in our_city_bigrams:
+                    continue
+                if self._find_in_country(w, country):
+                    continue
+                if self._is_common_noun(w, language):
+                    continue
+                has_target_city = any(
+                    self.all_cities_global.get(other_w) == country_l
+                    for other_w in words_set - {w}
+                )
+                if has_target_city:
+                    continue
+                _p['static'] = time.perf_counter() - _t1
+                return False, f"район '{w}' ({dist_country})", "districts", _p
 
         _p['static'] = time.perf_counter() - _t1
         _t2 = time.perf_counter()
