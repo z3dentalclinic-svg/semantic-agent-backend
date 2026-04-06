@@ -59,6 +59,20 @@ def _build_truncated_geo_index(geo_db: dict) -> Dict[str, str]:
 
 
 _seed_has_verb_cache: Dict[str, bool] = {}
+_seed_lemmas_cache: Dict[str, frozenset] = {}
+
+
+def _get_seed_lemmas(seed: str) -> frozenset:
+    """
+    Возвращает frozenset лемм слов seed'а.
+    Кэшируется — seed одинаков для всего батча (282 ключа),
+    поэтому пересчитывается только один раз.
+    """
+    if seed in _seed_lemmas_cache:
+        return _seed_lemmas_cache[seed]
+    lemmas = frozenset(morph.parse(w)[0].normal_form for w in seed.lower().split())
+    _seed_lemmas_cache[seed] = lemmas
+    return lemmas
 
 
 def _seed_has_verb(seed: str) -> bool:
@@ -1000,9 +1014,8 @@ def detect_seed_echo(tail: str, seed: str = "ремонт пылесосов", t
     seed="ремонт пылесосов", tail="после ремонт" → частичный дубль
     """
     tail_words = tail.lower().split()
-    seed_words = seed.lower().split()
-    seed_lemmas = {_get_parses(w, tp)[0].normal_form for w in seed_words}
-    
+    seed_lemmas = _get_seed_lemmas(seed)
+
     # Хвост целиком = одно из слов seed'а
     if len(tail_words) == 1:
         tail_lemma = _get_parses(tail_words[0], tp)[0].normal_form
@@ -1638,6 +1651,42 @@ def detect_standalone_number(tail: str, seed: str = "", tp: dict = None) -> Tupl
 # ============================================================
 # НОВЫЕ НЕГАТИВНЫЕ ДЕТЕКТОРЫ (мягкие — понижают вес, не убивают)
 # ============================================================
+
+def detect_truncated_geo_fast(tail: str, geo_db: dict, geo_index: dict, tp: dict = None) -> Tuple[bool, str]:
+    """
+    Быстрая версия detect_truncated_geo с pre-built индексом.
+    geo_index строится один раз в TailFunctionClassifier.__init__.
+    Вызывается из classify() вместо оригинальной версии.
+    """
+    if not tail or not geo_db:
+        return False, ""
+
+    words = tail.lower().split()
+    if len(words) != 1:
+        return False, ""
+
+    word = words[0]
+
+    if word.isdigit():
+        return False, ""
+
+    if len(word) < 3:
+        return False, ""
+
+    if word in geo_db:
+        return False, ""
+
+    lemma = _get_parses(word, tp)[0].normal_form
+    if lemma in geo_db:
+        return False, ""
+
+    # O(1) lookup из pre-built индекса (не вызывает _build_truncated_geo_index)
+    city = geo_index.get(word) or geo_index.get(lemma)
+    if city:
+        return True, f"Обрезанный город: '{word}' → '{city}'"
+
+    return False, ""
+
 
 def detect_truncated_geo(tail: str, geo_db: dict = None, tp: dict = None) -> Tuple[bool, str]:
     """
