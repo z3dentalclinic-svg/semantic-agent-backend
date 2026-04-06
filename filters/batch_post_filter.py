@@ -369,6 +369,7 @@ class BatchPostFilter:
         # Остальные кэши персистентны: слова между запросами одинаковые
         self._request_cache = {}
         self._lemmas_map = {}  # batch lemmas для текущего запроса
+        self._last_search_stats = {}  # суммарная статистика search_items цикла
 
         logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
         
@@ -425,6 +426,17 @@ class BatchPostFilter:
         logger.info("[BPF_PROFILE] precheck=%.3fs static=%.3fs search=%.3fs other=%.3fs | lemmatize=%.3fs",
                     _t_precheck, _t_static, _t_search, _t_other,
                     elapsed - _t_precheck - _t_static - _t_search - _t_other)
+        # Суммарная статистика по search_items циклу
+        _total_items = sum(getattr(self, '_last_search_stats', {}).get(k, 0)
+                          for k in ('total', 'skip_geo', 'not_in_db', 'checked'))
+        logger.info("[BPF_SEARCH_TOTAL] items_total=%d skip_geo=%d not_in_db=%d foreign_city_checked=%d "
+                    "skip_geo_t=%.3fs common_noun_t=%.3fs",
+                    self._last_search_stats.get('total', 0),
+                    self._last_search_stats.get('skip_geo', 0),
+                    self._last_search_stats.get('not_in_db', 0),
+                    self._last_search_stats.get('checked', 0),
+                    self._last_search_stats.get('skip_geo_t', 0),
+                    self._last_search_stats.get('common_noun_t', 0))
 
         return {
             'keywords': final_keywords,
@@ -574,12 +586,15 @@ class BatchPostFilter:
                     our_city_lemmas.add(lemma)
 
         _cnt_total = len(search_items)
-        _cnt_skip_short = 0
         _cnt_skip_geo = 0
         _cnt_not_in_db = 0
         _cnt_checked = 0
         _t_skip_geo_total = 0.0
         _t_common_noun_total = 0.0
+        # Накапливаем в instance для суммарного лога в filter_batch
+        if not hasattr(self, '_last_search_stats'):
+            self._last_search_stats = {}
+        self._last_search_stats['total'] = self._last_search_stats.get('total', 0) + _cnt_total
 
         for item in search_items:
             # Geox guard — только для unigrams
@@ -664,10 +679,13 @@ class BatchPostFilter:
             return False, "неправильная грамматическая форма", "grammar", _p
 
         _p['search'] = time.perf_counter() - _t2
-        logger.debug("[BPF_SEARCH] kw='%s' total=%d skip_geo=%d not_in_db=%d checked=%d "
-                     "skip_geo_t=%.4f common_noun_t=%.4f",
-                     keyword[:60], _cnt_total, _cnt_skip_geo, _cnt_not_in_db, _cnt_checked,
-                     _t_skip_geo_total, _t_common_noun_total)
+        # Накапливаем суммарную статистику
+        self._last_search_stats['total'] = self._last_search_stats.get('total', 0) + _cnt_total
+        self._last_search_stats['skip_geo'] = self._last_search_stats.get('skip_geo', 0) + _cnt_skip_geo
+        self._last_search_stats['not_in_db'] = self._last_search_stats.get('not_in_db', 0) + _cnt_not_in_db
+        self._last_search_stats['checked'] = self._last_search_stats.get('checked', 0) + _cnt_checked
+        self._last_search_stats['skip_geo_t'] = self._last_search_stats.get('skip_geo_t', 0) + _t_skip_geo_total
+        self._last_search_stats['common_noun_t'] = self._last_search_stats.get('common_noun_t', 0) + _t_common_noun_total
         return True, "", "", _p
 
     def _get_word_features(self, word: str, language: str) -> dict:
