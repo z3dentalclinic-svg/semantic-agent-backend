@@ -247,17 +247,13 @@ def apply_l0_filter(
     )
 
     # ── Per-detector тайминги (топ по убыванию) ─────────────────────────────
-    try:
-        from .tail_function_classifier import _detector_timings
-        if _detector_timings:
-            sorted_det = sorted(_detector_timings.items(), key=lambda x: -x[1])
-            logger.info(
-                "[L0_DETECTORS] %s",
-                " | ".join(f"{k}={v:.3f}s" for k, v in sorted_det)
-            )
-            _detector_timings.clear()  # сброс после батча
-    except Exception:
-        pass
+    if clf.detector_timings:
+        sorted_det = sorted(clf.detector_timings.items(), key=lambda x: -x[1])
+        logger.info(
+            "[L0_DETECTORS] %s",
+            " | ".join(f"{k}={v:.3f}s" for k, v in sorted_det)
+        )
+        clf.detector_timings.clear()  # сброс после батча
 
     return result
 
