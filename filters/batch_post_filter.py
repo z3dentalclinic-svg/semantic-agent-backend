@@ -363,10 +363,9 @@ class BatchPostFilter:
         start_time = time.time()
 
         # Сбрасываем кэш для нового запроса
+        # Сбрасываем только _request_cache — он зависит от country (ua/ru/by)
+        # Остальные кэши персистентны: слова между запросами одинаковые
         self._request_cache = {}
-        self._skip_geo_cache = {}
-        self._common_noun_cache = {}
-        self._lemma_cache = {}
         self._lemmas_map = {}  # batch lemmas для текущего запроса
 
         logger.info("[BPF] START filter_batch | country=%s | lang=%s | keywords=%d", country, language, len(keywords))
@@ -695,14 +694,22 @@ class BatchPostFilter:
     def _batch_lemmatize(self, words: Set[str], language: str) -> Dict[str, str]:
         if not self._has_morph:
             return {w: w for w in words}
-        
+
         morph = self.morph_ru if language == 'ru' else self.morph_uk
         lemmas = {}
-        
+
         for word in words:
+            # Пропускаем мусор до лемматизации
+            if len(word) < 3 or word.isdigit() or word in self.ignored_words:
+                lemmas[word] = word
+                continue
+            # Если слово уже есть в базе городов напрямую — лемматизация не нужна
+            if word in self.all_cities_global:
+                lemmas[word] = word
+                continue
             lemma = self._get_lemma(word, language, morph)
             lemmas[word] = lemma
-        
+
         return lemmas
 
     def _get_lemma(self, word: str, language: str, morph=None) -> str:
