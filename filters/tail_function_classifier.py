@@ -171,6 +171,14 @@ _COMMERCE_INCOMPATIBLE = (
     frozenset({'можно', 'нужно', 'стоит', 'сколько'})
 )
 
+# Сильные позитивные сигналы — если есть хотя бы один,
+# category_mismatch пропускается (Stage 0 short-circuit).
+# Эти детекторы уже надёжно валидировали хвост → дорогой embed не нужен.
+_STRONG_POSITIVES_SKIP_MISMATCH = frozenset({
+    'geo', 'brand', 'location', 'contacts', 'time',
+    'verb_modifier', 'prep_modifier', 'conjunctive',
+})
+
 
 class TailFunctionClassifier:
     """Классификатор хвостов на основе детекторов функций."""
@@ -270,6 +278,13 @@ class TailFunctionClassifier:
         ]
         
         for signal_name, detector in detectors_negative:
+            # ── Stage 0: short-circuit для category_mismatch ────────────────
+            # Если сильный позитивный сигнал уже подтвердил хвост (geo, brand,
+            # location и др.) — дорогой semantic детектор не запускается.
+            # Эти сигналы надёжнее и специализированнее чем общий mismatch.
+            if signal_name == 'category_mismatch':
+                if set(positive_signals) & _STRONG_POSITIVES_SKIP_MISMATCH:
+                    continue
             _t0 = time.perf_counter()
             detected, reason = detector()
             self.detector_timings[signal_name] = self.detector_timings.get(signal_name, 0.0) + (time.perf_counter() - _t0)
