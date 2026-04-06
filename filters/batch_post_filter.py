@@ -629,14 +629,16 @@ class BatchPostFilter:
                 
                 if is_real_city:
                     reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
-                    return False, reason, f"{found_country}_cities"
+                    _p['search'] = time.perf_counter() - _t2
+                    return False, reason, f"{found_country}_cities", _p
                 
                 # Спорное слово
                 if has_seed:
                     continue  # Есть seed — разрешаем
                 else:
                     reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
-                    return False, reason, f"{found_country}_cities"
+                    _p['search'] = time.perf_counter() - _t2
+                    return False, reason, f"{found_country}_cities", _p
             
             # Город не найден — проверяем на обычное существительное
             if self._is_common_noun(item_normalized, language):
