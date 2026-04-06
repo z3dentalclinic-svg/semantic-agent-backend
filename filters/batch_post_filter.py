@@ -519,10 +519,12 @@ class BatchPostFilter:
                 _p['static'] = time.perf_counter() - _t1
                 return False, f"Hard-Blacklist '{check_val}'", "hard_blacklist", _p
 
-        # Биграмы вычисляем один раз — используем везде ниже
+        country_l = country.lower()
+
+        # Биграмы вычисляем один раз — нужны для districts и _build_geo_candidates
         word_bigrams = self._extract_ngrams(words, 2)
 
-        # Собираем биграмы которые являются городами НАШЕЙ страны
+        # Собираем биграмы городов НАШЕЙ страны
         our_city_bigrams = set()
         for bg in word_bigrams:
             if self._find_in_country(bg, country):
@@ -530,8 +532,29 @@ class BatchPostFilter:
                 for part in bg.split():
                     our_city_bigrams.add(part)
 
-        country_l = country.lower()
+        # ОДИН проход по words_set вместо 4 отдельных циклов
+        # Проверяем abbreviations, countries, manual_small_cities
+        for w in words_set:
+            if w in self.city_abbreviations:
+                if self.city_abbreviations[w] != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"сокращение города '{w}' ({self.city_abbreviations[w]})", f"{self.city_abbreviations[w]}_abbreviations", _p
 
+            if w in self.countries:
+                if self.countries[w] != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"страна '{w}' ({self.countries[w]})", f"{self.countries[w]}_countries", _p
+
+            if w in self.manual_small_cities:
+                city_country = self.manual_small_cities[w]
+                if city_country == 'unknown':
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"неизвестный объект '{w}'", "unknown", _p
+                if city_country != country_l:
+                    _p['static'] = time.perf_counter() - _t1
+                    return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities", _p
+
+        # Districts — только words (не леммы), нужен our_city_bigrams
         for w in words:
             if w in self.districts:
                 dist_country = self.districts[w]
@@ -551,37 +574,12 @@ class BatchPostFilter:
                     _p['static'] = time.perf_counter() - _t1
                     return False, f"район '{w}' ({dist_country})", "districts", _p
 
-        for w in words + keyword_lemmas:
-            if w in self.city_abbreviations:
-                abbr_country = self.city_abbreviations[w]
-                if abbr_country != country_l:
-                    _p['static'] = time.perf_counter() - _t1
-                    return False, f"сокращение города '{w}' ({abbr_country})", f"{abbr_country}_abbreviations", _p
-
-        check_regions = words + keyword_lemmas + word_bigrams
-        for item in check_regions:
+        # Регионы — words_set + биграмы
+        for item in list(words_set) + word_bigrams:
             if item in self.regions:
-                region_country = self.regions[item]
-                if region_country != country_l:
+                if self.regions[item] != country_l:
                     _p['static'] = time.perf_counter() - _t1
-                    return False, f"регион '{item}' ({region_country})", f"{region_country}_regions", _p
-
-        for w in words + keyword_lemmas:
-            if w in self.countries:
-                ctry_code = self.countries[w]
-                if ctry_code != country_l:
-                    _p['static'] = time.perf_counter() - _t1
-                    return False, f"страна '{w}' ({ctry_code})", f"{ctry_code}_countries", _p
-
-        for w in words + keyword_lemmas:
-            if w in self.manual_small_cities:
-                city_country = self.manual_small_cities[w]
-                if city_country == 'unknown':
-                    _p['static'] = time.perf_counter() - _t1
-                    return False, f"неизвестный объект '{w}'", "unknown", _p
-                if city_country != country_l:
-                    _p['static'] = time.perf_counter() - _t1
-                    return False, f"малый город '{w}' ({city_country})", f"{city_country}_small_cities", _p
+                    return False, f"регион '{item}' ({self.regions[item]})", f"{self.regions[item]}_regions", _p
 
         _p['static'] = time.perf_counter() - _t1
         _t2 = time.perf_counter()
