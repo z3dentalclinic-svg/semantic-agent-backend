@@ -108,31 +108,35 @@ def apply_l0_filter(
     # ── Персистентный классификатор ─────────────────────────────────────────
     clf = _get_classifier(seed, target_country, geo_db, brand_db)
 
+    # ── Глобальный словарь morph-парсов для всего батча ────────────────────
+    from .shared_morph import morph as _morph
+
+    t_extract_total = 0.0
+    t_classify_total = 0.0
+
+    # Первый проход: собрать все хвосты и уникальные слова
+    _kw_tail_pairs = []
+    _all_tail_words: set = set()
+    for kw_item in keywords:
+        kw = kw_item.strip() if isinstance(kw_item, str) else kw_item.get("query", "").strip()
+        if not kw:
+            continue
+        _t0 = time.perf_counter()
+        tail = extract_tail(kw, seed, seed_ctx=seed_ctx)
+        t_extract_total += time.perf_counter() - _t0
+        _kw_tail_pairs.append((kw_item, kw, tail))
+        if tail:
+            _all_tail_words.update(tail.lower().split())
+
+    # Один проход morph.parse для всех уникальных слов
+    tail_parses = {w: _morph.parse(w) for w in _all_tail_words}
+
     valid_keywords = []
     grey_keywords = []
     trash_keywords = []
     trace_records = []
 
-    t_extract_total = 0.0
-    t_classify_total = 0.0
-
-    for kw_item in keywords:
-        # Поддержка str и dict форматов
-        if isinstance(kw_item, str):
-            kw = kw_item.strip()
-        elif isinstance(kw_item, dict):
-            kw = kw_item.get("query", "").strip()
-        else:
-            valid_keywords.append(kw_item)
-            continue
-
-        if not kw:
-            continue
-
-        # ── extract_tail с pre-computed seed_ctx ───────────────────────────
-        t0 = time.perf_counter()
-        tail = extract_tail(kw, seed, seed_ctx=seed_ctx)
-        t_extract_total += time.perf_counter() - t0
+    for kw_item, kw, tail in _kw_tail_pairs:
 
         # NO_SEED → GREY
         if tail is None:
@@ -160,9 +164,9 @@ def apply_l0_filter(
             })
             continue
 
-        # ── classify ────────────────────────────────────────────────────────
+        # ── classify с глобальным tail_parses ───────────────────────────────
         t0 = time.perf_counter()
-        r = clf.classify(tail)
+        r = clf.classify(tail, tail_parses=tail_parses)
         t_classify_total += time.perf_counter() - t0
 
         label = r["label"]
