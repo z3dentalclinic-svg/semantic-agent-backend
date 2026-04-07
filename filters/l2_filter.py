@@ -480,11 +480,18 @@ class L2Classifier:
         # keywords_grey может содержать строки (полные запросы),
         # поэтому lookup через _l0_trace критичен.
         l0_tail_lookup = {}
+        # Ключи где L0 не нашёл seed (tail=None) — seed отсутствует в запросе.
+        # Такие ключи нельзя классифицировать по хвосту — хвоста нет.
+        # L2 не должен использовать полный keyword как fallback-хвост:
+        # это даёт ложные PMI hits по случайным частотным словам (напр. "днепр").
+        l0_seed_not_found: set = set()
         for rec in l0_trace:
             kw_lower = rec.get("keyword", "").lower().strip()
-            tail = rec.get("tail", "")
+            tail = rec.get("tail")  # None если seed не найден
             if kw_lower and tail:
                 l0_tail_lookup[kw_lower] = tail
+            elif kw_lower and tail is None:
+                l0_seed_not_found.add(kw_lower)
         
         # === Извлекаем хвосты GREY ===
         grey_tails = []
@@ -497,6 +504,9 @@ class L2Classifier:
                 tail = kw.get("tail") or l0_tail_lookup.get(keyword.lower().strip(), keyword)
             else:
                 keyword = str(kw)
+                # Seed не найден → нет хвоста → L2 не может классифицировать, пропускаем
+                if keyword.lower().strip() in l0_seed_not_found:
+                    continue
                 tail = l0_tail_lookup.get(keyword.lower().strip(), keyword)
             
             if tail:
