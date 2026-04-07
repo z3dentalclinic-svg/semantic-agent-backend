@@ -92,6 +92,7 @@ class L2Classifier:
         self.config = config or L2Config()
         self._embedder = None
         self._cache: Dict[str, dict] = {}
+        self._lemma_cache: Dict[str, str] = {}  # кэш лемм для PMI
         self._load_cache()
     
     def _load_cache(self):
@@ -131,20 +132,32 @@ class L2Classifier:
     # SIGNAL 1: PMI (Batch Word Frequency)
     # =========================================================
     
+    def _lemmatize(self, word: str) -> str:
+        """
+        Лемматизация одного слова через pymorphy3 singleton с кэшем.
+        "роботов" → "робот", "аккумуляторных" → "аккумуляторный".
+        Кэш живёт на инстансе L2Classifier — переиспользуется между батчами.
+        """
+        if word not in self._lemma_cache:
+            morph = _get_morph()
+            self._lemma_cache[word] = morph.parse(word)[0].normal_form
+        return self._lemma_cache[word]
+
     def _compute_word_df(self, all_tails: List[str]) -> Counter:
         """
-        Document frequency: в скольких хвостах встречается каждое слово.
+        Document frequency по ЛЕММАМ: "роботов" и "робота" → один счётчик "робот".
+        Это устраняет PMI-асимметрию между словоформами одного слова.
         """
         word_df = Counter()
         for tail in all_tails:
             for w in set(tail.lower().split()):
-                word_df[w] += 1
+                word_df[self._lemmatize(w)] += 1
         return word_df
-    
+
     def _pmi_score(self, tail: str, word_df: Counter) -> float:
         """
-        PMI score = MIN log2(df+1) контентных слов хвоста.
-        
+        PMI score = MIN log2(df+1) контентных слов хвоста (по леммам).
+
         Используем min, не mean: если хоть одно слово редкое — PMI низкий.
         "щетки купить" = min(2.0, 6.4) = 2.0 → KNN zone.
         "купить гелевый" = min(6.4, 4.4) = 4.4 → VALID.
@@ -155,7 +168,7 @@ class L2Classifier:
             content = words
         if not content:
             return 0.0
-        scores = [math.log2(word_df.get(w, 0) + 1) for w in content]
+        scores = [math.log2(word_df.get(self._lemmatize(w), 0) + 1) for w in content]
         return min(scores)
     
     # =========================================================
@@ -480,18 +493,11 @@ class L2Classifier:
         # keywords_grey может содержать строки (полные запросы),
         # поэтому lookup через _l0_trace критичен.
         l0_tail_lookup = {}
-        # Ключи где L0 не нашёл seed (tail=None) — seed отсутствует в запросе.
-        # Такие ключи нельзя классифицировать по хвосту — хвоста нет.
-        # L2 не должен использовать полный keyword как fallback-хвост:
-        # это даёт ложные PMI hits по случайным частотным словам (напр. "днепр").
-        l0_seed_not_found: set = set()
         for rec in l0_trace:
             kw_lower = rec.get("keyword", "").lower().strip()
-            tail = rec.get("tail")  # None если seed не найден
+            tail = rec.get("tail", "")
             if kw_lower and tail:
                 l0_tail_lookup[kw_lower] = tail
-            elif kw_lower and tail is None:
-                l0_seed_not_found.add(kw_lower)
         
         # === Извлекаем хвосты GREY ===
         grey_tails = []
@@ -504,9 +510,6 @@ class L2Classifier:
                 tail = kw.get("tail") or l0_tail_lookup.get(keyword.lower().strip(), keyword)
             else:
                 keyword = str(kw)
-                # Seed не найден → нет хвоста → L2 не может классифицировать, пропускаем
-                if keyword.lower().strip() in l0_seed_not_found:
-                    continue
                 tail = l0_tail_lookup.get(keyword.lower().strip(), keyword)
             
             if tail:
