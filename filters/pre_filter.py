@@ -70,7 +70,14 @@ def pre_filter(query: str, seed: str) -> tuple:
     # 6. Одиночный символ: "ремонт пылесосов а"
     if len(tail) == 1 and not tail.isdigit():
         return True, f"одиночный символ: '{tail}'"
-    
+
+    # 7. Токен-спецсимвол в хвосте: "*1", "#2", "**", "©" и т.п.
+    # Токен считается спецсимвольным если не содержит ни одной буквы или цифры.
+    # Кросс-нишевое: не зависит от конкретных символов.
+    for token in tail_words:
+        if not re.search(r'[а-яёіїєґa-z]', token):
+            return True, f"токен-спецсимвол: '{token}'"
+
     return False, None
 
 
