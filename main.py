@@ -1083,7 +1083,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     if run_geo:
         parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
         _t0 = time.time()
-        result = filter_geo_garbage(result, seed=seed, target_country=country)
+        result = filter_geo_garbage(result, seed=seed, target_country=country, brand_db=BRAND_DB)
         _timings["geo_garbage_filter"] = round(time.time() - _t0, 4)
         parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
         
