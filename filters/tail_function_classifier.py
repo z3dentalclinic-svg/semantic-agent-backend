@@ -90,8 +90,9 @@ SIGNAL_WEIGHTS = {
 _SOFT_NEGATIVES = frozenset({
     'category_mismatch',  # chargram — не знает семантику частей/типов объекта
     'orphan_genitive',    # "ремонт двигателей пылесосов" — валидная конструкция
-    'single_infinitive',  # может быть валидным интентом
     'brand_collision',    # спорный сигнал
+    # single_infinitive намеренно НЕ здесь:
+    # в сочетании с category_mismatch (chargram=0) = голый несвязанный инфинитив → TRASH
 })
 
 
