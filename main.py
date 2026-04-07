@@ -1064,8 +1064,25 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     # Словарь реальных замеров: filter_name → секунды
     _timings: dict = {}
 
+    # ═══════════════════════════════════════════════════════════════
+    # ДЕДУПЛИКАЦИЯ НА ВХОДЕ — до всех фильтров
+    # Ключи от нескольких парсеров могут пересекаться.
+    # Один проход O(N) по set, сохраняет порядок первого вхождения.
+    # ═══════════════════════════════════════════════════════════════
+    _seen: set = set()
+    _deduped: list = []
+    for _kw in result.get("keywords", []):
+        _key = (_kw.lower().strip() if isinstance(_kw, str) else _kw.get("query", "").lower().strip())
+        if _key and _key not in _seen:
+            _seen.add(_key)
+            _deduped.append(_kw)
+    if len(_deduped) < len(result.get("keywords", [])):
+        _dup_count = len(result.get("keywords", [])) - len(_deduped)
+        logger.info(f"[DEDUP] removed {_dup_count} duplicate keywords before filters")
+    result["keywords"] = _deduped
+
     before_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
-    
+
     # PRE-ФИЛЬТР
     if run_pre:
         parser.tracer.before_filter("pre_filter", result.get("keywords", []))
@@ -1083,7 +1100,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     if run_geo:
         parser.tracer.before_filter("geo_garbage_filter", result.get("keywords", []))
         _t0 = time.time()
-        result = filter_geo_garbage(result, seed=seed, target_country=country, brand_db=BRAND_DB)
+        result = filter_geo_garbage(result, seed=seed, target_country=country)
         _timings["geo_garbage_filter"] = round(time.time() - _t0, 4)
         parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
         
