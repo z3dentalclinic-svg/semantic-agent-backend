@@ -1676,8 +1676,13 @@ def detect_truncated_geo_fast(tail: str, geo_db: dict, geo_index: dict, tp: dict
     if word in geo_db:
         return False, ""
 
-    lemma = _get_parses(word, tp)[0].normal_form
+    word_parsed = _get_parses(word, tp)[0]
+    lemma = word_parsed.normal_form
     if lemma in geo_db:
+        return False, ""
+
+    # Прилагательные — модификаторы ("старых пылесосов"), не усечённые топонимы
+    if word_parsed.tag.POS in ('ADJF', 'ADJS'):
         return False, ""
 
     # O(1) lookup из pre-built индекса (не вызывает _build_truncated_geo_index)
@@ -1721,8 +1726,13 @@ def detect_truncated_geo(tail: str, geo_db: dict = None, tp: dict = None) -> Tup
         return False, ""
 
     # Лемма — тоже полноценный город?
-    lemma = _get_parses(word, tp)[0].normal_form
+    word_parsed = _get_parses(word, tp)[0]
+    lemma = word_parsed.normal_form
     if lemma in geo_db:
+        return False, ""
+
+    # Прилагательные — модификаторы ("старых пылесосов"), не усечённые топонимы
+    if word_parsed.tag.POS in ('ADJF', 'ADJS'):
         return False, ""
 
     # O(1) lookup через pre-built индекс вместо O(65k) перебора
@@ -1897,6 +1907,21 @@ def detect_orphan_genitive(tail: str, seed: str = "", tp: dict = None) -> Tuple[
     
     # Последнее существительное seed тоже в генитиве?
     seed_words = seed.lower().split()
+
+    # Если seed содержит паттерн [NOUN_nomn → NOUN_gent] ("ремонт пылесосов"),
+    # хвост в генитиве — законное расширение той же генитивной конструкции, не сирота.
+    # "ремонт двигателей пылесосов" = ремонт управляет обоими генитивами.
+    last_gent_idx = -1
+    for i, sw in enumerate(seed_words):
+        sp = _get_parses(sw, tp)[0]
+        if sp.tag.POS == 'NOUN' and sp.tag.case == 'gent':
+            last_gent_idx = i
+    if last_gent_idx > 0:
+        prev_p = _get_parses(seed_words[last_gent_idx - 1], tp)[0]
+        if (prev_p.tag.POS in ('VERB', 'INFN') or
+                (prev_p.tag.POS == 'NOUN' and prev_p.tag.case == 'nomn')):
+            return False, ""
+
     for sw in reversed(seed_words):
         sp = morph.parse(sw)[0]
         if sp.tag.POS == 'NOUN':
