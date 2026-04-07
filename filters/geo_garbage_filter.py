@@ -242,13 +242,20 @@ CITY_DISTRICTS = {
         "деснянский", "деснянський", "desnianskyi", "позняки", "pozniaky",
         "троещина", "troieshchyna"
     },
-    "днепр": {
-        "амур", "amur", "чечеловский", "чечелівський", "chechelivskyi", 
-        "шевченковский", "шевченківський", "shevchenkivskyi", "соборный", "соборний", 
-        "soborny", "центральный", "центральний", "tsentralnyi", "central", "индустриальный", 
-        "індустріальний", "industrialnyi", "industrial", "новокодацкий", "новокодацький", 
-        "novokodatsky", "самарский", "самарський", "samarsky"
-    },
+        "днепр": {
+        "амур", "amur", "чечеловский", "чечелівський", "chechelivskyi",
+        "шевченковский", "шевченківський", "shevchenkivskyi", "соборный", "соборний",
+        "soborny", "центральный", "центральний", "tsentralnyi", "central", "индустриальный",
+        "індустріальний", "industrialnyi", "industrial", "новокодацкий", "новокодацький",
+        "novokodatsky", "самарский", "самарський", "samarsky",
+        # Жилые массивы и топонимы Днепра
+        "победа", "pobeda", "перемога",
+        "вокзал", "привокзальный",
+        "бассейн", "басейн",
+        "левый", "правый", "левобережный", "правобережный",
+        "нагорка", "тополь", "сокол", "кайдаки", "лоцманская",
+        "петровский", "северный", "южный", "юбилейный", "терновка", "покровский",
+    }
     "днепропетровск": {
         "амур", "amur", "чечеловский", "чечелівський", "шевченковский", "шевченківський", 
         "соборный", "соборний", "центральный", "центральний", "индустриальный", 
@@ -516,7 +523,7 @@ _PREPOSITIONS = {
 # Кэш нормализации токенов — накапливается между запросами
 _NORMALIZE_CACHE: Dict[str, str] = {}
 
-def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dict:
+def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_db: set = None) -> dict:
     """
     WHITE-LIST гео-фильтр v3.0 FINAL с нормализацией падежей
     
@@ -556,6 +563,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
     has_geonames = bool(_GEO_ENTITIES_CACHE)
     
     seed_lower = seed.lower()
+
+    # Бренды — пропускаем при гео-классификации.
+    # "ровента" есть в geonamescache как румынский топоним, но это бренд.
+    _brand_set: set = set()
+    if brand_db:
+        for b in brand_db:
+            _brand_set.add(b.lower())
+            _brand_set.add(b.lower().replace(' ', ''))
     target_country_upper = target_country.upper()
     
     # ═══════════════════════════════════════════════════════════════
@@ -693,6 +708,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua') -> dic
                             # Защита от ложных срабатываний: короткие обычные слова
                             # "час" = город Chas (Чехия), но это обычное слово
                             if len(check_word) <= 3:
+                                continue
+                            # Бренд не является городом даже если совпадает с топонимом
+                            if check_word in _brand_set or raw_word in _brand_set:
                                 continue
                             cities_in_query.add(check_word)
                             break
