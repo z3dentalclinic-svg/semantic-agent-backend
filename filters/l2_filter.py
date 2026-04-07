@@ -697,7 +697,17 @@ class L2Classifier:
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
-        result["keywords"] = l0_result.get("keywords", []) + l2_valid
+        # Дедупликация при сборке: L0_valid + L2_promoted могут содержать один ключ дважды
+        # (коллизия хвостов в tail_to_kw или повторная промоция).
+        _l2_seen: set = set()
+        _l2_merged: list = []
+        for _kw in l0_result.get("keywords", []) + l2_valid:
+            _k = (_kw.lower().strip() if isinstance(_kw, str)
+                  else _kw.get("keyword", _kw.get("query", "")).lower().strip())
+            if _k and _k not in _l2_seen:
+                _l2_seen.add(_k)
+                _l2_merged.append(_kw)
+        result["keywords"] = _l2_merged
         
         # TRASH: L0 + L2
         l2_trash = []
