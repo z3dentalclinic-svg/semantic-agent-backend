@@ -84,6 +84,16 @@ SIGNAL_WEIGHTS = {
     'intent_mismatch':   0.9,   # информационный seed + коммерческий tail — надёжный конфликт
 }
 
+# Мягкие негативные сигналы — эвристики с высокой вероятностью ошибки.
+# Если ВСЕ негативные сигналы из этого множества → максимум GREY, никогда TRASH.
+# Два мягких сигнала вместе не должны давать TRASH (напр. category_mismatch + orphan_genitive).
+_SOFT_NEGATIVES = frozenset({
+    'category_mismatch',  # chargram — не знает семантику частей/типов объекта
+    'orphan_genitive',    # "ремонт двигателей пылесосов" — валидная конструкция
+    'single_infinitive',  # может быть валидным интентом
+    'brand_collision',    # спорный сигнал
+})
+
 
 # ============================================================
 # Константы уровня модуля для _check_coherence.
@@ -451,9 +461,13 @@ class TailFunctionClassifier:
         
         # --- Случай 2: Только негативные ---
         if has_negative and not has_positive:
-            # Мягкие негативные сигналы (orphan_genitive, single_infinitive)
-            # не должны давать TRASH — только понижать до GREY
-            # Жёсткий TRASH только при neg_score >= 0.6
+            # Если ВСЕ негативные — мягкие эвристики, максимум GREY.
+            # Два мягких вместе (category_mismatch + orphan_genitive = 1.0)
+            # не должны давать TRASH — финальное решение за L3.
+            if all(s in _SOFT_NEGATIVES for s in negative):
+                return 'GREY', 0.4, pos_score, neg_score
+            # Жёсткий TRASH только при наличии хотя бы одного не-мягкого сигнала
+            # и neg_score >= 0.6
             if neg_score < 0.6:
                 return 'GREY', 0.4, pos_score, neg_score
             confidence = min(0.85 + neg_score * 0.05, 0.99)
