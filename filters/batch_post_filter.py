@@ -413,6 +413,7 @@ class BatchPostFilter:
         
         final_keywords = []
         final_anchors = []
+        blocked_reasons: dict = {}   # kw → reason string для _trace
         stats = {
             'total': len(unique_raw),
             'allowed': 0,
@@ -442,6 +443,7 @@ class BatchPostFilter:
                 stats['allowed'] += 1
             else:
                 final_anchors.append(kw)
+                blocked_reasons[kw] = reason   # ← для _trace
                 stats['blocked'] += 1
                 stats['reasons'][category] += 1
                 logger.warning("BPF block: '%s' → %s (%s)", kw, reason, category)
@@ -467,6 +469,7 @@ class BatchPostFilter:
         return {
             'keywords': final_keywords,
             'anchors': final_anchors,
+            'blocked_reasons': blocked_reasons,
             'stats': {
                 'total': stats['total'],
                 'allowed': stats['allowed'],
