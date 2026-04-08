@@ -1303,8 +1303,8 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
                 if noun_idx < len(noun_words):
                     target_word = noun_words[noun_idx]
                     target_parses = _get_parses(target_word, tp)
-                    tp = target_parses[0]
-                    is_inan = tp.tag.POS == 'NOUN' and 'inan' in tp.tag
+                    target_p = target_parses[0]
+                    is_inan = target_p.tag.POS == 'NOUN' and 'inan' in target_p.tag
                     has_geox = any('Geox' in str(p.tag) for p in target_parses)
                     
                     if is_inan and not has_geox:
@@ -1314,7 +1314,7 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
                 # Все ADJ, последний — neut,sing → выступает как NOUN(inan)
                 elif noun_idx == len(noun_words) and noun_idx >= 1:
                     last_adj = noun_words[-1]
-                    last_p = _get_parses(last_adj, tp)[0]
+                    last_p = _get_parses(last_adj, _tp_orig)[0]
                     if (last_p.tag.POS in ('ADJF', 'PRTF') and 
                         last_p.tag.gender == 'neut' and 
                         last_p.tag.case in ('nomn', 'accs')):
@@ -1323,9 +1323,10 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
         return False, ""
     
     all_modifiers = True
+    _tp_orig = tp  # сохраняем оригинальный tail_parses dict до цикла
     for tw in tail_words:
-        tp = _get_parses(tw, tp)[0]
-        pos = tp.tag.POS
+        tw_p = _get_parses(tw, _tp_orig)[0]
+        pos = tw_p.tag.POS
         
         # PRED (можно, нужно) и COMP (лучше) — всегда модификаторы
         # INFN (разводить, пить) — параллельный глагол при seed с глаголом
@@ -1339,7 +1340,7 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
         # PRCL guard: "только", "именно", "примерно" — pymorphy видит ADVB,
         # но имеют альт. парс PRCL → ограничительные частицы, не способ действия
         if pos == 'ADVB' and (tw.endswith('о') or tw.endswith('е')):
-            has_prcl = any(p.tag.POS == 'PRCL' for p in _get_parses(tw, tp))
+            has_prcl = any(p.tag.POS == 'PRCL' for p in _get_parses(tw, _tp_orig))
             if has_prcl:
                 all_modifiers = False
                 break
@@ -1350,17 +1351,17 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
         break
     
     if all_modifiers:
-        pos_tags = [_get_parses(w, tp)[0].tag.POS for w in tail_words]
+        pos_tags = [_get_parses(w, _tp_orig)[0].tag.POS for w in tail_words]
         return True, f"Модификатор глагола: '{tail}' ({', '.join(pos_tags)}) при seed с глаголом"
     
     # 2 слова: modifier + NOUN(inan, no Geox) = модификатор + уточнение объекта
     # "нужно порошок" = PRED + NOUN(inan), "правильно лекарство" = ADVB + NOUN(inan)
     if len(tail_words) == 2:
-        first_p = _get_parses(tail_words[0], tp)[0]
+        first_p = _get_parses(tail_words[0], _tp_orig)[0]
         first_is_modifier = (
             first_p.tag.POS in ('PRED', 'COMP', 'INFN') or
             (first_p.tag.POS == 'ADVB' and (tail_words[0].endswith('о') or tail_words[0].endswith('е'))
-             and not any(p.tag.POS == 'PRCL' for p in _get_parses(tail_words[0], tp)))
+             and not any(p.tag.POS == 'PRCL' for p in _get_parses(tail_words[0], _tp_orig)))
         )
         if first_is_modifier:
             second_parses = _get_parses(tail_words[1], tp)
