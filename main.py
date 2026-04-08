@@ -1089,7 +1089,8 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         _t0 = time.time()
         result = apply_pre_filter(result, seed=seed)
         _timings["pre_filter"] = round(time.time() - _t0, 4)
-        parser.tracer.after_filter("pre_filter", result.get("keywords", []))
+        _pre_reasons = result.pop("_blocked_reasons", {})
+        parser.tracer.after_filter("pre_filter", result.get("keywords", []), reasons=_pre_reasons)
         
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
         for kw in (before_set - after_set):
@@ -1102,7 +1103,8 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         _t0 = time.time()
         result = filter_geo_garbage(result, seed=seed, target_country=country)
         _timings["geo_garbage_filter"] = round(time.time() - _t0, 4)
-        parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []))
+        _geo_reasons = result.pop("_blocked_reasons", {})
+        parser.tracer.after_filter("geo_garbage_filter", result.get("keywords", []), reasons=_geo_reasons)
         
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
         for kw in (before_set - after_set):
@@ -1121,7 +1123,8 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         )
         result["keywords"] = bpf_result["keywords"]
         _timings["batch_post_filter"] = round(time.time() - _t0, 4)
-        parser.tracer.after_filter("batch_post_filter", result.get("keywords", []))
+        _bpf_reasons = bpf_result.get("blocked_reasons", {})
+        parser.tracer.after_filter("batch_post_filter", result.get("keywords", []), reasons=_bpf_reasons)
         
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
         for kw in (before_set - after_set):
@@ -1240,6 +1243,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     result["anchors_count"] = len(unique_anchors)
     
     result["_trace"] = parser.tracer.finish_request()
+
     result["_filter_timings"] = _timings  # ← реальные замеры времени
     result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l2": run_l2, "l3": run_l3, "rel": not parser.skip_relevance_filter}
     return result
