@@ -1495,25 +1495,26 @@ def detect_prepositional_modifier(tail: str, seed: str = "", tp: dict = None) ->
     required_cases = prep_cases[first_word]
     
     # 4. Найти NOUN после предлога (пропуская ADJ, NUM, PRCL, вложенные PREP)
+    _tp_prep = tp  # сохраняем оригинальный tail_parses dict
     for tw in tail_words[1:]:
-        tp = _get_parses(tw, tp)[0]
-        
-        if tp.tag.POS in ('ADJF', 'ADJS', 'PRTF', 'PRTS', 'NUMR', 'PRCL'):
+        tw_p = _get_parses(tw, _tp_prep)[0]
+
+        if tw_p.tag.POS in ('ADJF', 'ADJS', 'PRTF', 'PRTS', 'NUMR', 'PRCL'):
             continue
-        
+
         if tw.isdigit():
             continue
-            
-        if tp.tag.POS == 'NOUN':
-            all_parses = _get_parses(tw, tp)
+
+        if tw_p.tag.POS == 'NOUN':
+            all_parses = _get_parses(tw, _tp_prep)
             for p in all_parses:
                 if p.tag.case in required_cases:
                     return True, f"Обстоятельственный модификатор: '{first_word} ... {tw}' ({p.tag.case}) при seed с глаголом"
             return False, ""
-        
-        if tp.tag.POS == 'PREP':
+
+        if tw_p.tag.POS == 'PREP':
             continue
-        
+
         break
     
     return False, ""
