@@ -629,6 +629,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
     # ═══════════════════════════════════════════════════════════════
     
     unique_keywords = []
+    blocked_reasons: dict = data.setdefault("_blocked_reasons", {})
     stats = {
         'total': len(data["keywords"]),
         'blocked_occupied': 0,
@@ -686,6 +687,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 break
         
         if has_occupied:
+            blocked_reasons[query_lower.strip()] = f"оккупированная территория: '{matched}'"
             continue
         
         # ═══════════════════════════════════════════════════════════
@@ -728,6 +730,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 other_cities = {c for c in cities_in_query if c != seed_city}
                 if other_cities:
                     stats['blocked_multi_city'] += 1
+                    blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(other_cities)}"
                     continue
         
         # ═══════════════════════════════════════════════════════════
@@ -737,6 +740,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         
         if seed_city:
             blocked = False
+            _block_reason = ""
             
             for raw_word, word_norm in zip(clean_words, clean_words_normalized):
                 # КРИТИЧНО: Пропускаем разрешенные районы seed_city
@@ -764,6 +768,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                         )
                         stats['blocked_foreign_country'] += 1
                         blocked = True
+                        _block_reason = f"страна: '{check_word}' ({entity_country})"
                         break
                 
                 # Б. Природный объект (гора, река, озеро)?
@@ -771,9 +776,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     if raw_word not in seed_words and word_norm not in seed_words_normalized:
                         stats['blocked_geo_object'] += 1
                         blocked = True
+                        _block_reason = f"природный объект: '{check_word}' ({entity_type})"
                         break
             
             if blocked:
+                blocked_reasons[query_lower.strip()] = _block_reason
                 continue
         
         # ═══════════════════════════════════════════════════════════
@@ -784,6 +791,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         
         if seed_city and seed_canonical:
             has_wrong_district = False
+            _wrong_district_word = ""
             
             # Проверяем пары (raw, normalized) вместе
             for raw_word, word_norm in zip(clean_words, clean_words_normalized):
@@ -799,9 +807,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if district_canonical_city and district_canonical_city != seed_canonical:
                     has_wrong_district = True
                     stats['blocked_wrong_district'] += 1
+                    _wrong_district_word = raw_word
                     break
             
             if has_wrong_district:
+                blocked_reasons[query_lower.strip()] = f"район чужого города: '{_wrong_district_word}' → {district_canonical_city}"
                 continue
         
         # ═══════════════════════════════════════════════════════════
@@ -831,6 +841,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
             other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
             if other_cities_oblast:
                 stats['blocked_wrong_oblast'] += 1
+                blocked_reasons[query_lower.strip()] = f"область чужого города: {sorted(other_cities_oblast)}"
                 continue
         
         # ═══════════════════════════════════════════════════════════
@@ -840,6 +851,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         
         if seed_city and _morph_geox:
             has_foreign_geox = False
+            _geox_word = ""
             
             for raw_word, word_norm in zip(clean_words, clean_words_normalized):
                 # Пропускаем seed слова и разрешенные районы
@@ -858,9 +870,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if _GEOX_WORD_CACHE[raw_word]:
                     has_foreign_geox = True
                     stats['blocked_geox_region'] += 1
+                    _geox_word = raw_word
                     break
             
             if has_foreign_geox:
+                blocked_reasons[query_lower.strip()] = f"Geox-регион: '{_geox_word}'"
                 continue
         
         # ═══════════════════════════════════════════════════════════
