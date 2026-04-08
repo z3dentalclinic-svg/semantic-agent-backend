@@ -100,6 +100,7 @@ def apply_pre_filter(data: dict, seed: str) -> dict:
         return data
     
     filtered_keywords = []
+    blocked_reasons: dict = data.setdefault("_blocked_reasons", {})
     
     for item in data["keywords"]:
         # Поддержка строк и dict
@@ -115,6 +116,8 @@ def apply_pre_filter(data: dict, seed: str) -> dict:
         
         if not is_trash:
             filtered_keywords.append(item)
+        else:
+            blocked_reasons[query.lower().strip()] = reason or ""
     
     # Обновляем данные
     data["keywords"] = filtered_keywords
