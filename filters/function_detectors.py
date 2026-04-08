@@ -1248,6 +1248,8 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
     """
     if not tail or not seed:
         return False, ""
+
+    _tp_orig = tp  # сохраняем dict до любых локальных присваиваний
     
     tail_words = tail.lower().split()
     
@@ -1323,7 +1325,6 @@ def detect_verb_modifier(tail: str, seed: str = "", tp: dict = None) -> Tuple[bo
         return False, ""
     
     all_modifiers = True
-    _tp_orig = tp  # сохраняем оригинальный tail_parses dict до цикла
     for tw in tail_words:
         tw_p = _get_parses(tw, _tp_orig)[0]
         pos = tw_p.tag.POS
