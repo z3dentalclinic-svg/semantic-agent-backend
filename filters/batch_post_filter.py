@@ -524,6 +524,15 @@ class BatchPostFilter:
 
         country_l = country.lower()
 
+        # БАГ 3: слова стоящие после предлога направления — страна = контекст, не фильтр
+        # "купить айфон в германии" / "из америки" → валидно для UA
+        _TRAVEL_PREPS = frozenset({'в', 'из', 'с', 'до', 'по', 'через', 'на'})
+        _words_after_prep: set = set()
+        for _i, _wd in enumerate(words):
+            if _i > 0 and words[_i - 1] in _TRAVEL_PREPS:
+                _words_after_prep.add(_wd)
+                _words_after_prep.add(lemmas_map.get(_wd, _wd))
+
         # ОДИН проход по words_set: abbreviations, countries, manual_small_cities, regions
         for w in words_set:
             if w in self.city_abbreviations:
@@ -533,8 +542,12 @@ class BatchPostFilter:
 
             if w in self.countries:
                 if self.countries[w] != country_l:
-                    _p['static'] = time.perf_counter() - _t1
-                    return False, f"страна '{w}' ({self.countries[w]})", f"{self.countries[w]}_countries", _p
+                    # БАГ 3: "в германии" / "из польши" — предложный контекст, не мусор
+                    if w in _words_after_prep:
+                        pass  # разрешаем
+                    else:
+                        _p['static'] = time.perf_counter() - _t1
+                        return False, f"страна '{w}' ({self.countries[w]})", f"{self.countries[w]}_countries", _p
 
             if w in self.manual_small_cities:
                 city_country = self.manual_small_cities[w]
@@ -582,6 +595,9 @@ class BatchPostFilter:
                     continue
                 _lemma_w = lemmas_map.get(w, w)
                 if _lemma_w in _seed_words_set:
+                    continue
+                # БАГ 2: ASCII короткое слово (≤4) = бренд-суффикс, не район
+                if w.isascii() and w.isalpha() and len(w) <= 4:
                     continue
                 # Баг B: известное слово без Geox → нарицательное, не район
                 if self._get_word_features(w, language)['skip_geo']:
@@ -698,13 +714,9 @@ class BatchPostFilter:
                     _p['search'] = time.perf_counter() - _t2
                     return False, reason, f"{found_country}_cities", _p
                 
-                # Спорное слово
-                if has_seed:
-                    continue  # Есть seed — разрешаем
-                else:
-                    reason = f"Слово '{item}' — это город в {found_country.upper()}, а мы парсим {country.upper()}"
-                    _p['search'] = time.perf_counter() - _t2
-                    return False, reason, f"{found_country}_cities", _p
+                # Спорное слово (is_real_city=False — уже определено как бренд/не-город)
+                # 'ios', 'pro', 'сплит' — не реальные города → разрешаем
+                continue
             
             # Город не найден — проверяем на обычное существительное
             if self._is_common_noun(item_normalized, language):
