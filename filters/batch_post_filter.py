@@ -596,8 +596,9 @@ class BatchPostFilter:
                 _lemma_w = lemmas_map.get(w, w)
                 if _lemma_w in _seed_words_set:
                     continue
-                # БАГ 2: ASCII короткое слово (≤4) = бренд-суффикс, не район
-                if w.isascii() and w.isalpha() and len(w) <= 4:
+                # БАГ 2: ASCII короткое слово (≤4) = бренд-суффикс/модель, не район
+                # покрывает: se, pro, gold, m21, s21, a52
+                if w.isascii() and w.isalnum() and len(w) <= 4:
                     continue
                 # Баг B: известное слово без Geox → нарицательное, не район
                 if self._get_word_features(w, language)['skip_geo']:
