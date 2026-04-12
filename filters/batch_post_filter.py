@@ -571,9 +571,21 @@ class BatchPostFilter:
                     _p['static'] = time.perf_counter() - _t1
                     return False, f"регион '{bg}' ({self.regions[bg]})", f"{self.regions[bg]}_regions", _p
 
+        # П1 Баг A: слова из seed никогда не блокируем как район
+        _seed_words_set = set(re.findall(r'[а-яёa-z0-9-]+', seed.lower())) if seed else set()
+
         for w in words_in_districts:
             dist_country = self.districts[w]
             if dist_country != country_l:
+                # Баг A: слово из seed → не район
+                if w in _seed_words_set:
+                    continue
+                _lemma_w = lemmas_map.get(w, w)
+                if _lemma_w in _seed_words_set:
+                    continue
+                # Баг B: известное слово без Geox → нарицательное, не район
+                if self._get_word_features(w, language)['skip_geo']:
+                    continue
                 if w in our_city_bigrams:
                     continue
                 if self._find_in_country(w, country):
