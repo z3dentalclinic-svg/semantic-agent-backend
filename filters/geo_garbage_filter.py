@@ -886,6 +886,10 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     parses = _morph_geox.parse(raw_word)
                     _GEOX_WORD_CACHE[raw_word] = any('Geox' in str(p.tag) for p in parses)
                 if _GEOX_WORD_CACHE[raw_word]:
+                    # П3: если Geox-слово = целевая страна → разрешить
+                    geo_entity = all_geo_entities.get(raw_word) or all_geo_entities.get(word_norm)
+                    if geo_entity and geo_entity[1] == 'country' and geo_entity[0].upper() == target_country.upper():
+                        continue
                     has_foreign_geox = True
                     stats['blocked_geox_region'] += 1
                     _geox_word = raw_word
