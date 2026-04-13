@@ -761,6 +761,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 
                 # А. Страна?
                 if entity_type == 'country':
+                    # П3: страна = целевая (ua=ua) → разрешить
+                    if entity_country.upper() == target_country.upper():
+                        continue
                     # Любая страна, не упомянутая в seed, считается мусором
                     if raw_word not in seed_words and word_norm not in seed_words_normalized:
                         logger.info(
@@ -800,6 +803,21 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     continue
                 
                 # Слово — район какого-то города? Проверяем обе формы
+                # П5: Geox guard — нарицательное слово без Geox тега → не район
+                def _is_common_no_geox(word: str) -> bool:
+                    if not _morph_geox or not word or word.isascii():
+                        return False
+                    if word not in _GEOX_WORD_CACHE:
+                        parses = _morph_geox.parse(word)
+                        _GEOX_WORD_CACHE[word] = any('Geox' in str(p.tag) for p in parses)
+                    has_geox = _GEOX_WORD_CACHE[word]
+                    if has_geox:
+                        return False
+                    return _morph_geox.word_is_known(word)
+
+                if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
+                    continue
+
                 district_canonical_city = (
                     DISTRICT_TO_CANONICAL.get(raw_word) or 
                     DISTRICT_TO_CANONICAL.get(word_norm)
