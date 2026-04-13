@@ -725,13 +725,19 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     if entity_type == 'city':
                         cities_in_query.add(bigram)
             
-            # Если есть хотя бы один чужой город → БЛОК
+            # П4: блокируем только если город из ЧУЖОЙ страны (≠ target_country)
+            # UA города при target=ua всегда пропускаем (николаев, харьков, львов...)
             if len(cities_in_query) > 0:
                 other_cities = {c for c in cities_in_query if c != seed_city}
                 if other_cities:
-                    stats['blocked_multi_city'] += 1
-                    blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(other_cities)}"
-                    continue
+                    foreign_cities = {
+                        c for c in other_cities
+                        if all_geo_entities.get(c, ('', ''))[0].upper() != target_country.upper()
+                    }
+                    if foreign_cities:
+                        stats['blocked_multi_city'] += 1
+                        blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(foreign_cities)}"
+                        continue
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 3: Страны и природные объекты
@@ -761,10 +767,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 
                 # А. Страна?
                 if entity_type == 'country':
-                    # П3: страна = целевая (ua=ua) → разрешить
+                    # П3: страна = целевая → разрешить
                     if entity_country.upper() == target_country.upper():
                         continue
-                    # Любая страна, не упомянутая в seed, считается мусором
+                    # G3: страна seed_city (лондон→GB, англия→GB) → разрешить
+                    _seed_city_country = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
+                    if entity_country.upper() == _seed_city_country:
+                        continue
+                    # Любая чужая страна не из seed → мусор
                     if raw_word not in seed_words and word_norm not in seed_words_normalized:
                         logger.info(
                             f"[GEO_WHITE_LIST] ❌ COUNTRY_MENTION: '{query}' mentions country '{check_word}' ({entity_country})"
@@ -802,16 +812,17 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
-                # Слово — район какого-то города? Проверяем обе формы
                 # П5: Geox guard — нарицательное слово без Geox тега → не район
+                # G2: используем best parse (первичный) — не any() чтобы не блокировать
+                # омонимы ("запад"=NOUN inan + "запад"=Geox топоним → основное значение NOUN)
                 def _is_common_no_geox(word: str) -> bool:
                     if not _morph_geox or not word or word.isascii():
                         return False
-                    if word not in _GEOX_WORD_CACHE:
-                        parses = _morph_geox.parse(word)
-                        _GEOX_WORD_CACHE[word] = any('Geox' in str(p.tag) for p in parses)
-                    has_geox = _GEOX_WORD_CACHE[word]
-                    if has_geox:
+                    parses = _morph_geox.parse(word)
+                    if not parses:
+                        return False
+                    # Если PRIMARY parse (наиболее вероятный) НЕ Geox → нарицательное
+                    if 'Geox' in str(parses[0].tag):
                         return False
                     return _morph_geox.word_is_known(word)
 
@@ -855,12 +866,17 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if resolved and resolved != seed_city:
                     cities_in_query_oblast.add(resolved)
             
-            # Если есть чужие города → БЛОК
+            # П4: только FOREIGN города блокируют (UA города разрешены)
             other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
             if other_cities_oblast:
-                stats['blocked_wrong_oblast'] += 1
-                blocked_reasons[query_lower.strip()] = f"область чужого города: {sorted(other_cities_oblast)}"
-                continue
+                foreign_oblast = {
+                    c for c in other_cities_oblast
+                    if all_geo_entities.get(c, ('', ''))[0].upper() != target_country.upper()
+                }
+                if foreign_oblast:
+                    stats['blocked_wrong_oblast'] += 1
+                    blocked_reasons[query_lower.strip()] = f"область чужого города: {sorted(foreign_oblast)}"
+                    continue
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 6: Geox через pymorphy3 (регионы, республики, области)
@@ -881,15 +897,36 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if len(raw_word) <= 3 or raw_word.isascii():
                     continue
                 
-                # Проверяем Geox тег (с кэшем per-process)
-                if raw_word not in _GEOX_WORD_CACHE:
-                    parses = _morph_geox.parse(raw_word)
-                    _GEOX_WORD_CACHE[raw_word] = any('Geox' in str(p.tag) for p in parses)
-                if _GEOX_WORD_CACHE[raw_word]:
-                    # П3: если Geox-слово = целевая страна → разрешить
-                    geo_entity = all_geo_entities.get(raw_word) or all_geo_entities.get(word_norm)
-                    if geo_entity and geo_entity[1] == 'country' and geo_entity[0].upper() == target_country.upper():
-                        continue
+                # Проверяем Geox тег через PRIMARY parse (G2: не any — чтобы не блокировать омонимы)
+                _p6_parses = _morph_geox.parse(raw_word)
+                if not _p6_parses:
+                    continue
+                _p6_primary_is_geox = 'Geox' in str(_p6_parses[0].tag)
+                # Кэшируем для _is_common_no_geox
+                _GEOX_WORD_CACHE[raw_word] = any('Geox' in str(p.tag) for p in _p6_parses)
+                if _p6_primary_is_geox:
+                    # G1: прилагательное от целевой страны → разрешить
+                    # "украинские" → strip "ские" → "украин" → ('UA','country')
+                    _p6_adj_ends = [
+                        'ские', 'ский', 'ская', 'ских', 'ским', 'ском', 'скую', 'ское',
+                        'кие', 'кий', 'кая', 'ких', 'ким', 'ком', 'кую', 'кое',
+                    ]
+                    _seed_city_country = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
+                    _allowed_countries = {target_country.upper(), _seed_city_country}
+
+                    _geo_entity = all_geo_entities.get(raw_word) or all_geo_entities.get(word_norm)
+                    if not _geo_entity:
+                        for _end in _p6_adj_ends:
+                            if raw_word.endswith(_end) and len(raw_word) - len(_end) >= 4:
+                                _geo_entity = all_geo_entities.get(raw_word[:-len(_end)])
+                                if _geo_entity:
+                                    break
+
+                    if _geo_entity and _geo_entity[1] == 'country':
+                        # П3/G1/G3: целевая страна или страна seed_city → разрешить
+                        if _geo_entity[0].upper() in _allowed_countries:
+                            continue
+
                     has_foreign_geox = True
                     stats['blocked_geox_region'] += 1
                     _geox_word = raw_word
