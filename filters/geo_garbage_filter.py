@@ -59,6 +59,9 @@ CANONICAL_CITY_DISTRICTS: Dict[str, Set[str]] = {}
 # Маппинг: район → canonical_city (обратный lookup)
 DISTRICT_TO_CANONICAL: Dict[str, str] = {}
 
+# Маппинг: район → country_code (прямо из districts.json — единственный источник гео-правды)
+_DISTRICT_TO_COUNTRY: Dict[str, str] = {}
+
 # Маппинг: country_name (ru/uk/en) → (country_code, 'country')
 COUNTRY_NAMES_MULTILINGUAL: Dict[str, tuple] = {}
 
@@ -88,10 +91,12 @@ try:
         
         for _district_name, _info in _raw_districts.items():
             _city_raw = _info.get('city', '').lower()
+            _country_raw = _info.get('country', '').lower()
             # Маппим city из districts.json на canonical через geonamescache
             _canonical_city = CITY_CANONICAL_MAP.get(_city_raw, _city_raw)
             _temp[_canonical_city].add(_district_name)
             DISTRICT_TO_CANONICAL[_district_name] = _canonical_city
+            _DISTRICT_TO_COUNTRY[_district_name] = _country_raw
         
         CANONICAL_CITY_DISTRICTS = dict(_temp)
         logger.info(f"[GEO_DISTRICTS] CANONICAL_CITY_DISTRICTS: {len(CANONICAL_CITY_DISTRICTS)} cities, "
@@ -487,6 +492,14 @@ def _get_fallback_geo_entities() -> Dict[str, Tuple[str, str]]:
         
         'германия': ('DE', 'country'), 'germany': ('DE', 'country'), 'німеччина': ('DE', 'country'),
         'германи': ('DE', 'country'),  # нормализованная форма
+
+        'великобритания': ('GB', 'country'), 'united kingdom': ('GB', 'country'), 'britain': ('GB', 'country'),
+        'англия': ('GB', 'country'), 'england': ('GB', 'country'),
+        'великобритани': ('GB', 'country'),  # нормализованная форма "великобритании"
+        'англи': ('GB', 'country'),  # нормализованная форма "англии"
+
+        'голландия': ('NL', 'country'), 'нидерланды': ('NL', 'country'), 'netherlands': ('NL', 'country'),
+        'голланди': ('NL', 'country'),  # нормализованная форма
         
         # ═══ Природные объекты (горы) ═══
         'эльбрус': ('RU', 'mountain'), 'elbrus': ('RU', 'mountain'), 'ельбрус': ('RU', 'mountain'),
@@ -879,59 +892,45 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     continue
         
         # ═══════════════════════════════════════════════════════════
-        # ПРОВЕРКА 6: Geox через pymorphy3 (регионы, республики, области)
-        # Ловит: чечня, дагестан, бавария, каталония — без хардкода
+        # ПРОВЕРКА 6: Чужие гео-объекты через districts.json
+        # Алгоритм: слово есть в _DISTRICT_TO_COUNTRY И страна ≠ target → BLOCK
+        # Слово НЕТ в districts.json → не знаем что это → не блокируем
         # ═══════════════════════════════════════════════════════════
-        
-        if seed_city and _morph_geox:
+
+        if seed_city and _DISTRICT_TO_COUNTRY:
             has_foreign_geox = False
             _geox_word = ""
-            
+
             for raw_word, word_norm in zip(clean_words, clean_words_normalized):
                 # Пропускаем seed слова и разрешенные районы
                 if raw_word in seed_words or word_norm in seed_words_normalized:
                     continue
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
-                # Пропускаем короткие слова и латиницу
-                if len(raw_word) <= 3 or raw_word.isascii():
+
+                # Ищем слово в districts.json (raw и normalized форма)
+                dist_country = (
+                    _DISTRICT_TO_COUNTRY.get(raw_word) or
+                    _DISTRICT_TO_COUNTRY.get(word_norm)
+                )
+                if not dist_country:
+                    continue  # нет в districts.json → не блокируем
+
+                # Есть в districts.json → проверяем страну
+                if dist_country == target_country.lower():
+                    continue  # наша страна → разрешаем
+                if dist_country == 'unknown':
+                    continue  # неизвестная страна → не блокируем
+
+                # G3: страна seed_city → разрешаем (англия=gb при лондон=gb)
+                _seed_city_country = _DISTRICT_TO_COUNTRY.get(seed_city, '')
+                if dist_country == _seed_city_country:
                     continue
-                
-                # Проверяем Geox тег через PRIMARY parse (G2: не any — чтобы не блокировать омонимы)
-                _p6_parses = _morph_geox.parse(raw_word)
-                if not _p6_parses:
-                    continue
-                _p6_primary_is_geox = 'Geox' in str(_p6_parses[0].tag)
-                # Кэшируем для _is_common_no_geox
-                _GEOX_WORD_CACHE[raw_word] = any('Geox' in str(p.tag) for p in _p6_parses)
-                if _p6_primary_is_geox:
-                    # G1: прилагательное от целевой страны → разрешить
-                    # "украинские" → strip "ские" → "украин" → ('UA','country')
-                    _p6_adj_ends = [
-                        'ские', 'ский', 'ская', 'ских', 'ским', 'ском', 'скую', 'ское',
-                        'кие', 'кий', 'кая', 'ких', 'ким', 'ком', 'кую', 'кое',
-                    ]
-                    _seed_city_country = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
-                    _allowed_countries = {target_country.upper(), _seed_city_country}
 
-                    _geo_entity = all_geo_entities.get(raw_word) or all_geo_entities.get(word_norm)
-                    if not _geo_entity:
-                        for _end in _p6_adj_ends:
-                            if raw_word.endswith(_end) and len(raw_word) - len(_end) >= 4:
-                                _geo_entity = all_geo_entities.get(raw_word[:-len(_end)])
-                                if _geo_entity:
-                                    break
+                has_foreign_geox = True
+                _geox_word = raw_word
+                break
 
-                    if _geo_entity and _geo_entity[1] == 'country':
-                        # П3/G1/G3: целевая страна или страна seed_city → разрешить
-                        if _geo_entity[0].upper() in _allowed_countries:
-                            continue
-
-                    has_foreign_geox = True
-                    stats['blocked_geox_region'] += 1
-                    _geox_word = raw_word
-                    break
-            
             if has_foreign_geox:
                 blocked_reasons[query_lower.strip()] = f"Geox-регион: '{_geox_word}'"
                 continue
