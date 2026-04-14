@@ -635,7 +635,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 # Пропускаем явно нарицательные: NOUN, ADJF, VERB, ADVB, PREP, CONJ
                 if pos in ('VERB', 'ADVB', 'PREP', 'CONJ', 'PRCL', 'INTJ'):
                     continue
-                if pos == 'NOUN' and 'Geox' not in tag_str and 'Name' not in tag_str:
+                if pos == 'NOUN' and 'Geox' not in tag_str and 'Name' not in tag_str and 'Surn' not in tag_str:
                     continue
                 if pos == 'ADJF' and 'Geox' not in tag_str:
                     continue
