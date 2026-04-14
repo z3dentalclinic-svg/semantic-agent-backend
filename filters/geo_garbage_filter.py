@@ -141,6 +141,21 @@ except ImportError:
     logger.warning("[GEO_DISTRICTS] pymorphy3 not available for Geox checks")
 
 
+def _is_common_no_geox(word: str) -> bool:
+    """
+    Возвращает True если слово — нарицательное (primary parse НЕ Geox).
+    Используется в ПРОВЕРКАХ 4 и 6 как guard перед districts check.
+    """
+    if not _morph_geox or not word or word.isascii():
+        return False
+    parses = _morph_geox.parse(word)
+    if not parses:
+        return False
+    if 'Geox' in str(parses[0].tag):
+        return False
+    return _morph_geox.word_is_known(word)
+
+
 
 # ═══════════════════════════════════════════════════════════════════
 # МОДУЛЬНЫЙ КЭШ GEO-СУЩНОСТЕЙ (строится один раз при импорте)
@@ -745,19 +760,25 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     if entity_type == 'city':
                         cities_in_query.add(bigram)
             
-            # П4: блокируем только если город из ЧУЖОЙ страны (≠ target_country)
-            # UA города при target=ua всегда пропускаем (николаев, харьков, львов...)
+            # П4: логика зависит от наличия города в seed
             if len(cities_in_query) > 0:
                 other_cities = {c for c in cities_in_query if c != seed_city}
                 if other_cities:
-                    foreign_cities = {
-                        c for c in other_cities
-                        if all_geo_entities.get(c, ('', ''))[0].upper() != target_country.upper()
-                    }
-                    if foreign_cities:
+                    if seed_city:
+                        # seed С городом → любой другой город = BLOCK (включая UA)
                         stats['blocked_multi_city'] += 1
-                        blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(foreign_cities)}"
+                        blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(other_cities)}"
                         continue
+                    else:
+                        # seed БЕЗ города → блокируем только foreign города
+                        foreign_cities = {
+                            c for c in other_cities
+                            if all_geo_entities.get(c, ('', ''))[0].upper() != target_country.upper()
+                        }
+                        if foreign_cities:
+                            stats['blocked_multi_city'] += 1
+                            blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(foreign_cities)}"
+                            continue
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 3: Страны и природные объекты
@@ -837,20 +858,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
                 
-                # П5: Geox guard — нарицательное слово без Geox тега → не район
-                # G2: используем best parse (первичный) — не any() чтобы не блокировать
-                # омонимы ("запад"=NOUN inan + "запад"=Geox топоним → основное значение NOUN)
-                def _is_common_no_geox(word: str) -> bool:
-                    if not _morph_geox or not word or word.isascii():
-                        return False
-                    parses = _morph_geox.parse(word)
-                    if not parses:
-                        return False
-                    # Если PRIMARY parse (наиболее вероятный) НЕ Geox → нарицательное
-                    if 'Geox' in str(parses[0].tag):
-                        return False
-                    return _morph_geox.word_is_known(word)
-
+                # П5/G2: нарицательное слово → не район (guard на уровне модуля)
                 if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
                     continue
 
@@ -891,17 +899,22 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if resolved and resolved != seed_city:
                     cities_in_query_oblast.add(resolved)
             
-            # П4: только FOREIGN города блокируют (UA города разрешены)
+            # П4: логика зависит от наличия города в seed
             other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
             if other_cities_oblast:
-                foreign_oblast = {
-                    c for c in other_cities_oblast
-                    if all_geo_entities.get(c, ('', ''))[0].upper() != target_country.upper()
-                }
-                if foreign_oblast:
+                if seed_city:
                     stats['blocked_wrong_oblast'] += 1
-                    blocked_reasons[query_lower.strip()] = f"область чужого города: {sorted(foreign_oblast)}"
+                    blocked_reasons[query_lower.strip()] = f"область чужого города: {sorted(other_cities_oblast)}"
                     continue
+                else:
+                    foreign_oblast = {
+                        c for c in other_cities_oblast
+                        if all_geo_entities.get(c, ('', ''))[0].upper() != target_country.upper()
+                    }
+                    if foreign_oblast:
+                        stats['blocked_wrong_oblast'] += 1
+                        blocked_reasons[query_lower.strip()] = f"область чужого города: {sorted(foreign_oblast)}"
+                        continue
         
         # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 6: Чужие гео-объекты через districts.json
@@ -918,6 +931,10 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in seed_words or word_norm in seed_words_normalized:
                     continue
                 if raw_word in allowed_districts or word_norm in allowed_districts:
+                    continue
+
+                # Тот же guard что в ПРОВЕРКЕ 4: нарицательное слово → не район
+                if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
                     continue
 
                 # Ищем слово в districts.json (raw и normalized форма)
