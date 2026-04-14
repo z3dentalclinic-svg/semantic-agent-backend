@@ -674,6 +674,13 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         clean_words = [w for w in words if w not in _PREPOSITIONS and len(w) > 1]
         # Добавляем дефисные слова: "южно-сахалинск", "санкт-петербург"
         clean_words = clean_words + [h for h in hyphenated if h not in clean_words]
+
+        # Позиции слов в оригинальном words[] — для проверки предлога перед словом
+        # Используем первое вхождение каждого слова
+        _word_positions: Dict[str, int] = {}
+        for _wi, _ww in enumerate(words):
+            if _ww not in _word_positions:
+                _word_positions[_ww] = _wi
         
         # Биграмы — только для поиска составных городов ("сан франциско", "нью йорк")
         # НЕ добавляем в clean_words чтобы не ломать Geox/district/occupied проверки
@@ -780,14 +787,19 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 
                 # А. Страна?
                 if entity_type == 'country':
-                    # П3: страна = целевая → разрешить
+                    # П3: целевая страна → разрешить
                     if entity_country.upper() == target_country.upper():
                         continue
-                    # G3: страна seed_city (лондон→GB, англия→GB) → разрешить
+                    # G3: страна seed_city → разрешить (англия при лондон)
                     _seed_city_country = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
                     if entity_country.upper() == _seed_city_country:
                         continue
-                    # Любая чужая страна не из seed → мусор
+                    # Предлог перед страной → контекст доставки/покупки → разрешить
+                    # "из польши", "в германии", "до франции"
+                    _pos = _word_positions.get(raw_word, _word_positions.get(word_norm, -1))
+                    if _pos > 0 and words[_pos - 1] in _PREPOSITIONS:
+                        continue
+                    # Без предлога → таргетинг на другой рынок → BLOCK
                     if raw_word not in seed_words and word_norm not in seed_words_normalized:
                         logger.info(
                             f"[GEO_WHITE_LIST] ❌ COUNTRY_MENTION: '{query}' mentions country '{check_word}' ({entity_country})"
