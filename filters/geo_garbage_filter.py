@@ -614,29 +614,32 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         all_geo_entities.setdefault(city_name, (target_country_upper, 'city'))
     
     # ═══════════════════════════════════════════════════════════════
-    # Шаг 2: Определяем seed_city (с нормализацией!)
+    # Шаг 2: Определяем seed_city
+    # Используем _GEO_ENTITIES_CACHE (geonamescache) + Geox guard через pymorphy3
+    # Guard обязателен: без него случайные слова ("дом", "цветов") совпадают с городами
     # ═══════════════════════════════════════════════════════════════
-    
+
     seed_city = None
     seed_words = re.findall(r'[а-яёіїєґa-z]+', seed_lower)
     seed_words_normalized = [_normalize_token(w) for w in seed_words]
-    
-    # Приоритет: самый длинный город из CITY_DISTRICTS
-    potential_cities = [c for c in CITY_DISTRICTS.keys() if c in seed_lower]
-    if potential_cities:
-        seed_city = max(potential_cities, key=len)
-        logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (CITY_DISTRICTS)")
-    
-    # Ищем в all_geo_entities (нормализованные слова)
-    if not seed_city:
-        for word_norm in seed_words_normalized:
-            if word_norm in all_geo_entities:
-                entity_country, entity_type = all_geo_entities[word_norm]
-                if entity_type == 'city':
-                    seed_city = word_norm
-                    logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' (geonames, normalized)")
-                    break
-    
+
+    for word, word_norm in zip(seed_words, seed_words_normalized):
+        # Geox guard: только слова с primary parse Geox могут быть городами
+        if _morph_geox and len(word) > 2 and not word.isascii():
+            parses = _morph_geox.parse(word)
+            if not parses or 'Geox' not in str(parses[0].tag):
+                continue
+
+        # Ищем в geo cache (raw и normalized)
+        for check in [word, word_norm]:
+            entity = _GEO_ENTITIES_CACHE.get(check)
+            if entity and entity[1] == 'city':
+                seed_city = check
+                logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' ({entity[0]})")
+                break
+        if seed_city:
+            break
+
     if not seed_city:
         logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city in seed: '{seed}'. All queries pass.")
     
