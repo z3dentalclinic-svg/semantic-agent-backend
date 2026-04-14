@@ -741,9 +741,17 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
 
-                # Guard: нарицательное слово или имя (primary parse не Geox) → не город
-                if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
-                    continue
+                # Guard только для коротких/омонимичных слов:
+                # если primary parse = имя (Name) но НЕ Geox → скорее всего не город
+                # "марина" → Name femn → не город
+                # "запорожье" → Geox → город
+                # "одесса" → Geox → город
+                if _morph_geox and len(raw_word) > 2 and not raw_word.isascii():
+                    parses = _morph_geox.parse(raw_word)
+                    if parses:
+                        tag_str = str(parses[0].tag)
+                        if 'Name' in tag_str and 'Geox' not in tag_str:
+                            continue  # имя собственное без Geox → не город
 
                 # Проверяем обе формы — raw и normalized
                 for check_word in [raw_word, word_norm]:
