@@ -624,11 +624,21 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
     seed_words_normalized = [_normalize_token(w) for w in seed_words]
 
     for word, word_norm in zip(seed_words, seed_words_normalized):
-        # Geox guard: только слова с primary parse Geox могут быть городами
+        # Geox guard: пропускаем только явно нарицательные слова
+        # Разрешаем: Geox (топоним), Surn (фамилия=может быть город: Львов, Киров),
+        # Abbr (аббревиатура), UNKN (неизвестное — возможно транслит)
         if _morph_geox and len(word) > 2 and not word.isascii():
             parses = _morph_geox.parse(word)
-            if not parses or 'Geox' not in str(parses[0].tag):
-                continue
+            if parses:
+                tag_str = str(parses[0].tag)
+                pos = parses[0].tag.POS
+                # Пропускаем явно нарицательные: NOUN, ADJF, VERB, ADVB, PREP, CONJ
+                if pos in ('VERB', 'ADVB', 'PREP', 'CONJ', 'PRCL', 'INTJ'):
+                    continue
+                if pos == 'NOUN' and 'Geox' not in tag_str and 'Name' not in tag_str:
+                    continue
+                if pos == 'ADJF' and 'Geox' not in tag_str:
+                    continue
 
         # Ищем в geo cache (raw и normalized)
         for check in [word, word_norm]:
