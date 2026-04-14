@@ -737,7 +737,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 # КРИТИЧНО: Пропускаем разрешенные районы seed_city
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
-                
+
+                # Guard: нарицательное слово или имя (primary parse не Geox) → не город
+                if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
+                    continue
+
                 # Проверяем обе формы — raw и normalized
                 for check_word in [raw_word, word_norm]:
                     if check_word in all_geo_entities:
