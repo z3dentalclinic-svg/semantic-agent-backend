@@ -749,6 +749,22 @@ class L2Classifier:
                         "decision": debug.get("decision", ""),
                     }
                 l2_grey.append(kw)
+
+        # Pass-through: grey keywords где L2 не смог определить хвост
+        # (seed не найден в запросе буквально, или tail == полный keyword).
+        # Без этого они молча выпадают из output — не попадают ни в valid/trash/grey.
+        # Возвращаем их в grey для обработки L3.
+        _processed_kws_lower = {k.lower().strip() for k in kw_to_tail}
+        _l2_passthrough = 0
+        for kw in grey_keywords:
+            if isinstance(kw, dict):
+                keyword = kw.get("keyword", kw.get("query", ""))
+            else:
+                keyword = str(kw)
+            if keyword.lower().strip() not in _processed_kws_lower:
+                l2_grey.append(kw)
+                _l2_passthrough += 1
+
         result["keywords_grey"] = l2_grey
         
         # Stats
