@@ -630,15 +630,23 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         if _morph_geox and len(word) > 2 and not word.isascii():
             parses = _morph_geox.parse(word)
             if parses:
-                tag_str = str(parses[0].tag)
                 pos = parses[0].tag.POS
-                # Пропускаем явно нарицательные: NOUN, ADJF, VERB, ADVB, PREP, CONJ
-                if pos in ('VERB', 'ADVB', 'PREP', 'CONJ', 'PRCL', 'INTJ'):
+                # Пропускаем явно нарицательные функциональные слова
+                if pos in ('VERB', 'INFN', 'ADVB', 'PREP', 'CONJ', 'PRCL', 'INTJ'):
                     continue
-                if pos == 'NOUN' and 'Geox' not in tag_str and 'Name' not in tag_str and 'Surn' not in tag_str:
+                # ADJF без Geox в первичном разборе → нарицательное прилагательное
+                if pos == 'ADJF' and 'Geox' not in str(parses[0].tag):
                     continue
-                if pos == 'ADJF' and 'Geox' not in tag_str:
-                    continue
+                # NOUN: пропускаем только если НИ ОДИН разбор не содержит Geox/Surn/Name
+                # "Львов" имеет primary parse NOUN,gent,plur (от "лев"),
+                # но secondary parse — Surn → не пропускаем
+                if pos == 'NOUN':
+                    has_geo_parse = any(
+                        'Geox' in str(p.tag) or 'Surn' in str(p.tag) or 'Name' in str(p.tag)
+                        for p in parses
+                    )
+                    if not has_geo_parse:
+                        continue  # чисто нарицательное: "ремонт", "цветов", "дом"
 
         # Ищем в geo cache (raw и normalized)
         for check in [word, word_norm]:
