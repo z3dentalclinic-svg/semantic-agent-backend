@@ -28,6 +28,7 @@ from filters import (
     apply_l3_filter,   # ← L3 DeepSeek LLM классификатор (финальная GREY)
     L3Config,          # ← конфигурация L3
 )
+from filters.geo_garbage_filter import _GEO_POPULATION_CACHE  # population cache для BPF
 from geo import generate_geo_blacklist_full
 from config import USER_AGENTS, WHITELIST_TOKENS, MANUAL_RARE_CITIES, FORBIDDEN_GEO
 from utils.normalizer import normalize_keywords
@@ -312,7 +313,6 @@ class GoogleAutocompleteParser:
         }
         
         # Исправлена критическая ошибка: раньше передавался пустой словарь {}
-        from .geo_garbage_filter import _GEO_POPULATION_CACHE
         self.post_filter = BatchPostFilter(
             all_cities_global=ALL_CITIES_GLOBAL,  # ✅ ИСПРАВЛЕНО: передаём загруженную базу
             forbidden_geo=self.forbidden_geo,
