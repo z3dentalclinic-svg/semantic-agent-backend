@@ -1076,4 +1076,5 @@ __all__ = [
     'filter_geo_garbage',
     'OCCUPIED_TERRITORIES',
     'CITY_DISTRICTS',
+    '_GEO_POPULATION_CACHE',
 ]
