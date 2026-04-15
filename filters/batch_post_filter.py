@@ -610,6 +610,10 @@ class BatchPostFilter:
                 # покрывает: se, pro, gold, m21, s21, a52
                 if w.isascii() and w.isalnum() and len(w) <= 4:
                     continue
+                # Population guard: слово в districts но population < 50k → скорее бренд/модель
+                # "honda" → Honda (CO, JP, 28k) → бренд, не район
+                if self.population_cache.get(w, 0) < 50000:
+                    continue
                 # Баг B: известное слово без Geox → нарицательное, не район
                 if self._get_word_features(w, language)['skip_geo']:
                     continue
