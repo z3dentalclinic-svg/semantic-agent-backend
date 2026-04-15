@@ -30,15 +30,6 @@ def pre_filter(query: str, seed: str) -> tuple:
     if q.count(s) >= 2:
         return True, "дубль seed целиком"
     
-    # 1b. Слово из seed повторяется чаще чем в seed (ловит перестановки)
-    # "нимесил нимесил как принимать" → "нимесил" 2x в query, 1x в seed → мусор
-    from collections import Counter
-    q_counts = Counter(q.split())
-    s_counts = Counter(s.split())
-    for word, q_freq in q_counts.items():
-        if word in s_counts and q_freq > s_counts[word]:
-            return True, f"дубль слова seed: '{word}' ({q_freq}x в query, {s_counts[word]}x в seed)"
-    
     # 2. Извлекаем хвост
     if s not in q:
         return False, None
