@@ -163,6 +163,7 @@ def _is_common_no_geox(word: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════
 def _build_geo_entities_cache() -> Dict[str, tuple]:
     """Строим all_geo_entities один раз при старте сервера."""
+    global _GEO_POPULATION_CACHE
     result: Dict[str, tuple] = {}
     try:
         import geonamescache
@@ -170,11 +171,18 @@ def _build_geo_entities_cache() -> Dict[str, tuple]:
         cities = gc.get_cities()
         for city_data in cities.values():
             country_code = city_data.get('countrycode', '').upper()
+            population = city_data.get('population', 0) or 0
             name = city_data['name'].lower()
             result[name] = (country_code, 'city')
+            # Сохраняем population — используется в ПРОВЕРКЕ 2 для отсева мелких городов
+            if _GEO_POPULATION_CACHE.get(name, 0) < population:
+                _GEO_POPULATION_CACHE[name] = population
             for alt in city_data.get('alternatenames', []):
                 if len(alt) > 2:
-                    result[alt.lower()] = (country_code, 'city')
+                    alt_lower = alt.lower()
+                    result[alt_lower] = (country_code, 'city')
+                    if _GEO_POPULATION_CACHE.get(alt_lower, 0) < population:
+                        _GEO_POPULATION_CACHE[alt_lower] = population
         countries = gc.get_countries()
         for code, country_data in countries.items():
             name = country_data.get('name', '').lower()
@@ -190,6 +198,7 @@ def _build_geo_entities_cache() -> Dict[str, tuple]:
 
 # Инициализируем при импорте — один раз на весь lifetime процесса
 _GEO_ENTITIES_CACHE: Dict[str, tuple] = {}
+_GEO_POPULATION_CACHE: Dict[str, int] = {}   # city name → population (для threshold в ПРОВЕРКЕ 2)
 _GEOX_WORD_CACHE: Dict[str, bool] = {}  # кэш для _morph_geox.parse per-process
 
 # ═══════════════════════════════════════════════════════════════════
@@ -759,17 +768,28 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
 
-                # Guard только для коротких/омонимичных слов:
-                # если primary parse = имя (Name) но НЕ Geox → скорее всего не город
-                # "марина" → Name femn → не город
-                # "запорожье" → Geox → город
-                # "одесса" → Geox → город
+                # Guard: пропускаем слова которые явно не являются городами
+                # Расширенная логика — аналогична guard'у в seed_city detection
                 if _morph_geox and len(raw_word) > 2 and not raw_word.isascii():
                     parses = _morph_geox.parse(raw_word)
                     if parses:
+                        pos = parses[0].tag.POS
                         tag_str = str(parses[0].tag)
+                        # Личное имя без Geox → не город ("Марина", "Николай")
                         if 'Name' in tag_str and 'Geox' not in tag_str:
-                            continue  # имя собственное без Geox → не город
+                            continue
+                        # Прилагательное без Geox → не город ("железнодорожный", "центральный")
+                        if pos == 'ADJF' and 'Geox' not in tag_str:
+                            continue
+                        # Обычный NOUN без Geox/Surn/Name ни в одном разборе → не город
+                        # "тендер", "рынок", "вокзал" — нарицательные, не топонимы
+                        if pos == 'NOUN':
+                            has_geo_parse = any(
+                                'Geox' in str(p.tag) or 'Surn' in str(p.tag) or 'Name' in str(p.tag)
+                                for p in parses
+                            )
+                            if not has_geo_parse:
+                                continue
 
                 # Проверяем обе формы — raw и normalized
                 for check_word in [raw_word, word_norm]:
@@ -783,6 +803,32 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                             # Бренд не является городом даже если совпадает с топонимом
                             if check_word in _brand_set or raw_word in _brand_set:
                                 continue
+                            
+                            # Compound genitive: "героев днепра" → составное имя (метро/улица), не город
+                            # Признак: город найден через нормализацию И raw в genitive И prev слово тоже NOUN,gent
+                            if check_word == word_norm and check_word != raw_word and _morph_geox:
+                                _rp = _morph_geox.parse(raw_word)
+                                if _rp and _rp[0].tag.case == 'gent':
+                                    try:
+                                        _ri = clean_words.index(raw_word)
+                                        if _ri > 0:
+                                            _pp = _morph_geox.parse(clean_words[_ri - 1])
+                                            if _pp and _pp[0].tag.case == 'gent' and _pp[0].tag.POS == 'NOUN':
+                                                continue  # "героев днепра" → compound → не город
+                                    except ValueError:
+                                        pass
+                            
+                            # Population + literal geo trigger:
+                            # Мелкий иностранный город (< 50k) без гео-предлога → не блокируем.
+                            # "паркленд" (Tønder DK 16k, Parkland US 34k) без предлога → пропускаем.
+                            # "в паркленде" → предлог "в" → блокируем.
+                            # "харьков" (1.4M) без предлога → всё равно блокируем.
+                            _city_pop = _GEO_POPULATION_CACHE.get(check_word, 0)
+                            _raw_pos = _word_positions.get(raw_word, -1)
+                            _has_prep = _raw_pos > 0 and words[_raw_pos - 1] in _PREPOSITIONS
+                            if not _has_prep and _city_pop <= 50000:
+                                continue  # мелкий город без гео-предлога → пропускаем
+
                             cities_in_query.add(check_word)
                             break
             
@@ -900,6 +946,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     DISTRICT_TO_CANONICAL.get(word_norm)
                 )
                 if district_canonical_city and district_canonical_city != seed_canonical:
+                    # Блокируем только если район принадлежит иностранному городу.
+                    # UA район другого UA пригорода (жуляны→вишневе, нивки→коцюбинське) — пропускаем.
+                    _dist_country = (
+                        _DISTRICT_TO_COUNTRY.get(raw_word) or
+                        _DISTRICT_TO_COUNTRY.get(word_norm) or ''
+                    )
+                    if _dist_country.lower() == target_country.lower():
+                        continue  # отечественный район другого города → не блокируем
                     has_wrong_district = True
                     stats['blocked_wrong_district'] += 1
                     _wrong_district_word = raw_word
