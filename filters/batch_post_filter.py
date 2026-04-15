@@ -17,10 +17,14 @@ class BatchPostFilter:
                  all_cities_global: Dict[str, str], 
                  forbidden_geo: Set[str], 
                  districts: Optional[Dict[str, str]] = None,
-                 population_threshold: int = 5000):
+                 population_threshold: int = 5000,
+                 population_cache: Dict[str, int] = None):
         self.forbidden_geo = forbidden_geo
         self.districts = districts or {}
         self.population_threshold = population_threshold
+        # population_cache: city_name → population, из _GEO_POPULATION_CACHE geo_garbage_filter
+        # Используется в _is_real_city_not_brand для отсева мелких иностранных городов
+        self.population_cache: Dict[str, int] = population_cache or {}
         
         self.city_abbreviations = self._get_city_abbreviations()
         self.regions = self._get_regions()
@@ -316,6 +320,12 @@ class BatchPostFilter:
         if word_lower.isascii() and word_lower.isalpha():
             # Короткие латинские слова (≤4) - точно бренды
             if len(word_lower) <= 4:
+                return False
+            # Длинные латинские слова (5+): проверяем population
+            # "honda" (CO, 28k), "yamaha" (JP, мелкий) — бренды, не города
+            # Если population < 50k → скорее бренд чем реальный гео-таргет
+            city_pop = self.population_cache.get(word_lower, 0)
+            if city_pop < 50000:
                 return False
         
         # Очень короткие слова (1-2 буквы) - скорее аббревиатуры/бренды
@@ -854,7 +864,11 @@ class BatchPostFilter:
         return self._get_word_features(word, language)['skip_geo']
 
     def _extract_cities_from_seed(self, seed: str, country: str, language: str) -> Set[str]:
-        """🔥 FIX: Извлекает города из seed БЕЗ фильтра по стране"""
+        """🔥 FIX: Извлекает города из seed БЕЗ фильтра по стране.
+        Population guard: слово добавляется в seed_cities только если population >= 50k.
+        Это исключает нарицательные слова ("дом"→Dome GH, "нива"→мелкий город)
+        которые иначе триггерят ранний PASS на строке 516.
+        """
         if not self._has_morph:
             return set()
         
@@ -862,16 +876,18 @@ class BatchPostFilter:
         words = re.findall(r'[а-яёa-z0-9-]+', seed.lower())
         
         for word in words:
-            # БЕЗ ПРОВЕРКИ country!
+            # Population guard: только города с population >= 50k попадают в seed_cities
             if word in self.all_cities_global:
-                logger.debug(f"[BPF] seed_city WORD '{word}' -> {self.all_cities_global[word]}")
-                seed_cities.add(word)
+                if self.population_cache.get(word, 0) >= 50000:
+                    logger.debug(f"[BPF] seed_city WORD '{word}' -> {self.all_cities_global[word]}")
+                    seed_cities.add(word)
             
             lemma = self._get_lemma(word, language)
             if lemma in self.all_cities_global:
-                logger.debug(f"[BPF] seed_city LEMMA '{lemma}' <- '{word}' "
-                             f"-> {self.all_cities_global[lemma]}")
-                seed_cities.add(lemma)
+                if self.population_cache.get(lemma, 0) >= 50000:
+                    logger.debug(f"[BPF] seed_city LEMMA '{lemma}' <- '{word}' "
+                                 f"-> {self.all_cities_global[lemma]}")
+                    seed_cities.add(lemma)
         
         bigrams = self._extract_ngrams(words, 2)
         for bigram in bigrams:
