@@ -312,11 +312,13 @@ class GoogleAutocompleteParser:
         }
         
         # Исправлена критическая ошибка: раньше передавался пустой словарь {}
+        from .geo_garbage_filter import _GEO_POPULATION_CACHE
         self.post_filter = BatchPostFilter(
             all_cities_global=ALL_CITIES_GLOBAL,  # ✅ ИСПРАВЛЕНО: передаём загруженную базу
             forbidden_geo=self.forbidden_geo,
             districts=DISTRICTS_EXTENDED,
-            population_threshold=5000
+            population_threshold=5000,
+            population_cache=_GEO_POPULATION_CACHE,  # из geo_garbage_filter — строится при старте
         )
         logger.info("✅ Batch Post-Filter v7.9 initialized with REAL cities database")
         logger.info(f"   Database contains {len(ALL_CITIES_GLOBAL)} cities")
