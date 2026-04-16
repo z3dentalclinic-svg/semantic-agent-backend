@@ -80,7 +80,6 @@ SIGNAL_WEIGHTS = {
     'tech_garbage':    0.95,   # email/URL/телефон — почти 100% мусор
     'mixed_alpha':     0.9,    # смешанные алфавиты
     'standalone_num':  0.7,    # голое число — может ошибиться (модели)
-    'incoherent_tail': 0.85,   # многословный хвост с "чужими" словами
     'category_mismatch': 0.5,  # мягкий — embeddings ненадёжно классифицируют категории
     'truncated_geo':     0.85,  # обрезанный составной город — довольно надёжно
     'foreign_geo':       0.95,  # город/страна из чужого региона — очень надёжно (geo_db)
@@ -102,79 +101,9 @@ _SOFT_NEGATIVES = frozenset({
 
 
 # ============================================================
-# Константы уровня модуля для _check_coherence.
+# Константы уровня модуля.
 # Вычисляются ОДИН РАЗ при импорте — не пересоздаются на каждый вызов classify().
 # ============================================================
-
-_COHERENCE_COMMERCE = frozenset({
-    'цена', 'стоимость', 'прайс', 'тариф', 'расценка',
-    'купить', 'заказать', 'заказ', 'покупка', 'оплата',
-    'недорого', 'дёшево', 'дешево', 'бюджетный', 'акция',
-    'скидка', 'распродажа', 'бесплатно', 'стоить',
-    'услуга', 'сервис', 'прейскурант', 'калькулятор',
-})
-
-_COHERENCE_REPUTATION = frozenset({
-    'отзыв', 'рейтинг', 'оценка', 'обзор', 'мнение',
-    'рекомендация', 'жалоба', 'форум', 'блог',
-    'лучший', 'топ', 'худший', 'сравнение', 'рекомендовать',
-    'хороший', 'плохой',
-})
-
-_COHERENCE_ACTION = frozenset({
-    'инструкция', 'руководство', 'мануал',
-    'видео', 'видеоинструкция', 'фото', 'фотография',
-    'схема', 'чертёж', 'чертеж', 'диаграмма',
-    'разборка', 'сборка', 'чистка', 'замена',
-    'диагностика', 'профилактика', 'обслуживание',
-    'запчасть', 'деталь', 'комплектующие', 'фильтр',
-    'щётка', 'щетка', 'шланг', 'мешок', 'пылесборник',
-    'мотор', 'двигатель', 'турбина', 'аккумулятор',
-    'смотреть', 'скачать', 'найти', 'сделать', 'починить',
-    'почистить', 'разобрать', 'собрать', 'подключить',
-    'установить', 'настроить', 'проверить', 'заменить',
-    'показать', 'объяснить',
-    'пошаговый', 'подробный',
-})
-
-_COHERENCE_CONTACTS = frozenset({
-    'адрес', 'телефон', 'контакт', 'карта', 'маршрут',
-    'график', 'расписание', 'режим', 'часы', 'работа',
-    'контактный',
-})
-
-_COHERENCE_LOCATION = frozenset({
-    'рядом', 'поблизости', 'ближайший', 'недалеко',
-    'район', 'улица', 'дом', 'квартира',
-    'ближний', 'близкий',
-})
-
-_COHERENCE_TIME = frozenset({
-    'круглосуточно', 'срочно', 'быстро', 'сегодня', 'сейчас',
-    'срочный', 'круглосуточный',
-})
-
-_COHERENCE_MARKETPLACE = frozenset({
-    'олх', 'olx', 'розетка', 'rozetka', 'пром', 'hotline',
-    'алиэкспресс', 'aliexpress', 'амазон', 'amazon',
-    'эпицентр',
-})
-
-_COHERENCE_VALID_ADJ = frozenset({
-    'бюджетный', 'бесплатный', 'платный', 'гарантийный',
-    'новый', 'старый', 'профессиональный', 'домашний',
-    'дешёвый', 'дешевый', 'дорогой',
-})
-
-# Объединённый словарь всех известных лемм — для быстрой проверки
-_COHERENCE_ALL_KNOWN = (
-    _COHERENCE_COMMERCE | _COHERENCE_REPUTATION | _COHERENCE_ACTION |
-    _COHERENCE_CONTACTS | _COHERENCE_LOCATION | _COHERENCE_TIME |
-    _COHERENCE_MARKETPLACE | _COHERENCE_VALID_ADJ
-)
-
-# POS которые пропускаем в _check_coherence (служебные — НЕ прилагательные)
-_COHERENCE_SKIP_POS = frozenset({'PREP', 'CONJ', 'PRCL', 'INTJ', 'ADVB', 'PRED', 'COMP'})
 
 # Наборы для intent_mismatch check — тоже уровень модуля
 _GEO_COMPATIBLE_INTERROGATIVES = frozenset({'где', 'куда', 'откуда'})
@@ -363,30 +292,6 @@ class TailFunctionClassifier:
                 negative_signals.append('intent_mismatch')
                 reasons.append(f"⚠️ Конфликт интентов: seed '{seed_first_word}' (не о месте), tail содержит гео")
         
-        # ===== ПРОВЕРКА КОГЕРЕНТНОСТИ ХВОСТА =====
-        # Если детектор поймал одно слово в многословном хвосте,
-        # а остальные контентные слова — "чужие", понижаем до GREY
-        #
-        # ИСКЛЮЧЕНИЕ: если позитивный сигнал пришёл от ПАТТЕРНА (multi-word match)
-        # и хвост короткий (≤2 слов), паттерн покрывает весь хвост →
-        # coherence check не нужен, он просто разломает паттерн на слова.
-        # Пример: "своими руками" → detect_action ловит паттерн,
-        # но coherence видит "руками" как orphan.
-        if positive_signals:
-            tail_word_count = len(tail.lower().split())
-            has_pattern_match = any('паттерн' in r for r in reasons)
-            has_prep_modifier = 'prep_modifier' in positive_signals
-            
-            if tail_word_count <= 2 and has_pattern_match:
-                pass  # Паттерн покрывает весь хвост — coherence не нужен
-            elif has_prep_modifier:
-                pass  # Предложная группа покрывает весь хвост — coherence не нужен
-            else:
-                is_coherent, orphans = self._check_coherence(tail)
-                if not is_coherent:
-                    negative_signals.append('incoherent_tail')
-                    reasons.append(f"⚠️ Некогерентный хвост: слова {orphans} не относятся к поисковым паттернам")
-        
         # ===== АРБИТРАЖ С ВЕСАМИ =====
         label, confidence, pos_score, neg_score = self._arbitrate(
             positive_signals, negative_signals
@@ -401,68 +306,6 @@ class TailFunctionClassifier:
             'positive_score': pos_score,
             'negative_score': neg_score,
         }
-    
-    def _check_coherence(self, tail: str):
-        """
-        Проверяет когерентность многословного хвоста.
-
-        Принцип: если хвост 2+ слов и детектор поймал одно,
-        а остальные контентные слова не из известных категорий → incoherent.
-
-        "тигров фото" → фото=action ✅, тигров=??? → incoherent
-        "замена фильтра" → замена=action ✅, фильтр=action ✅ → coherent
-
-        Использует модульные frozenset-константы (_COHERENCE_ALL_KNOWN, _COHERENCE_SKIP_POS)
-        вместо пересборки 7 set'ов на каждый вызов.
-
-        Returns: (is_coherent: bool, orphan_words: list)
-        """
-        words = tail.lower().split()
-        if len(words) < 2:
-            return True, []
-
-        orphans = []
-        prev_pos = None
-        for w in words:
-            parsed = morph.parse(w)[0]
-            pos = parsed.tag.POS
-            lemma = parsed.normal_form
-
-            # Служебные и модификаторы — пропускаем
-            if pos in _COHERENCE_SKIP_POS:
-                prev_pos = pos
-                continue
-            # Слово после предлога — пропускаем только если это гео
-            if prev_pos == 'PREP':
-                nomn_form = parsed.inflect({'nomn'})
-                check_forms = {w, lemma}
-                if nomn_form:
-                    check_forms.add(nomn_form.word)
-                is_geo = any(cf in self.geo_db for cf in check_forms)
-                if not is_geo:
-                    from .function_detectors import _COUNTRIES
-                    is_geo = any(cf in _COUNTRIES for cf in check_forms)
-                if is_geo:
-                    prev_pos = pos
-                    continue
-                # Не гео — проверяем как обычное слово (fall through)
-            # Известная лемма — используем модульную константу
-            if lemma in _COHERENCE_ALL_KNOWN or w in _COHERENCE_ALL_KNOWN:
-                prev_pos = pos
-                continue
-            # Гео или бренд
-            if w in self.geo_db or lemma in self.geo_db:
-                prev_pos = pos
-                continue
-            if w in self.brand_db or lemma in self.brand_db:
-                prev_pos = pos
-                continue
-
-            orphans.append(w)
-            prev_pos = pos
-
-        return len(orphans) == 0, orphans
-
     
     def _arbitrate(
         self, positive: List[str], negative: List[str]
@@ -514,9 +357,6 @@ class TailFunctionClassifier:
             hard_negatives = {'duplicate', 'meta', 'tech_garbage', 'mixed_alpha', 'foreign_geo', 'intent_mismatch'}
             has_hard_negative = bool(set(negative) & hard_negatives)
             
-            # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
-            has_incoherent = 'incoherent_tail' in negative
-            
             # ─── Info-intent guard ───────────────────────────────────────────
             # Если info_intent (структурный маркер реального пользовательского
             # запроса: вопросительное слово, "это" на конце, "не + VERB") в позитивах,
@@ -532,27 +372,22 @@ class TailFunctionClassifier:
             #   meta — помечает "что такое/чем отличается/как называется" (это ВАЛИДНЫЕ паттерны)
             #   fragment — помечает "X это" и "не VERB" как обрывок (это НЕ обрывки на info-запросах)
             #   dangling — "чем опасна" имеет висячее ADJ (нормально для info)
-            #   incoherent_tail — на многословных вопросах часто ложно срабатывает
             #   category_mismatch — chargram не умеет семантически проверять вопросы
             #
             # Жёсткие негативы (duplicate, tech_garbage, mixed_alpha, foreign_geo,
             # intent_mismatch) в whitelist НЕ входят — если они сработали, это
             # реальный мусор несмотря на info-маркер.
             if 'info_intent' in positive:
-                _info_whitelist = {'meta', 'fragment', 'dangling', 'incoherent_tail', 'category_mismatch'}
+                _info_whitelist = {'meta', 'fragment', 'dangling', 'category_mismatch'}
                 if all(s in _info_whitelist for s in negative):
                     confidence = 0.7
                     return 'VALID', confidence, pos_score, neg_score
             # ─────────────────────────────────────────────────────────────────
             
-            if has_db_positive and not has_hard_negative and not has_incoherent:
+            if has_db_positive and not has_hard_negative:
                 # БД говорит VALID, эвристика говорит TRASH → доверяем БД
                 confidence = 0.75
                 return 'VALID', confidence, pos_score, neg_score
-            
-            # Incoherent → максимум GREY, никогда VALID
-            if has_incoherent and not has_hard_negative:
-                return 'GREY', 0.4, pos_score, neg_score
             
             if has_hard_negative:
                 # Мета-вопрос или дублирование → даже бренд не спасает
