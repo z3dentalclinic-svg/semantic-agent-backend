@@ -2219,3 +2219,180 @@ def detect_info_intent(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool
                 return True, f"Информационный запрос: troubleshooting 'не {words[i + 1]}'"
     
     return False, ""
+
+
+# ============================================================
+# Позитивные детекторы модификаторов seed (premod / postmod)
+# ============================================================
+
+# Части речи, допустимые как adjective-like модификаторы seed.
+# ADJF/ADJS — полные/краткие прилагательные.
+# PRTF/PRTS — причастия (функционально адъективны: "щадящая", "формирующий").
+_ADJ_LIKE_POS = frozenset({'ADJF', 'ADJS', 'PRTF', 'PRTS'})
+
+
+def _tail_agrees_with_seed(tail_word: str, seed_words, tp: dict = None) -> bool:
+    """
+    Проверяет: согласуется ли прилагательно-подобное слово tail_word
+    с хотя бы одним существительным из seed по морфологии.
+
+    Правила согласования (стандартная русская грамматика):
+    - Число (sing/plur) должно совпадать
+    - Падеж должен совпадать
+    - Род проверяется ТОЛЬКО для singular (во множественном числе
+      род в русских прилагательных не различается).
+
+    Seed-слова парсим только первым парсом (best score) — это защита
+    от ложных парсов типа "зубов" как фамилии (Sgtm,Surn).
+    Прилагательное перебираем по всем парсам, но с score >= 0.1.
+
+    Универсально для любого seed. Ноль хардкода.
+    """
+    adj_parses = _get_parses(tail_word, tp)
+    # Seed — только best parse для каждого слова
+    seed_parses = [_get_parses(sw, tp)[0] for sw in seed_words]
+
+    for ap in adj_parses:
+        if ap.tag.POS not in _ADJ_LIKE_POS:
+            continue
+        if ap.score < 0.1:
+            continue
+        for sp in seed_parses:
+            if sp.tag.POS != 'NOUN':
+                continue
+            if ap.tag.number != sp.tag.number:
+                continue
+            if ap.tag.case != sp.tag.case:
+                continue
+            # Gender check только для singular
+            if ap.tag.number == 'sing' and ap.tag.gender != sp.tag.gender:
+                continue
+            return True
+    return False
+
+
+def _tail_position_in_kw(tail: str, seed: str, kw: str) -> str:
+    """
+    Возвращает позицию tail относительно seed в оригинальном kw:
+    - 'pre'  — tail перед первым словом seed ("базальная имплантация зубов")
+    - 'post' — tail после первого слова seed ("имплантация жевательных зубов",
+               "имплантация зубов этапы")
+    - 'none' — не удалось определить
+
+    Принцип: ищем индекс первого слова seed в списке слов kw.
+    Сравниваем с индексом первого слова tail.
+
+    Работает даже когда seed РАЗОРВАН вставкой:
+    "имплантация жевательных зубов" — seed='имплантация зубов' разорван,
+    но первое слово seed ('имплантация') идёт перед tail ('жевательных').
+
+    Универсальный, без хардкода. Единственный случай когда возвращает 'none' —
+    если слово tail или первое слово seed отсутствует в kw как отдельный токен
+    (например склонение, разные регистры обработаны через lower()).
+    """
+    if not tail or not seed or not kw:
+        return 'none'
+
+    kw_words = kw.lower().strip().split()
+    seed_words = seed.lower().strip().split()
+    tail_words = tail.lower().strip().split()
+
+    if not kw_words or not seed_words or not tail_words:
+        return 'none'
+
+    seed_first = seed_words[0]
+    tail_first = tail_words[0]
+
+    if seed_first not in kw_words:
+        return 'none'
+    if tail_first not in kw_words:
+        return 'none'
+
+    seed_first_idx = kw_words.index(seed_first)
+    tail_first_idx = kw_words.index(tail_first)
+
+    if tail_first_idx < seed_first_idx:
+        return 'pre'
+    if tail_first_idx > seed_first_idx:
+        return 'post'
+    return 'none'
+
+
+def detect_premod_adjective(tail: str, seed: str = "", kw: str = "", tp: dict = None) -> Tuple[bool, str]:
+    """
+    Позитивный детектор: прилагательное/причастие ПЕРЕД seed,
+    согласованное с seed по морфологии.
+
+    Примеры (валидно):
+      "базальная имплантация зубов"     → tail='базальная' pre  ~ имплантация
+      "быстрая имплантация зубов"       → tail='быстрая'
+      "лазерная имплантация зубов"      → tail='лазерная'
+      "щадящая имплантация зубов"       → tail='щадящая' (PRTF)
+      "адресная доставка цветов"        → tail='адресная' ~ доставка
+      "круглосуточная доставка цветов"  → tail='круглосуточная'
+      "срочный ремонт пылесосов"        → tail='срочный' ~ ремонт
+
+    Не срабатывает:
+      "кривой имплантация зубов" — masc не согласован с femn/plur
+      "синий доставка цветов"    — masc nomn не согласован
+
+    Cross-niche: работает для любого seed. Ноль хардкода ниши.
+    Требует kw для определения позиции pre/post.
+
+    Если kw не передан — детектор не срабатывает (без позиции нельзя
+    отличить premod от postmod, они требуют разных детекторов).
+    """
+    if not tail or not seed or not kw:
+        return False, ""
+
+    words = tail.split()
+    if len(words) != 1:
+        return False, ""
+
+    word = words[0].lower()
+    if _tail_position_in_kw(tail, seed, kw) != 'pre':
+        return False, ""
+
+    seed_words = seed.lower().split()
+    if _tail_agrees_with_seed(word, seed_words, tp=tp):
+        return True, f"Премодификатор seed: '{word}' (ADJF/PRTF согласовано с seed)"
+    return False, ""
+
+
+def detect_postmod_adjective(tail: str, seed: str = "", kw: str = "", tp: dict = None) -> Tuple[bool, str]:
+    """
+    Позитивный детектор: прилагательное/причастие ПОСЛЕ seed,
+    согласованное с seed по морфологии.
+
+    Примеры (валидно):
+      "имплантация жевательных зубов"   → tail='жевательных' post ~ зубов
+      "имплантация верхних зубов"       → tail='верхних'
+      "имплантация передних зубов"      → tail='передних'
+      "имплантация коренных зубов"      → tail='коренных'
+      "имплантация молочных зубов"      → tail='молочных'
+      "доставка редких цветов"          → tail='редких'
+      "ремонт старых пылесосов"         → tail='старых'
+
+    По ИНДИКАТОРАМ работает ровно как premod — отличается только
+    позицией tail относительно seed. Разделение на два детектора
+    сделано осознанно для диагностики: по имени сигнала в trace
+    видно, что сработал — premod или postmod. Упрощает отладку
+    при появлении ложных срабатываний.
+
+    Cross-niche, ноль хардкода ниши.
+    """
+    if not tail or not seed or not kw:
+        return False, ""
+
+    words = tail.split()
+    if len(words) != 1:
+        return False, ""
+
+    word = words[0].lower()
+    if _tail_position_in_kw(tail, seed, kw) != 'post':
+        return False, ""
+
+    seed_words = seed.lower().split()
+    if _tail_agrees_with_seed(word, seed_words, tp=tp):
+        return True, f"Постмодификатор seed: '{word}' (ADJF/PRTF согласовано с seed)"
+    return False, ""
