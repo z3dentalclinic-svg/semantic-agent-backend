@@ -44,6 +44,15 @@ logger = logging.getLogger(__name__)
 _CLASSIFIER_CACHE: Dict[tuple, TailFunctionClassifier] = {}
 
 
+# ============================================================
+# Буквы эксклюзивно украинского алфавита.
+# Конечный набор из 4 символов (+ верхний регистр). Не ниша, не хардкод слов —
+# базовое свойство алфавита. Используется для быстрой детекции UA-запросов
+# в RU-пайплайне: если в kw есть хоть одна такая буква — это не RU, TRASH.
+# ============================================================
+_UA_EXCLUSIVE_LETTERS = frozenset('іїєґІЇЄҐ')
+
+
 def _get_classifier(
     seed: str,
     target_country: str,
@@ -137,6 +146,31 @@ def apply_l0_filter(
     trace_records = []
 
     for kw_item, kw, tail in _kw_tail_pairs:
+
+        # ── UA-язык → TRASH (ДО любой другой классификации) ───────────────
+        # Пайплайн настроен под RU-морфологию (pymorphy3, RU детекторы).
+        # UA-запросы через него не проходят корректно — нужна отдельная
+        # UA-копия фильтров (отложенный проект).
+        #
+        # Алгоритмический критерий: буквы {і, ї, є, ґ} существуют в UA
+        # и отсутствуют в RU. Одна такая буква в kw = украинский запрос.
+        # Проверяется на всём kw (а не на tail), чтобы ловить случаи
+        # где seed не найден из-за UA-морфологии.
+        #
+        # Не трогает:
+        #   - чистую латиницу (all on 6, straumann) — свои детекторы
+        #   - смешанный алфавит (рrice) — detect_mixed_alphabet
+        if _UA_EXCLUSIVE_LETTERS.intersection(kw):
+            trash_keywords.append(kw_item)
+            trace_records.append({
+                "keyword": kw,
+                "tail": tail,
+                "label": "TRASH",
+                "decided_by": "l0",
+                "reason": "Не русский язык: UA-буквы (і/ї/є/ґ) — нужна UA-копия пайплайна",
+                "signals": ["-wrong_language"],
+            })
+            continue
 
         # NO_SEED → GREY
         if tail is None:
