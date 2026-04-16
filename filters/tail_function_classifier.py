@@ -26,6 +26,8 @@ from .function_detectors import (
     # Новые мягкие детекторы
     detect_truncated_geo, detect_truncated_geo_fast, detect_orphan_genitive, detect_single_infinitive,
     detect_foreign_geo,
+    # Helpers
+    _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
 
 # Category mismatch detector (использует embeddings, ленивая загрузка)
@@ -206,6 +208,9 @@ class TailFunctionClassifier:
         self._seed_first_word = self._seed_words_lower[0] if self._seed_words_lower else ''
         self._seed_first_in_geo_incompatible = self._seed_first_word in _GEO_INCOMPATIBLE_INTERROGATIVES
         self._seed_first_in_commerce_incompatible = self._seed_first_word in _COMMERCE_INCOMPATIBLE
+        # Pre-computed: seed сервисный (услуга/процесс) или товарный?
+        # Используется в detect_single_infinitive и как флаг для commerce-infn positive.
+        self._seed_is_service = _is_service_seed(seed) if seed else True
         # Тайминги детекторов — накапливаются за батч, сбрасываются из l0_filter
         self.detector_timings: Dict[str, float] = {}
         # Индекс для truncated_geo — строится один раз при создании классификатора
@@ -274,6 +279,26 @@ class TailFunctionClassifier:
                 positive_signals.append(signal_name)
                 reasons.append(f"✅ {reason}")
 
+        # Commerce-инфинитив на ТОВАРНОМ seed = валидный purchase intent.
+        # detect_commerce держит "купить/заказать" как weak (нужен контекст из 2+ слов).
+        # Здесь добавляем positive для единичного commerce-инфинитива ТОЛЬКО
+        # когда seed явно товарный (не сервис), иначе "ремонт пылесосов купить"
+        # ошибочно станет VALID.
+        #
+        # ТОЛЬКО РУССКИЙ: lemma-match через pymorphy3. Украинские инфинитивы
+        # pymorphy3 не распознаёт как INFN → не попадут в этот блок → отдельный
+        # UA-пайплайн обрабатывает их своей морфологией.
+        if 'commerce' not in positive_signals and not self._seed_is_service:
+            _tail_words = tail.lower().split()
+            if len(_tail_words) == 1:
+                _w = _tail_words[0]
+                _p = (tail_parses.get(_w, None) if tail_parses else None)
+                if _p is None:
+                    _p = morph.parse(_w)
+                if _p and _p[0].tag.POS == 'INFN' and _p[0].normal_form in COMMERCE_INFN_LEMMAS:
+                    positive_signals.append('commerce')
+                    reasons.append(f"✅ Коммерческий intent (товарный seed): '{_p[0].normal_form}'")
+
         # ===== НЕГАТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_negative = [
             ('fragment',        lambda: detect_fragment(tail, self.seed, tp=tp)),
@@ -293,7 +318,7 @@ class TailFunctionClassifier:
             ('truncated_geo',   lambda: detect_truncated_geo_fast(tail, self.geo_db, self._truncated_geo_index, tp=tp)),
             ('foreign_geo',     lambda: detect_foreign_geo(tail, self.geo_db, self.target_country, tp=tp)),
             ('orphan_genitive', lambda: detect_orphan_genitive(tail, self.seed, tp=tp)),
-            ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp)),
+            ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp, seed_is_service=self._seed_is_service)),
         ]
         
         for signal_name, detector in detectors_negative:
