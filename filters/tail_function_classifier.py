@@ -523,6 +523,32 @@ class TailFunctionClassifier:
                 return 'GREY', 0.4, pos_score, neg_score
             
             if has_hard_negative:
+                # conjunctive + meta/definition запрос → VALID.
+                # Запросы вида "что такое X", "чем отличается X от Y", "как называется X",
+                # "что лучше X или Y" — это реальные пользовательские вопросы (research,
+                # сравнения, definition-запросы). Semantic Agent ищет максимально широкий
+                # пул ключей — любой тематической направленности. Такие запросы валидны
+                # сами по себе; юзер сам решит, нужны ли они ему (инфо-контент, сравнение,
+                # покупательский research).
+                #
+                # Условия:
+                #   1. 'conjunctive' в позитивах — структура "союз/сравнение + содержание"
+                #      подтверждена. Это маркер ЗАКОНЧЕННОГО запроса, не обрывка.
+                #   2. 'meta' обязательно в негативах — именно definition/comparison-паттерн,
+                #      а не голый fragment-обрывок ("доставка цветов и").
+                #   3. ВСЕ негативы принадлежат whitelist мягких definition-сигналов.
+                #      fragment добавлен потому что "что значит" даёт и meta, и fragment
+                #      одновременно (значит=CONJ на конце) — это тот же definition-паттерн.
+                #
+                # Незакрытый definition (одиночное "зачем" без conjunctive) сюда
+                # НЕ попадает — такие кейсы остаются TRASH (fragment) или GREY по общей
+                # логике арбитража. Это корректная серая зона.
+                if 'conjunctive' in positive and 'meta' in negative:
+                    _definition_whitelist = {'meta', 'incoherent_tail', 'category_mismatch', 'fragment', 'dangling'}
+                    if all(s in _definition_whitelist for s in negative):
+                        confidence = 0.7
+                        return 'VALID', confidence, pos_score, neg_score
+
                 # Мета-вопрос или дублирование → даже бренд не спасает
                 if pos_score > neg_score * 1.5:
                     return 'GREY', 0.3, pos_score, neg_score
