@@ -1,5 +1,5 @@
 """
-TailFunctionClassifier v2 — исправленный классификатор.
+TailFunctionClassifier v23 — исправленный классификатор.
 
 Изменения относительно v1:
 1. Пустой хвост = VALID (запрос = seed), не TRASH
