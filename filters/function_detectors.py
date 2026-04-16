@@ -107,12 +107,16 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
     
     COUNTRY-AWARE: geo_db = Dict[str, Set[str]] (название → {коды_стран}).
     Город считается VALID только если он существует в target_country.
+    Страна (из _COUNTRIES) — аналогично: позитив только если совпадает с target.
     
     "киев" (UA) → True (киев ∈ UA)
     "тир"  (UA) → False (тир ∈ LB, не в UA)
     "днс"  (UA) → False (днс нет в geo_db вообще)
     "или"  (UA) → False (или ∈ GB, не в UA + CONJ)
     "одессе" (UA) → True (лемма "одесса" ∈ UA)
+    "украине" (UA) → True (лемма "украина" ∈ _COUNTRIES, UA == target)
+    "ирландии" (IE) → True (лемма "ирландия" ∈ _COUNTRIES, IE == target)
+    "украине" (RU) → False (страна не совпадает с target)
     """
     target = target_country.upper()
     # POS которые НИКОГДА не являются городами в контексте поиска
@@ -127,7 +131,7 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
         if parsed.tag.POS in skip_pos:
             continue
         
-        # Точное совпадение + проверка страны
+        # Точное совпадение + проверка страны (city)
         if word in geo_db:
             if target in geo_db[word]:
                 return True, f"Город: '{word}' ({target})"
@@ -140,13 +144,31 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
             if target in geo_db[lemma]:
                 return True, f"Город (лемма): '{lemma}' ({target})"
             continue
+
+        # === Проверка стран через _COUNTRIES ===
+        # Target-country в tail = позитив ("в украине" при target=UA)
+        # _COUNTRIES — базовая география, ~80 стран, стабильный конечный список.
+        # Не ниша. Формат {лемма: ISO_код}.
+        # Проверяем и точное слово (латиница), и лемму (кириллица склоняемая).
+        if word in _COUNTRIES:
+            if _COUNTRIES[word] == target:
+                return True, f"Страна: '{word}' ({target})"
+            continue
+        if lemma in _COUNTRIES and lemma != word:
+            if _COUNTRIES[lemma] == target:
+                return True, f"Страна (лемма): '{lemma}' ({target})"
+            continue
     
-    # Проверяем многословные названия (нью йорк, кривой рог)
+    # Проверяем многословные названия (нью йорк, кривой рог, новая зеландия)
     if len(words) >= 2:
         bigram = ' '.join(words[:2])
         if bigram in geo_db:
             if target in geo_db[bigram]:
                 return True, f"Город (биграмм): '{bigram}' ({target})"
+        # Страна-биграмм: "саудовская аравия", "новая зеландия"
+        if bigram in _COUNTRIES:
+            if _COUNTRIES[bigram] == target:
+                return True, f"Страна (биграмм): '{bigram}' ({target})"
     
     return False, ""
 
