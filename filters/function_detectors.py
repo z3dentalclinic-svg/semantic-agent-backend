@@ -2112,10 +2112,15 @@ def detect_info_intent(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool
         # Сначала surface — дёшево, для несклоняемых (что/как/почему...)
         if w in _INTERROGATIVE_WORDS:
             return True, f"Информационный запрос: вопросительное слово '{w}'"
+        parsed = _get_parses(w, tp)[0]
         # Потом лемма — для склоняемых (какой/какая/какое/какие)
-        lemma = _get_parses(w, tp)[0].normal_form
-        if lemma in _INTERROGATIVE_WORDS:
-            return True, f"Информационный запрос: вопросительное слово '{w}' (лемма '{lemma}')"
+        if parsed.normal_form in _INTERROGATIVE_WORDS:
+            return True, f"Информационный запрос: вопросительное слово '{w}' (лемма '{parsed.normal_form}')"
+        # pymorphy3 тег Ques — ловит "насколько", "откуда" без расширения списка.
+        # Список — для слов без Ques-тега (что/как/когда/чем/сколько/куда).
+        # Комбинация покрывает оба набора без дублирования.
+        if 'Ques' in str(parsed.tag):
+            return True, f"Информационный запрос: вопросительное слово '{w}' (Ques-тег)"
     
     # Триггер 2: "это" на конце tail или в составе "что это".
     # "X это [описание]" или "X что это" — definition-маркер.
