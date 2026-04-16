@@ -1936,7 +1936,72 @@ def detect_orphan_genitive(tail: str, seed: str = "", tp: dict = None) -> Tuple[
     return False, ""
 
 
-def detect_single_infinitive(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool, str]:
+# Commerce-инфинитивы — чистые транзакционные глаголы (покупка/заказ).
+# На товарном seed ("аккумулятор на скутер") одиночный commerce-инфинитив —
+# валидный покупательский intent, не голый "повисший" глагол.
+# На сервисном seed ("ремонт пылесосов") остаётся TRASH: "ремонт пылесосов купить"
+# — несовместимая конструкция.
+#
+# NB: "зарядить/заменить/отремонтировать" — техническое действие, не purchase,
+# поэтому в whitelist НЕ входят (subproblem_2 в fp_analysis_report — DEFERRED).
+#
+# ТОЛЬКО РУССКИЕ ЛЕММЫ. Украинский язык обрабатывается отдельной копией
+# фильтров — смешивать нельзя (разная морфология → регрессии).
+COMMERCE_INFN_LEMMAS = frozenset({
+    'купить', 'заказать', 'приобрести', 'арендовать',
+})
+
+
+def _is_service_seed(seed: str) -> bool:
+    """
+    Алгоритмически определяет "сервисный" seed (услуга/процесс).
+    
+    Сервисный seed: NOUN(nomn/accs) + ... + NOUN(gent)
+    без предлога между первыми двумя словами.
+    
+    Примеры сервисных:
+    - "ремонт пылесосов"  (NOUN nomn + NOUN gent)
+    - "доставка цветов"
+    - "установка кондиционера цена"
+    - "пластика лица львов"
+    
+    Примеры товарных (НЕ сервисных):
+    - "аккумулятор на скутер"  (NOUN + PREP → False)
+    - "айфон 16"               (нет второго NOUN,gent → False)
+    - "как принимать нимесил"  (первое — не NOUN → False)
+    
+    Без словарей, чистая морфология.
+    """
+    words = seed.lower().split()
+    if len(words) < 2:
+        return False
+    
+    p0 = morph.parse(words[0])[0]
+    if p0.tag.POS != 'NOUN':
+        return False
+    # Первое слово должно быть в nomn или accs (именительный/винительный)
+    if 'nomn' not in p0.tag and 'accs' not in p0.tag:
+        return False
+    
+    p1 = morph.parse(words[1])[0]
+    # Предлог после первого NOUN → товарный паттерн (аккумулятор НА скутер)
+    if p1.tag.POS == 'PREP':
+        return False
+    
+    # Ищем NOUN в родительном падеже среди остальных слов seed
+    for w in words[1:]:
+        p = morph.parse(w)[0]
+        if p.tag.POS == 'NOUN' and 'gent' in p.tag:
+            return True
+    return False
+
+
+def detect_single_infinitive(
+    tail: str,
+    seed: str = "",
+    tp: dict = None,
+    seed_is_service: bool = True,
+) -> Tuple[bool, str]:
     """
     Мягкий детектор: одиночный инфинитив без объекта.
     
@@ -1945,11 +2010,15 @@ def detect_single_infinitive(tail: str, seed: str = "", tp: dict = None) -> Tupl
     НЕ ловим если:
     - detect_verb_modifier уже поймал (seed с глаголом + наречие)
     - Хвост > 1 слова ("почистить фильтр" — это detect_action)
+    - tail — commerce-инфинитив И seed НЕ сервисный (товарный)
     
     Мягкий негативный сигнал — может быть валидным интентом,
     но структурно неполный.
     
     Cross-niche: "аккумулятор скутер заменить", "окна заклеить"
+    
+    Параметр seed_is_service: True (default, безопасно) = старое поведение.
+    Передаётся из TailFunctionClassifier через pre-computed флаг.
     """
     if not tail or not seed:
         return False, ""
@@ -1971,6 +2040,15 @@ def detect_single_infinitive(tail: str, seed: str = "", tp: dict = None) -> Tupl
     for sw in seed_words:
         sp = morph.parse(sw)[0]
         if sp.tag.POS in ('INFN', 'VERB'):
+            return False, ""
+    
+    # Commerce-инфинитив на товарном seed — валидный purchase intent.
+    # Защита: срабатывает только если seed ЯВНО товарный (seed_is_service=False).
+    # Default seed_is_service=True не пропускает этот guard — безопасно
+    # для вызовов без нового параметра.
+    if not seed_is_service:
+        lemma = parsed.normal_form
+        if lemma in COMMERCE_INFN_LEMMAS:
             return False, ""
     
     return True, f"Голый инфинитив: '{word}' без объекта (seed без глагола)"
