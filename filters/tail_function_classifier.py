@@ -26,6 +26,8 @@ from .function_detectors import (
     # Новые мягкие детекторы
     detect_truncated_geo, detect_truncated_geo_fast, detect_orphan_genitive, detect_single_infinitive,
     detect_foreign_geo,
+    # Info-intent detector — информационные/research/how-to запросы как positive
+    detect_info_intent,
     # Helpers
     _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
@@ -62,6 +64,7 @@ SIGNAL_WEIGHTS = {
     'verb_modifier': 0.85,  # наречие при глаголе seed — лингвистически надёжный
     'conjunctive': 0.8,    # "и подарков" — расширение запроса
     'prep_modifier': 0.85,  # "при болях", "после еды" — лингвистически надёжный (PREP+case)
+    'info_intent': 0.9,     # информационный/research/how-to/troubleshooting запрос — структурный сигнал (вопросительные слова, "это" на конце, "не + VERB")
     
     # Негативные — ЭВРИСТИКИ (могут ошибаться)
     'fragment':        0.8,
@@ -189,7 +192,7 @@ _COMMERCE_INCOMPATIBLE = (
 # Эти детекторы уже надёжно валидировали хвост → дорогой embed не нужен.
 _STRONG_POSITIVES_SKIP_MISMATCH = frozenset({
     'geo', 'brand', 'location', 'contacts', 'time',
-    'verb_modifier', 'prep_modifier', 'conjunctive',
+    'verb_modifier', 'prep_modifier', 'conjunctive', 'info_intent',
 })
 
 
@@ -269,6 +272,7 @@ class TailFunctionClassifier:
             ('verb_modifier', lambda: detect_verb_modifier(tail, self.seed, tp=tp)),
             ('conjunctive',   lambda: detect_conjunctive_extension(tail, self.seed, tp=tp)),
             ('prep_modifier', lambda: detect_prepositional_modifier(tail, self.seed, tp=tp)),
+            ('info_intent',   lambda: detect_info_intent(tail, self.seed, tp=tp)),
         ]
 
         for signal_name, detector in detectors_positive:
@@ -503,7 +507,7 @@ class TailFunctionClassifier:
         if has_positive and has_negative:
             # Приоритет БД-сигналов: если geo или brand подтверждён,
             # а негатив — только эвристика, доверяем БД
-            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive', 'prep_modifier'}
+            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive', 'prep_modifier', 'info_intent'}
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
@@ -512,6 +516,34 @@ class TailFunctionClassifier:
             
             # Некогерентный хвост — не жёсткий, но ограничивает максимум до GREY
             has_incoherent = 'incoherent_tail' in negative
+            
+            # ─── Info-intent guard ───────────────────────────────────────────
+            # Если info_intent (структурный маркер реального пользовательского
+            # запроса: вопросительное слово, "это" на конце, "не + VERB") в позитивах,
+            # и ВСЕ негативы принадлежат whitelist мягких definition-эвристик —
+            # это валидный info/research/how-to/troubleshooting запрос.
+            #
+            # Semantic Agent ищет максимально широкий пул ключей любой направленности:
+            # коммерция, research, definition, how-to. Такие запросы — реальные
+            # вопросы реальных людей, которых Google выдаёт в autocomplete.
+            #
+            # Whitelist негативов — только мягкие эвристики, которые на info-запросах
+            # часто ложно срабатывают:
+            #   meta — помечает "что такое/чем отличается/как называется" (это ВАЛИДНЫЕ паттерны)
+            #   fragment — помечает "X это" и "не VERB" как обрывок (это НЕ обрывки на info-запросах)
+            #   dangling — "чем опасна" имеет висячее ADJ (нормально для info)
+            #   incoherent_tail — на многословных вопросах часто ложно срабатывает
+            #   category_mismatch — chargram не умеет семантически проверять вопросы
+            #
+            # Жёсткие негативы (duplicate, tech_garbage, mixed_alpha, foreign_geo,
+            # intent_mismatch) в whitelist НЕ входят — если они сработали, это
+            # реальный мусор несмотря на info-маркер.
+            if 'info_intent' in positive:
+                _info_whitelist = {'meta', 'fragment', 'dangling', 'incoherent_tail', 'category_mismatch'}
+                if all(s in _info_whitelist for s in negative):
+                    confidence = 0.7
+                    return 'VALID', confidence, pos_score, neg_score
+            # ─────────────────────────────────────────────────────────────────
             
             if has_db_positive and not has_hard_negative and not has_incoherent:
                 # БД говорит VALID, эвристика говорит TRASH → доверяем БД
@@ -523,32 +555,6 @@ class TailFunctionClassifier:
                 return 'GREY', 0.4, pos_score, neg_score
             
             if has_hard_negative:
-                # conjunctive + meta/definition запрос → VALID.
-                # Запросы вида "что такое X", "чем отличается X от Y", "как называется X",
-                # "что лучше X или Y" — это реальные пользовательские вопросы (research,
-                # сравнения, definition-запросы). Semantic Agent ищет максимально широкий
-                # пул ключей — любой тематической направленности. Такие запросы валидны
-                # сами по себе; юзер сам решит, нужны ли они ему (инфо-контент, сравнение,
-                # покупательский research).
-                #
-                # Условия:
-                #   1. 'conjunctive' в позитивах — структура "союз/сравнение + содержание"
-                #      подтверждена. Это маркер ЗАКОНЧЕННОГО запроса, не обрывка.
-                #   2. 'meta' обязательно в негативах — именно definition/comparison-паттерн,
-                #      а не голый fragment-обрывок ("доставка цветов и").
-                #   3. ВСЕ негативы принадлежат whitelist мягких definition-сигналов.
-                #      fragment добавлен потому что "что значит" даёт и meta, и fragment
-                #      одновременно (значит=CONJ на конце) — это тот же definition-паттерн.
-                #
-                # Незакрытый definition (одиночное "зачем" без conjunctive) сюда
-                # НЕ попадает — такие кейсы остаются TRASH (fragment) или GREY по общей
-                # логике арбитража. Это корректная серая зона.
-                if 'conjunctive' in positive and 'meta' in negative:
-                    _definition_whitelist = {'meta', 'incoherent_tail', 'category_mismatch', 'fragment', 'dangling'}
-                    if all(s in _definition_whitelist for s in negative):
-                        confidence = 0.7
-                        return 'VALID', confidence, pos_score, neg_score
-
                 # Мета-вопрос или дублирование → даже бренд не спасает
                 if pos_score > neg_score * 1.5:
                     return 'GREY', 0.3, pos_score, neg_score
