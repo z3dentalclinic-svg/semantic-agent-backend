@@ -200,7 +200,7 @@ def apply_l0_filter(
 
         # ── classify с глобальным tail_parses ───────────────────────────────
         t0 = time.perf_counter()
-        r = clf.classify(tail, tail_parses=tail_parses)
+        r = clf.classify(tail, tail_parses=tail_parses, kw=kw)
         t_classify_total += time.perf_counter() - t0
 
         label = r["label"]
