@@ -498,6 +498,16 @@ def detect_fragment(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool, s
             pass  # "когда"/"сколько" при seed с глаголом = модификатор, не обрывок
         elif last_parsed.tag.POS == 'PREP' and len(words) >= 2 and words[-2] in ('или', 'и', 'либо', 'чи'):
             pass  # Эллипсис: "до еды или после" = "до еды или после [еды]"
+        elif (len(last_word) == 1 and last_word.isalpha()
+              and len(words) >= 2
+              and _get_parses(words[-2], tp)[0].tag.POS == 'NOUN'):
+            # Одиночная буква после NOUN — классификатор/маркер, не обрывок:
+            # "гепатит б", "витамин с", "класс а", "группа о", "тип в".
+            # pymorphy тегирует одиночные буквы как PRCL/CONJ/INTJ, но в контексте
+            # "NOUN + БУКВА" это медицинская/техническая классификация.
+            # Универсальное структурное правило: если перед буквой существительное
+            # — это его маркер, не служебное слово.
+            pass
         else:
             return True, f"Обрывок: '{last_word}' ({last_parsed.tag.POS}) на конце"
     
@@ -1084,7 +1094,40 @@ def detect_broken_grammar(tail: str, tp: dict = None) -> Tuple[bool, str]:
         second_best = second_parses[0]
         if second_best.tag.POS is None:
             return False, ""
-        
+
+        # === ФИКС FP #3: одиночная буква как модификатор/элемент идиомы ===
+        # "от а до я", "при гепатите б" (здесь fragment ловит), "класса а", "витамин с"
+        # Одиночная буква после PREP — не "сломанная грамматика", это классификатор,
+        # буква алфавита в идиоме или медицинская/техническая маркировка.
+        # pymorphy даёт для одиночных букв POS=CONJ/PRCL/INTJ/NOUN(Fixd) — все варианты
+        # ненадёжны в контексте. Универсальное правило: len=1 → skip.
+        if len(second_word) == 1 and second_word.isalpha():
+            return False, ""
+
+        # === ФИКС FP #2: эллипсис после предлога ===
+        # "до или после беременности" — после PREP идёт союз, значит эллипсис:
+        # "до [чего-то] или после [чего-то]". Грамматика не сломана, просто
+        # первый объект опущен. Существующая логика в detect_fragment уже
+        # знает про эллипсис в конце (правило 1), но для broken_grammar
+        # его нужно явно пропустить.
+        if second_best.tag.POS == 'CONJ':
+            return False, ""
+
+        # === ФИКС FP #1: compound term (составной термин) после предлога ===
+        # "без синус лифтинга" — "синус" (nomn) + "лифтинга" (gent) = compound
+        # технический термин, который функционально = одно существительное в gent.
+        # Паттерн: PREP + NOUN(nomn) + NOUN(gent|gen2) в tail длиной >= 3 слов.
+        # Регрессия-safe: если только 2 слова (PREP + NOUN nomn) — это отдельный
+        # ослабляющий guard ниже ("для скутер"), не трогаем.
+        if len(words) >= 3:
+            third_parses = _get_parses(words[2], tp)
+            third_best = third_parses[0]
+            if (second_best.tag.POS == 'NOUN'
+                and second_best.tag.case == 'nomn'
+                and third_best.tag.POS == 'NOUN'
+                and third_best.tag.case in ('gent', 'gen2')):
+                return False, ""
+
         # === ФИКС: Ослабление для search queries ===
         # Паттерн "PREP + NOUN(nomn)" в 2-словном хвосте — типичный search query
         # "для скутер", "на мотоцикл", "от генератор" — человек не склоняет
@@ -1684,8 +1727,12 @@ def detect_truncated_geo_fast(tail: str, geo_db: dict, geo_index: dict, tp: dict
     if lemma in geo_db:
         return False, ""
 
-    # Прилагательные — модификаторы ("старых пылесосов"), не усечённые топонимы
-    if word_parsed.tag.POS in ('ADJF', 'ADJS'):
+    # Прилагательные — модификаторы ("старых пылесосов"), не усечённые топонимы.
+    # Числительные (NUMR) — "двух", "трех", "пяти" — не могут быть обрезанным
+    # топонимом даже если лемма случайно совпала с префиксом города.
+    # FP: "имплантация двух зубов" (tail='двух') → лемма 'два' → 'два ручья',
+    # но 'двух' — числительное в родительном падеже, не город.
+    if word_parsed.tag.POS in ('ADJF', 'ADJS', 'NUMR'):
         return False, ""
 
     # O(1) lookup из pre-built индекса (не вызывает _build_truncated_geo_index)
@@ -1734,8 +1781,12 @@ def detect_truncated_geo(tail: str, geo_db: dict = None, tp: dict = None) -> Tup
     if lemma in geo_db:
         return False, ""
 
-    # Прилагательные — модификаторы ("старых пылесосов"), не усечённые топонимы
-    if word_parsed.tag.POS in ('ADJF', 'ADJS'):
+    # Прилагательные — модификаторы ("старых пылесосов"), не усечённые топонимы.
+    # Числительные (NUMR) — "двух", "трех", "пяти" — не могут быть обрезанным
+    # топонимом даже если лемма случайно совпала с префиксом города.
+    # FP: "имплантация двух зубов" (tail='двух') → лемма 'два' → 'два ручья',
+    # но 'двух' — числительное в родительном падеже, не город.
+    if word_parsed.tag.POS in ('ADJF', 'ADJS', 'NUMR'):
         return False, ""
 
     # O(1) lookup через pre-built индекс вместо O(65k) перебора
