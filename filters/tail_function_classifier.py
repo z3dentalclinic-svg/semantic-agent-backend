@@ -28,6 +28,8 @@ from .function_detectors import (
     detect_foreign_geo,
     # Info-intent detector — информационные/research/how-to запросы как positive
     detect_info_intent,
+    # Premod/Postmod adjective — позиционные детекторы согласованных модификаторов
+    detect_premod_adjective, detect_postmod_adjective,
     # Helpers
     _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
@@ -65,6 +67,8 @@ SIGNAL_WEIGHTS = {
     'conjunctive': 0.8,    # "и подарков" — расширение запроса
     'prep_modifier': 0.85,  # "при болях", "после еды" — лингвистически надёжный (PREP+case)
     'info_intent': 0.9,     # информационный/research/how-to/troubleshooting запрос — структурный сигнал (вопросительные слова, "это" на конце, "не + VERB")
+    'premod_adj':  0.75,    # ADJF/PRTF перед seed, согласованное с ним — модификатор типа ("базальная имплантация")
+    'postmod_adj': 0.75,    # ADJF/PRTF после seed, согласованное с ним — модификатор вида ("имплантация жевательных зубов")
     
     # Негативные — ЭВРИСТИКИ (могут ошибаться)
     'fragment':        0.8,
@@ -122,6 +126,7 @@ _COMMERCE_INCOMPATIBLE = (
 _STRONG_POSITIVES_SKIP_MISMATCH = frozenset({
     'geo', 'brand', 'location', 'contacts', 'time',
     'verb_modifier', 'prep_modifier', 'conjunctive', 'info_intent',
+    'premod_adj', 'postmod_adj',
 })
 
 
@@ -149,13 +154,18 @@ class TailFunctionClassifier:
         from .function_detectors import _build_truncated_geo_index
         self._truncated_geo_index = _build_truncated_geo_index(geo_db) if geo_db else {}
     
-    def classify(self, tail: str, tail_parses: dict = None) -> Dict:
+    def classify(self, tail: str, tail_parses: dict = None, kw: str = "") -> Dict:
         """
         Классифицирует хвост запроса.
 
         tail_parses: глобальный словарь {слово → morph.parse(слово)} для всего батча.
         Строится один раз в l0_filter.py и передаётся сюда.
         Детекторы используют его вместо независимых вызовов morph.parse.
+
+        kw: оригинальный ключевой запрос (kw=seed+tail в разных позициях).
+        Нужен для позиционных детекторов (premod/postmod), которые определяют
+        позицию tail относительно seed. Если kw не передан — позиционные
+        детекторы просто не срабатывают, остальные работают как обычно.
 
         Returns:
             {
@@ -202,6 +212,8 @@ class TailFunctionClassifier:
             ('conjunctive',   lambda: detect_conjunctive_extension(tail, self.seed, tp=tp)),
             ('prep_modifier', lambda: detect_prepositional_modifier(tail, self.seed, tp=tp)),
             ('info_intent',   lambda: detect_info_intent(tail, self.seed, tp=tp)),
+            ('premod_adj',    lambda: detect_premod_adjective(tail, self.seed, kw, tp=tp)),
+            ('postmod_adj',   lambda: detect_postmod_adjective(tail, self.seed, kw, tp=tp)),
         ]
 
         for signal_name, detector in detectors_positive:
@@ -350,7 +362,9 @@ class TailFunctionClassifier:
         if has_positive and has_negative:
             # Приоритет БД-сигналов: если geo или brand подтверждён,
             # а негатив — только эвристика, доверяем БД
-            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive', 'prep_modifier', 'info_intent'}
+            db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive',
+                          'prep_modifier', 'info_intent',
+                          'premod_adj', 'postmod_adj'}
             has_db_positive = bool(set(positive) & db_signals)
             
             # Жёсткие негативные (почти всегда правы)
