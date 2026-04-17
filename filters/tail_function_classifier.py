@@ -370,6 +370,16 @@ class TailFunctionClassifier:
         
         # --- Случай 3: Конфликт ---
         if has_positive and has_negative:
+            # Абсолютные блокаторы — жёсткие вердикты, которые перевешивают
+            # любые позитивы. foreign_geo: если в kw чужое гео при target=UA,
+            # ключ не может быть "нашим" клиентом никакими коммерческими/info
+            # сигналами. Это вердикт о неприменимости, не об интенте.
+            # Сейчас только foreign_geo — другие hard_negatives требуют
+            # info_intent whitelist (meta) или не конфликтуют с позитивами.
+            absolute_blockers = {'foreign_geo'}
+            if set(negative) & absolute_blockers:
+                return 'TRASH', 0.9, pos_score, neg_score
+            
             # Приоритет БД-сигналов: если geo или brand подтверждён,
             # а негатив — только эвристика, доверяем БД
             db_signals = {'geo', 'brand', 'verb_modifier', 'conjunctive',
