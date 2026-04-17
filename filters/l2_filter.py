@@ -347,10 +347,22 @@ class L2Classifier:
         
         return (best_score, best_detail)
     
+    # Мягкие L0 негативы — информационные, НЕ блокируют VALID в L2.
+    # category_mismatch — chargram эвристика, срабатывает почти всегда
+    # (большинство tails лексически далеки от seed). Один сам по себе
+    # НЕ значит что ключ мусорный — это подсказка, не вердикт.
+    # Если это единственный негатив, считаем что L0 не нашёл проблем
+    # (pure_neg = False).
+    _SOFT_L0_NEGATIVES = frozenset({'category_mismatch'})
+
     def _parse_l0_signals(self, l0_trace: List[dict]) -> Dict[str, dict]:
         """
         Парсим L0 trace → для каждого keyword:
-        positive, negative, pure_neg (neg без pos).
+        positive, negative, pure_neg (hard neg без pos).
+
+        pure_neg = True только если есть ЖЁСТКИЕ негативные сигналы
+        (не считаем мягкий category_mismatch). Мягкие остаются в negative
+        для отладки/трассировки, но не блокируют R1 (high PMI → VALID).
         """
         result = {}
         for trace in l0_trace:
@@ -358,10 +370,12 @@ class L2Classifier:
             signals = trace.get("signals", [])
             neg = [s.lstrip('-') for s in signals if s.startswith('-')]
             pos = [s for s in signals if not s.startswith('-')]
+            # Жёсткие негативы — всё что не мягкое
+            hard_neg = [n for n in neg if n not in self._SOFT_L0_NEGATIVES]
             result[kw] = {
                 "positive": pos,
-                "negative": neg,
-                "pure_neg": bool(neg) and not bool(pos),
+                "negative": neg,  # храним все для трассировки
+                "pure_neg": bool(hard_neg) and not bool(pos),
             }
         return result
     
@@ -508,9 +522,16 @@ class L2Classifier:
         # === Извлекаем хвосты GREY ===
         # Несколько keyword могут иметь ОДИН tail (позиционные варианты:
         # "имплантация зубов этапы" и "этапы имплантация зубов" оба → tail='этапы').
-        # Храним все kw на каждый tail в списке, считаем embed/PMI один раз,
+        # Храним все kw на каждый tail в списке, считаем embed/PMI/KNN один раз,
         # финальный label применяем ко всем kw из списка.
-        grey_tails = []                  # уникальные tails
+        #
+        # Два списка:
+        # - grey_tails_unique: для цикла классификации (embed/KNN/morph/решение)
+        # - grey_tails_all: для PMI document frequency (со всеми повторами, как было
+        #   в оригинале). PMI — это частотный сигнал, ему нужна реальная частота
+        #   слов во входе, не дедуплицированная.
+        grey_tails = []                    # уникальные tails (используется в цикле)
+        grey_tails_all = []                # все вхождения (для PMI word_df)
         tail_to_kws: Dict[str, list] = {}  # tail → список всех kw с этим tail
         kw_to_tail = {}
 
@@ -530,8 +551,9 @@ class L2Classifier:
             if tail and tail.lower().strip() != keyword.lower().strip():
                 if tail not in tail_to_kws:
                     tail_to_kws[tail] = []
-                    grey_tails.append(tail)  # добавляем в grey_tails только один раз
+                    grey_tails.append(tail)  # в уникальный список — один раз
                 tail_to_kws[tail].append(kw)
+                grey_tails_all.append(tail)  # в PMI-список — каждое вхождение
                 kw_to_tail[keyword] = tail
         
         # L0 VALID хвосты для KNN + PMI
@@ -552,7 +574,11 @@ class L2Classifier:
         )
         
         # === SIGNAL 1: PMI ===
-        all_tails_for_df = valid_tails + grey_tails
+        # PMI использует список со ВСЕМИ вхождениями (grey_tails_all), не уникальный.
+        # word_df = document frequency = количество документов содержащих слово.
+        # Если несколько kw имеют одинаковый tail, каждый kw считается отдельным
+        # "документом" — это соответствует исходной логике до фикса коллизий.
+        all_tails_for_df = valid_tails + grey_tails_all
         word_df = self._compute_word_df(all_tails_for_df)
         pmi_scores = {tail: self._pmi_score(tail, word_df) for tail in grey_tails}
         
