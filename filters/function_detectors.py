@@ -9,9 +9,58 @@ function_detectors.py — 11 детекторов функции хвоста.
 """
 
 import pymorphy3  # noqa: F401
+import json
+import os
+import logging
 from typing import Tuple, Set, Dict
 
 from .shared_morph import morph
+
+logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISTRICT_TO_CANONICAL — слова которые являются районами/улицами городов.
+# Загружается из districts.json один раз при импорте модуля.
+#
+# Используется в detect_foreign_geo как guard: если слово есть в этой базе,
+# оно скорее всего район или улица, НЕ независимый город-топоним. Это защищает
+# от ложных срабатываний foreign_geo на словах-омонимах фамилий (гагарина,
+# ленина, шевченко), которые geonamescache может содержать как микрорайоны
+# в других городах, но в контексте запроса они означают улицу в seed-city.
+#
+# Каждый фильтр держит собственную копию базы (независимость модулей).
+# Память: ~7 МБ — несущественно.
+# ═══════════════════════════════════════════════════════════════════════════
+_DISTRICT_TO_CANONICAL: Dict[str, str] = {}
+
+def _load_districts():
+    """Загружает districts.json один раз при импорте модуля.
+    Возвращает dict: district_name → canonical_city (lowercased)."""
+    global _DISTRICT_TO_CANONICAL
+    try:
+        _path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "districts.json"
+        )
+        if not os.path.exists(_path):
+            logger.warning("[FOREIGN_GEO_GUARD] districts.json not found at %s", _path)
+            return
+        with open(_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        _DISTRICT_TO_CANONICAL = {
+            name.lower(): info.get("city", "").lower()
+            for name, info in raw.items()
+            if isinstance(info, dict)
+        }
+        logger.info(
+            "[FOREIGN_GEO_GUARD] loaded %d district entries from districts.json",
+            len(_DISTRICT_TO_CANONICAL)
+        )
+    except Exception as e:
+        logger.error("[FOREIGN_GEO_GUARD] failed to load districts.json: %s", e)
+        _DISTRICT_TO_CANONICAL = {}
+
+_load_districts()
 
 
 def _get_parses(word: str, tp: dict = None):
@@ -1928,7 +1977,8 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
         return False, ""
     
     # === Основная проверка ===
-    for word in words:
+    # Для контекстного определения улицы нужен индекс слов.
+    for i_word, word in enumerate(words):
         # Один вызов — получаем и первый парс и все парсы для Geox check
         all_parses = _get_parses(word, tp)
         parsed = all_parses[0]
@@ -1945,6 +1995,28 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
             check_forms.add(nomn_form.word)
 
         has_geox = any('Geox' in str(p.tag) for p in all_parses)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # Guard: DISTRICT_TO_CANONICAL — слово является районом/улицей
+        # ═══════════════════════════════════════════════════════════════════
+        # Если слово (или его лемма) есть в базе районов/улиц (districts.json),
+        # это НЕ независимый город-топоним, а район/микрорайон/улица. Примеры:
+        #
+        #   "гагарина"  → district of жуковский (RU)  → реально улица Гагарина
+        #                                                в любом городе
+        #   "ленина"    → district of улан-удэ (RU)   → реально улица Ленина
+        #   "шевченко"  → district of одеса (UA)      → район/улица Шевченко
+        #
+        # geonamescache часто содержит такие имена как "микрорайон имени X",
+        # где X — фамилия. В контексте запроса пользователя они означают
+        # улицу/район в seed-city (например "автовыкуп одесса на гагарина"
+        # = улица Гагарина в Одессе, не город Гагарин в РФ).
+        #
+        # Реальные города совпадающие с фамилиями (Пушкин, Гагарин, Королёв,
+        # Чехов, Чайковский) в DISTRICT_TO_CANONICAL ОТСУТСТВУЮТ — проверено
+        # на базе 288k записей. Они будут обработаны обычной логикой ниже.
+        if word in _DISTRICT_TO_CANONICAL or lemma in _DISTRICT_TO_CANONICAL:
+            continue
         
         # Проверка 1: чужой город (geo_db) — только для географических слов
         if has_geox:
