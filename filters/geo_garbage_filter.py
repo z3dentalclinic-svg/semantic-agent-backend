@@ -781,6 +781,15 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                         # Прилагательное без Geox → не город ("железнодорожный", "центральный")
                         if pos == 'ADJF' and 'Geox' not in tag_str:
                             continue
+                        # "на + Surn" = адрес улицы (ул. Гагарина, ул. Ленина, ул. Шевченко)
+                        # Surn без явного Geox означает фамилию; когда ей предшествует
+                        # предлог "на" — это указатель адреса, не город.
+                        # Не трогаем слова где Surn сочетается с Geox (редкие случаи
+                        # где фамилия совпадает с городом на уровне базы).
+                        if 'Surn' in tag_str and 'Geox' not in tag_str:
+                            _idx = _word_positions.get(raw_word, -1)
+                            if _idx > 0 and words[_idx - 1] == 'на':
+                                continue
                         # Обычный NOUN без Geox/Surn/Name ни в одном разборе → не город
                         # "тендер", "рынок", "вокзал" — нарицательные, не топонимы
                         if pos == 'NOUN':
@@ -841,10 +850,19 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
             
             # П4: логика зависит от наличия города в seed
             if len(cities_in_query) > 0:
-                other_cities = {c for c in cities_in_query if c != seed_city}
+                # Нормализация: seed_city может быть в nomn ('одесса'), а в query
+                # может быть в падеже ('одессе' → loct). Сравниваем по нормальной
+                # форме чтобы не считать разные падежи одного города двумя городами.
+                # _normalize_token обрезает падежные окончания: 'одессе'→'одесс',
+                # 'одесса'→'одесс' → равны.
+                seed_city_norm = _normalize_token(seed_city)
+                other_cities = {
+                    c for c in cities_in_query
+                    if _normalize_token(c) != seed_city_norm
+                }
                 if other_cities:
                     if seed_city:
-                        # seed С городом → любой другой город = BLOCK (включая UA)
+                        # seed С городом → любой ДРУГОЙ город = BLOCK (включая UA)
                         stats['blocked_multi_city'] += 1
                         blocked_reasons[query_lower.strip()] = f"2+ города: {sorted(other_cities)}"
                         continue
