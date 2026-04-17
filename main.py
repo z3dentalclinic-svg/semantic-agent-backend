@@ -27,6 +27,7 @@ from filters import (
     apply_l2_filter,   # ← L2 Tri-Signal классификатор (PMI + Centroid + L0 signals)
     apply_l3_filter,   # ← L3 DeepSeek LLM классификатор (финальная GREY)
     L3Config,          # ← конфигурация L3
+    group_valid_keywords,  # ← группировка VALID по детекторным сигналам
 )
 from filters.geo_garbage_filter import _GEO_POPULATION_CACHE  # population cache для BPF
 from geo import generate_geo_blacklist_full
@@ -1243,6 +1244,20 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             unique_anchors.append(a)
     result["anchors"] = unique_anchors
     result["anchors_count"] = len(unique_anchors)
+    
+    # ── Группировка VALID по детекторным сигналам ─────────────────────────────
+    # Добавляет result["groups"] со структурой:
+    #   {"order": [...], "by_group": {...}, "summary": {...}}
+    # Работает после всех фильтров (L0 + L2 + L3) — группирует финальный VALID пул.
+    # L2/L3 promoted ключи без L0 сигналов попадают в группу "other".
+    # Оригинальный result["keywords"] не меняется.
+    _t0 = time.time()
+    try:
+        result = group_valid_keywords(result, seed=seed)
+        _timings["grouping"] = round(time.time() - _t0, 4)
+    except Exception as e:
+        logger.warning(f"[GROUPING] Failed: {e}")
+        result["groups"] = {"order": [], "by_group": {}, "summary": {}}
     
     result["_trace"] = parser.tracer.finish_request()
 
