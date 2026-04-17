@@ -506,8 +506,12 @@ class L2Classifier:
                 l0_seed_not_found.add(kw_lower)
 
         # === Извлекаем хвосты GREY ===
-        grey_tails = []
-        tail_to_kw = {}
+        # Несколько keyword могут иметь ОДИН tail (позиционные варианты:
+        # "имплантация зубов этапы" и "этапы имплантация зубов" оба → tail='этапы').
+        # Храним все kw на каждый tail в списке, считаем embed/PMI один раз,
+        # финальный label применяем ко всем kw из списка.
+        grey_tails = []                  # уникальные tails
+        tail_to_kws: Dict[str, list] = {}  # tail → список всех kw с этим tail
         kw_to_tail = {}
 
         for kw in grey_keywords:
@@ -524,8 +528,10 @@ class L2Classifier:
             # Если tail == полный keyword — seed не был найден, L0 использовал fallback.
             # Такой keyword классифицировать нельзя: PMI будет считаться по случайным словам.
             if tail and tail.lower().strip() != keyword.lower().strip():
-                grey_tails.append(tail)
-                tail_to_kw[tail] = kw
+                if tail not in tail_to_kws:
+                    tail_to_kws[tail] = []
+                    grey_tails.append(tail)  # добавляем в grey_tails только один раз
+                tail_to_kws[tail].append(kw)
                 kw_to_tail[keyword] = tail
         
         # L0 VALID хвосты для KNN + PMI
@@ -586,8 +592,11 @@ class L2Classifier:
         classified = {"valid": [], "grey": [], "trash": []}
         
         for tail in grey_tails:
-            kw = tail_to_kw.get(tail)
-            keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
+            # Для l0_signals lookup используем первый kw (любой подойдёт — l0_signals
+            # идентичны для всех kw с одинаковым tail, т.к. зависят от tail а не от kw)
+            kws_for_tail = tail_to_kws.get(tail, [])
+            kw = kws_for_tail[0] if kws_for_tail else None
+            keyword = kw.get("keyword", tail) if isinstance(kw, dict) else (kw if isinstance(kw, str) else tail)
             
             pmi = pmi_scores.get(tail, 0)
             knn = knn_scores.get(tail, 0.0)
@@ -679,8 +688,8 @@ class L2Classifier:
         l2_valid = []
         for item in classified["valid"]:
             tail = item["tail"]
-            if tail in tail_to_kw:
-                kw = tail_to_kw[tail]
+            # Если несколько keyword имели один tail — все получают тот же label
+            for kw in tail_to_kws.get(tail, []):
                 if isinstance(kw, dict):
                     kw = kw.copy()
                 debug = item.get("debug", {})
@@ -697,8 +706,8 @@ class L2Classifier:
                         "decision": debug.get("decision", ""),
                     }
                 l2_valid.append(kw)
-        # Дедупликация при сборке: L0_valid + L2_promoted могут содержать один ключ дважды
-        # (коллизия хвостов в tail_to_kw или повторная промоция).
+        # Дедупликация при сборке: L0_valid и L2_promoted могут содержать один ключ дважды
+        # (ключ уже был в L0 VALID и L2 пытается его повторно промоутить).
         _l2_seen: set = set()
         _l2_merged: list = []
         for _kw in l0_result.get("keywords", []) + l2_valid:
@@ -713,8 +722,7 @@ class L2Classifier:
         l2_trash = []
         for item in classified["trash"]:
             tail = item["tail"]
-            if tail in tail_to_kw:
-                kw = tail_to_kw[tail]
+            for kw in tail_to_kws.get(tail, []):
                 if isinstance(kw, dict):
                     kw = kw.copy()
                     kw["anchor_reason"] = "L2_TRASH"
@@ -732,8 +740,7 @@ class L2Classifier:
         l2_grey = []
         for item in classified["grey"]:
             tail = item["tail"]
-            if tail in tail_to_kw:
-                kw = tail_to_kw[tail]
+            for kw in tail_to_kws.get(tail, []):
                 if isinstance(kw, dict):
                     kw = kw.copy()
                 debug = item.get("debug", {})
@@ -785,20 +792,28 @@ class L2Classifier:
             for item in classified[category]:
                 tail = item["tail"]
                 debug = item.get("debug", {})
-                kw = tail_to_kw.get(tail)
-                keyword = kw.get("keyword", tail) if isinstance(kw, dict) else tail
-                l2_trace.append({
-                    "keyword": keyword, "tail": tail, "label": lbl,
-                    "pmi": debug.get("pmi", 0),
-                    "knn_score": debug.get("knn_score", 0),
-                    "morph_score": debug.get("morph_score", 0),
-                    "morph_detail": debug.get("morph_detail", ""),
+                # Один trace-запись на каждый keyword с этим tail
+                kws_for_tail = tail_to_kws.get(tail, [])
+                if not kws_for_tail:
+                    # fallback если tail как-то потерялся
+                    kws_for_tail = [None]
+                for kw in kws_for_tail:
+                    if kw is None:
+                        keyword = tail
+                    else:
+                        keyword = kw.get("keyword", tail) if isinstance(kw, dict) else str(kw)
+                    l2_trace.append({
+                        "keyword": keyword, "tail": tail, "label": lbl,
+                        "pmi": debug.get("pmi", 0),
+                        "knn_score": debug.get("knn_score", 0),
+                        "morph_score": debug.get("morph_score", 0),
+                        "morph_detail": debug.get("morph_detail", ""),
                         "ref_overlap": debug.get("ref_overlap", []),
-                    "spec_token": debug.get("spec_token", ""),
-                    "l0_pos": debug.get("l0_pos", []),
-                    "l0_neg": debug.get("l0_neg", []),
-                    "decision": debug.get("decision", ""),
-                })
+                        "spec_token": debug.get("spec_token", ""),
+                        "l0_pos": debug.get("l0_pos", []),
+                        "l0_neg": debug.get("l0_neg", []),
+                        "decision": debug.get("decision", ""),
+                    })
         result["l2_trace"] = l2_trace
         
         # === Diagnostic dump ===
