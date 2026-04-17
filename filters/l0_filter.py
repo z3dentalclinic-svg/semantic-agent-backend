@@ -96,6 +96,8 @@ def apply_l0_filter(
         result с обновлёнными keywords, keywords_grey, anchors, _l0_trace, _filter_timings
     """
     t_l0_start = time.perf_counter()
+    # Детальные тайминги этапов L0 для диагностики узких мест
+    _t_stage = {}
 
     keywords = result.get("keywords", [])
     if not keywords:
@@ -111,11 +113,15 @@ def apply_l0_filter(
 
     # ── Pre-compute seed_ctx ОДИН РАЗ для всего батча ──────────────────────
     # Seed одинаков для всех ключей → лематизация seed не повторяется N раз.
+    _t = time.perf_counter()
     seed_lower = seed.lower().strip()
     seed_ctx = build_seed_ctx(seed_lower)
+    _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
+    _t = time.perf_counter()
     clf = _get_classifier(seed, target_country, geo_db, brand_db)
+    _t_stage['get_classifier'] = time.perf_counter() - _t
 
     # ── Глобальный словарь morph-парсов для всего батча ────────────────────
     from .shared_morph import morph as _morph
@@ -124,6 +130,7 @@ def apply_l0_filter(
     t_classify_total = 0.0
 
     # Первый проход: собрать все хвосты и уникальные слова
+    _t = time.perf_counter()
     _kw_tail_pairs = []
     _all_tail_words: set = set()
     for kw_item in keywords:
@@ -136,9 +143,12 @@ def apply_l0_filter(
         _kw_tail_pairs.append((kw_item, kw, tail))
         if tail:
             _all_tail_words.update(tail.lower().split())
+    _t_stage['collect_tails_loop'] = time.perf_counter() - _t
 
     # Один проход morph.parse для всех уникальных слов
+    _t = time.perf_counter()
     tail_parses = {w: _morph.parse(w) for w in _all_tail_words}
+    _t_stage['morph_parse_batch'] = time.perf_counter() - _t
 
     # ── Pre-batch embeddings для category_mismatch ───────────────────────────
     # category_mismatch имеет каскад Stage 1 (chargram) → Stage 2 (MiniLM).
@@ -149,6 +159,8 @@ def apply_l0_filter(
     #
     # Экономия: 7-8 секунд (индивидуальные вызовы MiniLM) → ~0.3 секунды
     # (один батч для всех проблемных tails).
+    _t = time.perf_counter()
+    _stage2_count = 0
     try:
         from .category_mismatch_detector import (
             get_category_detector, _chargram_similarity, CategoryConfig
@@ -169,6 +181,7 @@ def apply_l0_filter(
             cg = _chargram_similarity(_seed_for_cm, t_clean, _cm_cfg.ngram_size)
             if _cm_cfg.chargram_low < cg < _cm_cfg.chargram_high:
                 _stage2_tails.append(t_clean)
+        _stage2_count = len(_stage2_tails)
         if _stage2_tails:
             _cm_detector.pre_batch(_stage2_tails)
     except ImportError:
@@ -176,12 +189,16 @@ def apply_l0_filter(
         pass
     except Exception as e:
         logger.warning("[L0] pre_batch for category_mismatch failed: %s", e)
+    _t_stage['pre_batch_cm'] = time.perf_counter() - _t
+    _t_stage['_stage2_count'] = _stage2_count
 
     valid_keywords = []
     grey_keywords = []
     trash_keywords = []
     trace_records = []
 
+    # Замер всего основного цикла (включая classify, UA check, NO_SEED, etc.)
+    _t_loop_start = time.perf_counter()
     for kw_item, kw, tail in _kw_tail_pairs:
 
         # ── UA-язык → TRASH (ДО любой другой классификации) ───────────────
@@ -262,6 +279,7 @@ def apply_l0_filter(
             grey_keywords.append(kw_item)
 
     # ── Обновляем result ─────────────────────────────────────────────────────
+    _t_stage['main_loop'] = time.perf_counter() - _t_loop_start
 
     result["keywords"] = valid_keywords
     result["count"] = len(valid_keywords)
@@ -280,6 +298,7 @@ def apply_l0_filter(
     result["_l0_trace"] = trace_records
 
     # ── Сохраняем диагностику ────────────────────────────────────────────────
+    _t = time.perf_counter()
     try:
         import json as _json
         diag = {
@@ -298,10 +317,16 @@ def apply_l0_filter(
             _json.dump(diag, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("[L0] Failed to save diagnostic: %s", e)
+    _t_stage['save_diagnostic'] = time.perf_counter() - _t
 
     # ── Тайминги ─────────────────────────────────────────────────────────────
     t_l0_total = time.perf_counter() - t_l0_start
     _add_timings(result, t_extract_total, t_classify_total, t_l0_total)
+
+    # Детальный лог этапов — видно где 8 секунд прячется
+    _stages_str = " | ".join(f"{k}={v:.3f}s" if isinstance(v, float) else f"{k}={v}"
+                              for k, v in _t_stage.items())
+    logger.info("[L0_STAGES] %s", _stages_str)
 
     # ── Лог итогов ──────────────────────────────────────────────────────────
     total = len(trace_records)
