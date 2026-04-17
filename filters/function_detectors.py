@@ -162,13 +162,22 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
     # Проверяем многословные названия (нью йорк, кривой рог, новая зеландия)
     if len(words) >= 2:
         bigram = ' '.join(words[:2])
-        if bigram in geo_db:
-            if target in geo_db[bigram]:
-                return True, f"Город (биграмм): '{bigram}' ({target})"
+        # Нормализация дефис↔пробел: Google Autocomplete обычно возвращает
+        # мультислов через пробел ("ивано франковск"), а geo_db может хранить
+        # через дефис ("ивано-франковск") — или наоборот. Проверяем оба варианта.
+        bigram_variants = {bigram, bigram.replace(' ', '-'), bigram.replace('-', ' ')}
+        for variant in bigram_variants:
+            if variant in geo_db:
+                if target in geo_db[variant]:
+                    return True, f"Город (биграмм): '{variant}' ({target})"
+                # вариант найден, но не для target → значит чужое гео
+                break  # продолжать бессмысленно
         # Страна-биграмм: "саудовская аравия", "новая зеландия"
-        if bigram in _COUNTRIES:
-            if _COUNTRIES[bigram] == target:
-                return True, f"Страна (биграмм): '{bigram}' ({target})"
+        for variant in bigram_variants:
+            if variant in _COUNTRIES:
+                if _COUNTRIES[variant] == target:
+                    return True, f"Страна (биграмм): '{variant}' ({target})"
+                break
     
     return False, ""
 
@@ -1518,11 +1527,14 @@ def detect_prepositional_modifier(tail: str, seed: str = "", tp: dict = None) ->
     if not tail_words:
         return False, ""
     
-    # 1. Seed должен содержать глагол
-    if not _seed_has_verb(seed):
-        return False, ""
+    # Раньше тут был guard `if not _seed_has_verb(seed): return False`
+    # который блокировал детектор для noun-seed ("имплантация зубов",
+    # "ремонт пылесосов"). Это резало валидные ключи типа
+    # "имплантация зубов без боли / для детей / при диабете".
+    # Структурной защиты достаточно: PREP + правильный падеж для конкретного
+    # предлога — это надёжный сигнал, работающий одинаково для любого seed.
     
-    # 2. Tail должен начинаться с предлога
+    # Tail должен начинаться с предлога
     first_word = tail_words[0]
     first_parsed = _get_parses(first_word, tp)[0]
     
@@ -1545,6 +1557,10 @@ def detect_prepositional_modifier(tail: str, seed: str = "", tp: dict = None) ->
         'около': {'gent', 'gen2'},
         'вместо': {'gent', 'gen2'},
         'кроме': {'gent', 'gen2'},
+        'у': {'gent', 'gen2'},     # "у кого/чего" — привязка к получателю/обладателю
+                                    # "имплантация зубов у собак", "у детей", "у пенсионеров"
+                                    # Раньше считался "аргументным" (зависит от глагола),
+                                    # но для noun-seed это валидная структурная привязка.
         'при': {'loct', 'loc2'},
         'по': {'datv'},
         'перед': {'ablt'},
@@ -1950,6 +1966,34 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
                     if country_code != target:
                         return True, f"Чужая страна: '{check_word}' ({country_code}, не {target})"
                     break
+    
+    # === Проверка биграмм (мультислов топонимов) ===
+    # Google Autocomplete часто отдаёт мультисловные города через пробел
+    # ("улан удэ", "ханты мансийск"), а geo_db хранит через дефис
+    # ("улан-удэ"). Проверяем обе нормализации.
+    # Не требует Geox-guard: биграммы достаточно специфичны (6+ символов),
+    # ложных срабатываний на общих словах не даёт.
+    for i in range(len(words) - 1):
+        w1, w2 = words[i], words[i + 1]
+        # пропускаем служебные
+        p1 = _get_parses(w1, tp)[0]
+        p2 = _get_parses(w2, tp)[0]
+        if p1.tag.POS in skip_pos or p2.tag.POS in skip_pos:
+            continue
+        bigram = f"{w1} {w2}"
+        bigram_variants = {bigram, bigram.replace(' ', '-')}
+        for variant in bigram_variants:
+            if variant in geo_db:
+                countries = geo_db[variant]
+                if target not in countries:
+                    foreign = ', '.join(sorted(countries))
+                    return True, f"Чужой город (биграмм): '{variant}' ({foreign}, не {target})"
+                break
+            if variant in _COUNTRIES:
+                country_code = _COUNTRIES[variant]
+                if country_code != target:
+                    return True, f"Чужая страна (биграмм): '{variant}' ({country_code}, не {target})"
+                break
     
     return False, ""
 
