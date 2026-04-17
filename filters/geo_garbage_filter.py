@@ -785,9 +785,26 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in DISTRICT_TO_CANONICAL or word_norm in DISTRICT_TO_CANONICAL:
                     continue
 
+                # ═══════════════════════════════════════════════════════════
+                # Проверка: слово явно присутствует в geo_entities как город?
+                # ═══════════════════════════════════════════════════════════
+                # Делаем это ДО morph guard (ADJF/NOUN без Geox), потому что
+                # некоторые города pymorphy разбирает как ADJF без Geox
+                # (Хмельницкий, Железнодорожный, Минераловодский). Если база
+                # geonamescache их содержит — доверяем базе, не pymorphy.
+                # Если же слово не нашлось в базе — дальше применяем morph
+                # guard как обычно (Николай=Name, центральный=ADJF и т.д.).
+                _found_in_geo = False
+                for check_word in [raw_word, word_norm]:
+                    if check_word in all_geo_entities:
+                        if all_geo_entities[check_word][1] == 'city':
+                            _found_in_geo = True
+                            break
+
                 # Guard: пропускаем слова которые явно не являются городами
+                # Применяем только если слово НЕ найдено в geo_entities.
                 # Расширенная логика — аналогична guard'у в seed_city detection
-                if _morph_geox and len(raw_word) > 2 and not raw_word.isascii():
+                if not _found_in_geo and _morph_geox and len(raw_word) > 2 and not raw_word.isascii():
                     parses = _morph_geox.parse(raw_word)
                     if parses:
                         pos = parses[0].tag.POS
