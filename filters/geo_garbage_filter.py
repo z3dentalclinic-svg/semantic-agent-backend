@@ -768,6 +768,23 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
 
+                # ═══════════════════════════════════════════════════════════
+                # DISTRICT_TO_CANONICAL guard — слово является районом/улицей
+                # ═══════════════════════════════════════════════════════════
+                # Если слово есть в базе районов (districts.json) в ЛЮБОМ
+                # городе — это НЕ независимый город-топоним, а район или
+                # улица. Примеры ложных срабатываний без этого guard'а:
+                #
+                #   "автовыкуп одесса на гагарина" — geonamescache знает
+                #   "гагарин" как город в РФ. Без guard'а считается 2 города
+                #   (одесса + гагарин). С guard'ом: "гагарина" есть в DISTRICT
+                #   базе как микрорайон Жуковского → пропускаем, это улица.
+                #
+                # Реальные города-фамилии (Пушкин, Королёв, Чехов) в DISTRICT
+                # базе отсутствуют — их обработает обычная логика cities.
+                if raw_word in DISTRICT_TO_CANONICAL or word_norm in DISTRICT_TO_CANONICAL:
+                    continue
+
                 # Guard: пропускаем слова которые явно не являются городами
                 # Расширенная логика — аналогична guard'у в seed_city detection
                 if _morph_geox and len(raw_word) > 2 and not raw_word.isascii():
@@ -781,15 +798,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                         # Прилагательное без Geox → не город ("железнодорожный", "центральный")
                         if pos == 'ADJF' and 'Geox' not in tag_str:
                             continue
-                        # "на + Surn" = адрес улицы (ул. Гагарина, ул. Ленина, ул. Шевченко)
-                        # Surn без явного Geox означает фамилию; когда ей предшествует
-                        # предлог "на" — это указатель адреса, не город.
-                        # Не трогаем слова где Surn сочетается с Geox (редкие случаи
-                        # где фамилия совпадает с городом на уровне базы).
-                        if 'Surn' in tag_str and 'Geox' not in tag_str:
-                            _idx = _word_positions.get(raw_word, -1)
-                            if _idx > 0 and words[_idx - 1] == 'на':
-                                continue
                         # Обычный NOUN без Geox/Surn/Name ни в одном разборе → не город
                         # "тендер", "рынок", "вокзал" — нарицательные, не топонимы
                         if pos == 'NOUN':
