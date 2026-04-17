@@ -1,5 +1,5 @@
 """
-TailFunctionClassifier v23 — исправленный классификатор.
+TailFunctionClassifier v2 — исправленный классификатор.
 
 Изменения относительно v1:
 1. Пустой хвост = VALID (запрос = seed), не TRASH
@@ -123,10 +123,20 @@ _COMMERCE_INCOMPATIBLE = (
 # Сильные позитивные сигналы — если есть хотя бы один,
 # category_mismatch пропускается (Stage 0 short-circuit).
 # Эти детекторы уже надёжно валидировали хвост → дорогой embed не нужен.
+# Сильные позитивные сигналы — если есть хотя бы один,
+# category_mismatch пропускается (Stage 0 short-circuit).
+# Любой позитивный детектор уже подтвердил что хвост содержит валидный интент —
+# дорогая semantic проверка не даёт дополнительной точности.
+# category_mismatch — мягкий safety-net для хвостов БЕЗ позитивов.
 _STRONG_POSITIVES_SKIP_MISMATCH = frozenset({
-    'geo', 'brand', 'location', 'contacts', 'time',
+    # Database / structural
+    'geo', 'brand',
+    # Pattern-based strong positives
+    'location', 'contacts', 'time',
     'verb_modifier', 'prep_modifier', 'conjunctive', 'info_intent',
     'premod_adj', 'postmod_adj',
+    # Commerce / reputation / action / type — если сработали, интент подтверждён
+    'commerce', 'reputation', 'action', 'type_spec',
 })
 
 
