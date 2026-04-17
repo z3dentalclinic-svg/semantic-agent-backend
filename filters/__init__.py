@@ -9,6 +9,7 @@ Contains all filtering logic:
 - l0_filter: Layer 0 structural classifier (26 detectors)
 - l2_filter: Layer 2 semantic classifier (Dual Cosine embeddings)
 - l3_filter: Layer 3 DeepSeek LLM classifier (remaining GREY)
+- keyword_grouping: Final VALID grouping by detector signals (geo/commerce/info/...)
 """
 import json
 import os
@@ -22,6 +23,7 @@ from .relevance_filter import filter_relevant_keywords
 from .l0_filter import apply_l0_filter
 from .l2_filter import L2Classifier, apply_l2_filter
 from .l3_filter import apply_l3_filter, L3Config
+from .keyword_grouping import group_valid_keywords, get_group_label
 
 logger = logging.getLogger(__name__)
 
@@ -60,4 +62,6 @@ __all__ = [
     'apply_l2_filter',
     'apply_l3_filter',
     'L3Config',
+    'group_valid_keywords',
+    'get_group_label',
 ]
