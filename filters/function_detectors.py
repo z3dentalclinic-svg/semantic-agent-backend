@@ -1055,8 +1055,39 @@ def detect_dangling(tail: str, seed: str = "ремонт пылесосов", ge
     has_noun = False
     adj_words_info = []
 
+    # Маркеры именованных сущностей pymorphy3: географические названия,
+    # фамилии, имена, неизменяемые имена собственные, singular tantum.
+    # Используются для отсечения ложного dangling на транслитерациях брендов
+    # (глово, дреаме и пр.), которые pymorphy тегирует ADJS первым разбором,
+    # но имеют NOUN-разбор с маркером имени собственного.
+    NAMED_ENTITY_MARKERS = ('Geox', 'Sgtm', 'Name', 'Surn', 'Fixd')
+
     for i, (w, p) in enumerate(zip(words, parsed_first)):
         if p.tag.POS in ('ADJF', 'ADJS'):
+            # === FIX FP (глово): ambiguous transliteration guard ===
+            # Неизвестное pymorphy слово с первым парсом ADJF/ADJS, но имеющее
+            # NOUN-разбор с маркером именованной сущности — это транслитерированный
+            # бренд/название, а не настоящее прилагательное. Не считаем ADJ.
+            #
+            # Пример: tail='глово' → первый парс ADJS 'гловый' (score 0.489),
+            # но есть NOUN-парс 'глово' с тегами Sgtm,Geox (имя собственное,
+            # singularia tantum). Это бренд Glovo (сервис доставки), не "гловое".
+            #
+            # Защита от сломки настоящих прилагательных:
+            #   — 'новое/гелевый/большое' тоже имеют NOUN-разборы, но БЕЗ маркеров
+            #     именованной сущности, поэтому не попадают под это правило
+            #   — word_is_known=False гарантирует что это неизвестное слово,
+            #     а не обычное прилагательное русского языка
+            if not morph.word_is_known(w):
+                has_named_entity_noun = any(
+                    alt.tag.POS == 'NOUN'
+                    and any(m in str(alt.tag) for m in NAMED_ENTITY_MARKERS)
+                    for alt in all_parses_list[i]
+                )
+                if has_named_entity_noun:
+                    # Трактуем как NOUN (именованная сущность), не как ADJ
+                    has_noun = True
+                    continue
             has_adj = True
             adj_words_info.append((w, all_parses_list[i]))  # уже готовые полные парсы
         if p.tag.POS == 'NOUN':
@@ -1305,7 +1336,48 @@ def detect_broken_grammar(tail: str, tp: dict = None) -> Tuple[bool, str]:
     first = words[0]
     if first in prep_cases:
         required_cases = prep_cases[first]
-        
+
+        # === FIX FP (из за границы): составные предлоги ===
+        # Русские составные предлоги: "из-за", "из-под", "по-над", "по-под",
+        # "по-за". Пишутся через дефис, но пользователи часто пишут через
+        # пробел. Без этой проверки "из за границы" → TRASH (broken_grammar),
+        # хотя это валидный русский оборот ("из-за границы" = причина).
+        #
+        # Важно: составные предлоги имеют СВОИ падежные требования, отличные
+        # от простой формы предлога. "по" требует датив, но "по-над" требует
+        # творительный ("по-над водой"). Таблица держит точные требования
+        # для каждой составной формы.
+        compound_preps = {
+            ('из', 'за'):   {'gent', 'gen2'},  # "из-за границы"
+            ('из', 'под'):  {'gent', 'gen2'},  # "из-под крана"
+            ('по', 'над'):  {'ablt'},          # "по-над водой"
+            ('по', 'под'):  {'ablt'},          # "по-под деревом"
+            ('по', 'за'):   {'ablt'},          # "по-за рекой"
+        }
+        if len(words) >= 3:
+            compound_key = (first, words[1])
+            if compound_key in compound_preps:
+                compound_cases = compound_preps[compound_key]
+                third_word = words[2]
+                # Числа пропускаем
+                if third_word.isdigit():
+                    return False, ""
+                third_parses = _get_parses(third_word, tp)
+                third_best = third_parses[0]
+                # Неизвестное слово — не считаем сломанной грамматикой
+                if third_best.tag.POS is None:
+                    return False, ""
+                # Если хотя бы один парс даёт нужный падеж — грамматика OK
+                for tp_ in third_parses:
+                    if tp_.tag.case in compound_cases:
+                        return False, ""
+                # Падеж неверный для составного предлога — реально сломано
+                actual_case = third_best.tag.case
+                return True, (
+                    f"Грамматика: составной предлог '{first} {words[1]}' "
+                    f"требует {compound_cases}, а '{third_word}' в {actual_case}"
+                )
+
         # Проверяем падеж следующего слова
         second_word = words[1]
         
