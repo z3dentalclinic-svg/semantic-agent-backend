@@ -513,6 +513,43 @@ class BatchPostFilter:
                 w in self.manual_small_cities
                 for w in words_set
             )
+            # Дополнительная проверка: составные топонимы (биграммы/триграммы).
+            # Без неё ключи типа "нижний тагил", "горно алтайск",
+            # "комсомольск на амуре", "в комсомольске на амуре" проскакивают
+            # PRE-CHECK как VALID — отдельные слова нет в all_cities_global,
+            # только биграммы/триграммы как целое.
+            # Проверяем и raw, и лемматизированные варианты (для падежей).
+            if not has_any_geo and len(words) >= 2:
+                # Лемматизированные слова (уже есть в keyword_lemmas)
+                # Проверяем биграммы и триграммы в raw + lemma варианте.
+                # Биграммы
+                for i in range(len(words) - 1):
+                    w1, w2 = words[i], words[i + 1]
+                    l1, l2 = keyword_lemmas[i], keyword_lemmas[i + 1]
+                    bg_variants = {
+                        f"{w1} {w2}",
+                        f"{l1} {l2}",
+                    }
+                    # Плюс версии с дефисом
+                    for bg in list(bg_variants):
+                        bg_variants.add(bg.replace(' ', '-'))
+                    if any(bg in self.city_multi_index for bg in bg_variants):
+                        has_any_geo = True
+                        break
+                # Триграммы (если биграмма не нашлась)
+                if not has_any_geo and len(words) >= 3:
+                    for i in range(len(words) - 2):
+                        w1, w2, w3 = words[i], words[i + 1], words[i + 2]
+                        l1, l2, l3 = keyword_lemmas[i], keyword_lemmas[i + 1], keyword_lemmas[i + 2]
+                        tg_variants = {
+                            f"{w1} {w2} {w3}",
+                            f"{l1} {l2} {l3}",
+                        }
+                        for tg in list(tg_variants):
+                            tg_variants.add(tg.replace(' ', '-'))
+                        if any(tg in self.city_multi_index for tg in tg_variants):
+                            has_any_geo = True
+                            break
             if not has_any_geo:
                 _p['precheck'] = time.perf_counter() - _t0
                 return True, "", "", _p
@@ -612,8 +649,15 @@ class BatchPostFilter:
                     continue
                 # Population guard: слово в districts но population < 50k → скорее бренд/модель
                 # "honda" → Honda (CO, JP, 28k) → бренд, не район
+                # НО: если слово НЕ похоже на бренд (кириллица, длинное, нет в brand list),
+                # то это реальный район чужого города который просто не в cities-базе
+                # (юнусабад, чиланзар, лошица — районы больших городов).
+                # Brand-like guard (_is_brand_like) защищает от ложных срабатываний.
                 if self.population_cache.get(w, 0) < 50000:
-                    continue
+                    if self._is_brand_like(w):
+                        continue  # реально похоже на бренд → пропускаем
+                    # Иначе это редкий район — продолжаем проверку
+                    # (дальнейшие guard'ы всё ещё применяются)
                 # Баг B: известное слово без Geox → нарицательное, не район
                 if self._get_word_features(w, language)['skip_geo']:
                     continue
