@@ -68,6 +68,104 @@ def _load_districts():
 _load_districts()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CITY NORMALIZATION — привязка разных орфографий города к канонической форме.
+#
+# Проблема: districts.json хранит city в разных орфографиях:
+#   'голосеевский район' → city='kyiv'       (англ)
+#   'позняки'            → city='київ'       (укр)
+#   'приднепровский район' → city='черкаси'  (укр)
+# А seed всегда на русском ("днепр", "киев", "харьков").
+#
+# Решение: reverse-индекс через geonamescache.alternatenames.
+# Любое написание ('днепр', 'дніпро', 'dnipro') нормализуется в одну и ту же
+# каноническую форму ('dnipro'). При коллизии (одинаковый alt для разных городов)
+# выигрывает город с большей population — защита от мелких foreign омонимов.
+#
+# Fallback: если geonamescache не установлен или не импортируется — словарь
+# остаётся пустым. Детекторы _wrong_district/_unknown_district в этом случае
+# просто не срабатывают (возвращают False), деградируя до текущего поведения.
+# ═══════════════════════════════════════════════════════════════════════════
+_CITY_NORMALIZE: Dict[str, str] = {}
+
+try:
+    import geonamescache as _gnc
+    _GEONAMESCACHE_AVAILABLE = True
+except ImportError:
+    _GEONAMESCACHE_AVAILABLE = False
+
+
+def _build_city_normalize():
+    """Строит reverse-индекс alt_name → canonical_english_name.
+
+    При коллизии выигрывает город с большей population (крупный город
+    перевешивает мелкий омоним).
+
+    Пример:
+      'днепр' → 'dnipro'
+      'дніпро' → 'dnipro'
+      'киев' → 'kyiv'
+      'київ' → 'kyiv'
+
+    Если geonamescache недоступен — оставляем пустой словарь и логируем warning.
+    Это НЕ ошибка: детекторы wrong_district/unknown_district просто не
+    сработают, поведение деградирует до текущего (как будто их нет).
+    """
+    global _CITY_NORMALIZE
+    if not _GEONAMESCACHE_AVAILABLE:
+        logger.warning(
+            "[CITY_NORMALIZE] geonamescache not available — district city "
+            "normalization disabled, detect_wrong_district will no-op"
+        )
+        return
+
+    try:
+        gc = _gnc.GeonamesCache()
+        cities = gc.get_cities()
+        # Сортируем по убыванию population — при коллизии выигрывает крупный.
+        sorted_cities = sorted(cities.values(), key=lambda c: -c.get('population', 0))
+
+        for city in sorted_cities:
+            canonical = city['name'].lower().strip()
+            if not canonical:
+                continue
+            # Идентити-маппинг для каноникала (первый регистрирующийся выигрывает
+            # за счёт сортировки по population).
+            if canonical not in _CITY_NORMALIZE:
+                _CITY_NORMALIZE[canonical] = canonical
+            # Все альтернативные имена
+            for alt in city.get('alternatenames', []):
+                alt_lower = alt.lower().strip()
+                if alt_lower and alt_lower not in _CITY_NORMALIZE:
+                    _CITY_NORMALIZE[alt_lower] = canonical
+
+        logger.info(
+            "[CITY_NORMALIZE] loaded %d city name variants from geonamescache",
+            len(_CITY_NORMALIZE)
+        )
+    except Exception as e:
+        logger.error("[CITY_NORMALIZE] failed to build index: %s", e)
+        _CITY_NORMALIZE = {}
+
+
+_build_city_normalize()
+
+
+def _normalize_city(name: str) -> str:
+    """Возвращает каноническую форму города по любому его alt-name.
+
+    Если имя не найдено в индексе — возвращает как есть (lower).
+    Это defensive fallback: для неизвестных городов сравнение работает
+    по строке-как-есть. Когда geonamescache недоступен, всё сравнение
+    сводится к сравнению "как есть", что эквивалентно отключённому детектору
+    (в абсолютном большинстве случаев district.city != seed_word по строке).
+    """
+    if not name:
+        return ""
+    key = name.lower().strip()
+    return _CITY_NORMALIZE.get(key, key)
+
+
 def _get_parses(word: str, tp: dict = None):
     """
     Возвращает все морфологические разборы слова.
@@ -2567,3 +2665,258 @@ def detect_postmod_adjective(tail: str, seed: str = "", kw: str = "", tp: dict =
     if _tail_agrees_with_seed(word, seed_words, tp=tp):
         return True, f"Постмодификатор seed: '{word}' (ADJF/PRTF согласовано с seed)"
     return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISTRICT GUARD — защита от районов ЧУЖИХ городов.
+#
+# Проблема: seed='ремонт пылесосов днепр' таргетит город Днепр.
+# Google Autocomplete подсовывает ключи с районами ДРУГИХ городов:
+#   'днепр голосеевский район' — Голосеевский район = район Киева
+#   'днепр позняки'            — Позняки = район Киева
+#   'днепр солонянский район'  — район Днепропетровской области (не город)
+# Сейчас detect_location тупо ловит слово "район" → VALID, detect_geo
+# ловит биграмму "голосеевский район" как UA city → +geo → VALID.
+#
+# Решение — ДВА параллельных детектора, работающих поверх существующих
+# позитивных сигналов:
+#
+# 1. detect_wrong_district (HARD NEGATIVE)
+#    Биграмма "X район/микрорайон/квартал" есть в _DISTRICT_TO_CANONICAL,
+#    её city после нормализации НЕ совпадает с seed_city → TRASH.
+#
+# 2. detect_unknown_district (SOFT NEGATIVE)
+#    Биграммы НЕТ в базе, но структура валидна (ADJF/NOUN + район) →
+#    GREY (L3 разрулит по семантике).
+#
+# Оба работают ТОЛЬКО когда в seed есть distinct city. Без city в seed
+# интент районного таргетинга невозможен — детекторы no-op.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Суффиксы, которые образуют district-биграмму вместе с префиксом-модификатором.
+# Единственный "полу-хардкод" в модуле — но это лингвистические категории слов,
+# а не список конкретных районов. Cross-niche неизменен.
+_DISTRICT_SUFFIXES = frozenset({'район', 'микрорайон', 'квартал'})
+
+# POS префиксов-модификаторов, которые НЕ дают district-биграмму.
+# Местоименные прилагательные (моём/нашем/вашем/своём) имеют тег Apro —
+# отфильтровываем по нему алгоритмически, без хардкод-списка.
+_SKIP_POS_FOR_DISTRICT_PREFIX = {'NPRO', 'PREP', 'CONJ', 'PRCL', 'INTJ'}
+
+
+# Кэш seed_city — извлечение делается один раз на весь батч.
+# Ключ: tuple(seed_words_lower), чтобы был hashable.
+_seed_city_cache: Dict[tuple, str] = {}
+
+
+def _extract_seed_city(seed: str, tp: dict = None) -> str:
+    """Извлекает канонический city из seed, если он есть.
+
+    Ищет в seed первое слово (или лемма первого слова), которое нормализуется
+    в известный город geonamescache. Возвращает канонический english name
+    ('dnipro', 'kyiv', ...) или '' если города в seed нет.
+
+    Результат кэшируется — seed одинаков для всего батча.
+    """
+    if not seed or not _CITY_NORMALIZE:
+        return ""
+
+    seed_words = tuple(seed.lower().split())
+    if seed_words in _seed_city_cache:
+        return _seed_city_cache[seed_words]
+
+    result = ""
+    for w in seed_words:
+        # 1. Прямой lookup
+        if w in _CITY_NORMALIZE:
+            result = _CITY_NORMALIZE[w]
+            break
+        # 2. Через лемму (днепром → днепр, киеве → киев)
+        parsed = _get_parses(w, tp)
+        if parsed:
+            lemma = parsed[0].normal_form
+            if lemma in _CITY_NORMALIZE:
+                result = _CITY_NORMALIZE[lemma]
+                break
+
+    _seed_city_cache[seed_words] = result
+    return result
+
+
+def _find_district_bigram(tail: str, tp: dict = None):
+    """Ищет биграмму 'X район/микрорайон/квартал' в tail.
+
+    X — любое слово с валидной POS (ADJF/ADJS/NOUN/PRTF/PRTS), но НЕ
+    местоименное прилагательное (тег Apro) и НЕ NPRO/PREP/CONJ/PRCL/INTJ.
+
+    Возвращает:
+      (bigram_lower, prefix_word, suffix_word) — если найдена
+      (None, None, None) — если не найдена
+
+    bigram_lower возвращается в двух формах (raw и с леммой суффикса),
+    чтобы проверить матч в _DISTRICT_TO_CANONICAL. Суффиксы в базе
+    'район'/'микрорайон'/'квартал' хранятся в номинативе единственного;
+    пользователь может написать 'районе' (loct) → берём лемму суффикса.
+    """
+    words = tail.lower().split()
+    if len(words) < 2:
+        return None, None, None
+
+    for i in range(len(words) - 1):
+        w_suffix = words[i + 1]
+        p_suffix = _get_parses(w_suffix, tp)[0]
+        # Суффикс — либо точное совпадение raw, либо лемма
+        suffix_lemma = p_suffix.normal_form
+        if w_suffix not in _DISTRICT_SUFFIXES and suffix_lemma not in _DISTRICT_SUFFIXES:
+            continue
+
+        # Проверяем префикс
+        w_prefix = words[i]
+        p_prefix = _get_parses(w_prefix, tp)[0]
+
+        if p_prefix.tag.POS in _SKIP_POS_FOR_DISTRICT_PREFIX:
+            continue
+        # Местоименные прилагательные: моём/нашем/вашем/своём/том/каком/этом
+        if 'Apro' in str(p_prefix.tag):
+            continue
+
+        # Допустимые POS — ADJF/ADJS/NOUN/PRTF/PRTS и редкие variant'ы
+        if p_prefix.tag.POS not in {'ADJF', 'ADJS', 'NOUN', 'PRTF', 'PRTS'}:
+            continue
+
+        # Нормализация биграммы для поиска в _DISTRICT_TO_CANONICAL:
+        # варианты "raw X + raw suffix", "raw X + lemma suffix".
+        # Лемматизировать префикс НЕ надо — в districts.json они хранятся
+        # как 'голосеевский район' (именительный ADJF), а в русских хвостах
+        # ADJF прилагательные приходят в согласовании с номинативным 'район'
+        # тоже в номинативе. Для 'районе' нужна только лемма суффикса.
+        return (w_prefix, w_suffix, suffix_lemma)
+
+    return None, None, None
+
+
+def detect_wrong_district(
+    tail: str, seed: str = "",
+    tp: dict = None
+) -> Tuple[bool, str]:
+    """HARD NEGATIVE: в хвосте биграмма 'X район', этот район принадлежит
+    другому городу (не тому, что в seed).
+
+    Пример:
+      seed='ремонт пылесосов днепр', tail='голосеевский район'
+      → биграмма найдена в _DISTRICT_TO_CANONICAL с city='kyiv'
+      → seed_city='dnipro' ≠ 'kyiv' → TRASH
+
+    No-op когда:
+      - _DISTRICT_TO_CANONICAL пуст (districts.json не загружен)
+      - _CITY_NORMALIZE пуст (geonamescache недоступен)
+      - в seed нет distinct city (taрgetинг не городской)
+      - биграммы 'X район' в tail нет
+      - биграммы нет в базе _DISTRICT_TO_CANONICAL
+    """
+    if not seed or not _DISTRICT_TO_CANONICAL or not _CITY_NORMALIZE:
+        return False, ""
+
+    seed_city = _extract_seed_city(seed, tp=tp)
+    if not seed_city:
+        return False, ""
+
+    prefix, suffix_raw, suffix_lemma = _find_district_bigram(tail, tp=tp)
+    if prefix is None:
+        return False, ""
+
+    # Проверяем все варианты биграммы: raw/lemma prefix × raw/lemma suffix.
+    # В _DISTRICT_TO_CANONICAL биграммы хранятся в номинативе ('голосеевский район'),
+    # но пользователи пишут и в loct ('голосеевском районе'). Покрываем оба случая.
+    prefix_lemma = _get_parses(prefix, tp)[0].normal_form
+    candidates = {
+        f"{prefix} {suffix_raw}",
+        f"{prefix} {suffix_lemma}",
+        f"{prefix_lemma} {suffix_raw}",
+        f"{prefix_lemma} {suffix_lemma}",
+    }
+    for bigram in candidates:
+        district_city_raw = _DISTRICT_TO_CANONICAL.get(bigram)
+        if not district_city_raw:
+            continue
+        district_city_norm = _normalize_city(district_city_raw)
+        if district_city_norm != seed_city:
+            return True, (
+                f"Район другого города: '{bigram}' принадлежит "
+                f"'{district_city_raw}' (норм: '{district_city_norm}'), "
+                f"а seed указывает '{seed_city}'"
+            )
+        # Совпал — свой район своего города, не блокируем
+        return False, ""
+
+    # Биграмма не в базе — это работа detect_unknown_district
+    return False, ""
+
+
+def detect_unknown_district(
+    tail: str, seed: str = "",
+    tp: dict = None
+) -> Tuple[bool, str]:
+    """SOFT NEGATIVE: в хвосте структура 'X район/микрорайон/квартал',
+    биграммы НЕТ в базе _DISTRICT_TO_CANONICAL.
+
+    Используется когда в seed есть город, но конкретный район не знаем.
+    Это мягкий сигнал: может быть реальный район того же города (тогда
+    VALID), может быть район другого города (тогда TRASH) — решение
+    оставляем за L3.
+
+    Возвращает True только если:
+      - в seed есть distinct city
+      - биграмма 'X район' действительно есть (валидная структура)
+      - биграммы НЕТ в _DISTRICT_TO_CANONICAL
+
+    No-op симметрично detect_wrong_district. Без city в seed не срабатывает,
+    чтобы не ловить generic-случаи типа "купить пылесос голосеевский район"
+    (где seed не городской → район может быть из любого города → пусть
+    location-паттерн работает как раньше).
+    """
+    if not seed:
+        return False, ""
+
+    # Нужен хотя бы пустой, но загруженный (глобальный initialized) индекс.
+    # Если districts не загрузились, это равно "биграмма не в базе" всегда,
+    # и мы будем заваливать все 'X район' в GREY. Защита: no-op.
+    if not _DISTRICT_TO_CANONICAL:
+        return False, ""
+
+    # Без city в seed детектор не работает (см. docstring).
+    # _CITY_NORMALIZE может быть пуст (geonamescache недоступен) — тогда
+    # _extract_seed_city вернёт '' и мы выйдем. Это корректно: без
+    # нормализации мы не можем ничего осмысленно противопоставить.
+    if not _CITY_NORMALIZE:
+        return False, ""
+
+    seed_city = _extract_seed_city(seed, tp=tp)
+    if not seed_city:
+        return False, ""
+
+    prefix, suffix_raw, suffix_lemma = _find_district_bigram(tail, tp=tp)
+    if prefix is None:
+        return False, ""
+
+    # Есть ли биграмма в базе? Проверяем все варианты (raw/lemma × raw/lemma).
+    prefix_lemma = _get_parses(prefix, tp)[0].normal_form
+    candidates = {
+        f"{prefix} {suffix_raw}",
+        f"{prefix} {suffix_lemma}",
+        f"{prefix_lemma} {suffix_raw}",
+        f"{prefix_lemma} {suffix_lemma}",
+    }
+    for bigram in candidates:
+        if bigram in _DISTRICT_TO_CANONICAL:
+            # Биграмма известна — это работа detect_wrong_district,
+            # а не unknown.
+            return False, ""
+
+    # Биграмма валидна структурно, но не в базе — мягкий сигнал.
+    # Используем лемматизированные формы в reason для читаемости.
+    display_bigram = f"{prefix_lemma} {suffix_lemma}"
+    return True, (
+        f"Неизвестный район: '{display_bigram}' отсутствует в базе "
+        f"districts.json, а seed указывает '{seed_city}'"
+    )
