@@ -2171,10 +2171,25 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
     
     # === Предпроверка: есть ли target_country в хвосте? ===
     # Если да → паттерн "из [своей] в [чужую]" → cross-border intent → не блокируем
+    #
+    # ВАЖНО: эта предпроверка строго ограничена географическими словами
+    # (POS=NOUN с тегом Geox). Без этого ADJS типа 'южно' (лемма 'южный',
+    # inflect(nomn)='южное') случайно совпадают с UA-топонимами через
+    # pymorphy.inflect и отключают весь детектор. Пример регрессии:
+    #   tail='южно сахалинск' → 'южно' ADJS → nomn='южное' → есть в UA geo_db
+    #   → has_target_country=True → False, "" (не блокируем)
+    # После фикса 'южно' (не Geox, не NOUN) пропускается, биграмма
+    # 'южно-сахалинск' проверяется корректно.
     has_target_country = False
     for word in words:
-        parsed = _get_parses(word, tp)[0]
+        all_parses = _get_parses(word, tp)
+        parsed = all_parses[0]
         if parsed.tag.POS in skip_pos:
+            continue
+        # Geox-guard: только географические существительные могут быть
+        # target-страной/городом в этой предпроверке. Прилагательные,
+        # глаголы, нарицательные существительные — не могут.
+        if parsed.tag.POS != 'NOUN' or not any('Geox' in str(p.tag) for p in all_parses):
             continue
         lemma = parsed.normal_form
         nomn_form = parsed.inflect({'nomn'})
@@ -2190,7 +2205,7 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
                 break
         if has_target_country:
             break
-    
+
     if has_target_country:
         # "из украины в италию" → обе страны → cross-border → не блокируем
         return False, ""
