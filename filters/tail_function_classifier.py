@@ -32,6 +32,8 @@ from .function_detectors import (
     detect_premod_adjective, detect_postmod_adjective,
     # District guard — районы чужих городов при городском seed
     detect_wrong_district, detect_unknown_district,
+    # Product spec — технические спецификации товара (12в, 4т, 220 ом)
+    detect_product_spec,
     # Helpers
     _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
@@ -94,6 +96,7 @@ SIGNAL_WEIGHTS = {
     'intent_mismatch':   0.9,   # информационный seed + коммерческий tail — надёжный конфликт
     'wrong_district':    0.95,  # известный район ЧУЖОГО города при городском seed — hard block
     'unknown_district':  0.4,   # мягкий — район, которого нет в базе, но структура валидна
+    'product_spec':      0.85,  # технические параметры товара (12 в, 4т, 220 ом) — надёжный сигнал
 }
 
 # Мягкие негативные сигналы — эвристики с высокой вероятностью ошибки.
@@ -104,6 +107,7 @@ _SOFT_NEGATIVES = frozenset({
     'orphan_genitive',    # "ремонт двигателей пылесосов" — валидная конструкция
     'brand_collision',    # спорный сигнал
     'unknown_district',   # 'X район' валидной структуры, нет в базе — L3 разрулит
+    'standalone_num',     # голое число ('12', '150') — может быть товарный параметр, L3 решит
     # single_infinitive намеренно НЕ здесь:
     # в сочетании с category_mismatch (chargram=0) = голый несвязанный инфинитив → TRASH
 })
@@ -142,6 +146,8 @@ _STRONG_POSITIVES_SKIP_MISMATCH = frozenset({
     'premod_adj', 'postmod_adj',
     # Commerce / reputation / action / type — если сработали, интент подтверждён
     'commerce', 'reputation', 'action', 'type_spec',
+    # Product spec — технические параметры на товарном seed уже валидируют интент
+    'product_spec',
 })
 
 
@@ -229,6 +235,7 @@ class TailFunctionClassifier:
             ('info_intent',   lambda: detect_info_intent(tail, self.seed, tp=tp)),
             ('premod_adj',    lambda: detect_premod_adjective(tail, self.seed, kw, tp=tp)),
             ('postmod_adj',   lambda: detect_postmod_adjective(tail, self.seed, kw, tp=tp)),
+            ('product_spec',  lambda: detect_product_spec(tail, self.seed, tp=tp)),
         ]
 
         for signal_name, detector in detectors_positive:
@@ -341,6 +348,35 @@ class TailFunctionClassifier:
                 positive_signals.remove('location')
                 reasons.append(
                     "⚠ location подавлен: сигнал дублирует district-guard"
+                )
+
+        # ===== PRODUCT SPEC — подавление дублирующих негативов =====
+        # Если сработал product_spec, он валидировал короткий технический
+        # tail ('12 в', '4т', '220ом'). На таких паттернах некоторые
+        # негативные детекторы ошибочно срабатывают:
+        #   — detect_fragment видит 'в' как PREP на конце ('12 в')
+        #   — detect_short_garbage видит '4т' как неизвестный короткий токен
+        #   — detect_standalone_number видит '12' как голое число
+        #   — detect_broken_grammar видит некорректное согласование
+        # Все эти сигналы ловят ту же цифро-буквенную структуру, которую
+        # product_spec уже опознал как валидную спецификацию. Их негатив
+        # информационно дублирующий и неоправданно ведёт ключ в GREY.
+        #
+        # Подавляем только когда product_spec сработал. Другие tail'ы
+        # (обычные короткие мусорные 'аб', 'кх', голые числа без спека
+        # паттерна) проходят через эти детекторы нормально.
+        if 'product_spec' in positive_signals:
+            _spec_suppressed = {
+                'fragment', 'short_garbage', 'standalone_num',
+                'broken_grammar',
+            }
+            _removed = [s for s in negative_signals if s in _spec_suppressed]
+            if _removed:
+                negative_signals[:] = [
+                    s for s in negative_signals if s not in _spec_suppressed
+                ]
+                reasons.append(
+                    f"⚠ подавлены дубликаты product_spec: {_removed}"
                 )
 
         # ===== АРБИТРАЖ С ВЕСАМИ =====
