@@ -88,6 +88,26 @@ _load_districts()
 # ═══════════════════════════════════════════════════════════════════════════
 _CITY_NORMALIZE: Dict[str, str] = {}
 
+# Множество alt-names всех столиц мира из geonamescache.
+# Используется DISTRICT-guard'ом в detect_foreign_geo для защиты от
+# слишком агрессивной district-маскировки.
+#
+# Проблема без этого множества: _DISTRICT_TO_CANONICAL содержит варшава/
+# париж как микрорайоны в мелких городах (Славянск, Павловский Посад),
+# и district-guard безусловно пропускал ЛЮБОЙ match. Результат:
+# tail='в варшаве' с target=UA не ловился как foreign, потому что
+# 'варшава' есть в DISTRICT-базе.
+#
+# Изначально пробовалось population-based решение (>= 500k жителей), но
+# у некоторых нарицательных слов (заря) в geonamescache аномальные
+# population-значения из-за коллизий alt-names с foreign деревнями.
+# Capital-flag — более надёжный и простой сигнал: это буквально список
+# "важных" городов мира, курируемый Wikidata/OpenStreetMap.
+#
+# Содержит ~11k alt-names для ~200 столиц на всех языках (кириллица,
+# латиница, локальные алфавиты).
+_CAPITAL_ALT_NAMES: Set[str] = set()
+
 try:
     import geonamescache as _gnc
     _GEONAMESCACHE_AVAILABLE = True
@@ -122,6 +142,7 @@ def _build_city_normalize():
     try:
         gc = _gnc.GeonamesCache()
         cities = gc.get_cities()
+        countries = gc.get_countries()
         # Сортируем по убыванию population — при коллизии выигрывает крупный.
         sorted_cities = sorted(cities.values(), key=lambda c: -c.get('population', 0))
 
@@ -139,9 +160,32 @@ def _build_city_normalize():
                 if alt_lower and alt_lower not in _CITY_NORMALIZE:
                     _CITY_NORMALIZE[alt_lower] = canonical
 
+        # Собираем множество alt-names всех столиц мира.
+        # countries[cc]['capital'] содержит английское имя столицы.
+        # Находим city-запись этой столицы (по name + countrycode) и берём
+        # все её alternatenames на всех языках.
+        capitals_by_cc = {}
+        for cc, info in countries.items():
+            cap_name = info.get('capital', '').lower().strip()
+            if cap_name:
+                capitals_by_cc[cc.upper()] = cap_name
+
+        for city in cities.values():
+            cc = city.get('countrycode', '').upper()
+            if cc not in capitals_by_cc:
+                continue
+            if city['name'].lower().strip() != capitals_by_cc[cc]:
+                continue
+            # Это столица — добавляем её canonical + все alt-names
+            _CAPITAL_ALT_NAMES.add(city['name'].lower().strip())
+            for alt in city.get('alternatenames', []):
+                alt_lower = alt.lower().strip()
+                if alt_lower:
+                    _CAPITAL_ALT_NAMES.add(alt_lower)
+
         logger.info(
-            "[CITY_NORMALIZE] loaded %d city name variants from geonamescache",
-            len(_CITY_NORMALIZE)
+            "[CITY_NORMALIZE] loaded %d city name variants, %d capital alt-names",
+            len(_CITY_NORMALIZE), len(_CAPITAL_ALT_NAMES)
         )
     except Exception as e:
         logger.error("[CITY_NORMALIZE] failed to build index: %s", e)
@@ -164,6 +208,29 @@ def _normalize_city(name: str) -> str:
         return ""
     key = name.lower().strip()
     return _CITY_NORMALIZE.get(key, key)
+
+
+def _is_foreign_district_name(name: str, target_country: str) -> bool:
+    """Возвращает True если name — известный район/улица чужого города.
+
+    Используется в detect_geo чтобы защититься от ложного +geo на словах,
+    которые одновременно являются одиночным UA-городом (например 'южное') и
+    частью foreign-района ('южное бутово' = район в RU).
+
+    Логика:
+      — name есть в _DISTRICT_TO_CANONICAL
+      — его country в базе != target_country
+      → это чужой район, одиночное +geo выдавать нельзя
+
+    Symmetrically для 'позняки' (country=UA): если target=UA, возвращает
+    False (свой район, не foreign). Если target=RU, возвращает True.
+    """
+    if not name or not _DISTRICT_TO_CANONICAL:
+        return False
+    country = _DISTRICT_TO_COUNTRY.get(name.lower(), '')
+    if not country:
+        return False
+    return country.lower() != target_country.lower()
 
 
 def _get_parses(word: str, tp: dict = None):
@@ -330,6 +397,28 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
             variants.add(b)
             variants.add(b.replace(' ', '-'))
             variants.add(b.replace('-', ' '))
+
+        # === FOREIGN DISTRICT guard (задача "южное бутово") ===
+        # Если биграмма есть в _DISTRICT_TO_CANONICAL с country != target,
+        # это foreign-район. Нельзя выдавать +geo от одиночного слова
+        # (например 'южное' как UA-city), потому что в контексте биграммы
+        # 'южное бутово' это район Москвы. Early exit: идём сразу к концу
+        # функции, не проверяя одиночные.
+        district_foreign = False
+        for v in variants:
+            if v in _DISTRICT_TO_CANONICAL:
+                country = _DISTRICT_TO_COUNTRY.get(v, '')
+                if country and country.lower() != target_country.lower():
+                    district_foreign = True
+                    break
+        if district_foreign:
+            # Пропускаем проверки в ЭТОЙ биграмме — чтобы:
+            # 1. Не выдать +geo от биграммы, которой нет в geo_db (южное бутово)
+            # 2. Не выдать +geo от одиночного слова внутри биграммы (южное → UA)
+            # Выходим из функции — это был foreign district, detect_foreign_geo
+            # даст свой вердикт отдельно.
+            return False, ""
+
         # Проверка городов
         for v in variants:
             if v in geo_db:
@@ -351,7 +440,29 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
         parsed = _get_parses(word, tp)[0]
         if parsed.tag.POS in skip_pos:
             continue
-        
+
+        # === FOREIGN DISTRICT guard для одиночных (задача "позняки") ===
+        # Если слово (или его лемма) есть в _DISTRICT_TO_CANONICAL с country
+        # != target — это чужой район, не независимый город. Не выдаём +geo
+        # даже если это слово есть в geo_db как topoним target-страны.
+        # Пример: 'позняки' country=UA → target=UA → не блокируем (свой район).
+        #         'позняки' при target=RU → блокируем.
+        #
+        # ПРИОРИТЕТ raw-слова: если word сам по себе точно есть в geo_db как
+        # target-city (например 'южное' есть в geo_db как {'UA'}), то raw-матч
+        # перевешивает district-guard по лемме. Иначе 'южное' → lemma 'южный'
+        # → в districts как район Всеволожска (RU) → guard ошибочно режет
+        # корректный UA-город одиночным.
+        # ПРОВЕРКА guard'а на raw остаётся (если word сам foreign district).
+        if _is_foreign_district_name(word, target_country):
+            continue
+        # Guard по лемме применяем только если raw НЕ найден как target-city
+        word_is_target_city = word in geo_db and target in geo_db[word]
+        if (not word_is_target_city
+                and len(word) >= 5 and lem != word
+                and _is_foreign_district_name(lem, target_country)):
+            continue
+
         # Точное совпадение (city)
         if word in geo_db:
             if target in geo_db[word]:
@@ -2234,23 +2345,30 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
         # Guard: DISTRICT_TO_CANONICAL — слово является районом/улицей
         # ═══════════════════════════════════════════════════════════════════
         # Если слово (или его лемма) есть в базе районов/улиц (districts.json),
-        # пропускаем безусловно. База содержит:
+        # пропускаем ЗА ИСКЛЮЧЕНИЕМ случая когда это столица мира.
+        # База содержит:
         #   — улицы-фамилии (гагарина, ленина, шевченко) — универсальные для
         #     всех городов
         #   — микрорайоны с распространёнными нарицательными названиями (бор,
         #     сады, маяк, заря, рог, церковь) — совпадают с обычными словами
         #   — реальные foreign-микрорайоны (лошица, чиланзар, юнусабад) —
         #     редкие специфичные названия
+        #   — ТОПОНИМЫ-ОМОНИМЫ КРУПНЫХ ГОРОДОВ (варшава/париж/лондон/
+        #     амстердам — улицы/микрорайоны в мелких городах, называющиеся
+        #     в честь столиц). Без capital-bypass 'в варшаве' пропускалось
+        #     как "район Славянска" и не блокировалось как foreign.
         #
-        # Попытка блокировать только "реальные foreign-районы" через эвристики
-        # (Geox-парс, длина слова) даёт слишком много ложных срабатываний:
-        #   — "кривой рог" ломается потому что "рог" в базе как RU-район
-        #   — "белая церковь" ломается потому что "белая" с RU-привязкой
-        # Надёжнее пропускать все DISTRICT-матчи — L3 разберётся с foreign-
-        # районами по семантике.
+        # Capital-bypass: если слово — alt-name столицы мира (из set
+        # _CAPITAL_ALT_NAMES), district-guard НЕ пропускаем, слово идёт
+        # дальше на проверку foreign_geo. Мелкие микротопонимы (бор, заря)
+        # не являются столицами → guard работает как раньше.
         if word in _DISTRICT_TO_CANONICAL or lemma in _DISTRICT_TO_CANONICAL:
-            continue
-        
+            # Проверяем: возможно это alt-name столицы мира
+            is_capital = word in _CAPITAL_ALT_NAMES or lemma in _CAPITAL_ALT_NAMES
+            if not is_capital:
+                continue
+            # Иначе — не пропускаем, идём дальше на foreign-check
+
         # Проверка 1: чужой город (geo_db) — только для географических слов
         if has_geox:
             for check_word in check_forms:
@@ -2288,11 +2406,34 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
         bigram = f"{w1} {w2}"
         bigram_variants = {bigram, bigram.replace(' ', '-')}
         # DISTRICT guard для биграмм: если биграмма есть в DISTRICT базе —
-        # пропускаем (район/улица, не независимый город). Применяем без
-        # разделения на country, потому что распространённые биграммы типа
-        # "N км", "белая церковь", "кривой рог" часто коллизят.
-        if any(v in _DISTRICT_TO_CANONICAL for v in bigram_variants):
-            continue
+        # обрабатываем по country:
+        #   — country == target_country → свой район → пропускаем (continue),
+        #     не блокируем ("кривой рог", "белая церковь" с target=UA)
+        #   — country != target_country → чужой район → БЛОКИРУЕМ как foreign
+        #     ("южное бутово" с country=RU при target=UA → foreign)
+        # Capital-bypass: если биграмма-городом является столицей (редкий
+        # случай, обычно столицы однословные, но "сан марино" бывает) —
+        # не пропускаем через district-guard, идём на обычную проверку.
+        district_country = None
+        district_bigram = None
+        for v in bigram_variants:
+            if v in _DISTRICT_TO_CANONICAL:
+                if v in _CAPITAL_ALT_NAMES:
+                    # Столица-биграмм — не district, идём дальше
+                    break
+                district_country = _DISTRICT_TO_COUNTRY.get(v, '').lower()
+                district_bigram = v
+                break
+        if district_country is not None:
+            if district_country == target_country.lower():
+                # Свой район — не блокируем, continue к следующей биграмме
+                continue
+            # Чужой район → foreign (аналогично чужому городу)
+            return True, (
+                f"Чужой район (биграмм): '{district_bigram}' "
+                f"принадлежит городу '{_DISTRICT_TO_CANONICAL.get(district_bigram, '?')}' "
+                f"({district_country.upper()}, не {target})"
+            )
         
         for variant in bigram_variants:
             if variant in geo_db:
