@@ -163,75 +163,119 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
     Город считается VALID только если он существует в target_country.
     Страна (из _COUNTRIES) — аналогично: позитив только если совпадает с target.
     
+    АЛГОРИТМ: longest-first scanning window.
+    1. Триграммы (raw + head-lemma, с вариантами dash/space)
+    2. Биграммы (raw + head-lemma + full-lemma, с вариантами dash/space)
+    3. Одиночные токены (raw + lemma при len>=5)
+    
+    EARLY EXIT: если длинный n-грамм найден (в любой стране) — не идём дальше.
+    Это критично: "в комсомольске на амуре" найдёт триграмму 'комсомольск-на-амуре' (RU)
+    и НЕ спустится к одиночному 'комсомольск' (который в UA, переименован в 2016).
+    
+    NO-LEMMA-FOR-SHORT: одиночные токены < 5 символов не лемматизируются.
+    Без этого 'горно' → 'горный' (артефакт pymorphy) и матчится на случайный микро-топоним.
+    Для составных имён голова перехватывается биграммой 'горно-алтайск' раньше.
+    
     "киев" (UA) → True (киев ∈ UA)
     "тир"  (UA) → False (тир ∈ LB, не в UA)
     "днс"  (UA) → False (днс нет в geo_db вообще)
     "или"  (UA) → False (или ∈ GB, не в UA + CONJ)
     "одессе" (UA) → True (лемма "одесса" ∈ UA)
     "украине" (UA) → True (лемма "украина" ∈ _COUNTRIES, UA == target)
-    "ирландии" (IE) → True (лемма "ирландия" ∈ _COUNTRIES, IE == target)
-    "украине" (RU) → False (страна не совпадает с target)
+    "нижний тагил" (UA) → False (биграмм 'нижний тагил' ∈ RU, foreign early exit)
+    "в комсомольске на амуре" (UA) → False (триграмм 'комсомольск-на-амуре' ∈ RU)
+    "горно алтайск" (UA) → False (биграмм 'горно-алтайск' ∈ RU)
     """
     target = target_country.upper()
     # POS которые НИКОГДА не являются городами в контексте поиска
     skip_pos = {'CONJ', 'PREP', 'PRCL', 'INTJ'}
     
     words = tail.lower().split()
+    if not words:
+        return False, ""
     
-    for word in words:
+    # Лемматизируем все токены один раз (используется везде)
+    lemmas = [_get_parses(w, tp)[0].normal_form for w in words]
+    
+    # ── 1. ТРИГРАММЫ (scanning window) ─────────────────────────────────
+    # Для составных имён: "ростов-на-дону", "комсомольск-на-амуре", "каменск-на-оби".
+    # head-lemma покрывает косвенные падежи головы: "в ростове на дону" → "ростов на дону".
+    # Остальные токены (на/амуре/дону) raw — они часть имени, не свободные грам.формы.
+    for i in range(len(words) - 2):
+        raw3 = words[i:i+3]
+        head3 = [lemmas[i]] + words[i+1:i+3]
+        bases = {' '.join(raw3), ' '.join(head3)}
+        variants = set()
+        for b in bases:
+            variants.add(b)
+            variants.add(b.replace(' ', '-'))
+            variants.add(b.replace('-', ' '))
+        for v in variants:
+            if v in geo_db:
+                if target in geo_db[v]:
+                    return True, f"Город (триграмм): '{v}' ({target})"
+                # найдено, но не для target — foreign составное имя
+                # EARLY EXIT: НЕ идём к биграммам/одиночным, иначе ложный positive
+                # на части составного имени (комсомольск → UA одиночный).
+                return False, ""
+    
+    # ── 2. БИГРАММЫ (scanning window) ──────────────────────────────────
+    # Покрывает: "нижний тагил", "ивано франковск", "кривой рог", "горно алтайск",
+    # а также косвенные падежи головы ("в нижнем тагиле" → full-lemma "нижний тагил").
+    for i in range(len(words) - 1):
+        raw2 = words[i:i+2]
+        head2 = [lemmas[i]] + words[i+1:i+2]
+        full2 = lemmas[i:i+2]
+        bases = {' '.join(raw2), ' '.join(head2), ' '.join(full2)}
+        variants = set()
+        for b in bases:
+            variants.add(b)
+            variants.add(b.replace(' ', '-'))
+            variants.add(b.replace('-', ' '))
+        # Проверка городов
+        for v in variants:
+            if v in geo_db:
+                if target in geo_db[v]:
+                    return True, f"Город (биграмм): '{v}' ({target})"
+                return False, ""
+        # Проверка стран-биграмм ("саудовская аравия", "новая зеландия")
+        for v in variants:
+            if v in _COUNTRIES:
+                if _COUNTRIES[v] == target:
+                    return True, f"Страна (биграмм): '{v}' ({target})"
+                return False, ""
+    
+    # ── 3. ОДИНОЧНЫЕ ТОКЕНЫ ────────────────────────────────────────────
+    # Сюда доходим только если n-граммы ничего не нашли.
+    # Короткие токены (< 5 символов) НЕ лемматизируем — pymorphy даёт артефакты
+    # на частях составных имён (горно → горный, усть → устье, верх → верх).
+    for word, lem in zip(words, lemmas):
         parsed = _get_parses(word, tp)[0]
-        
-        # Пропускаем служебные слова в любом случае
         if parsed.tag.POS in skip_pos:
             continue
         
-        # Точное совпадение + проверка страны (city)
+        # Точное совпадение (city)
         if word in geo_db:
             if target in geo_db[word]:
                 return True, f"Город: '{word}' ({target})"
-            # Город существует, но в другой стране → пропускаем (не TRASH, просто нет сигнала)
+            continue  # чужой город одиночным токеном — не блокируем тут
+        
+        # Лемматизация (киеву → киев, одессе → одесса) — только для длинных
+        if len(word) >= 5 and lem != word and lem in geo_db:
+            if target in geo_db[lem]:
+                return True, f"Город (лемма): '{lem}' ({target})"
             continue
         
-        # Лемматизация (киеву → киев, одессе → одесса)
-        lemma = parsed.normal_form
-        if lemma in geo_db and lemma != word:
-            if target in geo_db[lemma]:
-                return True, f"Город (лемма): '{lemma}' ({target})"
-            continue
-
-        # === Проверка стран через _COUNTRIES ===
-        # Target-country в tail = позитив ("в украине" при target=UA)
-        # _COUNTRIES — базовая география, ~80 стран, стабильный конечный список.
-        # Не ниша. Формат {лемма: ISO_код}.
-        # Проверяем и точное слово (латиница), и лемму (кириллица склоняемая).
+        # Страны (точное слово)
         if word in _COUNTRIES:
             if _COUNTRIES[word] == target:
                 return True, f"Страна: '{word}' ({target})"
             continue
-        if lemma in _COUNTRIES and lemma != word:
-            if _COUNTRIES[lemma] == target:
-                return True, f"Страна (лемма): '{lemma}' ({target})"
+        # Страны (лемма) — для стран порог длины не критичен, но оставим консистентно
+        if len(word) >= 5 and lem != word and lem in _COUNTRIES:
+            if _COUNTRIES[lem] == target:
+                return True, f"Страна (лемма): '{lem}' ({target})"
             continue
-    
-    # Проверяем многословные названия (нью йорк, кривой рог, новая зеландия)
-    if len(words) >= 2:
-        bigram = ' '.join(words[:2])
-        # Нормализация дефис↔пробел: Google Autocomplete обычно возвращает
-        # мультислов через пробел ("ивано франковск"), а geo_db может хранить
-        # через дефис ("ивано-франковск") — или наоборот. Проверяем оба варианта.
-        bigram_variants = {bigram, bigram.replace(' ', '-'), bigram.replace('-', ' ')}
-        for variant in bigram_variants:
-            if variant in geo_db:
-                if target in geo_db[variant]:
-                    return True, f"Город (биграмм): '{variant}' ({target})"
-                # вариант найден, но не для target → значит чужое гео
-                break  # продолжать бессмысленно
-        # Страна-биграмм: "саудовская аравия", "новая зеландия"
-        for variant in bigram_variants:
-            if variant in _COUNTRIES:
-                if _COUNTRIES[variant] == target:
-                    return True, f"Страна (биграмм): '{variant}' ({target})"
-                break
     
     return False, ""
 
