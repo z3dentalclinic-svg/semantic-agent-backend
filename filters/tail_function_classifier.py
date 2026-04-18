@@ -30,6 +30,8 @@ from .function_detectors import (
     detect_info_intent,
     # Premod/Postmod adjective — позиционные детекторы согласованных модификаторов
     detect_premod_adjective, detect_postmod_adjective,
+    # District guard — районы чужих городов при городском seed
+    detect_wrong_district, detect_unknown_district,
     # Helpers
     _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
@@ -90,6 +92,8 @@ SIGNAL_WEIGHTS = {
     'orphan_genitive':   0.5,   # мягкий — может быть валидным ("фильтров")
     'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
     'intent_mismatch':   0.9,   # информационный seed + коммерческий tail — надёжный конфликт
+    'wrong_district':    0.95,  # известный район ЧУЖОГО города при городском seed — hard block
+    'unknown_district':  0.4,   # мягкий — район, которого нет в базе, но структура валидна
 }
 
 # Мягкие негативные сигналы — эвристики с высокой вероятностью ошибки.
@@ -99,6 +103,7 @@ _SOFT_NEGATIVES = frozenset({
     'category_mismatch',  # chargram — не знает семантику частей/типов объекта
     'orphan_genitive',    # "ремонт двигателей пылесосов" — валидная конструкция
     'brand_collision',    # спорный сигнал
+    'unknown_district',   # 'X район' валидной структуры, нет в базе — L3 разрулит
     # single_infinitive намеренно НЕ здесь:
     # в сочетании с category_mismatch (chargram=0) = голый несвязанный инфинитив → TRASH
 })
@@ -274,6 +279,11 @@ class TailFunctionClassifier:
             ('foreign_geo',     lambda: detect_foreign_geo(tail, self.geo_db, self.target_country, tp=tp)),
             ('orphan_genitive', lambda: detect_orphan_genitive(tail, self.seed, tp=tp)),
             ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp, seed_is_service=self._seed_is_service)),
+            # District guard — районы чужих городов при городском seed.
+            # wrong_district = HARD: биграмма 'X район' есть в базе, city ≠ seed_city.
+            # unknown_district = SOFT: биграмма валидна структурно, но не в базе → GREY.
+            ('wrong_district',   lambda: detect_wrong_district(tail, self.seed, tp=tp)),
+            ('unknown_district', lambda: detect_unknown_district(tail, self.seed, tp=tp)),
         ]
         
         for signal_name, detector in detectors_negative:
@@ -313,7 +323,26 @@ class TailFunctionClassifier:
             if self._seed_first_in_geo_incompatible and 'geo' in positive_signals:
                 negative_signals.append('intent_mismatch')
                 reasons.append(f"⚠️ Конфликт интентов: seed '{seed_first_word}' (не о месте), tail содержит гео")
-        
+
+        # ===== DISTRICT GUARD — подавление дублирующего location =====
+        # Если сработал wrong_district или unknown_district, они ловили ту же
+        # биграмму 'X район', которая даёт +location через тупой паттерн-матч
+        # на слово "район". Этот +location информационно дублирует сигнал от
+        # district-guard и в арбитраже неоправданно защищает ключ от мягкого
+        # unknown_district (location=0.9 > unknown_district=0.4).
+        #
+        # Подавляем location когда он пришёл именно от district-биграммы:
+        # детектор district уже обработал биграмму и вынес свой вердикт.
+        # Другие location-паттерны (рядом, на дому, 'в моём районе') не
+        # триггерят district-guard, поэтому безопасны.
+        if ('wrong_district' in negative_signals or
+                'unknown_district' in negative_signals):
+            if 'location' in positive_signals:
+                positive_signals.remove('location')
+                reasons.append(
+                    "⚠ location подавлен: сигнал дублирует district-guard"
+                )
+
         # ===== АРБИТРАЖ С ВЕСАМИ =====
         label, confidence, pos_score, neg_score = self._arbitrate(
             positive_signals, negative_signals
@@ -374,9 +403,9 @@ class TailFunctionClassifier:
             # любые позитивы. foreign_geo: если в kw чужое гео при target=UA,
             # ключ не может быть "нашим" клиентом никакими коммерческими/info
             # сигналами. Это вердикт о неприменимости, не об интенте.
-            # Сейчас только foreign_geo — другие hard_negatives требуют
-            # info_intent whitelist (meta) или не конфликтуют с позитивами.
-            absolute_blockers = {'foreign_geo'}
+            # wrong_district: в хвосте известный район чужого города при
+            # городском seed — аналогичная неприменимость таргетинга.
+            absolute_blockers = {'foreign_geo', 'wrong_district'}
             if set(negative) & absolute_blockers:
                 return 'TRASH', 0.9, pos_score, neg_score
             
