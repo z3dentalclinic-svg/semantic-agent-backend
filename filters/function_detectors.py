@@ -19,24 +19,27 @@ from .shared_morph import morph
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DISTRICT_TO_CANONICAL — слова которые являются районами/улицами городов.
+# DISTRICT-базы — слова которые являются районами/улицами городов.
 # Загружается из districts.json один раз при импорте модуля.
 #
-# Используется в detect_foreign_geo как guard: если слово есть в этой базе,
-# оно скорее всего район или улица, НЕ независимый город-топоним. Это защищает
-# от ложных срабатываний foreign_geo на словах-омонимах фамилий (гагарина,
-# ленина, шевченко), которые geonamescache может содержать как микрорайоны
-# в других городах, но в контексте запроса они означают улицу в seed-city.
+# Две параллельные мапы:
+#   _DISTRICT_TO_CANONICAL: district_name → canonical_city
+#   _DISTRICT_TO_COUNTRY:   district_name → country_code (lowercased, 'ua'/'ru'/'by'/...)
+#
+# Используется в detect_foreign_geo для контекстного определения:
+#   — район нашей страны (country == target) → не блокируем (улица в нашем городе)
+#   — район чужой страны (country != target) → блокируем как foreign (чужой город/район)
 #
 # Каждый фильтр держит собственную копию базы (независимость модулей).
 # Память: ~7 МБ — несущественно.
 # ═══════════════════════════════════════════════════════════════════════════
 _DISTRICT_TO_CANONICAL: Dict[str, str] = {}
+_DISTRICT_TO_COUNTRY: Dict[str, str] = {}
 
 def _load_districts():
     """Загружает districts.json один раз при импорте модуля.
-    Возвращает dict: district_name → canonical_city (lowercased)."""
-    global _DISTRICT_TO_CANONICAL
+    Возвращает две мапы: district→city и district→country."""
+    global _DISTRICT_TO_CANONICAL, _DISTRICT_TO_COUNTRY
     try:
         _path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -47,11 +50,12 @@ def _load_districts():
             return
         with open(_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        _DISTRICT_TO_CANONICAL = {
-            name.lower(): info.get("city", "").lower()
-            for name, info in raw.items()
-            if isinstance(info, dict)
-        }
+        for name, info in raw.items():
+            if not isinstance(info, dict):
+                continue
+            name_lower = name.lower()
+            _DISTRICT_TO_CANONICAL[name_lower] = info.get("city", "").lower()
+            _DISTRICT_TO_COUNTRY[name_lower] = info.get("country", "").lower()
         logger.info(
             "[FOREIGN_GEO_GUARD] loaded %d district entries from districts.json",
             len(_DISTRICT_TO_CANONICAL)
@@ -59,6 +63,7 @@ def _load_districts():
     except Exception as e:
         logger.error("[FOREIGN_GEO_GUARD] failed to load districts.json: %s", e)
         _DISTRICT_TO_CANONICAL = {}
+        _DISTRICT_TO_COUNTRY = {}
 
 _load_districts()
 
@@ -2000,21 +2005,20 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
         # Guard: DISTRICT_TO_CANONICAL — слово является районом/улицей
         # ═══════════════════════════════════════════════════════════════════
         # Если слово (или его лемма) есть в базе районов/улиц (districts.json),
-        # это НЕ независимый город-топоним, а район/микрорайон/улица. Примеры:
+        # пропускаем безусловно. База содержит:
+        #   — улицы-фамилии (гагарина, ленина, шевченко) — универсальные для
+        #     всех городов
+        #   — микрорайоны с распространёнными нарицательными названиями (бор,
+        #     сады, маяк, заря, рог, церковь) — совпадают с обычными словами
+        #   — реальные foreign-микрорайоны (лошица, чиланзар, юнусабад) —
+        #     редкие специфичные названия
         #
-        #   "гагарина"  → district of жуковский (RU)  → реально улица Гагарина
-        #                                                в любом городе
-        #   "ленина"    → district of улан-удэ (RU)   → реально улица Ленина
-        #   "шевченко"  → district of одеса (UA)      → район/улица Шевченко
-        #
-        # geonamescache часто содержит такие имена как "микрорайон имени X",
-        # где X — фамилия. В контексте запроса пользователя они означают
-        # улицу/район в seed-city (например "автовыкуп одесса на гагарина"
-        # = улица Гагарина в Одессе, не город Гагарин в РФ).
-        #
-        # Реальные города совпадающие с фамилиями (Пушкин, Гагарин, Королёв,
-        # Чехов, Чайковский) в DISTRICT_TO_CANONICAL ОТСУТСТВУЮТ — проверено
-        # на базе 288k записей. Они будут обработаны обычной логикой ниже.
+        # Попытка блокировать только "реальные foreign-районы" через эвристики
+        # (Geox-парс, длина слова) даёт слишком много ложных срабатываний:
+        #   — "кривой рог" ломается потому что "рог" в базе как RU-район
+        #   — "белая церковь" ломается потому что "белая" с RU-привязкой
+        # Надёжнее пропускать все DISTRICT-матчи — L3 разберётся с foreign-
+        # районами по семантике.
         if word in _DISTRICT_TO_CANONICAL or lemma in _DISTRICT_TO_CANONICAL:
             continue
         
@@ -2054,6 +2058,13 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
             continue
         bigram = f"{w1} {w2}"
         bigram_variants = {bigram, bigram.replace(' ', '-')}
+        # DISTRICT guard для биграмм: если биграмма есть в DISTRICT базе —
+        # пропускаем (район/улица, не независимый город). Применяем без
+        # разделения на country, потому что распространённые биграммы типа
+        # "N км", "белая церковь", "кривой рог" часто коллизят.
+        if any(v in _DISTRICT_TO_CANONICAL for v in bigram_variants):
+            continue
+        
         for variant in bigram_variants:
             if variant in geo_db:
                 countries = geo_db[variant]
