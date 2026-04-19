@@ -3444,4 +3444,103 @@ def detect_product_spec(tail: str, seed: str = "", tp: dict = None) -> Tuple[boo
             )
         return False, ""
 
+    # Случай 3: длинный tail (3+ токенов) — ищем подстроку <число> <ед>
+    # Примеры: 'про 256 гб', 'про макс 1 тб', 'про 128 gb'
+    # Только для часто встречающихся единиц измерения ёмкости памяти,
+    # чтобы не ловить ложно "за 40 тысяч" и подобное.
+    # Проверяем любую пару соседних токенов (digit, short_unit_letters).
+    _MEMORY_UNITS = {'гб', 'тб', 'gb', 'tb', 'мб', 'mb'}
+    for i in range(len(tokens) - 1):
+        if (_PRODUCT_SPEC_DIGIT.match(tokens[i])
+                and tokens[i + 1].lower() in _MEMORY_UNITS):
+            return True, (
+                f"Спецификация товара (память): '{tokens[i]} {tokens[i+1]}'"
+            )
+    # Также слитная форма в любой позиции ('256гб', '1тб')
+    for tok in tokens:
+        if _PRODUCT_SPEC_COMBINED.match(tok):
+            # Дополнительная проверка — это действительно память?
+            # Извлекаем буквенную часть и сверяем с MEMORY_UNITS
+            for unit in _MEMORY_UNITS:
+                if tok.endswith(unit):
+                    return True, f"Спецификация товара (память): '{tok}'"
+
+    return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RETAILER DETECTOR — онлайн-магазины, маркетплейсы, торговые сети.
+#
+# В отличие от detect_brand (производитель: Samsung, Xiaomi), этот детектор
+# ищет продавцов: Rozetka, Amazon, OLX, Comfy, Wildberries и т.д.
+#
+# Retailer в tail — сильный коммерческий сигнал: пользователь указал где
+# хочет купить, это конкретный покупательский интент. Вес 0.85, в SKIP-
+# MISMATCH — если сработал, category_mismatch игнорируется.
+#
+# Database: retailers_db — Set[str] загруженный из retailers.json
+# (см. databases.load_retailers_db). Многословные имена ("нова пошта",
+# "медиа маркт") хранятся как единые строки — проверяются биграммами.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def detect_retailer(tail: str, retailers_db: Set[str], tp: dict = None) -> Tuple[bool, str]:
+    """Позитивный детектор: упоминание ритейлера/маркетплейса в хвосте.
+
+    Args:
+        tail: хвост запроса
+        retailers_db: множество названий ритейлеров (lowercase)
+        tp: trace parser
+
+    Примеры:
+        'розетка'           → True ('розетка')
+        'купить в rozetka'  → True ('rozetka')
+        'нова пошта'        → True ('нова пошта' как биграмм)
+        'на куфаре'         → True (префикс-match 'куфар')
+        'в розетке'         → True (префикс-match 'розетка')
+        'доставка онлайн'   → False
+
+    Алгоритм:
+      1. Одиночные токены: прямая проверка word in retailers_db
+      2. Префикс-match: если word.startswith(retailer) с разницей ≤ 3 символа —
+         это косвенный падеж. Ловит "куфаре" (loct от "куфар"), "розетке"
+         (loct от "розетка"). Порог ≥ 4 символов на имя ритейлера (короткие
+         не склоняются или редки — "юла", "ozon", "dns").
+      3. Биграммы: 'w1 w2' и 'w1-w2' — для многословных ("нова пошта")
+    """
+    if not tail or not retailers_db:
+        return False, ""
+
+    words = tail.lower().split()
+    if not words:
+        return False, ""
+
+    # 1. Биграммы — проверяем первыми, чтобы многословные ("нова пошта",
+    # "медиа маркт") не распались на одиночные компоненты.
+    for i in range(len(words) - 1):
+        bigram = f"{words[i]} {words[i+1]}"
+        bigram_dash = f"{words[i]}-{words[i+1]}"
+        if bigram in retailers_db:
+            return True, f"Ритейлер (биграмм): '{bigram}'"
+        if bigram_dash in retailers_db:
+            return True, f"Ритейлер (биграмм): '{bigram_dash}'"
+
+    # 2. Одиночные токены (точное совпадение)
+    for word in words:
+        if word in retailers_db:
+            return True, f"Ритейлер: '{word}'"
+
+    # 3. Префикс-match для косвенных падежей ("на куфаре" → "куфар")
+    # Имя ритейлера должно быть длиной >= 4 символов (короткие типа "юла",
+    # "dns", "ozon" редко склоняются, да и префиксом могут ложно совпасть).
+    # Разница длин ≤ 3 символа = типичный суффикс падежа (-е, -ом, -ами).
+    for word in words:
+        if len(word) < 5:  # короткое слово не может быть косвенным падежом
+            continue
+        for retailer in retailers_db:
+            if len(retailer) < 4 or ' ' in retailer or '-' in retailer:
+                continue  # биграммы и короткие не через префикс
+            if word.startswith(retailer) and len(word) - len(retailer) <= 3:
+                return True, f"Ритейлер (падеж): '{word}' → '{retailer}'"
+
     return False, ""
