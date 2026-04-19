@@ -34,6 +34,8 @@ from .function_detectors import (
     detect_wrong_district, detect_unknown_district,
     # Product spec — технические спецификации товара (12в, 4т, 220 ом)
     detect_product_spec,
+    # Retailer — онлайн-магазины и маркетплейсы (Rozetka, Amazon, OLX)
+    detect_retailer,
     # Helpers
     _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
@@ -97,6 +99,7 @@ SIGNAL_WEIGHTS = {
     'wrong_district':    0.95,  # известный район ЧУЖОГО города при городском seed — hard block
     'unknown_district':  0.4,   # мягкий — район, которого нет в базе, но структура валидна
     'product_spec':      0.85,  # технические параметры товара (12 в, 4т, 220 ом) — надёжный сигнал
+    'retailer':          0.85,  # упоминание ритейлера/маркетплейса — сильный коммерческий интент
 }
 
 # Мягкие негативные сигналы — эвристики с высокой вероятностью ошибки.
@@ -150,15 +153,20 @@ _STRONG_POSITIVES_SKIP_MISMATCH = frozenset({
     'commerce', 'reputation', 'action', 'type_spec',
     # Product spec — технические параметры на товарном seed уже валидируют интент
     'product_spec',
+    # Retailer — ритейлер/маркетплейс в хвосте = конкретный коммерческий интент
+    'retailer',
 })
 
 
 class TailFunctionClassifier:
     """Классификатор хвостов на основе детекторов функций."""
     
-    def __init__(self, geo_db: Set[str], brand_db: Set[str], seed: str = "ремонт пылесосов", target_country: str = "ua"):
+    def __init__(self, geo_db: Set[str], brand_db: Set[str], seed: str = "ремонт пылесосов", target_country: str = "ua", retailer_db: Set[str] = None):
         self.geo_db = geo_db
         self.brand_db = brand_db
+        # retailer_db опциональный — если None, детектор не будет ничего ловить.
+        # Загружать его должен вызывающий код через databases.load_retailers_db().
+        self.retailer_db = retailer_db or set()
         self.seed = seed
         self.target_country = target_country
 
@@ -238,6 +246,7 @@ class TailFunctionClassifier:
             ('premod_adj',    lambda: detect_premod_adjective(tail, self.seed, kw, tp=tp)),
             ('postmod_adj',   lambda: detect_postmod_adjective(tail, self.seed, kw, tp=tp)),
             ('product_spec',  lambda: detect_product_spec(tail, self.seed, tp=tp)),
+            ('retailer',      lambda: detect_retailer(tail, self.retailer_db, tp=tp)),
         ]
 
         for signal_name, detector in detectors_positive:
