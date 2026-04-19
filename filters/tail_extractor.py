@@ -101,15 +101,38 @@ def extract_tail(query: str, seed: str, seed_ctx: dict = None):
         seed_ctx = build_seed_ctx(s)
 
     # === Шаг 1: Точный split ===
+    # Подстрочный match с проверкой word-boundary.
+    # Без boundary: seed="купить айфон 16" найдётся в q="купить айфон 16е"
+    # как подстрока, tail='е'. Но "16е" — цельный артикул/модель (iPhone 16e),
+    # и не должен разрываться. Разделяем только на word-boundary:
+    # после последнего символа seed должна быть НЕ буква и НЕ цифра
+    # (или конец строки). Универсально для 16е, 16e, 16gb, 16s, 160, 2016.
     if s in q:
-        parts = q.split(s, 1)
-        before = parts[0].strip()
-        after = parts[1].strip() if len(parts) > 1 else ""
+        import re as _re
+        _matched = False
+        for _m in _re.finditer(_re.escape(s), q):
+            _end = _m.end()
+            # Конец строки → boundary OK
+            if _end >= len(q):
+                _matched = True
+                _before_idx = _m.start()
+                break
+            # Следующий символ не буква и не цифра → boundary OK
+            _next_ch = q[_end]
+            if not (_next_ch.isalpha() or _next_ch.isdigit()):
+                _matched = True
+                _before_idx = _m.start()
+                break
+        if _matched:
+            before = q[:_before_idx].strip()
+            after = q[_end:].strip()
 
-        if before:
-            before = ' '.join(_strip_trailing_preps(before.split()))
+            if before:
+                before = ' '.join(_strip_trailing_preps(before.split()))
 
-        return ' '.join([before, after]).strip()
+            return ' '.join([before, after]).strip()
+        # Нет корректной boundary — идём к шагу 2 (он работает по токенам,
+        # а не по подстроке, там '16е' не равно '16' и не даст ложный матч)
 
     # Pre-compute query data ОДИН РАЗ для шагов 2-4
     # (если точный матч не сработал — нужны леммы для fuzzy/unordered)
