@@ -3544,3 +3544,90 @@ def detect_retailer(tail: str, retailers_db: Set[str], tp: dict = None) -> Tuple
                 return True, f"Ритейлер (падеж): '{word}' → '{retailer}'"
 
     return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# detect_model_variant — короткие латинские токены после seed как вариант
+# модели товара или единица измерения.
+#
+# Алгоритмический признак:
+#   — в начале tail стоит токен длиной 2-5 символов
+#   — токен состоит ТОЛЬКО из латиницы и/или цифр (isascii + all alnum)
+#   — хотя бы один символ — буква (чистые числа уже ловит product_spec)
+#   — НЕ compare-маркер (vs, vs., versus)
+#
+# Cross-niche паттерн. Работает на любой товарной нише где модификатор
+# модели/единицы измерения приходит латиницей:
+#   'iphone 16 pro / max / se / ultra / plus / air'
+#   'samsung s24 ultra'
+#   'rtx 3060 ti'
+#   'audi a4 quattro'                 (8 символов — НЕ матч, слишком длинно)
+#   'купить аккумулятор 12 ah'        (ah как единица ёмкости)
+#   'ремонт телевизора oled'          (oled как тип матрицы)
+#   'монитор 144 hz'                  (hz как единица)
+#   'ноутбук 16 gb'                   (gb как память)
+#
+# Защита от ложных положительных:
+#   — Кириллицу не трогаем — там есть шумные слова ('жук', 'лето', 'жанр'),
+#     не отличимые от моделей без списка.
+#   — Compare-маркеры (vs/versus) исключаем явно — они дают другой интент.
+#   — Длина ≤ 5 исключает большинство англ. прилагательных шума
+#     ('cheap', 'great', 'broken' — 5-7 букв, часть не пройдёт).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_MODEL_VARIANT_COMPARE_TOKENS = frozenset({'vs', 'versus'})
+
+
+def detect_model_variant(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool, str]:
+    """Positive детектор: короткий латинский модификатор модели после seed.
+
+    Срабатывает если первый токен tail — латинский, длиной 2-5 символов,
+    содержит хотя бы одну букву, и не является compare-маркером.
+
+    Args:
+        tail: хвост запроса
+        seed: базовый запрос (не используется, оставлен для консистентности)
+        tp: trace parser (не используется)
+
+    Returns:
+        (True, reason) если токен — модель/единица измерения
+        (False, "") иначе
+
+    Примеры:
+        'pro'           → True ('Модель/единица: pro')
+        'ultra 512 gb'  → True ('Модель/единица: ultra')
+        'ah'            → True ('Модель/единица: ah')
+        'pro max'       → True (первый токен 'pro')
+        'vs 15'         → False (compare-маркер)
+        'жук'           → False (не латиница)
+        '512'           → False (только цифры — ловит product_spec)
+        'quattro'       → False (7 символов — слишком длинно)
+    """
+    if not tail:
+        return False, ""
+
+    tokens = tail.split()
+    if not tokens:
+        return False, ""
+
+    first = tokens[0].lower()
+
+    # Длина 2-5 символов
+    if not (2 <= len(first) <= 5):
+        return False, ""
+
+    # Compare-маркер → не модель
+    if first in _MODEL_VARIANT_COMPARE_TOKENS:
+        return False, ""
+
+    # Только латиница и/или цифры, без знаков препинания
+    if not first.isascii():
+        return False, ""
+    if not first.isalnum():
+        return False, ""
+
+    # Хотя бы одна буква (чистые числа — задача product_spec)
+    if not any(c.isalpha() for c in first):
+        return False, ""
+
+    return True, f"Модель/единица: '{first}'"
