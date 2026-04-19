@@ -16,53 +16,18 @@ l0_filter.py — Серверная обёртка L0 классификатор
 
 ОПТИМИЗАЦИИ:
 1. Персистентный кэш TailFunctionClassifier — не пересоздаётся на каждый батч.
-   Кэш по ключу (seed, target_country). geo_db/brand_db/retailer_db загружаются
-   один раз.
+   Кэш по ключу (seed, target_country). geo_db/brand_db загружаются один раз.
 2. build_seed_ctx() вызывается один раз до цикла — seed одинаков для всего батча.
 3. _filter_timings добавляется к result — для профилирования горячих точек.
 """
 
 import logging
-import sys
+import re
 import time
 from typing import Dict, List, Set, Any, Optional
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ПРЯМЫЕ PRINT-ДИАГНОСТИКИ — обходим logger, пишем сразу в stdout.
-# Работает даже если logging сконфигурирован нестандартно.
-# Флаш сразу — чтобы лог не терялся в буфере при падении.
-# ═══════════════════════════════════════════════════════════════════════════
-print("[L0_RETAIL_DIAG] ======== l0_filter module is being imported ========", flush=True)
-
 from .tail_extractor import extract_tail, build_seed_ctx
 from .tail_function_classifier import TailFunctionClassifier
-
-print("[L0_RETAIL_DIAG] submodule imports OK (tail_extractor, tail_function_classifier)", flush=True)
-
-# Проверяем что retailer_db грузится
-try:
-    from .databases import load_retailers_db as _probe_load
-    _probe_rdb = _probe_load()
-    print(
-        f"[L0_RETAIL_DIAG] retailers.json probe: size={len(_probe_rdb) if _probe_rdb else 0} "
-        f"| 'олх' in db: {'олх' in (_probe_rdb or set())} "
-        f"| 'ситилинк' in db: {'ситилинк' in (_probe_rdb or set())}",
-        flush=True,
-    )
-    # Тест детектора
-    from .function_detectors import detect_retailer as _probe_detect
-    _t1 = _probe_detect('олх', _probe_rdb)
-    _t2 = _probe_detect('ситилинк', _probe_rdb)
-    print(
-        f"[L0_RETAIL_DIAG] detect_retailer probe: olh={_t1[0]} (reason={_t1[1][:50]!r}) "
-        f"| citilink={_t2[0]}",
-        flush=True,
-    )
-    del _probe_rdb, _probe_load, _probe_detect, _t1, _t2
-except Exception as _probe_err:
-    import traceback
-    print(f"[L0_RETAIL_DIAG] PROBE FAILED: {type(_probe_err).__name__}: {_probe_err}", flush=True)
-    traceback.print_exc()
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +37,8 @@ logger = logging.getLogger(__name__)
 # TailFunctionClassifier создаётся ОДИН РАЗ на (seed, target_country)
 # и переиспользуется во всех последующих запросах с тем же seed.
 #
-# ВАЖНО: кэш хранит ссылку на geo_db / brand_db / retailer_db.
-# Если эти базы пересоздаются при каждом запросе (новый dict/set) —
+# ВАЖНО: кэш хранит ссылку на geo_db / brand_db.
+# Если эти базы пересоздаются при каждом запросе (новый dict) —
 # кэш теряет смысл. Убедитесь что bases загружаются при старте сервера
 # и передаются одним и тем же объектом.
 # ============================================================
@@ -90,81 +55,33 @@ _UA_EXCLUSIVE_LETTERS = frozenset('іїєґІЇЄҐ')
 
 
 # ============================================================
-# Fallback-загрузка retailer_db — модульный singleton.
-# Если вызывающий код не передаёт retailer_db явно (backward-compat),
-# грузим один раз при первом обращении и переиспользуем далее.
+# Украинские слова БЕЗ эксклюзивных UA-букв.
+# Эти леммы не существуют в русском (купити, замовити, заказати) или
+# существуют но НИКОГДА не встречаются в хвосте русского поискового
+# запроса как осмысленная единица (пошта, ринок, ціни, вартість).
+#
+# Используются в fallback-проверке когда `tail is None`:
+# если extractor не нашёл seed, и в kw присутствует хотя бы одно из
+# этих слов — это UA-запрос для отдельного пайплайна → TRASH.
+#
+# НЕ используется на tail после успешного извлечения: там классификатор
+# сам разбирает ключи типа "купити аккумулятор на скутер 12 в" (VALID
+# через product_spec).
 # ============================================================
-_RETAILER_DB_FALLBACK: Optional[Set[str]] = None
+_UA_AMBIGUOUS_WORDS = frozenset({
+    'купити', 'замовити', 'заказати',
+    'огляд', 'розстрочку', 'ринок',
+    'ціни', 'вартість', 'пошта',
+})
 
 
-def _get_fallback_retailer_db() -> Set[str]:
-    """Ленивая загрузка retailer_db из databases.load_retailers_db().
-
-    Вызывается только когда apply_l0_filter не получил retailer_db извне.
-    Результат кэшируется на уровне модуля — один load_retailers_db() на
-    весь процесс.
-    """
-    global _RETAILER_DB_FALLBACK
-    if _RETAILER_DB_FALLBACK is None:
-        try:
-            from .databases import load_retailers_db
-            _RETAILER_DB_FALLBACK = load_retailers_db()
-            logger.warning(
-                "[L0_DIAG] Loaded retailer_db fallback: %d retailers "
-                "(sample: %s)",
-                len(_RETAILER_DB_FALLBACK),
-                sorted(list(_RETAILER_DB_FALLBACK))[:5] if _RETAILER_DB_FALLBACK else [],
-            )
-        except Exception as e:
-            logger.error("[L0_DIAG] Failed to load retailer_db fallback: %s", e, exc_info=True)
-            _RETAILER_DB_FALLBACK = set()
-    return _RETAILER_DB_FALLBACK
-
-
-# ============================================================
-# СТАРТАП-ПРОГРЕВ retailer_db при импорте модуля.
-# Это гарантирует что лог "[L0_DIAG] Loaded retailer_db..." появится
-# в момент старта сервиса (а не при первом запросе), и если загрузка
-# падает — сразу видно в stderr.
-# ============================================================
-try:
-    _preload_rdb = _get_fallback_retailer_db()
-    logger.warning(
-        "[L0_DIAG] STARTUP: retailer_db preloaded at module import. "
-        "size=%d test_lookups: ['олх']=%s ['розетка']=%s ['ситилинк']=%s ['мтс']=%s",
-        len(_preload_rdb) if _preload_rdb else 0,
-        'олх' in _preload_rdb if _preload_rdb else False,
-        'розетка' in _preload_rdb if _preload_rdb else False,
-        'ситилинк' in _preload_rdb if _preload_rdb else False,
-        'мтс' in _preload_rdb if _preload_rdb else False,
-    )
-except Exception as _e:
-    logger.error(
-        "[L0_DIAG] STARTUP: retailer_db preload FAILED: %s",
-        _e, exc_info=True,
-    )
-
-
-def _sanity_probe_retailer(retailer_db: Set[str]) -> None:
-    """Диагностика: проверить что detect_retailer реально работает с данной БД.
-
-    Запускает detect_retailer на 3 контрольных tail'ах ('олх', 'розетка',
-    'ситилинк'). Если хоть один не даёт (True, ...) — в логе warning.
-    Вызывается один раз при создании классификатора.
-    """
-    try:
-        from .function_detectors import detect_retailer
-        probes = ['олх', 'розетка', 'ситилинк']
-        results = []
-        for t in probes:
-            detected, reason = detect_retailer(t, retailer_db)
-            results.append(f"{t}={'OK' if detected else 'FAIL'}")
-        logger.warning(
-            "[L0_DIAG] retailer sanity probe: %s | db_size=%d",
-            " ".join(results), len(retailer_db) if retailer_db else 0,
-        )
-    except Exception as e:
-        logger.error("[L0_DIAG] retailer sanity probe failed: %s", e)
+# Regex: числовые токены (целые числа как отдельные слова).
+# Используется для обнаружения "wrong model" сценария:
+# seed="купить айфон 16", kw="купить айфон 14 киев" → seed extractor
+# вернул None (число 16 не найдено в kw, только 14) → TRASH.
+#
+# Boundary \b гарантирует что 16 НЕ матчится в 16gb, 2016, 160.
+_NUMBER_TOKEN_RE = re.compile(r'\b\d+\b')
 
 
 def _get_classifier(
@@ -180,30 +97,20 @@ def _get_classifier(
     """
     key = (seed.lower().strip(), target_country.lower())
     if key not in _CLASSIFIER_CACHE:
-        logger.warning(
-            "[L0_DIAG] Creating classifier: seed='%s' country='%s' "
-            "geo_db=%d brand_db=%d retailer_db=%d",
+        logger.info(
+            "[L0] Creating new classifier for seed='%s' country='%s' "
+            "(geo_db=%d brand_db=%d retailer_db=%d)",
             seed, target_country,
             len(geo_db) if geo_db else 0,
             len(brand_db) if brand_db else 0,
             len(retailer_db) if retailer_db else 0,
         )
-        _sanity_probe_retailer(retailer_db)
         _CLASSIFIER_CACHE[key] = TailFunctionClassifier(
             geo_db=geo_db,
             brand_db=brand_db,
             seed=seed,
             target_country=target_country,
             retailer_db=retailer_db,
-        )
-        # Верификация: действительно ли classifier получил retailer_db?
-        _post = _CLASSIFIER_CACHE[key]
-        _inner_rdb = getattr(_post, 'retailer_db', None)
-        logger.warning(
-            "[L0_DIAG] Classifier created. Inner retailer_db size: %d "
-            "(expected: %d)",
-            len(_inner_rdb) if _inner_rdb else 0,
-            len(retailer_db) if retailer_db else 0,
         )
     return _CLASSIFIER_CACHE[key]
 
@@ -225,8 +132,8 @@ def apply_l0_filter(
         target_country: целевая страна
         geo_db: база городов Dict[str, Set[str]] (название → {коды_стран})
         brand_db: база брендов (set). Если None — пустой set
-        retailer_db: база ритейлеров/маркетплейсов (set). Если None — грузится
-                     fallback через databases.load_retailers_db() (backward-compat).
+        retailer_db: база ритейлеров/маркетплейсов (set). Если None — пустой set.
+                     Должен загружаться вызывающим кодом через databases.load_retailers_db().
 
     Returns:
         result с обновлёнными keywords, keywords_grey, anchors, _l0_trace, _filter_timings
@@ -246,46 +153,25 @@ def apply_l0_filter(
         geo_db = {}
     if brand_db is None:
         brand_db = set()
-    # Если вызывающий код не передал retailer_db — грузим сами.
-    # Это backward-compat для старых вызовов apply_l0_filter(..., brand_db=...).
-    _rdb_was_none = retailer_db is None
     if retailer_db is None:
-        retailer_db = _get_fallback_retailer_db()
-
-    # DIAG: логируем вход чтобы видеть как вызывается apply_l0_filter
-    logger.warning(
-        "[L0_DIAG] apply_l0_filter entry: seed='%s' country='%s' "
-        "keywords=%d retailer_db_passed=%s retailer_db_final=%d",
-        seed, target_country, len(keywords),
-        "None(fallback)" if _rdb_was_none else f"{len(retailer_db)}",
-        len(retailer_db) if retailer_db else 0,
-    )
+        retailer_db = set()
 
     # ── Pre-compute seed_ctx ОДИН РАЗ для всего батча ──────────────────────
     # Seed одинаков для всех ключей → лематизация seed не повторяется N раз.
     _t = time.perf_counter()
     seed_lower = seed.lower().strip()
     seed_ctx = build_seed_ctx(seed_lower)
+    # Pre-compute: цельные числовые токены в seed (как frozenset для O(1) lookup).
+    # Используется в NO_SEED-ветке ниже для классификации "wrong model"
+    # сценария: seed="купить айфон 16", kw="купить айфон 14 киев" → 14 не
+    # совпадает ни с одним числом seed → TRASH.
+    _seed_numbers = frozenset(_NUMBER_TOKEN_RE.findall(seed_lower))
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
-    # DIAG: прямой print перед создания (вместо logger'а)
-    print(
-        f"[L0_RETAIL_DIAG] apply_l0_filter: seed={seed!r} | "
-        f"retailer_db size = {len(retailer_db) if retailer_db else 0} | "
-        f"classifiers cached: {len(_CLASSIFIER_CACHE)}",
-        flush=True,
-    )
     _t = time.perf_counter()
     clf = _get_classifier(seed, target_country, geo_db, brand_db, retailer_db)
     _t_stage['get_classifier'] = time.perf_counter() - _t
-
-    # DIAG: что получил classifier внутри
-    _clf_rdb_size = len(getattr(clf, 'retailer_db', None) or set())
-    print(
-        f"[L0_RETAIL_DIAG] classifier ready: clf.retailer_db size = {_clf_rdb_size}",
-        flush=True,
-    )
 
     # ── Глобальный словарь morph-парсов для всего батча ────────────────────
     from .shared_morph import morph as _morph
@@ -390,8 +276,73 @@ def apply_l0_filter(
             })
             continue
 
-        # NO_SEED → GREY
+        # NO_SEED: extractor не нашёл seed в kw.
+        # Решение label'а зависит от ДВУХ алгоритмических условий:
+        #
+        # Условие A — "wrong model" сценарий.
+        # Если seed содержит целые числовые токены (например "купить айфон 16"
+        # → seed_numbers = {"16"}), и в kw есть числа, но НИ ОДНО из них не
+        # совпадает с seed_numbers — значит пользователь ищет ДРУГУЮ модель
+        # или версию, семантически несовместимую с seed. Примеры:
+        #   • "купить айфон 14 киев"      → 14 ∉ {16} → TRASH
+        #   • "iphone 6 16gb"             → 6 ∉ {16} → TRASH (16gb не токен)
+        #   • "купить айфон 9 плюс"       → 9 ∉ {16} → TRASH
+        # Cross-niche защита: для сидов без чисел ("доставка цветов",
+        # "имплантация зубов") seed_numbers пустой — условие никогда не
+        # срабатывает. Для "аккумулятор на скутер" seed_numbers тоже пустой.
+        #
+        # Условие B — украинский язык без эксклюзивных букв.
+        # UA-буквы {і, ї, є, ґ} уже ловит verify выше. Но есть украинские
+        # слова на той же кириллице что и русский: "купити", "замовити",
+        # "огляд", "розстрочку" и т.д. — они не отличаются от RU буквами,
+        # но это всё равно украинский пайплайн.
+        #
+        # Если ни A ни B не сработали — оставляем GREY как раньше
+        # (возможные валидные синонимы, перестановки, частичные совпадения).
         if tail is None:
+            _kw_lower = kw.lower()
+            _kw_words_set = set(_kw_lower.split())
+
+            # Условие B — проверяем первым, дешевле (один set intersection)
+            _ua_hit = _kw_words_set & _UA_AMBIGUOUS_WORDS
+            if _ua_hit:
+                trash_keywords.append(kw_item)
+                trace_records.append({
+                    "keyword": kw,
+                    "tail": None,
+                    "label": "TRASH",
+                    "decided_by": "l0",
+                    "reason": (
+                        f"UA-слово в kw ('{sorted(_ua_hit)[0]}') — "
+                        "нужна UA-копия пайплайна"
+                    ),
+                    "signals": ["-wrong_language"],
+                })
+                continue
+
+            # Условие A — проверяем если seed содержит числа
+            if _seed_numbers:
+                _kw_numbers = _NUMBER_TOKEN_RE.findall(_kw_lower)
+                # Есть числа в kw и ни одно не совпадает с seed-числом
+                if _kw_numbers and not any(n in _seed_numbers for n in _kw_numbers):
+                    trash_keywords.append(kw_item)
+                    trace_records.append({
+                        "keyword": kw,
+                        "tail": None,
+                        "label": "TRASH",
+                        "decided_by": "l0",
+                        "reason": (
+                            f"seed не найден + другие числа "
+                            f"{sorted(set(_kw_numbers))} "
+                            f"≠ seed-числа {sorted(_seed_numbers)} → TRASH "
+                            f"(wrong model/version)"
+                        ),
+                        "signals": ["-wrong_model"],
+                    })
+                    continue
+
+            # Fallback: seed не найден, но ни A, ни B не сработали → GREY
+            # Могут быть валидные синонимы, перестановки, частичные совпадения.
             grey_keywords.append(kw_item)
             trace_records.append({
                 "keyword": kw,
@@ -460,20 +411,6 @@ def apply_l0_filter(
     result["anchors_count"] = len(existing_anchors)
 
     result["_l0_trace"] = trace_records
-
-    # DIAG: per-batch счётчик hits позитивных детекторов — сразу видно
-    # сработал ли retailer, и сколько раз. Если retailer_hits=0 при
-    # непустом retailer_db — проблема в передаче/коде, не в базе.
-    _pos_hits = {}
-    for tr in trace_records:
-        for s in tr.get("signals", []):
-            if not s.startswith("-"):
-                _pos_hits[s] = _pos_hits.get(s, 0) + 1
-    _hits_str = " ".join(f"{k}={v}" for k, v in sorted(_pos_hits.items(), key=lambda x: -x[1]))
-    logger.warning(
-        "[L0_DIAG] positive detector hits (seed='%s'): %s | retailer_hits=%d",
-        seed, _hits_str, _pos_hits.get("retailer", 0),
-    )
 
     # ── Сохраняем диагностику ────────────────────────────────────────────────
     _t = time.perf_counter()
