@@ -197,6 +197,20 @@ except ImportError:
     BRAND_DB = set()
     logger.warning("[L0] databases.py not found, BRAND_DB пуст")
 
+# RETAILER_DB: база ритейлеров/маркетплейсов для detect_retailer в L0.
+# Передаётся явно в apply_l0_filter() — без этого detect_retailer работает
+# как no-op (см. TailFunctionClassifier.__init__, default retailer_db=None).
+try:
+    from databases import load_retailers_db
+    RETAILER_DB = load_retailers_db()
+    logger.info(f"[L0] RETAILER_DB: {len(RETAILER_DB)} записей")
+except ImportError:
+    RETAILER_DB = set()
+    logger.warning("[L0] databases.py not found, RETAILER_DB пуст")
+except Exception as _e:
+    RETAILER_DB = set()
+    logger.error(f"[L0] Failed to load RETAILER_DB: {_e}")
+
 # DeepSeek API key для L3
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
@@ -1151,6 +1165,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             target_country=country,
             geo_db=GEO_DB,
             brand_db=BRAND_DB,
+            retailer_db=RETAILER_DB,
         )
         _timings["l0_filter"] = round(time.time() - _t0, 4)
         
