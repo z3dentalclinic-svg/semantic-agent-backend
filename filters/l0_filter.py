@@ -16,14 +16,15 @@ l0_filter.py — Серверная обёртка L0 классификатор
 
 ОПТИМИЗАЦИИ:
 1. Персистентный кэш TailFunctionClassifier — не пересоздаётся на каждый батч.
-   Кэш по ключу (seed, target_country). geo_db/brand_db загружаются один раз.
+   Кэш по ключу (seed, target_country). geo_db/brand_db/retailer_db загружаются
+   один раз.
 2. build_seed_ctx() вызывается один раз до цикла — seed одинаков для всего батча.
 3. _filter_timings добавляется к result — для профилирования горячих точек.
 """
 
 import logging
 import time
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Set, Any, Optional
 
 from .tail_extractor import extract_tail, build_seed_ctx
 from .tail_function_classifier import TailFunctionClassifier
@@ -36,8 +37,8 @@ logger = logging.getLogger(__name__)
 # TailFunctionClassifier создаётся ОДИН РАЗ на (seed, target_country)
 # и переиспользуется во всех последующих запросах с тем же seed.
 #
-# ВАЖНО: кэш хранит ссылку на geo_db / brand_db.
-# Если эти базы пересоздаются при каждом запросе (новый dict) —
+# ВАЖНО: кэш хранит ссылку на geo_db / brand_db / retailer_db.
+# Если эти базы пересоздаются при каждом запросе (новый dict/set) —
 # кэш теряет смысл. Убедитесь что bases загружаются при старте сервера
 # и передаются одним и тем же объектом.
 # ============================================================
@@ -53,11 +54,42 @@ _CLASSIFIER_CACHE: Dict[tuple, TailFunctionClassifier] = {}
 _UA_EXCLUSIVE_LETTERS = frozenset('іїєґІЇЄҐ')
 
 
+# ============================================================
+# Fallback-загрузка retailer_db — модульный singleton.
+# Если вызывающий код не передаёт retailer_db явно (backward-compat),
+# грузим один раз при первом обращении и переиспользуем далее.
+# ============================================================
+_RETAILER_DB_FALLBACK: Optional[Set[str]] = None
+
+
+def _get_fallback_retailer_db() -> Set[str]:
+    """Ленивая загрузка retailer_db из databases.load_retailers_db().
+
+    Вызывается только когда apply_l0_filter не получил retailer_db извне.
+    Результат кэшируется на уровне модуля — один load_retailers_db() на
+    весь процесс.
+    """
+    global _RETAILER_DB_FALLBACK
+    if _RETAILER_DB_FALLBACK is None:
+        try:
+            from .databases import load_retailers_db
+            _RETAILER_DB_FALLBACK = load_retailers_db()
+            logger.info(
+                "[L0] Loaded retailer_db fallback: %d retailers",
+                len(_RETAILER_DB_FALLBACK),
+            )
+        except Exception as e:
+            logger.warning("[L0] Failed to load retailer_db fallback: %s", e)
+            _RETAILER_DB_FALLBACK = set()
+    return _RETAILER_DB_FALLBACK
+
+
 def _get_classifier(
     seed: str,
     target_country: str,
     geo_db: Dict,
     brand_db: Set,
+    retailer_db: Set,
 ) -> TailFunctionClassifier:
     """
     Возвращает персистентный классификатор для данного (seed, target_country).
@@ -65,12 +97,20 @@ def _get_classifier(
     """
     key = (seed.lower().strip(), target_country.lower())
     if key not in _CLASSIFIER_CACHE:
-        logger.info("[L0] Creating new classifier for seed='%s' country='%s'", seed, target_country)
+        logger.info(
+            "[L0] Creating new classifier for seed='%s' country='%s' "
+            "(geo_db=%d, brand_db=%d, retailer_db=%d)",
+            seed, target_country,
+            len(geo_db) if geo_db else 0,
+            len(brand_db) if brand_db else 0,
+            len(retailer_db) if retailer_db else 0,
+        )
         _CLASSIFIER_CACHE[key] = TailFunctionClassifier(
             geo_db=geo_db,
             brand_db=brand_db,
             seed=seed,
             target_country=target_country,
+            retailer_db=retailer_db,
         )
     return _CLASSIFIER_CACHE[key]
 
@@ -81,6 +121,7 @@ def apply_l0_filter(
     target_country: str = "ua",
     geo_db: Dict[str, Set[str]] = None,
     brand_db: Set[str] = None,
+    retailer_db: Set[str] = None,
 ) -> Dict[str, Any]:
     """
     Применяет L0 классификатор к списку ключевых слов.
@@ -91,6 +132,8 @@ def apply_l0_filter(
         target_country: целевая страна
         geo_db: база городов Dict[str, Set[str]] (название → {коды_стран})
         brand_db: база брендов (set). Если None — пустой set
+        retailer_db: база ритейлеров/маркетплейсов (set). Если None — грузится
+                     fallback через databases.load_retailers_db() (backward-compat).
 
     Returns:
         result с обновлёнными keywords, keywords_grey, anchors, _l0_trace, _filter_timings
@@ -110,6 +153,10 @@ def apply_l0_filter(
         geo_db = {}
     if brand_db is None:
         brand_db = set()
+    # Если вызывающий код не передал retailer_db — грузим сами.
+    # Это backward-compat для старых вызовов apply_l0_filter(..., brand_db=...).
+    if retailer_db is None:
+        retailer_db = _get_fallback_retailer_db()
 
     # ── Pre-compute seed_ctx ОДИН РАЗ для всего батча ──────────────────────
     # Seed одинаков для всех ключей → лематизация seed не повторяется N раз.
@@ -120,7 +167,7 @@ def apply_l0_filter(
 
     # ── Персистентный классификатор ─────────────────────────────────────────
     _t = time.perf_counter()
-    clf = _get_classifier(seed, target_country, geo_db, brand_db)
+    clf = _get_classifier(seed, target_country, geo_db, brand_db, retailer_db)
     _t_stage['get_classifier'] = time.perf_counter() - _t
 
     # ── Глобальный словарь morph-парсов для всего батча ────────────────────
