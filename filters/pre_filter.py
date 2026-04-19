@@ -49,15 +49,41 @@ def pre_filter(query: str, seed: str) -> tuple:
     # Блокировать их опасно: "услуги в юриста лондоне" может быть разорванной
     # конструкцией "услуги В-юриста лондон" или артефактом где В ≠ шум.
     #
+    # ИСКЛЮЧЕНИЕ для 'б у' / 'у б': биграмма из букв 'б' и 'у' рядом —
+    # устойчивое сокращение "б/у" (бывшее в употреблении), валидный
+    # коммерческий термин в e-commerce ("купить айфон 16 б у",
+    # "купить айфон 16 про макс б у"). Блокировать нельзя.
+    #
     # Срабатывает когда:
     #   — все слова seed присутствуют в query (с префикс-match для падежей)
     #   — в query есть одиночный токен ИЗ SAFE_NOISE_LETTERS
+    #   — этот токен НЕ часть биграммы 'б у' / 'у б'
     SAFE_NOISE_LETTERS = {'а', 'б', 'a', 'b'}
     q_words = q.split()
+
+    def _is_b_u_abbreviation(idx: int) -> bool:
+        """Проверяет: токен на позиции idx — часть 'б у' (рус. б/у)."""
+        token = q_words[idx]
+        # только русская 'б'
+        if token != 'б':
+            return False
+        # 'б' + следующее слово 'у'
+        if idx + 1 < len(q_words) and q_words[idx + 1] == 'у':
+            return True
+        # 'у' + предыдущее 'б' (для паттерна 'у б', хотя редкий)
+        if idx - 1 >= 0 and q_words[idx - 1] == 'у':
+            return True
+        return False
+
     noise_letter = None
-    for w in q_words:
+    noise_idx = None
+    for i, w in enumerate(q_words):
         if w in SAFE_NOISE_LETTERS:
+            # Защита для 'б у'
+            if _is_b_u_abbreviation(i):
+                continue
             noise_letter = w
+            noise_idx = i
             break
     if noise_letter:
         s_words_list = s.split()
