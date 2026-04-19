@@ -792,7 +792,57 @@ def detect_action(tail: str, tp: dict = None) -> Tuple[bool, str]:
 # НЕГАТИВНЫЕ ДЕТЕКТОРЫ (дефект формы → TRASH)
 # ============================================================
 
-def detect_fragment(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool, str]:
+def _is_infix_between_seed_words(token: str, seed: str, kw: str) -> bool:
+    """Проверяет: стоит ли token в kw МЕЖДУ словами seed.
+
+    Пример infix:
+      kw = "имплантация без зубов"
+      seed = "имплантация зубов"
+      token = "без"
+      → seed-слова в kw на позициях [0, 2], token на позиции 1 между ними
+      → True
+
+    Пример НЕ infix:
+      kw = "ремонт пылесосов без"
+      seed = "ремонт пылесосов"
+      token = "без"
+      → seed-слова на [0, 1], token на 2 ПОСЛЕ seed
+      → False
+
+    Требования:
+      — все слова seed присутствуют в kw
+      — token встречается в kw СТРОГО между первым и последним словом seed
+    """
+    if not token or not seed or not kw:
+        return False
+
+    kw_words = kw.lower().split()
+    seed_words_set = set(seed.lower().split())
+    token_lower = token.lower()
+
+    # Индексы всех позиций seed-слов в kw
+    seed_positions = [i for i, w in enumerate(kw_words) if w in seed_words_set]
+    if len(seed_positions) < 2:
+        return False  # seed не представлен двумя+ словами — не infix
+
+    # Индекс token
+    try:
+        token_positions = [i for i, w in enumerate(kw_words) if w == token_lower]
+    except ValueError:
+        return False
+    if not token_positions:
+        return False
+
+    first_seed = min(seed_positions)
+    last_seed = max(seed_positions)
+    # Хотя бы один экземпляр token стоит строго МЕЖДУ крайними seed-позициями
+    for tp_ in token_positions:
+        if first_seed < tp_ < last_seed:
+            return True
+    return False
+
+
+def detect_fragment(tail: str, seed: str = "", tp: dict = None, kw: str = "") -> Tuple[bool, str]:
     """
     Детектор обрывка: хвост заканчивается на служебное слово,
     или состоит из одной копулы/частицы.
@@ -802,6 +852,12 @@ def detect_fragment(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool, s
     
     SEED-AWARE: если seed содержит глагол, одиночное "когда"/"сколько"
     в tail = временной модификатор глагола, не обрывок.
+
+    kw-AWARE (infix-guard): если tail = один PREP, но в kw этот PREP
+    стоит МЕЖДУ словами seed ("имплантация без зубов" при seed="имплантация
+    зубов"), это не обрывок — это инфикс-вставка образующая PREP-группу
+    со вторым словом seed. В этом случае возвращаем False, пусть
+    category_mismatch (soft) отправит ключ в GREY, L3 разрулит.
     """
     words = tail.lower().split()
     if not words:
@@ -845,6 +901,16 @@ def detect_fragment(tail: str, seed: str = "", tp: dict = None) -> Tuple[bool, s
             # "NOUN + БУКВА" это медицинская/техническая классификация.
             # Универсальное структурное правило: если перед буквой существительное
             # — это его маркер, не служебное слово.
+            pass
+        elif (len(words) == 1 and last_parsed.tag.POS == 'PREP'
+              and kw and seed
+              and _is_infix_between_seed_words(last_word, seed, kw)):
+            # Инфикс-вставка: tail=PREP попал между слов seed в kw.
+            # Пример: kw="имплантация без зубов", seed="имплантация зубов",
+            # tail="без" → PREP вклинился в seed, образуя семантическую группу
+            # "без зубов". Это не обрывок, а изменение смысла запроса.
+            # Выходим без блока — дальше сработает только soft category_mismatch,
+            # ключ уйдёт в GREY, L3 разрулит по семантике.
             pass
         else:
             return True, f"Обрывок: '{last_word}' ({last_parsed.tag.POS}) на конце"
