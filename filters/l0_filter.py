@@ -74,14 +74,38 @@ def _get_fallback_retailer_db() -> Set[str]:
         try:
             from .databases import load_retailers_db
             _RETAILER_DB_FALLBACK = load_retailers_db()
-            logger.info(
-                "[L0] Loaded retailer_db fallback: %d retailers",
+            logger.warning(
+                "[L0_DIAG] Loaded retailer_db fallback: %d retailers "
+                "(sample: %s)",
                 len(_RETAILER_DB_FALLBACK),
+                sorted(list(_RETAILER_DB_FALLBACK))[:5] if _RETAILER_DB_FALLBACK else [],
             )
         except Exception as e:
-            logger.warning("[L0] Failed to load retailer_db fallback: %s", e)
+            logger.error("[L0_DIAG] Failed to load retailer_db fallback: %s", e)
             _RETAILER_DB_FALLBACK = set()
     return _RETAILER_DB_FALLBACK
+
+
+def _sanity_probe_retailer(retailer_db: Set[str]) -> None:
+    """Диагностика: проверить что detect_retailer реально работает с данной БД.
+
+    Запускает detect_retailer на 3 контрольных tail'ах ('олх', 'розетка',
+    'ситилинк'). Если хоть один не даёт (True, ...) — в логе warning.
+    Вызывается один раз при создании классификатора.
+    """
+    try:
+        from .function_detectors import detect_retailer
+        probes = ['олх', 'розетка', 'ситилинк']
+        results = []
+        for t in probes:
+            detected, reason = detect_retailer(t, retailer_db)
+            results.append(f"{t}={'OK' if detected else 'FAIL'}")
+        logger.warning(
+            "[L0_DIAG] retailer sanity probe: %s | db_size=%d",
+            " ".join(results), len(retailer_db) if retailer_db else 0,
+        )
+    except Exception as e:
+        logger.error("[L0_DIAG] retailer sanity probe failed: %s", e)
 
 
 def _get_classifier(
@@ -97,20 +121,30 @@ def _get_classifier(
     """
     key = (seed.lower().strip(), target_country.lower())
     if key not in _CLASSIFIER_CACHE:
-        logger.info(
-            "[L0] Creating new classifier for seed='%s' country='%s' "
-            "(geo_db=%d, brand_db=%d, retailer_db=%d)",
+        logger.warning(
+            "[L0_DIAG] Creating classifier: seed='%s' country='%s' "
+            "geo_db=%d brand_db=%d retailer_db=%d",
             seed, target_country,
             len(geo_db) if geo_db else 0,
             len(brand_db) if brand_db else 0,
             len(retailer_db) if retailer_db else 0,
         )
+        _sanity_probe_retailer(retailer_db)
         _CLASSIFIER_CACHE[key] = TailFunctionClassifier(
             geo_db=geo_db,
             brand_db=brand_db,
             seed=seed,
             target_country=target_country,
             retailer_db=retailer_db,
+        )
+        # Верификация: действительно ли classifier получил retailer_db?
+        _post = _CLASSIFIER_CACHE[key]
+        _inner_rdb = getattr(_post, 'retailer_db', None)
+        logger.warning(
+            "[L0_DIAG] Classifier created. Inner retailer_db size: %d "
+            "(expected: %d)",
+            len(_inner_rdb) if _inner_rdb else 0,
+            len(retailer_db) if retailer_db else 0,
         )
     return _CLASSIFIER_CACHE[key]
 
@@ -155,8 +189,18 @@ def apply_l0_filter(
         brand_db = set()
     # Если вызывающий код не передал retailer_db — грузим сами.
     # Это backward-compat для старых вызовов apply_l0_filter(..., brand_db=...).
+    _rdb_was_none = retailer_db is None
     if retailer_db is None:
         retailer_db = _get_fallback_retailer_db()
+
+    # DIAG: логируем вход чтобы видеть как вызывается apply_l0_filter
+    logger.warning(
+        "[L0_DIAG] apply_l0_filter entry: seed='%s' country='%s' "
+        "keywords=%d retailer_db_passed=%s retailer_db_final=%d",
+        seed, target_country, len(keywords),
+        "None(fallback)" if _rdb_was_none else f"{len(retailer_db)}",
+        len(retailer_db) if retailer_db else 0,
+    )
 
     # ── Pre-compute seed_ctx ОДИН РАЗ для всего батча ──────────────────────
     # Seed одинаков для всех ключей → лематизация seed не повторяется N раз.
@@ -343,6 +387,20 @@ def apply_l0_filter(
     result["anchors_count"] = len(existing_anchors)
 
     result["_l0_trace"] = trace_records
+
+    # DIAG: per-batch счётчик hits позитивных детекторов — сразу видно
+    # сработал ли retailer, и сколько раз. Если retailer_hits=0 при
+    # непустом retailer_db — проблема в передаче/коде, не в базе.
+    _pos_hits = {}
+    for tr in trace_records:
+        for s in tr.get("signals", []):
+            if not s.startswith("-"):
+                _pos_hits[s] = _pos_hits.get(s, 0) + 1
+    _hits_str = " ".join(f"{k}={v}" for k, v in sorted(_pos_hits.items(), key=lambda x: -x[1]))
+    logger.warning(
+        "[L0_DIAG] positive detector hits (seed='%s'): %s | retailer_hits=%d",
+        seed, _hits_str, _pos_hits.get("retailer", 0),
+    )
 
     # ── Сохраняем диагностику ────────────────────────────────────────────────
     _t = time.perf_counter()
