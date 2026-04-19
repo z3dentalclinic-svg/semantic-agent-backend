@@ -1434,6 +1434,56 @@ def detect_duplicate_words(tail: str, tp: dict = None) -> Tuple[bool, str]:
         if has_dup_across_conjunction:
             return False, ""
     
+    # === ФИКС: Model comparison через число ===
+    # "чехол на 16 про макс под 17 про макс" — повтор 'про макс' через цифру
+    # '17' = сравнение моделей, а не дубликат-мусор.
+    # "про 16 про 17", "айфон 13 айфон 14" — перечисление/сравнение моделей.
+    #
+    # Алгоритмический признак: между двумя экземплярами повторяющегося
+    # слова/леммы стоит цифровой токен. Цифра = маркер новой модели/объекта.
+    #
+    # Защита от ложных срабатываний:
+    #   — pre_filter ловит буквальные дубли seed целиком до того как L0
+    #     увидит ключ ("iphone 16 iphone 16 купить" → pre_filter BLOCK)
+    #   — если мусор с числом между повторами всё же прошёл pre_filter —
+    #     он всё равно попадёт в GREY (нет позитивных сигналов),
+    #     L3 разрулит по семантике
+    digit_positions = {i for i, w in enumerate(words) if w.isdigit()}
+    if digit_positions:
+        # Строим позиции по словам (для точного повтора)
+        from collections import defaultdict
+        word_positions = defaultdict(list)
+        for i, w in enumerate(words):
+            word_positions[w].append(i)
+        # Проверяем: есть ли повтор слова с цифрой между экземплярами?
+        has_model_comparison = False
+        for w, positions in word_positions.items():
+            if len(positions) < 2 or w.isdigit():
+                continue
+            for dp in digit_positions:
+                if positions[0] < dp < positions[-1]:
+                    has_model_comparison = True
+                    break
+            if has_model_comparison:
+                break
+        # Если не нашли точный повтор через число — пробуем через леммы
+        if not has_model_comparison:
+            lemma_positions_for_models = defaultdict(list)
+            for i, w in enumerate(words):
+                lemma = _get_parses(w, tp)[0].normal_form
+                lemma_positions_for_models[lemma].append(i)
+            for lemma, positions in lemma_positions_for_models.items():
+                if len(positions) < 2:
+                    continue
+                for dp in digit_positions:
+                    if positions[0] < dp < positions[-1]:
+                        has_model_comparison = True
+                        break
+                if has_model_comparison:
+                    break
+        if has_model_comparison:
+            return False, ""
+
     # Проверка точных дубликатов
     if len(words) != len(set(words)):
         dupes = [w for w in words if words.count(w) > 1]
@@ -2441,6 +2491,30 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
     
     # === Основная проверка ===
     # Для контекстного определения улицы нужен индекс слов.
+    # Origin-scope: множество позиций слов которые находятся в правой части
+    # от origin-prep (из/с/со/от). Эти слова — источник импорта, не blocking
+    # foreign. Scope заканчивается на location-prep (в/во/на) который
+    # открывает locational сегмент.
+    #
+    # Примеры:
+    #   "из нью йорка"     → scope={1,2}  (йорк не блокировать)
+    #   "из сша в украину" → scope={1}    (сша не блок, украина — target)
+    #   "про макс из сша"  → scope={3}    (сша не блок)
+    #   "в сша"            → scope={}     (нормальная foreign блокировка)
+    origin_preps = {'из', 'с', 'со', 'от'}
+    location_preps = {'в', 'во', 'на'}
+    origin_scope = set()
+    _in_origin = False
+    for _i, _w in enumerate(words):
+        if _w in origin_preps:
+            _in_origin = True
+            continue
+        if _w in location_preps:
+            _in_origin = False
+            continue
+        if _in_origin:
+            origin_scope.add(_i)
+
     for i_word, word in enumerate(words):
         # Один вызов — получаем и первый парс и все парсы для Geox check
         all_parses = _get_parses(word, tp)
@@ -2458,6 +2532,10 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
             check_forms.add(nomn_form.word)
 
         has_geox = any('Geox' in str(p.tag) for p in all_parses)
+
+        # Origin-guard: слово в origin-scope — источник импорта, не blocking
+        if i_word in origin_scope:
+            continue
         
         # ═══════════════════════════════════════════════════════════════════
         # Guard: DISTRICT_TO_CANONICAL — слово является районом/улицей
@@ -2521,6 +2599,13 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
         p2 = _get_parses(w2, tp)[0]
         if p1.tag.POS in skip_pos or p2.tag.POS in skip_pos:
             continue
+
+        # Origin-guard для биграмм: если ОБЕ позиции биграммы в origin-scope,
+        # вся биграмма — источник импорта, не блокируем.
+        # (origin_scope вычислено выше в основной проверке)
+        if i in origin_scope and (i + 1) in origin_scope:
+            continue
+
         bigram = f"{w1} {w2}"
         bigram_variants = {bigram, bigram.replace(' ', '-')}
         # DISTRICT guard для биграмм: если биграмма есть в DISTRICT базе —
