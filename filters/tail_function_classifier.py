@@ -36,6 +36,8 @@ from .function_detectors import (
     detect_product_spec,
     # Retailer — онлайн-магазины и маркетплейсы (Rozetka, Amazon, OLX)
     detect_retailer,
+    # Model variant — короткие латинские модификаторы модели/единиц (pro, ultra, gb, hz)
+    detect_model_variant,
     # Helpers
     _is_service_seed, COMMERCE_INFN_LEMMAS,
 )
@@ -100,6 +102,7 @@ SIGNAL_WEIGHTS = {
     'unknown_district':  0.4,   # мягкий — район, которого нет в базе, но структура валидна
     'product_spec':      0.85,  # технические параметры товара (12 в, 4т, 220 ом) — надёжный сигнал
     'retailer':          0.85,  # упоминание ритейлера/маркетплейса — сильный коммерческий интент
+    'model_variant':     0.75,  # короткий латинский модификатор (pro/ultra/gb/hz) — структурный сигнал для англ. моделей и ед. измерения
 }
 
 # Мягкие негативные сигналы — эвристики с высокой вероятностью ошибки.
@@ -247,6 +250,7 @@ class TailFunctionClassifier:
             ('postmod_adj',   lambda: detect_postmod_adjective(tail, self.seed, kw, tp=tp)),
             ('product_spec',  lambda: detect_product_spec(tail, self.seed, tp=tp)),
             ('retailer',      lambda: detect_retailer(tail, self.retailer_db, tp=tp)),
+            ('model_variant', lambda: detect_model_variant(tail, self.seed, tp=tp)),
         ]
 
         for signal_name, detector in detectors_positive:
