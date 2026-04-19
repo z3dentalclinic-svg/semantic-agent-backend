@@ -81,9 +81,33 @@ def _get_fallback_retailer_db() -> Set[str]:
                 sorted(list(_RETAILER_DB_FALLBACK))[:5] if _RETAILER_DB_FALLBACK else [],
             )
         except Exception as e:
-            logger.error("[L0_DIAG] Failed to load retailer_db fallback: %s", e)
+            logger.error("[L0_DIAG] Failed to load retailer_db fallback: %s", e, exc_info=True)
             _RETAILER_DB_FALLBACK = set()
     return _RETAILER_DB_FALLBACK
+
+
+# ============================================================
+# СТАРТАП-ПРОГРЕВ retailer_db при импорте модуля.
+# Это гарантирует что лог "[L0_DIAG] Loaded retailer_db..." появится
+# в момент старта сервиса (а не при первом запросе), и если загрузка
+# падает — сразу видно в stderr.
+# ============================================================
+try:
+    _preload_rdb = _get_fallback_retailer_db()
+    logger.warning(
+        "[L0_DIAG] STARTUP: retailer_db preloaded at module import. "
+        "size=%d test_lookups: ['олх']=%s ['розетка']=%s ['ситилинк']=%s ['мтс']=%s",
+        len(_preload_rdb) if _preload_rdb else 0,
+        'олх' in _preload_rdb if _preload_rdb else False,
+        'розетка' in _preload_rdb if _preload_rdb else False,
+        'ситилинк' in _preload_rdb if _preload_rdb else False,
+        'мтс' in _preload_rdb if _preload_rdb else False,
+    )
+except Exception as _e:
+    logger.error(
+        "[L0_DIAG] STARTUP: retailer_db preload FAILED: %s",
+        _e, exc_info=True,
+    )
 
 
 def _sanity_probe_retailer(retailer_db: Set[str]) -> None:
@@ -213,6 +237,18 @@ def apply_l0_filter(
     _t = time.perf_counter()
     clf = _get_classifier(seed, target_country, geo_db, brand_db, retailer_db)
     _t_stage['get_classifier'] = time.perf_counter() - _t
+
+    # DIAG: всегда логируем состояние классификатора (в том числе
+    # взятого из кэша). Если classifier.retailer_db пустой — ясно что
+    # он был создан до деплоя правки.
+    _clf_rdb = getattr(clf, 'retailer_db', None)
+    logger.warning(
+        "[L0_DIAG] classifier state (seed='%s'): retailer_db_in_clf=%d "
+        "from_cache=%s",
+        seed,
+        len(_clf_rdb) if _clf_rdb else 0,
+        "yes" if len(_CLASSIFIER_CACHE) > 0 else "no",
+    )
 
     # ── Глобальный словарь morph-парсов для всего батча ────────────────────
     from .shared_morph import morph as _morph
