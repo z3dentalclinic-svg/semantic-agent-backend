@@ -96,7 +96,42 @@ def pre_filter(query: str, seed: str) -> tuple:
     # 2. Извлекаем хвост
     if s not in q:
         return False, None
-    
+
+    # Word-boundary guard: seed найден как подстрока, но граница символа
+    # может не совпадать с границей слова. Пример: seed="купить айфон 16",
+    # query="купить айфон 16е" → split даёт tail="е" (одинокая буква),
+    # что ниже блокируется правилом #6 как "одиночный символ". Но на
+    # самом деле "16е" — цельный артикул/модель, а не seed+буква.
+    #
+    # Аналогично для любой ситуации где после seed идёт буква или цифра:
+    #   — "16е", "16e", "16gb", "16s", "16x" (цифро-буквенные модели)
+    #   — "160", "1600", "2016" (другие числа начинающиеся с 16)
+    #
+    # Алгоритм: находим все позиции seed в query и проверяем хотя бы одну
+    # с корректной word-boundary справа. Если ни одна не корректна —
+    # значит seed не найден как отдельный токен, возвращаем False (не TRASH).
+    # Классификатор/extractor разберутся дальше.
+    def _seed_has_word_boundary(q_text: str, s_text: str) -> bool:
+        import re as _re
+        # \b на границе seed-подстроки: после последнего символа seed
+        # должна быть НЕ буква и НЕ цифра (или конец строки)
+        for m in _re.finditer(_re.escape(s_text), q_text):
+            end_pos = m.end()
+            # Конец строки = OK
+            if end_pos >= len(q_text):
+                return True
+            # Следующий символ НЕ буква и НЕ цифра = OK (пробел, -, /, . и т.д.)
+            next_ch = q_text[end_pos]
+            if not (next_ch.isalpha() or next_ch.isdigit()):
+                return True
+        return False
+
+    if not _seed_has_word_boundary(q, s):
+        # Seed найден как подстрока, но НЕ как отдельный токен.
+        # Не TRASH на этом уровне — пусть дальше разбирается extract_tail
+        # и классификатор (они имеют свою логику обработки).
+        return False, None
+
     parts = q.split(s, 1)
     before = parts[0].strip()
     after = parts[1].strip() if len(parts) > 1 else ""
