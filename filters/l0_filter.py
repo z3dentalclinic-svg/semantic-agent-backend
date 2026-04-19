@@ -23,11 +23,46 @@ l0_filter.py — Серверная обёртка L0 классификатор
 """
 
 import logging
+import sys
 import time
 from typing import Dict, List, Set, Any, Optional
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ПРЯМЫЕ PRINT-ДИАГНОСТИКИ — обходим logger, пишем сразу в stdout.
+# Работает даже если logging сконфигурирован нестандартно.
+# Флаш сразу — чтобы лог не терялся в буфере при падении.
+# ═══════════════════════════════════════════════════════════════════════════
+print("[L0_RETAIL_DIAG] ======== l0_filter module is being imported ========", flush=True)
+
 from .tail_extractor import extract_tail, build_seed_ctx
 from .tail_function_classifier import TailFunctionClassifier
+
+print("[L0_RETAIL_DIAG] submodule imports OK (tail_extractor, tail_function_classifier)", flush=True)
+
+# Проверяем что retailer_db грузится
+try:
+    from .databases import load_retailers_db as _probe_load
+    _probe_rdb = _probe_load()
+    print(
+        f"[L0_RETAIL_DIAG] retailers.json probe: size={len(_probe_rdb) if _probe_rdb else 0} "
+        f"| 'олх' in db: {'олх' in (_probe_rdb or set())} "
+        f"| 'ситилинк' in db: {'ситилинк' in (_probe_rdb or set())}",
+        flush=True,
+    )
+    # Тест детектора
+    from .function_detectors import detect_retailer as _probe_detect
+    _t1 = _probe_detect('олх', _probe_rdb)
+    _t2 = _probe_detect('ситилинк', _probe_rdb)
+    print(
+        f"[L0_RETAIL_DIAG] detect_retailer probe: olh={_t1[0]} (reason={_t1[1][:50]!r}) "
+        f"| citilink={_t2[0]}",
+        flush=True,
+    )
+    del _probe_rdb, _probe_load, _probe_detect, _t1, _t2
+except Exception as _probe_err:
+    import traceback
+    print(f"[L0_RETAIL_DIAG] PROBE FAILED: {type(_probe_err).__name__}: {_probe_err}", flush=True)
+    traceback.print_exc()
 
 logger = logging.getLogger(__name__)
 
@@ -234,20 +269,22 @@ def apply_l0_filter(
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
+    # DIAG: прямой print перед создания (вместо logger'а)
+    print(
+        f"[L0_RETAIL_DIAG] apply_l0_filter: seed={seed!r} | "
+        f"retailer_db size = {len(retailer_db) if retailer_db else 0} | "
+        f"classifiers cached: {len(_CLASSIFIER_CACHE)}",
+        flush=True,
+    )
     _t = time.perf_counter()
     clf = _get_classifier(seed, target_country, geo_db, brand_db, retailer_db)
     _t_stage['get_classifier'] = time.perf_counter() - _t
 
-    # DIAG: всегда логируем состояние классификатора (в том числе
-    # взятого из кэша). Если classifier.retailer_db пустой — ясно что
-    # он был создан до деплоя правки.
-    _clf_rdb = getattr(clf, 'retailer_db', None)
-    logger.warning(
-        "[L0_DIAG] classifier state (seed='%s'): retailer_db_in_clf=%d "
-        "from_cache=%s",
-        seed,
-        len(_clf_rdb) if _clf_rdb else 0,
-        "yes" if len(_CLASSIFIER_CACHE) > 0 else "no",
+    # DIAG: что получил classifier внутри
+    _clf_rdb_size = len(getattr(clf, 'retailer_db', None) or set())
+    print(
+        f"[L0_RETAIL_DIAG] classifier ready: clf.retailer_db size = {_clf_rdb_size}",
+        flush=True,
     )
 
     # ── Глобальный словарь morph-парсов для всего батча ────────────────────
