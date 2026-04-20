@@ -187,6 +187,27 @@ def _extract_fuzzy_ordered(
 
         if not found:
             # === Шаг 2.5: Кросс-скриптовый мост ===
+            # Мост предназначен для транслитераций бренда/модели между скриптами:
+            # seed='купить айфон' + kw='купить iphone 15' → айфон ↔ iphone.
+            #
+            # Guard: если слово seed (по точному совпадению или лемме) УЖЕ
+            # присутствует в kw где-либо — мост НЕ активируется. Вместо этого
+            # возвращаем None, чтобы Шаг 3 (unordered) смог найти слово на
+            # реальной позиции. Без этого guard'а ordered-режим Шага 2
+            # "застревает" на search_from, и cross-script ошибочно матчит
+            # слово seed на случайный latin/cyr токен в хвосте.
+            #
+            # Пример без guard'а:
+            #   seed='samsung galaxy s21 ремонт', kw='ремонт samsung galaxy s21 ultra'
+            #   samsung→kw[1], galaxy→kw[2], s21→kw[3], search_from=4
+            #   ремонт: kw[4]='ultra' — не лемма → cross-script ложно: ремонт↔ultra
+            #   → tail='ремонт' (ложное seed_echo)
+            #
+            # С guard'ом:
+            #   ремонт есть в kw[0] (точно) → Шаг 2 возвращает None →
+            #   Шаг 3 unordered находит {0,1,2,3} → tail='ultra' ✓
+            if (sw in query_words) or (sl in query_lemmas):
+                return None  # слово есть в kw → пусть unordered отработает
             # Только для контентных слов (бренды, модели)
             if not seed_is_function[i_sw]:
                 sw_is_cyr = seed_is_cyr[i_sw]
