@@ -84,6 +84,62 @@ _UA_AMBIGUOUS_WORDS = frozenset({
 _NUMBER_TOKEN_RE = re.compile(r'\b\d+\b')
 
 
+def _check_last_word_skip_eligible(seed_ctx: dict) -> bool:
+    """
+    Проверяет, допустим ли fallback-экстракт с укороченным seed (без последнего слова).
+
+    Структурный критерий: разрешаем пропуск последнего слова seed'а ТОЛЬКО когда
+    это слово — самостоятельная сущность-квалификатор (цена/москва/лондон), а не
+    грамматически зависимый объект (нимесил, скутер, машин).
+
+    Условия (ВСЕ обязательны):
+      1. seed >= 3 слов — короткие seed (2 слова) не затрагиваются правкой.
+      2. Последнее слово — NOUN в nomn или accs (самостоятельная сущность, не
+         зависимый модификатор). Падежи gent/datv/instr/loct обычно означают
+         зависимость от предыдущего слова → разрывать нельзя.
+      3. Предпоследнее слово — NOUN. Если там ADJF ("стиральных машин") или
+         INFN ("принимать нимесил") — последнее слово связано грамматически
+         с предыдущим в единое NP или является прямым объектом глагола.
+      4. Предпоследнее слово не PREP/CONJ. Если seed вида "аккумулятор на скутер"
+         или "холодильник и плита", последнее слово зависит от предлога/союза
+         и не может быть пропущено. (Покрыто условием 3 — PREP/CONJ не NOUN,
+         но комментарий оставляем для ясности.)
+
+    Примеры eligible=True:
+      - "установка кондиционера цена"  → 'цена' = nomn NOUN, 'кондиционера' = NOUN
+      - "доставка цветов москва"       → 'москва' = nomn NOUN, 'цветов' = NOUN
+      - "услуги юриста лондон"          → 'лондон' = accs NOUN, 'юриста' = NOUN
+      - "курсы английского языка киев" → 'киев' = nomn NOUN, 'языка' = NOUN
+
+    Примеры eligible=False:
+      - "аккумулятор на скутер"  → предпоследнее 'на' — PREP, не NOUN
+      - "как принимать нимесил"  → предпоследнее 'принимать' — INFN, не NOUN
+      - "купить айфон 16"         → последнее '16' — не NOUN (число)
+      - "ремонт стиральных машин" → предпоследнее 'стиральных' — ADJF, не NOUN
+      - "пластика лица львов"     → последнее 'львов' в gent, не nomn/accs
+    """
+    words = seed_ctx['words']
+    if len(words) < 3:
+        return False
+
+    pos = seed_ctx['pos']
+
+    # Последнее и предпоследнее — NOUN
+    if pos[-1] != 'NOUN' or pos[-2] != 'NOUN':
+        return False
+
+    # Падеж последнего слова: nomn (независимая сущность) или accs (часто
+    # совпадает с nomn для неодуш. м.р., pymorphy выбирает один из вариантов
+    # непредсказуемо для городов: "москва"→nomn, "лондон"→accs).
+    # Gent/datv/instr/loct означают грамматическую зависимость — разрывать нельзя.
+    from .shared_morph import morph as _m
+    last_case = _m.parse(words[-1])[0].tag.case
+    if last_case not in ('nomn', 'accs'):
+        return False
+
+    return True
+
+
 def _get_classifier(
     seed: str,
     target_country: str,
@@ -166,6 +222,25 @@ def apply_l0_filter(
     # сценария: seed="купить айфон 16", kw="купить айфон 14 киев" → 14 не
     # совпадает ни с одним числом seed → TRASH.
     _seed_numbers = frozenset(_NUMBER_TOKEN_RE.findall(seed_lower))
+
+    # Pre-compute: fallback-экстракт с укороченным seed (без последнего слова).
+    # Мотивация: когда пользователь вводит seed из 3+ слов, последнее слово
+    # которого — самостоятельный квалификатор ('цена', 'москва', 'отзывы'),
+    # то большинство реальных autocomplete-запросов его НЕ содержат (редкое
+    # слово-триггер). Пример: seed="установка кондиционера цена" — 383 из 393
+    # ключей без "цена" в них, но все про установку кондиционера. Без fallback
+    # все они теряются в GREY 'seed не найден'.
+    #
+    # Eligibility строго морфологическая (см. _check_last_word_skip_eligible).
+    # Cross-niche защита: для сидов из 2 слов, сидов с PREP между словами,
+    # сидов с ADJF/INFN перед последним словом — правило НЕ срабатывает.
+    _skip_last_eligible = _check_last_word_skip_eligible(seed_ctx)
+    if _skip_last_eligible:
+        _short_seed = ' '.join(seed_ctx['words'][:-1])
+        _short_seed_ctx = build_seed_ctx(_short_seed)
+    else:
+        _short_seed = None
+        _short_seed_ctx = None
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
@@ -183,17 +258,31 @@ def apply_l0_filter(
     _t = time.perf_counter()
     _kw_tail_pairs = []
     _all_tail_words: set = set()
+    _fallback_used_count = 0  # счётчик для логов
     for kw_item in keywords:
         kw = kw_item.strip() if isinstance(kw_item, str) else kw_item.get("query", "").strip()
         if not kw:
             continue
         _t0 = time.perf_counter()
         tail = extract_tail(kw, seed, seed_ctx=seed_ctx)
+
+        # Fallback: если основной extract не нашёл seed и критерий eligibility
+        # выполнен, пробуем укороченный seed (без последнего слова). Это ловит
+        # случаи когда пользователь не добавлял слово-квалификатор к основному
+        # seed ("установка кондиционера в квартире" при seed="...цена"). Tail
+        # при этом получается нормального вида — его обрабатывают существующие
+        # детекторы (premod_adj, geo, info_intent, retailer, category_mismatch).
+        if tail is None and _skip_last_eligible:
+            tail = extract_tail(kw, _short_seed, seed_ctx=_short_seed_ctx)
+            if tail is not None:
+                _fallback_used_count += 1
+
         t_extract_total += time.perf_counter() - _t0
         _kw_tail_pairs.append((kw_item, kw, tail))
         if tail:
             _all_tail_words.update(tail.lower().split())
     _t_stage['collect_tails_loop'] = time.perf_counter() - _t
+    _t_stage['fallback_used'] = _fallback_used_count
 
     # Один проход morph.parse для всех уникальных слов
     _t = time.perf_counter()
