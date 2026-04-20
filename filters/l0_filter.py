@@ -238,9 +238,20 @@ def apply_l0_filter(
     if _skip_last_eligible:
         _short_seed = ' '.join(seed_ctx['words'][:-1])
         _short_seed_ctx = build_seed_ctx(_short_seed)
+        # Lemma-guard: для валидации fallback требуем, чтобы ВСЕ леммы
+        # укороченного seed присутствовали в kw как леммы (прямое совпадение,
+        # без cross-script моста). Это отсекает случаи когда cross-script
+        # из _extract_fuzzy_ordered ложно матчит контентное русское слово seed
+        # на случайный latin-токен в kw (напр. 'установка vs', 'кондиционер vs
+        # инструкция' — 'vs' ошибочно принимается за транслитерацию одного из
+        # слов seed). Cross-script мост оставляем для полного seed (там он
+        # важен для "купить iphone" при seed "купить айфон"), но в fallback —
+        # консервативнее.
+        _short_seed_lemmas_set = frozenset(_short_seed_ctx['lemmas'])
     else:
         _short_seed = None
         _short_seed_ctx = None
+        _short_seed_lemmas_set = frozenset()
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
@@ -272,10 +283,24 @@ def apply_l0_filter(
         # seed ("установка кондиционера в квартире" при seed="...цена"). Tail
         # при этом получается нормального вида — его обрабатывают существующие
         # детекторы (premod_adj, geo, info_intent, retailer, category_mismatch).
+        #
+        # Lemma-guard: принимаем fallback-tail ТОЛЬКО если ВСЕ леммы укороченного
+        # seed реально присутствуют в kw как леммы (прямое lemma-совпадение,
+        # без cross-script моста). Это отсекает ложные срабатывания Шага 2
+        # _extract_fuzzy_ordered, где cross-script мост соединяет русское слово
+        # seed с случайным latin-токеном в kw (vs, pro, new):
+        #   kw="установка vs"            → cross-script: кондиционер↔vs → tail=''
+        #   kw="кондиционер vs инструкция" → cross-script: установка↔vs → tail='инструкция'
+        # На полном seed такие кейсы отсеиваются (там ещё 'цена' нужна), но
+        # fallback с коротким seed их пропускает. Guard закрывает эту дыру.
         if tail is None and _skip_last_eligible:
-            tail = extract_tail(kw, _short_seed, seed_ctx=_short_seed_ctx)
-            if tail is not None:
-                _fallback_used_count += 1
+            _tail_fb = extract_tail(kw, _short_seed, seed_ctx=_short_seed_ctx)
+            if _tail_fb is not None:
+                # Lemma-guard: все леммы укороченного seed должны быть в kw.
+                _kw_lemmas = {_morph.parse(w)[0].normal_form for w in kw.lower().split()}
+                if _short_seed_lemmas_set.issubset(_kw_lemmas):
+                    tail = _tail_fb
+                    _fallback_used_count += 1
 
         t_extract_total += time.perf_counter() - _t0
         _kw_tail_pairs.append((kw_item, kw, tail))
