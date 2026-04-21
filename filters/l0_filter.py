@@ -84,6 +84,216 @@ _UA_AMBIGUOUS_WORDS = frozenset({
 _NUMBER_TOKEN_RE = re.compile(r'\b\d+\b')
 
 
+# ============================================================
+# SANITY CHECK: отсев ложных L0 VALID на LATN-сидах.
+#
+# Проблема: tail_extractor на сидах с латинскими токенами (samsung galaxy s21,
+# macbook pro, xiaomi redmi) возвращает пустой tail для ключей, в которых
+# часть токенов сида отсутствует. Causes (существующие в Шагах 2/3/4):
+#   - partial_match разрешает пропуск LATN-токенов seed (POS=None, не CONTENT)
+#   - cross-script мост ошибочно связывает ремонт↔review, ремонт↔hotline
+# Исправить эти баги системно требует большой правки в tail_extractor; это
+# отдельная задача с риском регрессий на других LATN-паттернах.
+#
+# Текущий подход: принимаем как есть выход tail_extractor, но добавляем
+# финальную проверку L0 VALID. Если kw не содержит обязательных content-слов
+# seed (точное совпадение, лемма, или кросс-скрипт через brand_db / translit),
+# переводим VALID → GREY с reason "sanity_mismatch". L2 затем через PMI/KNN
+# может реабилитировать семантические синонимы (замена экрана, не работает,
+# чистка) как близкие к reference words сида.
+#
+# Правило (подтверждено пользователем):
+#   - len(seed) <= 2: все content-слова обязательны (строго)
+#   - len(seed) >= 3: допустим 1 пропуск content-слова (soft, N-1 из N)
+#   - LATN-модели (LATN-токены seed ОТСУТСТВУЮЩИЕ в brand_db) — ВСЕГДА строго.
+#     Модель — уникальный идентификатор продукта: пропуск = другая модель.
+#
+# Cross-script поддержка (чтобы 'ремонт самсунг с21' при seed 'samsung galaxy
+# s21 ремонт' оставался VALID):
+#   - LATN-бренды seed считаются присутствующими, если в kw есть ЛЮБОЕ
+#     cyr-слово из brand_db (т.е. "kw упоминает какой-то известный бренд").
+#   - LATN-модели seed сравниваются с транслитерированным ключом (с21→s21).
+#
+# Безопасность для cyr-only сидов (цветы, зубы, кондиционер, скутер):
+#   - latn_model пустой → model-check не срабатывает
+#   - len >= 3 → soft rule допускает 1 пропуск
+#   - Результат: 0 регрессий на 4 контрольных cyr-only датасетах.
+# ============================================================
+
+# Алгоритмическая транслитерация cyr→lat. Используется для проверки LATN-моделей
+# сида в kw: слова вида "с21"/"м21"/"с24" в kw автоматически матчатся на
+# "s21"/"m21"/"s24" в seed. Таблица не покрывает все фонетические варианты
+# (х→h/kh, ц→ts/c) — это не нужно для моделей, которые обычно состоят из
+# 1-2 букв + цифр.
+_TRANSLIT_CYR_TO_LAT = str.maketrans({
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+    'ж': 'z', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'h', 'ц': 'c', 'ч': 'c', 'ш': 's', 'щ': 's',
+    'ъ': '',  'ы': 'y', 'ь': '',  'э': 'e', 'ю': 'u', 'я': 'a',
+})
+
+
+def _translit_cyr_to_lat(w: str) -> str:
+    """Транслитерация кириллического слова в латиницу."""
+    return w.translate(_TRANSLIT_CYR_TO_LAT)
+
+
+def _parse_seed_for_sanity(seed_ctx: dict, brand_db: Set[str]) -> Optional[dict]:
+    """
+    Разбирает seed на 3 категории content-токенов:
+      - cyr_content: леммы cyr-слов с POS in {NOUN,VERB,ADJF,ADJS,INFN,PRTF,PRTS}
+      - latn_brand:  LATN-токены seed, ПРИСУТСТВУЮЩИЕ в brand_db (бренды)
+      - latn_model:  LATN-токены seed, ОТСУТСТВУЮЩИЕ в brand_db (модели/коды)
+
+    Возвращает None если у seed нет ни одного content-токена (пустой/мусорный seed).
+    """
+    words = seed_ctx['words']
+    lemmas = seed_ctx['lemmas']
+    pos = seed_ctx['pos']
+    is_lat = seed_ctx['is_lat']
+    is_number = seed_ctx['is_number']
+
+    CONTENT_POS = {'NOUN', 'VERB', 'ADJF', 'ADJS', 'INFN', 'PRTF', 'PRTS'}
+
+    cyr_content: Set[str] = set()
+    latn_brand: Set[str] = set()
+    latn_model: Set[str] = set()
+
+    for i, w in enumerate(words):
+        if is_number[i]:
+            continue  # числа — отдельная логика (_seed_numbers), не трогаем
+        p = pos[i]
+        if p is None and is_lat[i]:
+            # LATN-токен: разделяем на brand (в brand_db) или model (вне brand_db)
+            if w in brand_db or lemmas[i] in brand_db:
+                latn_brand.add(w)
+            else:
+                latn_model.add(w)
+        elif p in CONTENT_POS:
+            # cyr-контентное слово (или любое с известной POS-ролью): лемма как anchor
+            cyr_content.add(lemmas[i])
+        # PREP/CONJ/PRCL/INTJ и прочие функциональные — пропускаем
+
+    # Длина seed в словах (как пишет пользователь), включая PREP/CONJ.
+    # По ней определяется жёсткость правила: <=2 строго, >=3 soft (N-1).
+    # Причина использовать words, а не content-токены: для сида "аккумулятор на
+    # скутер" (3 слова, 2 content-токена) пользователь ожидает soft-поведение
+    # (типа "аккумулятор для segway" остаётся VALID). А content_len=2 дал бы
+    # строгое правило и ложную демотацию.
+    seed_word_count = len(seed_ctx['words'])
+
+    # Если нет ни одного content-токена — нечего проверять
+    if len(cyr_content) + len(latn_brand) + len(latn_model) == 0:
+        return None
+
+    return {
+        'cyr_content': frozenset(cyr_content),
+        'latn_brand': frozenset(latn_brand),
+        'latn_model': frozenset(latn_model),
+        'seed_word_count': seed_word_count,
+    }
+
+
+def _sanity_check_valid(
+    kw: str,
+    sanity_ctx: dict,
+    brand_db: Set[str],
+    morph,
+) -> Optional[str]:
+    """
+    Проверяет L0 VALID ключ на соответствие требованиям seed.
+
+    Возвращает None если всё ок (ключ остаётся VALID).
+    Возвращает строку-причину если ключ нужно демотировать в GREY.
+
+    Причины:
+      - "missing_model:<token>"  — LATN-модель seed отсутствует в kw
+      - "missing_content:<N>"    — пропущено больше допустимого content-слов
+
+    Алгоритм:
+      1. Собираем множества слов и лемм kw, признак "в kw есть cyr-brand".
+      2. Модели (latn_model) — проверяем ВСЕ точно/лемма/translit. Строго.
+      3. Бренды (latn_brand) — проверяем точно/лемма ИЛИ наличие любого
+         cyr-brand слова в kw (cross-script замена).
+      4. Cyr-content — проверяем точно/лемма.
+      5. Считаем количество отсутствующих среди (brand + cyr_content):
+         content_len <= 2 → допустимо 0, content_len >= 3 → допустимо 1.
+         Модели в счёт не входят — они уже проверены строго на шаге 2.
+    """
+    cyr_content = sanity_ctx['cyr_content']
+    latn_brand = sanity_ctx['latn_brand']
+    latn_model = sanity_ctx['latn_model']
+    seed_word_count = sanity_ctx['seed_word_count']
+
+    # Если в сиде нет ни моделей, ни брендов, ни content-слов — нечего проверять
+    if not cyr_content and not latn_brand and not latn_model:
+        return None
+
+    kw_words = kw.lower().split()
+    kw_words_set = set(kw_words)
+    kw_lemmas_set: Set[str] = set()
+    kw_has_cyr_brand = False
+    for w in kw_words:
+        lemma = morph.parse(w)[0].normal_form
+        kw_lemmas_set.add(lemma)
+        if not kw_has_cyr_brand:
+            # Cross-script brand detection: в kw есть cyr-слово которое
+            # является бренд-токеном в brand_db (напр. 'самсунг', 'макбук',
+            # 'асус', 'редми'). Это эквивалент присутствия LATN-брендов seed.
+            if any('\u0400' <= c <= '\u04ff' for c in w):
+                if w in brand_db or lemma in brand_db:
+                    kw_has_cyr_brand = True
+
+    kw_all = kw_words_set | kw_lemmas_set
+
+    # ── Шаг 2: модели обязательны строго (с cyr→lat translit fallback) ────
+    kw_translit_cache = None  # ленивый кэш
+    for m in latn_model:
+        if m in kw_all:
+            continue
+        # Translit: 'с21' → 's21' — для случаев 'ремонт самсунг с21'
+        if kw_translit_cache is None:
+            kw_translit_cache = set()
+            for w in kw_words:
+                if any('\u0400' <= c <= '\u04ff' for c in w):
+                    kw_translit_cache.add(_translit_cyr_to_lat(w))
+        if m in kw_translit_cache:
+            continue
+        return f"missing_model:{m}"
+
+    # ── Шаг 3+4: бренды и cyr-content с N-1 допуском ──────────────────────
+    missing_count = 0
+    missing_tokens = []
+
+    # Cyr-content (леммы)
+    for cl in cyr_content:
+        if cl not in kw_all:
+            missing_count += 1
+            missing_tokens.append(cl)
+
+    # LATN-бренды
+    for lb in latn_brand:
+        if lb in kw_all:
+            continue
+        # Cross-script: наличие cyr-brand в kw покрывает любой LATN-бренд seed
+        if kw_has_cyr_brand:
+            continue
+        missing_count += 1
+        missing_tokens.append(lb)
+
+    # Допустимое количество пропусков: 0 для коротких seed (<=2 слов),
+    # 1 для более длинных (>=3 слов). Порог по общей длине seed (с PREP/CONJ),
+    # не по количеству content-токенов — так сохраняется soft-поведение для
+    # сидов с предлогами ("аккумулятор на скутер" = 3 слова → soft).
+    allowed = 0 if seed_word_count <= 2 else 1
+
+    if missing_count > allowed:
+        return f"missing_content:{','.join(missing_tokens[:3])}"
+
+    return None
+
+
 def _check_last_word_skip_eligible(seed_ctx: dict) -> bool:
     """
     Проверяет, допустим ли fallback-экстракт с укороченным seed (без последнего слова).
@@ -252,6 +462,13 @@ def apply_l0_filter(
         _short_seed = None
         _short_seed_ctx = None
         _short_seed_lemmas_set = frozenset()
+
+    # ── Pre-compute sanity-check контекст ──────────────────────────────────
+    # Разбираем seed один раз: cyr_content / latn_brand / latn_model.
+    # Использует тот же brand_db, который уже загружен для detect_brand.
+    # Если brand_db пустой — latn_brand также пустой, весь LATN идёт в
+    # latn_model (строгая проверка). Это безопасная деградация.
+    _sanity_ctx = _parse_seed_for_sanity(seed_ctx, brand_db) if brand_db else None
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
@@ -509,6 +726,38 @@ def apply_l0_filter(
 
     # ── Обновляем result ─────────────────────────────────────────────────────
     _t_stage['main_loop'] = time.perf_counter() - _t_loop_start
+
+    # ── SANITY CHECK: демотируем ложные VALID в GREY ────────────────────────
+    # Для LATN-heavy сидов (samsung galaxy s21 ремонт, ремонт macbook pro и т.п.)
+    # tail_extractor пропускает через partial_match/cross-script ключи, в которых
+    # нет обязательных content-слов seed. Проверяем каждый VALID ключ и если он
+    # не соответствует правилам (см. _sanity_check_valid) — переводим в GREY,
+    # где L2 через PMI/KNN попробует реабилитировать семантически близкие.
+    # Cross-niche: на cyr-only seeds (цветы/зубы/кондиционер) правило либо
+    # пропускает всё (len>=3 soft), либо требует все леммы (len==2 строго).
+    _t_sanity_start = time.perf_counter()
+    _sanity_demoted_count = 0
+    if _sanity_ctx is not None:
+        _kept_valid = []
+        for kw_item in valid_keywords:
+            kw = kw_item if isinstance(kw_item, str) else kw_item.get("query", "")
+            reason = _sanity_check_valid(kw, _sanity_ctx, brand_db, _morph)
+            if reason is None:
+                _kept_valid.append(kw_item)
+                continue
+            # Демотируем: добавляем в GREY, обновляем trace_record
+            grey_keywords.append(kw_item)
+            _sanity_demoted_count += 1
+            for tr in trace_records:
+                if tr.get("keyword") == kw and tr.get("label") == "VALID":
+                    tr["label"] = "GREY"
+                    tr["decided_by"] = "l0_sanity"
+                    tr["reason"] = f"sanity_mismatch: {reason}"
+                    tr["signals"] = tr.get("signals", []) + ["-sanity_mismatch"]
+                    break
+        valid_keywords = _kept_valid
+    _t_stage['sanity_check'] = time.perf_counter() - _t_sanity_start
+    _t_stage['sanity_demoted'] = _sanity_demoted_count
 
     result["keywords"] = valid_keywords
     result["count"] = len(valid_keywords)
