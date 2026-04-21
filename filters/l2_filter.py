@@ -358,11 +358,17 @@ class L2Classifier:
     def _parse_l0_signals(self, l0_trace: List[dict]) -> Dict[str, dict]:
         """
         Парсим L0 trace → для каждого keyword:
-        positive, negative, pure_neg (hard neg без pos).
+        positive, negative, pure_neg (hard neg без pos), demoted_by_sanity.
 
         pure_neg = True только если есть ЖЁСТКИЕ негативные сигналы
         (не считаем мягкий category_mismatch). Мягкие остаются в negative
         для отладки/трассировки, но не блокируют R1 (high PMI → VALID).
+
+        demoted_by_sanity = True если L0 sanity-check перевёл этот ключ
+        из VALID в GREY из-за intent/model/brand mismatch. L2 не должен
+        реабилитировать его обратно в VALID через PMI/KNN — иначе мусор
+        возвращается из-за самопитающегося reference (ложные VALID в
+        одном батче повышают df своих слов → PMI высокий → реабилитация).
         """
         result = {}
         for trace in l0_trace:
@@ -372,10 +378,16 @@ class L2Classifier:
             pos = [s for s in signals if not s.startswith('-')]
             # Жёсткие негативы — всё что не мягкое
             hard_neg = [n for n in neg if n not in self._SOFT_L0_NEGATIVES]
+            # Флаг демотации L0 sanity-check — интент/модель/бренд не совпали
+            demoted_by_sanity = (
+                trace.get("decided_by") == "l0_sanity"
+                or "sanity_mismatch" in neg
+            )
             result[kw] = {
                 "positive": pos,
                 "negative": neg,  # храним все для трассировки
                 "pure_neg": bool(hard_neg) and not bool(pos),
+                "demoted_by_sanity": demoted_by_sanity,
             }
         return result
     
@@ -629,9 +641,11 @@ class L2Classifier:
             morph = morph_scores.get(tail, 0.0)
             morph_detail = morph_details.get(tail, "")
             l0_sig = l0_signals.get(keyword, {
-                "positive": [], "negative": [], "pure_neg": False
+                "positive": [], "negative": [], "pure_neg": False,
+                "demoted_by_sanity": False,
             })
             pure_neg = l0_sig["pure_neg"]
+            demoted_by_sanity = l0_sig.get("demoted_by_sanity", False)
             overlap = word_overlap.get(tail, [])
             has_spec, spec_token = self._has_spec_token(tail)
             
@@ -645,14 +659,26 @@ class L2Classifier:
                 "l0_pos": l0_sig["positive"],
                 "l0_neg": l0_sig["negative"],
                 "pure_neg": pure_neg,
+                "demoted_by_sanity": demoted_by_sanity,
             }
             
             # --- Decision rules ---
             label = "GREY"
             reason = ""
             
+            # R0: L0 sanity-check демотировал этот ключ (intent/model/brand mismatch)
+            # → L2 НЕ реабилитирует через PMI/KNN/morph.
+            # Почему: reference для PMI строится на valid+grey; если в grey сидит много
+            # ключей с одинаковыми мусорными словами (купить/украина), df высокий,
+            # PMI ≥ threshold → ложный R1 VALID. Это самопитающийся цикл.
+            # L0 sanity уже выделил этот класс ключей как не-intent → доверяем L0.
+            # Остаётся GREY — пусть L3 (DeepSeek) решит окончательно.
+            if demoted_by_sanity:
+                label = "GREY"
+                reason = "L0_sanity_demoted (intent/model/brand mismatch)"
+            
             # R1: High PMI + no pure negative → VALID
-            if pmi >= cfg.pmi_valid_threshold and not pure_neg:
+            elif pmi >= cfg.pmi_valid_threshold and not pure_neg:
                 label = "VALID"
                 reason = f"PMI {pmi:.2f} >= {cfg.pmi_valid_threshold}"
             
