@@ -208,28 +208,50 @@ def _sanity_check_valid(
     Возвращает строку-причину если ключ нужно демотировать в GREY.
 
     Причины:
-      - "missing_model:<token>"  — LATN-модель seed отсутствует в kw
-      - "missing_content:<N>"    — пропущено больше допустимого content-слов
+      - "missing_model:<token>"   — LATN-модель seed отсутствует в kw
+      - "missing_brand"           — ни один LATN-бренд seed не найден (ни прямо,
+                                     ни через cyr-brand из brand_db)
+      - "missing_intent:<lemma>"  — обязательное cyr-content слово отсутствует
+                                     (intent-anchor в LATN-сиде)
+      - "missing_content:<N>"     — пропущено больше допустимого cyr-content
+                                     слов в cyr-only сиде
 
-    Алгоритм:
-      1. Собираем множества слов и лемм kw, признак "в kw есть cyr-brand".
-      2. Модели (latn_model) — проверяем ВСЕ точно/лемма/translit. Строго.
-      3. Бренды (latn_brand) — проверяем точно/лемма ИЛИ наличие любого
-         cyr-brand слова в kw (cross-script замена).
-      4. Cyr-content — проверяем точно/лемма.
-      5. Считаем количество отсутствующих среди (brand + cyr_content):
-         content_len <= 2 → допустимо 0, content_len >= 3 → допустимо 1.
-         Модели в счёт не входят — они уже проверены строго на шаге 2.
+    Правила:
+      1. LATN-модели (latn_model) — всегда все обязательны. Модель — уникальный
+         идентификатор продукта, пропуск = другая модель. С translit fallback:
+         "с21" в kw → засчитывается как "s21" из seed.
+      2. LATN-бренды (latn_brand) — достаточно одного присутствующего (прямо
+         в kw, или через любой cyr-brand из brand_db, напр. 'самсунг', 'макбук').
+      3. CYR-content-слова:
+         - Если в seed есть LATN-токены (бренды/модели) → сид товарный, cyr-слова
+           являются intent-anchor (ремонт/купить/чехол). Все обязательны.
+         - Если LATN в seed нет → сид чисто услуговый, cyr-слова квалификаторы.
+           При seed_word_count <= 2 все обязательны, при >= 3 допустим 1 пропуск.
+           Это сохраняет fallback поведение для сидов типа "установка
+           кондиционера цена" (пропуск 'цена' → 'установка кондиционера olx' ok).
+
+    Обоснование разделения:
+      - "samsung galaxy s21 hotline" (LATN-сид без 'ремонт'): intent-mismatch,
+        пользователь ищет магазин hotline, не ремонт.
+      - "samsung galaxy s21 разборка", "... teardown": другой intent (teardown
+        != ремонт), demote.
+      - "установка кондиционера olx": cyr-сид, 'цена' опциональный квалификатор,
+        OLX это ретейлер → commerce intent совместим с установкой. Keep.
+      - "ремонт samsung s21" (без galaxy): все LATN-бренды seed покрыты через
+        'samsung' в kw (N-1 достаточно для brand pool). Keep.
     """
     cyr_content = sanity_ctx['cyr_content']
     latn_brand = sanity_ctx['latn_brand']
     latn_model = sanity_ctx['latn_model']
     seed_word_count = sanity_ctx['seed_word_count']
 
-    # Если в сиде нет ни моделей, ни брендов, ни content-слов — нечего проверять
+    # Если в сиде нет ни content-слов — нечего проверять
     if not cyr_content and not latn_brand and not latn_model:
         return None
 
+    is_latn_seed = bool(latn_brand or latn_model)
+
+    # Собираем множества kw: точные слова + леммы + флаг наличия cyr-brand
     kw_words = kw.lower().split()
     kw_words_set = set(kw_words)
     kw_lemmas_set: Set[str] = set()
@@ -237,22 +259,16 @@ def _sanity_check_valid(
     for w in kw_words:
         lemma = morph.parse(w)[0].normal_form
         kw_lemmas_set.add(lemma)
-        if not kw_has_cyr_brand:
-            # Cross-script brand detection: в kw есть cyr-слово которое
-            # является бренд-токеном в brand_db (напр. 'самсунг', 'макбук',
-            # 'асус', 'редми'). Это эквивалент присутствия LATN-брендов seed.
-            if any('\u0400' <= c <= '\u04ff' for c in w):
-                if w in brand_db or lemma in brand_db:
-                    kw_has_cyr_brand = True
-
+        if not kw_has_cyr_brand and any('\u0400' <= c <= '\u04ff' for c in w):
+            if w in brand_db or lemma in brand_db:
+                kw_has_cyr_brand = True
     kw_all = kw_words_set | kw_lemmas_set
 
-    # ── Шаг 2: модели обязательны строго (с cyr→lat translit fallback) ────
-    kw_translit_cache = None  # ленивый кэш
+    # ── Шаг 1: latn_model обязательны строго (с translit) ────────────────
+    kw_translit_cache = None
     for m in latn_model:
         if m in kw_all:
             continue
-        # Translit: 'с21' → 's21' — для случаев 'ремонт самсунг с21'
         if kw_translit_cache is None:
             kw_translit_cache = set()
             for w in kw_words:
@@ -262,34 +278,23 @@ def _sanity_check_valid(
             continue
         return f"missing_model:{m}"
 
-    # ── Шаг 3+4: бренды и cyr-content с N-1 допуском ──────────────────────
-    missing_count = 0
-    missing_tokens = []
+    # ── Шаг 2: latn_brand хотя бы один ────────────────────────────────────
+    if latn_brand:
+        if not (latn_brand & kw_all):
+            if not kw_has_cyr_brand:
+                return "missing_brand"
 
-    # Cyr-content (леммы)
-    for cl in cyr_content:
-        if cl not in kw_all:
-            missing_count += 1
-            missing_tokens.append(cl)
-
-    # LATN-бренды
-    for lb in latn_brand:
-        if lb in kw_all:
-            continue
-        # Cross-script: наличие cyr-brand в kw покрывает любой LATN-бренд seed
-        if kw_has_cyr_brand:
-            continue
-        missing_count += 1
-        missing_tokens.append(lb)
-
-    # Допустимое количество пропусков: 0 для коротких seed (<=2 слов),
-    # 1 для более длинных (>=3 слов). Порог по общей длине seed (с PREP/CONJ),
-    # не по количеству content-токенов — так сохраняется soft-поведение для
-    # сидов с предлогами ("аккумулятор на скутер" = 3 слова → soft).
-    allowed = 0 if seed_word_count <= 2 else 1
-
-    if missing_count > allowed:
-        return f"missing_content:{','.join(missing_tokens[:3])}"
+    # ── Шаг 3: cyr_content по правилу длины/типа сида ─────────────────────
+    missing_cyr = [cl for cl in cyr_content if cl not in kw_all]
+    if is_latn_seed:
+        # Товарный сид: cyr-content = intent-anchor, все обязательны
+        if missing_cyr:
+            return f"missing_intent:{missing_cyr[0]}"
+    else:
+        # Услуговый cyr-only сид: квалификаторы, soft при len>=3
+        allowed = 0 if seed_word_count <= 2 else 1
+        if len(missing_cyr) > allowed:
+            return f"missing_content:{','.join(missing_cyr[:3])}"
 
     return None
 
