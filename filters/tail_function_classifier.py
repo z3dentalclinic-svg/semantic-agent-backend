@@ -55,11 +55,9 @@ except ImportError:
 from .shared_morph import morph
 
 # Диагностический лог для блокера 1 Fix 2 (апрель 2026).
-# Активен безусловно. Пишет WARN в logger для коротких CYR-гео-кандидатных
-# tails — что именно получает detect_geo в classify и что возвращает.
-# Нужен для разбора расхождения production vs local.
-# ОТКЛЮЧИТЬ после диагностики: поставить _FIX2_DIAG = False.
-_FIX2_DIAG = True
+# ОТКЛЮЧЕНО после успешной диагностики (блокер 1 найден в geo/blacklist.py).
+# Включить снова: _FIX2_DIAG = True.
+_FIX2_DIAG = False
 _fix2_logger = logging.getLogger('fix2_diag')
 
 # Накопленные тайминги по детекторам — суммируются за весь батч.
