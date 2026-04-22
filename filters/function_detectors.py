@@ -2783,7 +2783,9 @@ def detect_single_infinitive(
     НЕ ловим если:
     - detect_verb_modifier уже поймал (seed с глаголом + наречие)
     - Хвост > 1 слова ("почистить фильтр" — это detect_action)
-    - tail — commerce-инфинитив И seed НЕ сервисный (товарный)
+    - Seed СЕРВИСНЫЙ — голый инфинитив на сервисном seed = commitment-интент
+      ("курсы английского языка киев записаться", "ремонт пылесосов оплатить")
+    - tail — commerce-инфинитив И seed товарный (купить/заказать/...)
     
     Мягкий негативный сигнал — может быть валидным интентом,
     но структурно неполный.
@@ -2815,14 +2817,19 @@ def detect_single_infinitive(
         if sp.tag.POS in ('INFN', 'VERB'):
             return False, ""
     
-    # Commerce-инфинитив на товарном seed — валидный purchase intent.
-    # Защита: срабатывает только если seed ЯВНО товарный (seed_is_service=False).
-    # Default seed_is_service=True не пропускает этот guard — безопасно
-    # для вызовов без нового параметра.
-    if not seed_is_service:
-        lemma = parsed.normal_form
-        if lemma in COMMERCE_INFN_LEMMAS:
-            return False, ""
+    # На СЕРВИСНОМ seed (услуга/процесс: "курсы X", "ремонт Y", "доставка Z")
+    # голый инфинитив — commitment-интент пользователя, а не обрывок.
+    # "курсы английского записаться" / "ремонт пылесосов оплатить" /
+    # "доставка цветов забронировать" — все валидные коммерческие запросы.
+    # L2/L3 при необходимости отфильтруют редкие реально мусорные кейсы.
+    if seed_is_service:
+        return False, ""
+    
+    # Товарный seed + commerce-инфинитив = валидный purchase intent
+    # (сохраняет старое поведение для обратной совместимости)
+    lemma = parsed.normal_form
+    if lemma in COMMERCE_INFN_LEMMAS:
+        return False, ""
     
     return True, f"Голый инфинитив: '{word}' без объекта (seed без глагола)"
 
