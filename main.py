@@ -185,6 +185,13 @@ GEO_DB = {}
 for city_name, country_code in ALL_CITIES_GLOBAL.items():
     GEO_DB.setdefault(city_name, set()).add(country_code.upper())
 for district_name, country_code in DISTRICTS_EXTENDED.items():
+    # Пропускаем записи с неопределённой страной (country='unknown' или '').
+    # В districts.json таких ~13k записей — мусор из парсинга геоданных,
+    # никогда не совпадает с target_country, но создаёт ложные одиночные
+    # матчи (напр. 'кривой' → {'UNKNOWN'} перекрывает биграмму 'кривой рог').
+    cc = (country_code or '').lower().strip()
+    if not cc or cc == 'unknown':
+        continue
     GEO_DB.setdefault(district_name, set()).add(country_code.upper())
 logger.info(f"[L0] GEO_DB: {len(GEO_DB)} записей (cities: {len(ALL_CITIES_GLOBAL)}, districts: {len(DISTRICTS_EXTENDED)})")
 
