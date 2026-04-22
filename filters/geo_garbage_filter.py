@@ -997,7 +997,15 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 # КРИТИЧНО: Пропускаем разрешенные районы seed_city
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
-                
+
+                # G4: адъективная форма + street_marker → улица внутри seed_city.
+                if _is_street_name_context(raw_word, word_norm):
+                    continue
+
+                # G6: жк/мкр перед словом → имя ЖК, не страна/гео-объект.
+                if _is_complex_name_context(raw_word):
+                    continue
+
                 # Проверяем обе формы
                 matched_entity = None
                 for check_word in [raw_word, word_norm]:
@@ -1156,6 +1164,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
 
                 # Тот же guard что в ПРОВЕРКЕ 4: нарицательное слово → не район
                 if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
+                    continue
+
+                # G4: адъективная форма + street_marker → улица внутри seed_city.
+                if _is_street_name_context(raw_word, word_norm):
+                    continue
+
+                # G6: жк/мкр перед словом → имя ЖК, не чужая Geox-регион.
+                if _is_complex_name_context(raw_word):
                     continue
 
                 # Ищем слово в districts.json (raw и normalized форма)
