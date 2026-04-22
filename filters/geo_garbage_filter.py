@@ -41,6 +41,11 @@ import re
 import logging
 import json
 import os
+
+from filters._geo_context import (
+    is_street_name_context as _g_is_street,
+    is_complex_name_context as _g_is_complex,
+)
 from typing import Dict, Set, List, Tuple
 
 logger = logging.getLogger("GeoGarbageFilter")
@@ -558,34 +563,6 @@ _PREPOSITIONS = {
     'ў', 'каля', 'ля', 'пры',
     'w', 'na', 'przy', 'od', 'do', 'z', 'o',
 }
-
-# G4 — маркеры улично-районной структуры.
-# Если слово[i] нормализуется в город, а слово[i+1] или [i-1] — street marker,
-# значит слово[i] это часть названия улицы/района внутри текущего города,
-# а не независимый чужой город.
-# Примеры: "харьковский район", "харьковское шоссе", "днепровская набережная",
-# "героев днепра проспект". Cross-niche: покрывает все UA/RU/BY города.
-_STREET_MARKERS = {
-    # Улично-районная структура
-    'район', 'шоссе', 'массив', 'проспект', 'улица', 'переулок', 'площадь',
-    'бульвар', 'переезд', 'вокзал', 'набережная', 'аллея', 'тупик',
-    'квартал', 'проезд', 'станция', 'метро',
-    # UA
-    'вулиця', 'провулок', 'майдан', 'бульвар', 'проспект', 'набережна',
-    'площа', 'квартал', 'станція',
-    # Сокращения (часто в запросах)
-    'ул', 'пр', 'просп', 'пер', 'пл', 'ст', 'наб', 'бул',
-}
-
-# G6 — маркеры жилого/торгового комплекса. Произвольное имя после маркера.
-# "жк софия", "мкр крылатское", "микрорайон прикарпатский" — имя = название ЖК,
-# не город. Cross-niche: работает для любых жилых комплексов.
-_COMPLEX_MARKERS = {
-    'жк', 'мкр', 'микрорайон', 'жилой', 'комплекс', 'тц', 'трц', 'бц',
-    'жм', 'жилмассив',
-    # UA
-    'житловий', 'комплекс',
-}
 # Кэш нормализации токенов — накапливается между запросами
 _NORMALIZE_CACHE: Dict[str, str] = {}
 
@@ -767,44 +744,6 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
             clean_words_normalized.append(_NORMALIZE_CACHE[w])
         
         # ═══════════════════════════════════════════════════════════
-        # G4/G6 helpers — контекстные guards перед city/district матчем.
-        # G4: adj-город + street_marker справа → улица/район внутри seed_city.
-        # G6: complex_marker + топоним слева → название ЖК, не город.
-        # ═══════════════════════════════════════════════════════════
-        def _is_street_name_context(raw_word: str, word_norm: str) -> bool:
-            """
-            G4: слово выглядит как адъективная форма города, а следующее
-            слово — маркер улично-районной структуры (район/шоссе/массив).
-            Пример: 'харьковский район', 'днепровское шоссе'.
-            Срабатывает ТОЛЬКО если raw слово АДЪЕКТИВ (ends -ский/-ская/-ское
-            и т.п.) — защита от честного совпадения города с маркером
-            ('николаев район' не срабатывает, т.к. 'николаев' не адъектив).
-            """
-            # Проверка: raw_word — адъектив? (отличается от word_norm через adj-суффикс)
-            if raw_word == word_norm:
-                return False  # не адъектив, чистое имя города
-            adj_suffixes = ('ский', 'ская', 'ское', 'ской', 'ским', 'ского',
-                           'ськ', 'ська', 'ське', 'ською', 'ському')
-            if not any(raw_word.endswith(s) for s in adj_suffixes):
-                return False
-            # Слово справа от raw_word — street marker?
-            pos = _word_positions.get(raw_word, -1)
-            if pos < 0 or pos + 1 >= len(words):
-                return False
-            return words[pos + 1] in _STREET_MARKERS
-
-        def _is_complex_name_context(raw_word: str) -> bool:
-            """
-            G6: слева от raw_word — маркер жилого/торгового комплекса.
-            Значит raw_word = название ЖК, не город.
-            Пример: 'жк софия', 'мкр крылатское'.
-            """
-            pos = _word_positions.get(raw_word, -1)
-            if pos <= 0:
-                return False
-            return words[pos - 1] in _COMPLEX_MARKERS
-
-        # ═══════════════════════════════════════════════════════════
         # ПРОВЕРКА 1: Оккупированные территории (блокируем ВСЕГДА!)
         # Убрано условие target_country == 'ua'
         # ═══════════════════════════════════════════════════════════
@@ -856,15 +795,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in DISTRICT_TO_CANONICAL or word_norm in DISTRICT_TO_CANONICAL:
                     continue
 
-                # G4: адъективная форма города + маркер улицы/района справа →
-                # часть названия улицы внутри текущего города, не чужой.
-                # 'харьковский район', 'днепровское шоссе', 'харьковское шоссе'.
-                if _is_street_name_context(raw_word, word_norm):
+                # G4: adj-форма города + street_marker справа → улица/район seed_city
+                if _g_is_street(raw_word, word_norm, _word_positions, words):
                     continue
 
-                # G6: жк/мкр/микрорайон слева → имя ЖК, не город.
-                # 'жк софия', 'мкр крылатское'.
-                if _is_complex_name_context(raw_word):
+                # G6: жк/мкр перед словом → имя ЖК, не независимый топоним
+                if _g_is_complex(raw_word, _word_positions, words):
                     continue
 
                 # ═══════════════════════════════════════════════════════════
@@ -998,12 +934,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
 
-                # G4: адъективная форма + street_marker → улица внутри seed_city.
-                if _is_street_name_context(raw_word, word_norm):
+                # G4: adj-форма города + street_marker → улица внутри seed_city
+                if _g_is_street(raw_word, word_norm, _word_positions, words):
                     continue
 
-                # G6: жк/мкр перед словом → имя ЖК, не страна/гео-объект.
-                if _is_complex_name_context(raw_word):
+                # G6: жк/мкр перед словом → имя ЖК, не страна/природный объект
+                if _g_is_complex(raw_word, _word_positions, words):
                     continue
 
                 # Проверяем обе формы
@@ -1074,13 +1010,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
                     continue
 
-                # G4: адъективная форма + street_marker → улица внутри seed_city.
-                # Не трактуем как district чужого города.
-                if _is_street_name_context(raw_word, word_norm):
+                # G4: adj-форма + street_marker → улица внутри seed_city
+                if _g_is_street(raw_word, word_norm, _word_positions, words):
                     continue
 
-                # G6: жк/мкр перед словом → имя ЖК, не district чужого города.
-                if _is_complex_name_context(raw_word):
+                # G6: жк/мкр перед словом → имя ЖК, не district чужого города
+                if _g_is_complex(raw_word, _word_positions, words):
                     continue
 
                 district_canonical_city = (
@@ -1166,12 +1101,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if _is_common_no_geox(raw_word) or _is_common_no_geox(word_norm):
                     continue
 
-                # G4: адъективная форма + street_marker → улица внутри seed_city.
-                if _is_street_name_context(raw_word, word_norm):
+                # G4: adj-форма + street_marker → улица внутри seed_city
+                if _g_is_street(raw_word, word_norm, _word_positions, words):
                     continue
 
-                # G6: жк/мкр перед словом → имя ЖК, не чужая Geox-регион.
-                if _is_complex_name_context(raw_word):
+                # G6: жк/мкр перед словом → имя ЖК, не Geox-регион
+                if _g_is_complex(raw_word, _word_positions, words):
                     continue
 
                 # Ищем слово в districts.json (raw и normalized форма)
