@@ -497,7 +497,10 @@ def apply_l0_filter(
         if not kw:
             continue
         _t0 = time.perf_counter()
-        tail = extract_tail(kw, seed, seed_ctx=seed_ctx)
+        tail = extract_tail(
+            kw, seed, seed_ctx=seed_ctx,
+            geo_db=geo_db, target_country=target_country,
+        )
 
         # Fallback: если основной extract не нашёл seed и критерий eligibility
         # выполнен, пробуем укороченный seed (без последнего слова). Это ловит
@@ -516,7 +519,10 @@ def apply_l0_filter(
         # На полном seed такие кейсы отсеиваются (там ещё 'цена' нужна), но
         # fallback с коротким seed их пропускает. Guard закрывает эту дыру.
         if tail is None and _skip_last_eligible:
-            _tail_fb = extract_tail(kw, _short_seed, seed_ctx=_short_seed_ctx)
+            _tail_fb = extract_tail(
+                kw, _short_seed, seed_ctx=_short_seed_ctx,
+                geo_db=geo_db, target_country=target_country,
+            )
             if _tail_fb is not None:
                 # Lemma-guard: все леммы укороченного seed должны быть в kw.
                 _kw_lemmas = {_morph.parse(w)[0].normal_form for w in kw.lower().split()}
