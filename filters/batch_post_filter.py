@@ -9,6 +9,11 @@ import time
 from typing import List, Dict, Set, Tuple, Optional
 from collections import Counter
 
+from filters._geo_context import (
+    is_street_name_context as _g_is_street,
+    is_complex_name_context as _g_is_complex,
+)
+
 logger = logging.getLogger("BatchPostFilter")
 
 
@@ -571,6 +576,12 @@ class BatchPostFilter:
 
         country_l = country.lower()
 
+        # Позиции слов в исходном порядке — для G4/G6 контекстных guards
+        _word_positions = {}
+        for _wi, _ww in enumerate(words):
+            if _ww not in _word_positions:
+                _word_positions[_ww] = _wi
+
         # БАГ 3: слова стоящие после предлога направления — страна = контекст, не фильтр
         # "купить айфон в германии" / "из америки" → валидно для UA
         _TRAVEL_PREPS = frozenset({'в', 'из', 'с', 'до', 'по', 'через', 'на'})
@@ -582,6 +593,13 @@ class BatchPostFilter:
 
         # ОДИН проход по words_set: abbreviations, countries, manual_small_cities, regions
         for w in words_set:
+            # G4/G6 guards: если слово — часть имени улицы или ЖК, не блокируем
+            _lemma_w = lemmas_map.get(w, w)
+            if _g_is_street(w, _lemma_w, _word_positions, words):
+                continue
+            if _g_is_complex(w, _word_positions, words):
+                continue
+
             if w in self.city_abbreviations:
                 if self.city_abbreviations[w] != country_l:
                     _p['static'] = time.perf_counter() - _t1
@@ -642,6 +660,12 @@ class BatchPostFilter:
                     continue
                 _lemma_w = lemmas_map.get(w, w)
                 if _lemma_w in _seed_words_set:
+                    continue
+                # G4: adj-форма + street_marker справа → улица, не чужой район
+                if _g_is_street(w, _lemma_w, _word_positions, words):
+                    continue
+                # G6: жк/мкр слева → имя ЖК, не чужой район
+                if _g_is_complex(w, _word_positions, words):
                     continue
                 # БАГ 2: ASCII короткое слово (≤4) = бренд-суффикс/модель, не район
                 # покрывает: se, pro, gold, m21, s21, a52
