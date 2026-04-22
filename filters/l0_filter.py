@@ -26,7 +26,7 @@ import re
 import time
 from typing import Dict, List, Set, Any, Optional
 
-from .tail_extractor import extract_tail, build_seed_ctx
+from .tail_extractor import extract_tail, build_seed_ctx, _all_top_lemmas
 from .tail_function_classifier import TailFunctionClassifier
 
 logger = logging.getLogger(__name__)
@@ -147,16 +147,34 @@ def _parse_seed_for_sanity(seed_ctx: dict, brand_db: Set[str]) -> Optional[dict]
       - latn_model:  LATN-токены seed, ОТСУТСТВУЮЩИЕ в brand_db (модели/коды)
 
     Возвращает None если у seed нет ни одного content-токена (пустой/мусорный seed).
+
+    Fix 3 (multi-lemma sanity, апрель 2026): для cyr-content используем ПОЛНЫЕ
+    множества лемм из seed_ctx['lemmas_all'] (score ≥ 0.9×top_score), не только
+    одну top-1 normal_form. Это решает лемма-ловушку pymorphy3 в sanity-check
+    аналогично как Fix 1 в tail_extractor:
+      - seed 'цветов' → normal_form[0]='цвет' (score 0.5), alt='цветок' (score 0.5)
+      - kw 'цветы' → normal_form[0]='цветок' (score 0.65)
+      - top-1 сравнение: 'цвет' vs {'цветок'} → НЕ пересекаются → false missing
+      - multi-lemma: {'цвет','цветок'} vs {'цветок'} → пересекаются → OK
+
+    Возвращаем структуру в двух формах:
+      - 'cyr_content_sets': tuple[frozenset[str], ...] — per-seed-word множества
+        лемм. Используется _sanity_check_valid для алгоритмического multi-lemma
+        match через set intersection.
+      - 'cyr_content': frozenset[str] — flat объединение всех лемм. Оставлено
+        для backward-compat (если где-то снаружи читается).
     """
     words = seed_ctx['words']
     lemmas = seed_ctx['lemmas']
+    lemmas_all = seed_ctx['lemmas_all']  # list[set[str]] — Fix 1
     pos = seed_ctx['pos']
     is_lat = seed_ctx['is_lat']
     is_number = seed_ctx['is_number']
 
     CONTENT_POS = {'NOUN', 'VERB', 'ADJF', 'ADJS', 'INFN', 'PRTF', 'PRTS'}
 
-    cyr_content: Set[str] = set()
+    cyr_content_sets: List[frozenset] = []  # per-seed-word множества лемм
+    cyr_content_flat: Set[str] = set()       # flat для backward-compat
     latn_brand: Set[str] = set()
     latn_model: Set[str] = set()
 
@@ -171,8 +189,10 @@ def _parse_seed_for_sanity(seed_ctx: dict, brand_db: Set[str]) -> Optional[dict]
             else:
                 latn_model.add(w)
         elif p in CONTENT_POS:
-            # cyr-контентное слово (или любое с известной POS-ролью): лемма как anchor
-            cyr_content.add(lemmas[i])
+            # cyr-контентное слово: храним ВСЕ леммы с score ≥ 0.9×top (из Fix 1)
+            lem_set = frozenset(lemmas_all[i]) if lemmas_all[i] else frozenset({lemmas[i]})
+            cyr_content_sets.append(lem_set)
+            cyr_content_flat.update(lem_set)
         # PREP/CONJ/PRCL/INTJ и прочие функциональные — пропускаем
 
     # Длина seed в словах (как пишет пользователь), включая PREP/CONJ.
@@ -184,11 +204,12 @@ def _parse_seed_for_sanity(seed_ctx: dict, brand_db: Set[str]) -> Optional[dict]
     seed_word_count = len(seed_ctx['words'])
 
     # Если нет ни одного content-токена — нечего проверять
-    if len(cyr_content) + len(latn_brand) + len(latn_model) == 0:
+    if len(cyr_content_sets) + len(latn_brand) + len(latn_model) == 0:
         return None
 
     return {
-        'cyr_content': frozenset(cyr_content),
+        'cyr_content_sets': tuple(cyr_content_sets),   # Fix 3: multi-lemma
+        'cyr_content': frozenset(cyr_content_flat),     # backward-compat
         'latn_brand': frozenset(latn_brand),
         'latn_model': frozenset(latn_model),
         'seed_word_count': seed_word_count,
@@ -241,6 +262,7 @@ def _sanity_check_valid(
         'samsung' в kw (N-1 достаточно для brand pool). Keep.
     """
     cyr_content = sanity_ctx['cyr_content']
+    cyr_content_sets = sanity_ctx.get('cyr_content_sets', ())  # Fix 3: multi-lemma
     latn_brand = sanity_ctx['latn_brand']
     latn_model = sanity_ctx['latn_model']
     seed_word_count = sanity_ctx['seed_word_count']
@@ -251,18 +273,30 @@ def _sanity_check_valid(
 
     is_latn_seed = bool(latn_brand or latn_model)
 
-    # Собираем множества kw: точные слова + леммы + флаг наличия cyr-brand
+    # Собираем множества kw: точные слова + top-1 леммы + multi-lemma (Fix 3)
+    # kw_lemmas_all[i] — ВСЕ леммы i-го слова kw со score ≥ 0.9×top_score.
+    # Используется для пересечения с seed cyr_content_sets (аналог Fix 1).
     kw_words = kw.lower().split()
     kw_words_set = set(kw_words)
     kw_lemmas_set: Set[str] = set()
+    kw_lemmas_all: List[frozenset] = []  # Fix 3: per-kw-word multi-lemma
     kw_has_cyr_brand = False
     for w in kw_words:
-        lemma = morph.parse(w)[0].normal_form
-        kw_lemmas_set.add(lemma)
+        parsed = morph.parse(w)
+        top_lemma = parsed[0].normal_form if parsed else w
+        kw_lemmas_set.add(top_lemma)
+        # Multi-lemma через _all_top_lemmas (Fix 3 — тот же порог 0.9×top что Fix 1)
+        kw_lemmas_all.append(frozenset(_all_top_lemmas(w)))
         if not kw_has_cyr_brand and any('\u0400' <= c <= '\u04ff' for c in w):
-            if w in brand_db or lemma in brand_db:
+            if w in brand_db or top_lemma in brand_db:
                 kw_has_cyr_brand = True
     kw_all = kw_words_set | kw_lemmas_set
+    # Flat множество ВСЕХ лемм kw — для задач где direction проверки lemma-in-kw
+    # (latn_model/brand уже через kw_all работают, здесь нужно для Fix 3 sanity)
+    kw_lemmas_all_flat: Set[str] = set()
+    for ls in kw_lemmas_all:
+        kw_lemmas_all_flat |= ls
+    kw_all_multi = kw_all | kw_lemmas_all_flat  # top-1 ∪ all-top
 
     # ── Шаг 1: latn_model обязательны строго (с translit) ────────────────
     kw_translit_cache = None
@@ -284,8 +318,35 @@ def _sanity_check_valid(
             if not kw_has_cyr_brand:
                 return "missing_brand"
 
-    # ── Шаг 3: cyr_content по правилу длины/типа сида ─────────────────────
-    missing_cyr = [cl for cl in cyr_content if cl not in kw_all]
+    # ── Шаг 3: cyr_content по правилу длины/типа сида (Fix 3 multi-lemma) ─
+    # Seed content слово считается "присутствующим" в kw если:
+    #   - exact word match (raw text), ИЛИ
+    #   - пересечение multi-lemma множеств seed-слова и любого kw-слова
+    #     (множества из _all_top_lemmas, порог 0.5×top — решает цвет/цветок).
+    #
+    # Проверка raw word перед lemma-intersection — защита от edge case когда
+    # слово и лемма различаются, но kw содержит seed_word буквально.
+    missing_cyr = []
+    if cyr_content_sets:
+        # Fix 3 path: multi-lemma
+        for seed_lem_set in cyr_content_sets:
+            found = False
+            # raw match: любая лемма этого seed-слова буквально в kw_words_set?
+            if seed_lem_set & kw_words_set:
+                found = True
+            else:
+                # multi-lemma intersection: любое kw-слово имеет общую лемму?
+                for kw_lem_set in kw_lemmas_all:
+                    if seed_lem_set & kw_lem_set:
+                        found = True
+                        break
+            if not found:
+                # Для сообщения missing — берём top-1 лемму (первую из множества)
+                missing_cyr.append(next(iter(seed_lem_set)))
+    else:
+        # Fallback: старая логика (top-1 flat cyr_content, если cyr_content_sets пуст)
+        missing_cyr = [cl for cl in cyr_content if cl not in kw_all]
+
     if is_latn_seed:
         # Товарный сид: cyr-content = intent-anchor, все обязательны
         if missing_cyr:
