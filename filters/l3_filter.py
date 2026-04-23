@@ -157,30 +157,42 @@ def _call_gemini(config: L3Config, system_prompt: str, user_prompt: str) -> str:
         "generationConfig": {
             "temperature": config.temperature,
             "maxOutputTokens": 500,
-            # thinkingBudget=0 отключает reasoning → максимальная скорость
-            "thinkingConfig": {
-                "thinkingBudget": 0
-            }
         }
     }
 
-    response = requests.post(
-        f"{config.api_url}?key={config.api_key}",
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=config.timeout,
-    )
+    try:
+        response = requests.post(
+            f"{config.api_url}?key={config.api_key}",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=config.timeout,
+        )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Gemini network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"Gemini API error {response.status_code}: {response.text[:300]}")
+        raise Exception(
+            f"Gemini API error {response.status_code}: {response.text[:500]}"
+        )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception as e:
+        raise Exception(f"Gemini JSON parse error: {e}. Raw: {response.text[:300]}")
 
     # Gemini формат: candidates[0].content.parts[0].text
     try:
         return data['candidates'][0]['content']['parts'][0]['text'].strip()
-    except (KeyError, IndexError) as e:
-        raise Exception(f"Gemini unexpected response format: {str(data)[:300]}")
+    except (KeyError, IndexError, TypeError) as e:
+        # Проверяем частые причины
+        if 'candidates' not in data:
+            raise Exception(f"Gemini no candidates in response: {str(data)[:400]}")
+        cand = data['candidates'][0] if data.get('candidates') else {}
+        finish = cand.get('finishReason', 'UNKNOWN')
+        raise Exception(
+            f"Gemini unexpected response format (finishReason={finish}): "
+            f"{str(data)[:400]}"
+        )
 
 
 def _call_api(config: L3Config, system_prompt: str, user_prompt: str) -> str:
