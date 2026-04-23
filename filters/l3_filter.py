@@ -296,20 +296,28 @@ def apply_l3_filter(
         provider = os.environ.get("L3_PROVIDER", "deepseek").lower()
         config = L3Config(provider=provider)
 
-    # API key: параметр → env var → пусто
-    if not config.api_key:
-        env_key = PROVIDERS[config.provider]["env_key"]
-        config.api_key = os.environ.get(env_key, "")
+    # КРИТИЧНО: всегда перечитываем api_key из env, игнорируя возможное
+    # устаревшее значение в config (например если config был создан при старте
+    # приложения до смены L3_PROVIDER или ключа).
+    env_key_name = PROVIDERS[config.provider]["env_key"]
+    env_key_value = os.environ.get(env_key_name, "").strip()
+    if env_key_value:
+        config.api_key = env_key_value
 
     if not config.api_key:
-        env_key = PROVIDERS[config.provider]["env_key"]
-        logger.warning(f"[L3] No API key for provider={config.provider} (set {env_key}) — skipping")
+        logger.warning(f"[L3] No API key for provider={config.provider} (set {env_key_name}) — skipping")
         result["l3_stats"] = {
             "error": "no_api_key",
             "provider": config.provider,
             "input_grey": len(grey_keywords)
         }
         return result
+
+    # Диагностика ключа (без его раскрытия)
+    logger.info(
+        f"[L3] provider={config.provider} key_len={len(config.api_key)} "
+        f"prefix={config.api_key[:6]!r} suffix={config.api_key[-4:]!r}"
+    )
 
     kw_strings = []
     kw_objects = []
