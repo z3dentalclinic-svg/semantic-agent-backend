@@ -36,6 +36,11 @@ PROVIDERS = {
         "api_url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
         "env_key": "GEMINI_API_KEY",
     },
+    "gemini-pro": {
+        "model": "gemini-3.1-pro-preview",
+        "api_url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
+        "env_key": "GEMINI_API_KEY",
+    },
 }
 
 
@@ -156,7 +161,7 @@ def _call_gemini(config: L3Config, system_prompt: str, user_prompt: str) -> str:
         ],
         "generationConfig": {
             "temperature": config.temperature,
-            "maxOutputTokens": 500,
+            "maxOutputTokens": 2000,
         }
     }
 
@@ -199,7 +204,7 @@ def _call_api(config: L3Config, system_prompt: str, user_prompt: str) -> str:
     """Роутер: выбирает нужную функцию по провайдеру."""
     if config.provider == "deepseek":
         return _call_deepseek(config, system_prompt, user_prompt)
-    elif config.provider == "gemini":
+    elif config.provider in ("gemini", "gemini-pro"):
         return _call_gemini(config, system_prompt, user_prompt)
     else:
         raise ValueError(f"Unknown provider: {config.provider}")
