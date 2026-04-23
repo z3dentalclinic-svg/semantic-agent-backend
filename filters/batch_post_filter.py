@@ -1,5 +1,5 @@
 """
-Batch Post-Filter v7.91 - FUNDAMENTAL FIX: GEO DATABASE PRIORITY
+Batch Post-Filter v7.9 - FUNDAMENTAL FIX: GEO DATABASE PRIORITY
 Based on Gemini's recommendations for 187 countries support
 """
 
@@ -741,6 +741,13 @@ class BatchPostFilter:
                     continue
             
             item_normalized = self._get_lemma(item, language)
+
+            # G4/G6: если item — часть улицы/района в seed_city или имя ЖК → не блокируем
+            if ' ' not in item and '-' not in item:
+                if _g_is_street(item, item_normalized, _word_positions, words):
+                    continue
+                if _g_is_complex(item, _word_positions, words):
+                    continue
 
             # PRIORITY 1: СВОЙ ГОРОД (целевая страна) — пропускаем
             is_our_city = self._find_in_country(item, country)
