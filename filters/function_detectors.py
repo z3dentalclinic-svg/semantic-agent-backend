@@ -15,6 +15,10 @@ import logging
 from typing import Tuple, Set, Dict
 
 from .shared_morph import morph
+from ._geo_context import (
+    is_street_name_context as _g_is_street,
+    is_complex_name_context as _g_is_complex,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +362,13 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
     words = tail.lower().split()
     if not words:
         return False, ""
-    
+
+    # Позиции слов — для G4/G6 контекстных guards
+    _word_positions = {}
+    for _wi, _ww in enumerate(words):
+        if _ww not in _word_positions:
+            _word_positions[_ww] = _wi
+
     # Лемматизируем все токены один раз (используется везде)
     lemmas = [_get_parses(w, tp)[0].normal_form for w in words]
     
@@ -439,6 +449,14 @@ def detect_geo(tail: str, geo_db: Dict[str, Set[str]], target_country: str = "ua
     for word, lem in zip(words, lemmas):
         parsed = _get_parses(word, tp)[0]
         if parsed.tag.POS in skip_pos:
+            continue
+
+        # G4: adj-форма + street_marker справа → имя улицы, не город
+        if _g_is_street(word, lem, _word_positions, words):
+            continue
+
+        # G6: жк/мкр перед словом → имя ЖК, не город
+        if _g_is_complex(word, _word_positions, words):
             continue
 
         # === FOREIGN DISTRICT guard для одиночных (задача "позняки") ===
@@ -2447,6 +2465,12 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
     skip_pos = {'CONJ', 'PREP', 'PRCL', 'INTJ'}
     
     words = tail.lower().split()
+
+    # Позиции слов — для G4/G6 контекстных guards (жк/мкр + топоним, adj + street_marker)
+    _word_positions = {}
+    for _wi, _ww in enumerate(words):
+        if _ww not in _word_positions:
+            _word_positions[_ww] = _wi
     
     # === Предпроверка: есть ли target_country в хвосте? ===
     # Если да → паттерн "из [своей] в [чужую]" → cross-border intent → не блокируем
@@ -2535,6 +2559,14 @@ def detect_foreign_geo(tail: str, geo_db: dict = None, target_country: str = "ua
 
         # Origin-guard: слово в origin-scope — источник импорта, не blocking
         if i_word in origin_scope:
+            continue
+
+        # G4: adj-форма + street_marker справа → улица внутри seed_city, не чужой город
+        if _g_is_street(word, lemma, _word_positions, words):
+            continue
+
+        # G6: жк/мкр перед словом → имя ЖК, не чужой город
+        if _g_is_complex(word, _word_positions, words):
             continue
         
         # ═══════════════════════════════════════════════════════════════════
