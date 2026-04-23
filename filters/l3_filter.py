@@ -39,10 +39,19 @@ PROVIDERS = {
 }
 
 
+def _default_provider() -> str:
+    """Читает провайдера из env L3_PROVIDER, дефолт deepseek."""
+    return os.environ.get("L3_PROVIDER", "deepseek").lower().strip()
+
+
 @dataclass
 class L3Config:
-    """Конфигурация L3 классификатора."""
-    provider: str = "deepseek"     # "deepseek" или "gemini"
+    """Конфигурация L3 классификатора.
+
+    provider по умолчанию берётся из env L3_PROVIDER.
+    Чтобы принудительно задать — передай provider="gemini" явно.
+    """
+    provider: str = field(default_factory=_default_provider)
     api_key: str = ""
     model: str = ""                # берётся из PROVIDERS[provider]["model"] если пусто
     api_url: str = ""              # берётся из PROVIDERS[provider]["api_url"] если пусто
@@ -53,7 +62,6 @@ class L3Config:
     max_parallel: int = 5
 
     def __post_init__(self):
-        # Подтягиваем дефолты из PROVIDERS если не заданы явно
         if self.provider not in PROVIDERS:
             raise ValueError(f"Unknown provider: {self.provider}. Use 'deepseek' or 'gemini'")
         prov = PROVIDERS[self.provider]
