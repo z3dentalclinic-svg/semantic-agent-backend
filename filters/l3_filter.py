@@ -1,60 +1,70 @@
 """
-l3_filter.py — Слой 3: DeepSeek LLM классификатор для оставшихся GREY.
+l3_filter.py — Слой 3: LLM классификатор для оставшихся GREY.
+Поддерживает два провайдера: DeepSeek и Gemini.
 
-Размещается в filters/l3_filter.py
+Переключение через env var L3_PROVIDER:
+    L3_PROVIDER=deepseek  → DeepSeek (дефолт)
+    L3_PROVIDER=gemini    → Gemini 2.5 Flash-Lite
 
-Что делает:
-    1. Берёт keywords_grey из result dict (после L0 → L2)
-    2. Отправляет ПАРАЛЛЕЛЬНО батчами на DeepSeek API
-    3. VALID → добавляет в keywords
-    4. TRASH → добавляет в anchors (с anchor_reason="L3_TRASH")
-    5. ERROR → оставляет в keywords_grey (fallback)
-
-Возвращает:
-    result dict с обновлёнными keywords/anchors/keywords_grey
-    + l3_stats (для UI)
-    + _l3_trace (для tracer)
-
-Параллельность:
-    Все батчи отправляются одновременно через ThreadPoolExecutor.
-    3 батча по 50 ключей → ~3 секунды вместо ~9 последовательно.
-
-Стоимость: ~$0.001 за батч 50 ключей (DeepSeek-chat).
-
-Требования:
-    pip install requests
-    env var DEEPSEEK_API_KEY или передать через L3Config
+Ключи API:
+    DEEPSEEK_API_KEY — для DeepSeek
+    GEMINI_API_KEY   — для Gemini
 """
 
 import os
 import time
 import logging
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# КОНФИГУРАЦИЯ
+# КОНФИГУРАЦИЯ ПРОВАЙДЕРОВ
 # ═══════════════════════════════════════════════════════════════
+
+PROVIDERS = {
+    "deepseek": {
+        "model": "deepseek-chat",
+        "api_url": "https://api.deepseek.com/chat/completions",
+        "env_key": "DEEPSEEK_API_KEY",
+    },
+    "gemini": {
+        "model": "gemini-2.5-flash-lite",
+        "api_url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
+        "env_key": "GEMINI_API_KEY",
+    },
+}
+
 
 @dataclass
 class L3Config:
     """Конфигурация L3 классификатора."""
+    provider: str = "deepseek"     # "deepseek" или "gemini"
     api_key: str = ""
-    model: str = "deepseek-chat"
-    api_url: str = "https://api.deepseek.com/chat/completions"
+    model: str = ""                # берётся из PROVIDERS[provider]["model"] если пусто
+    api_url: str = ""              # берётся из PROVIDERS[provider]["api_url"] если пусто
     batch_size: int = 50
     timeout: int = 60
     temperature: float = 0.0
     max_retries: int = 2
-    max_parallel: int = 5   # максимум параллельных запросов
+    max_parallel: int = 5
+
+    def __post_init__(self):
+        # Подтягиваем дефолты из PROVIDERS если не заданы явно
+        if self.provider not in PROVIDERS:
+            raise ValueError(f"Unknown provider: {self.provider}. Use 'deepseek' or 'gemini'")
+        prov = PROVIDERS[self.provider]
+        if not self.model:
+            self.model = prov["model"]
+        if not self.api_url:
+            self.api_url = prov["api_url"]
 
 
 # ═══════════════════════════════════════════════════════════════
-# ПРОМПТ (взят из layer2_deepseek.py, адаптирован)
+# ПРОМПТ (без изменений)
 # ═══════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """Ты — эксперт по фильтрации поисковых запросов для украинского рынка.
@@ -85,7 +95,6 @@ TRASH — бессмысленный запрос, мусор парсинга, 
 # ═══════════════════════════════════════════════════════════════
 
 def _build_user_prompt(seed: str, keywords: List[str]) -> str:
-    """Формирует пользовательский промпт с батчем ключей."""
     lines = [f'Seed: "{seed}"', "", "Запросы:"]
     for i, kw in enumerate(keywords, 1):
         lines.append(f"{i}. {kw}")
@@ -94,7 +103,7 @@ def _build_user_prompt(seed: str, keywords: List[str]) -> str:
 
 
 def _call_deepseek(config: L3Config, system_prompt: str, user_prompt: str) -> str:
-    """Отправляет запрос к DeepSeek API."""
+    """Вызов DeepSeek API (OpenAI-compatible формат)."""
     import requests
 
     response = requests.post(
@@ -122,8 +131,61 @@ def _call_deepseek(config: L3Config, system_prompt: str, user_prompt: str) -> st
     return data['choices'][0]['message']['content'].strip()
 
 
+def _call_gemini(config: L3Config, system_prompt: str, user_prompt: str) -> str:
+    """Вызов Gemini API (Google Generative Language)."""
+    import requests
+
+    # Gemini: system идёт отдельным полем systemInstruction, user — в contents
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": user_prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": config.temperature,
+            "maxOutputTokens": 500,
+            # thinkingBudget=0 отключает reasoning → максимальная скорость
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            }
+        }
+    }
+
+    response = requests.post(
+        f"{config.api_url}?key={config.api_key}",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=config.timeout,
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"Gemini API error {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+
+    # Gemini формат: candidates[0].content.parts[0].text
+    try:
+        return data['candidates'][0]['content']['parts'][0]['text'].strip()
+    except (KeyError, IndexError) as e:
+        raise Exception(f"Gemini unexpected response format: {str(data)[:300]}")
+
+
+def _call_api(config: L3Config, system_prompt: str, user_prompt: str) -> str:
+    """Роутер: выбирает нужную функцию по провайдеру."""
+    if config.provider == "deepseek":
+        return _call_deepseek(config, system_prompt, user_prompt)
+    elif config.provider == "gemini":
+        return _call_gemini(config, system_prompt, user_prompt)
+    else:
+        raise ValueError(f"Unknown provider: {config.provider}")
+
+
 def _parse_response(response: str, expected_count: int) -> List[str]:
-    """Парсит ответ DeepSeek: '1,0,1,1,0' → ['VALID', 'TRASH', ...]"""
     clean = ''.join(c for c in response if c in '01,')
     parts = [p.strip() for p in clean.split(',') if p.strip()]
 
@@ -147,7 +209,6 @@ def _parse_response(response: str, expected_count: int) -> List[str]:
 
 
 def _extract_keyword_string(kw) -> str:
-    """Извлекает строку из keyword (str или dict)."""
     if isinstance(kw, dict):
         return kw.get("keyword", kw.get("query", ""))
     return str(kw)
@@ -160,18 +221,13 @@ def _process_batch(
     config: L3Config,
     total_batches: int,
 ) -> Tuple[int, List[str], float]:
-    """
-    Обрабатывает один батч. Вызывается в потоке ThreadPoolExecutor.
-    
-    Returns: (batch_idx, labels, api_time)
-    """
     batch_num = batch_idx + 1
     user_prompt = _build_user_prompt(seed, batch)
 
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response = _call_deepseek(config, SYSTEM_PROMPT, user_prompt)
+            response = _call_api(config, SYSTEM_PROMPT, user_prompt)
             elapsed = time.time() - t0
 
             labels = _parse_response(response, len(batch))
@@ -179,7 +235,7 @@ def _process_batch(
             valid_count = labels.count('VALID')
             trash_count = labels.count('TRASH')
             logger.info(
-                f"[L3] Batch {batch_num}/{total_batches} — "
+                f"[L3] Batch {batch_num}/{total_batches} [{config.provider}] — "
                 f"VALID: {valid_count}, TRASH: {trash_count} ({elapsed:.1f}s)"
             )
             return (batch_idx, labels, elapsed)
@@ -198,7 +254,7 @@ def _process_batch(
 
 
 # ═══════════════════════════════════════════════════════════════
-# ГЛАВНАЯ ФУНКЦИЯ: apply_l3_filter
+# ГЛАВНАЯ ФУНКЦИЯ
 # ═══════════════════════════════════════════════════════════════
 
 def apply_l3_filter(
@@ -207,21 +263,6 @@ def apply_l3_filter(
     enable_l3: bool = True,
     config: Optional[L3Config] = None,
 ) -> Dict[str, Any]:
-    """
-    Применяет L3 фильтр к результату после L0 → L2.
-
-    Берёт keywords_grey, отправляет ПАРАЛЛЕЛЬНО на DeepSeek API,
-    распределяет: VALID → keywords, TRASH → anchors, ERROR → keywords_grey.
-
-    Args:
-        result: dict с keywords, keywords_grey, anchors (выход L2)
-        seed: базовый запрос
-        enable_l3: включить L3
-        config: L3Config (api_key, model, batch_size...)
-
-    Returns:
-        обновлённый result dict + l3_stats + _l3_trace
-    """
     if not enable_l3:
         return result
 
@@ -230,38 +271,44 @@ def apply_l3_filter(
         logger.info("[L3] No GREY keywords to process")
         return result
 
-    cfg = config or L3Config()
+    # Определяем провайдера из env (если config не задан)
+    if config is None:
+        provider = os.environ.get("L3_PROVIDER", "deepseek").lower()
+        config = L3Config(provider=provider)
 
     # API key: параметр → env var → пусто
-    if not cfg.api_key:
-        cfg.api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not config.api_key:
+        env_key = PROVIDERS[config.provider]["env_key"]
+        config.api_key = os.environ.get(env_key, "")
 
-    if not cfg.api_key:
-        logger.warning("[L3] No API key — skipping L3 filter")
-        result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
+    if not config.api_key:
+        env_key = PROVIDERS[config.provider]["env_key"]
+        logger.warning(f"[L3] No API key for provider={config.provider} (set {env_key}) — skipping")
+        result["l3_stats"] = {
+            "error": "no_api_key",
+            "provider": config.provider,
+            "input_grey": len(grey_keywords)
+        }
         return result
 
-    # Извлекаем строки ключей и оригинальные объекты
     kw_strings = []
     kw_objects = []
     for kw in grey_keywords:
         kw_strings.append(_extract_keyword_string(kw))
         kw_objects.append(kw)
 
-    # Нарезаем на батчи
     batches = []
-    for i in range(0, len(kw_strings), cfg.batch_size):
-        batches.append(kw_strings[i:i + cfg.batch_size])
+    for i in range(0, len(kw_strings), config.batch_size):
+        batches.append(kw_strings[i:i + config.batch_size])
 
     total_batches = len(batches)
-    workers = min(cfg.max_parallel, total_batches)
+    workers = min(config.max_parallel, total_batches)
 
     logger.info(
-        f"[L3] Processing {len(kw_strings)} GREY keywords via {cfg.model} "
-        f"({total_batches} batches, {workers} parallel)"
+        f"[L3] Processing {len(kw_strings)} GREY keywords via {config.model} "
+        f"[provider={config.provider}] ({total_batches} batches, {workers} parallel)"
     )
 
-    # ── Параллельная обработка батчей ──
     batch_results: Dict[int, List[str]] = {}
     api_time = 0.0
     t_wall_start = time.time()
@@ -269,7 +316,7 @@ def apply_l3_filter(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
-                _process_batch, idx, batch, seed, cfg, total_batches
+                _process_batch, idx, batch, seed, config, total_batches
             ): idx
             for idx, batch in enumerate(batches)
         }
@@ -281,21 +328,18 @@ def apply_l3_filter(
 
     wall_time = round(time.time() - t_wall_start, 2)
 
-    # Собираем labels в правильном порядке
     all_labels = []
     for idx in range(total_batches):
         all_labels.extend(batch_results[idx])
 
-    # ── Собираем результат ──
     out = result.copy()
 
     l3_valid = []
     l3_trash = []
-    l3_error = []  # ERROR → остаются в grey
+    l3_error = []
     l3_trace = []
 
     for kw_obj, kw_str, label in zip(kw_objects, kw_strings, all_labels):
-        # Трейс-запись (для tracer и UI)
         trace_rec = {
             "keyword": kw_str,
             "label": label,
@@ -307,11 +351,10 @@ def apply_l3_filter(
 
         l3_trace.append(trace_rec)
 
-        # Распределяем по корзинам
         if label == "VALID":
             if isinstance(kw_obj, dict):
                 kw_out = kw_obj.copy()
-                kw_out["l3"] = {"label": "VALID", "source": cfg.model}
+                kw_out["l3"] = {"label": "VALID", "source": config.model}
             else:
                 kw_out = kw_str
             l3_valid.append(kw_out)
@@ -320,25 +363,22 @@ def apply_l3_filter(
             if isinstance(kw_obj, dict):
                 kw_out = kw_obj.copy()
                 kw_out["anchor_reason"] = "L3_TRASH"
-                kw_out["l3"] = {"label": "TRASH", "source": cfg.model}
+                kw_out["l3"] = {"label": "TRASH", "source": config.model}
             else:
                 kw_out = {
                     "keyword": kw_str,
                     "anchor_reason": "L3_TRASH",
-                    "l3": {"label": "TRASH", "source": cfg.model},
+                    "l3": {"label": "TRASH", "source": config.model},
                 }
             l3_trash.append(kw_out)
 
         else:
-            # ERROR → fallback в grey
             l3_error.append(kw_obj)
 
-    # Обновляем result
     out["keywords"] = result.get("keywords", []) + l3_valid
     out["anchors"] = result.get("anchors", []) + l3_trash
-    out["keywords_grey"] = l3_error  # обычно пусто если API работает
+    out["keywords_grey"] = l3_error
 
-    # Обновляем счётчики
     kw_count = len(out["keywords"])
     if "count" in out:
         out["count"] = kw_count
@@ -347,25 +387,24 @@ def apply_l3_filter(
     if "total_unique_keywords" in out:
         out["total_unique_keywords"] = kw_count
 
-    # Статистика для UI
     out["l3_stats"] = {
         "input_grey": len(kw_strings),
         "l3_valid": len(l3_valid),
         "l3_trash": len(l3_trash),
         "l3_error": len(l3_error),
-        "api_time": round(api_time, 2),   # суммарное время всех батчей
-        "wall_time": wall_time,            # реальное время (параллельно)
+        "api_time": round(api_time, 2),
+        "wall_time": wall_time,
         "batches": total_batches,
         "parallel": workers,
-        "model": cfg.model,
+        "model": config.model,
+        "provider": config.provider,
     }
 
-    # Трейс для tracer
     out["_l3_trace"] = l3_trace
 
     logger.info(
-        f"[L3] Done: {len(l3_valid)} VALID, {len(l3_trash)} TRASH, "
-        f"{len(l3_error)} ERROR | wall: {wall_time}s "
+        f"[L3] Done [provider={config.provider}]: {len(l3_valid)} VALID, "
+        f"{len(l3_trash)} TRASH, {len(l3_error)} ERROR | wall: {wall_time}s "
         f"({total_batches} batches × {workers} parallel)"
     )
 
