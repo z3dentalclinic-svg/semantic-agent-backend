@@ -1,7 +1,8 @@
 """
-l3_filter.py — Слой 3: Gemini 3.1 Pro классификатор для оставшихся GREY.
+l3_filter.py — Слой 3: DeepSeek V4-Flash классификатор для оставшихся GREY.
 
-Ключ: env GEMINI_API_KEY
+Ключ: env DEEPSEEK_API_KEY
+Модель: deepseek-v4-flash (non-thinking mode по умолчанию)
 """
 
 import os
@@ -14,8 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gemini-3.1-flash-lite-preview"
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+MODEL = "deepseek-v4-flash"
+API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 
 @dataclass
@@ -43,44 +44,49 @@ def _build_user_prompt(seed: str, keywords: List[str]) -> str:
     return "\n".join(lines)
 
 
-def _call_gemini(api_key: str, system_prompt: str, user_prompt: str, timeout: int, temperature: float) -> str:
+def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, timeout: int, temperature: float) -> str:
     import requests
 
     payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": 8192,
-        }
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": 8192,
+        "stream": False,
     }
 
     try:
         response = requests.post(
-            f"{API_URL}?key={api_key}",
-            headers={"Content-Type": "application/json"},
+            API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
             json=payload,
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Gemini network error: {type(e).__name__}: {e}")
+        raise Exception(f"DeepSeek network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"Gemini API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"DeepSeek API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"Gemini JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"DeepSeek JSON parse error: {e}. Raw: {response.text[:300]}")
 
     try:
-        return data['candidates'][0]['content']['parts'][0]['text'].strip()
+        return data['choices'][0]['message']['content'].strip()
     except (KeyError, IndexError, TypeError):
-        if 'candidates' not in data:
-            raise Exception(f"Gemini no candidates: {str(data)[:400]}")
-        cand = data['candidates'][0] if data.get('candidates') else {}
-        finish = cand.get('finishReason', 'UNKNOWN')
-        raise Exception(f"Gemini unexpected response (finishReason={finish}): {str(data)[:400]}")
+        if 'choices' not in data:
+            raise Exception(f"DeepSeek no choices: {str(data)[:400]}")
+        choice = data['choices'][0] if data.get('choices') else {}
+        finish = choice.get('finish_reason', 'UNKNOWN')
+        raise Exception(f"DeepSeek unexpected response (finish_reason={finish}): {str(data)[:400]}")
 
 
 def _parse_response(response: str, expected_count: int) -> List[str]:
@@ -122,7 +128,7 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response = _call_gemini(
+            response = _call_deepseek(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
                 config.timeout, config.temperature
             )
@@ -165,12 +171,12 @@ def apply_l3_filter(
         config = L3Config()
 
     # Всегда берём свежий ключ из env (игнорируем устаревший в config)
-    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if env_key:
         config.api_key = env_key
 
     if not config.api_key:
-        logger.warning("[L3] No GEMINI_API_KEY — skipping")
+        logger.warning("[L3] No DEEPSEEK_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
