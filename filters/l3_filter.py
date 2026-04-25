@@ -51,7 +51,7 @@ def _call_gemini(api_key: str, system_prompt: str, user_prompt: str, timeout: in
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 2000,
+            "maxOutputTokens": 8192,
         }
     }
 
