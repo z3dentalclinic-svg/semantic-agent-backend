@@ -44,7 +44,8 @@ def _build_user_prompt(seed: str, keywords: List[str]) -> str:
     return "\n".join(lines)
 
 
-def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, timeout: int, temperature: float) -> str:
+def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, timeout: int, temperature: float) -> Tuple[str, Dict[str, Any]]:
+    """Возвращает (content, diag) где diag = {usage, has_reasoning_content, reasoning_preview}."""
     import requests
 
     payload = {
@@ -80,7 +81,24 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, timeout: 
         raise Exception(f"DeepSeek JSON parse error: {e}. Raw: {response.text[:300]}")
 
     try:
-        return data['choices'][0]['message']['content'].strip()
+        choice = data['choices'][0]
+        message = choice['message']
+        content = message['content'].strip()
+
+        # Диагностика thinking mode
+        usage = data.get('usage', {}) or {}
+        reasoning_content = message.get('reasoning_content', '') or ''
+        diag = {
+            "prompt_tokens": usage.get('prompt_tokens'),
+            "completion_tokens": usage.get('completion_tokens'),
+            "total_tokens": usage.get('total_tokens'),
+            "reasoning_tokens": (usage.get('completion_tokens_details', {}) or {}).get('reasoning_tokens'),
+            "has_reasoning_content": bool(reasoning_content),
+            "reasoning_content_len": len(reasoning_content),
+            "reasoning_preview": reasoning_content[:200] if reasoning_content else "",
+            "finish_reason": choice.get('finish_reason'),
+        }
+        return content, diag
     except (KeyError, IndexError, TypeError):
         if 'choices' not in data:
             raise Exception(f"DeepSeek no choices: {str(data)[:400]}")
@@ -128,7 +146,7 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response = _call_deepseek(
+            response, diag = _call_deepseek(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
                 config.timeout, config.temperature
             )
@@ -142,6 +160,21 @@ def _process_batch(
                 f"[L3] Batch {batch_num}/{total_batches} — "
                 f"VALID: {valid_count}, TRASH: {trash_count} ({elapsed:.1f}s)"
             )
+            # Диагностика thinking mode
+            logger.info(
+                f"[L3-DIAG] Batch {batch_num}: "
+                f"prompt={diag.get('prompt_tokens')} "
+                f"completion={diag.get('completion_tokens')} "
+                f"reasoning_tokens={diag.get('reasoning_tokens')} "
+                f"has_reasoning_content={diag.get('has_reasoning_content')} "
+                f"reasoning_len={diag.get('reasoning_content_len')} "
+                f"finish={diag.get('finish_reason')}"
+            )
+            if diag.get('has_reasoning_content'):
+                logger.info(
+                    f"[L3-DIAG] Batch {batch_num} reasoning_preview: "
+                    f"{diag.get('reasoning_preview')!r}"
+                )
             return (batch_idx, labels, elapsed)
 
         except Exception as e:
