@@ -57,6 +57,10 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, timeout: 
         "temperature": temperature,
         "max_tokens": 8192,
         "stream": False,
+        # КРИТИЧНО: явно выключаем thinking mode.
+        # Без этого V4-Flash в preview включает thinking по умолчанию,
+        # что даёт 3-4K reasoning_tokens на батч 50 ключей и 30-50x замедление.
+        "thinking": {"type": "disabled"},
     }
 
     try:
