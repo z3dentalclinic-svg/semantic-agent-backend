@@ -1,5 +1,14 @@
 """
-l3_filter.py — Слой 3: Gemini 3.1 Pro классификатор для оставшихся GREY.
+l3_filter.py — Слой 3: Gemini Flash-Lite классификатор для GREY-зоны.
+
+Версия: score-based (0-100) с трехкорзинным распределением.
+
+Архитектура:
+- batch_size=20, max_parallel=7 (снижение attention dilution в Flash-Lite)
+- score 0-100 вместо бинарки 0/1 (видна уверенность модели)
+- 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
+- exponential backoff (2->4->8->16с) на 5 попытках для защиты от 503
+- Параметры region/language передаются в user-prompt (не хардкор)
 
 Ключ: env GEMINI_API_KEY
 """
@@ -21,56 +30,65 @@ API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:gene
 @dataclass
 class L3Config:
     api_key: str = ""
-    batch_size: int = 50
+    batch_size: int = 20            # снижено с 50: меньше attention dilution в Flash-Lite
     timeout: int = 120
     temperature: float = 0.0
-    max_retries: int = 4  # = 5 попыток с экспоненциальным backoff (2→4→8→16с)
-    max_parallel: int = 5
-    enable_explanations: bool = True  # диагностический режим: модель объясняет каждое решение
+    max_retries: int = 4            # = 5 попыток с exponential backoff (2->4->8->16с)
+    max_parallel: int = 7           # увеличено с 5: компенсация уменьшения батча
+    score_valid_threshold: int = 70 # score >= 70 -> VALID
+    score_trash_threshold: int = 40 # score < 40 -> TRASH (между = GREY)
+    region: str = "Украина"         # параметр в user-prompt
+    language: str = "русский"       # параметр в user-prompt
 
 
-SYSTEM_PROMPT = """Ты — эксперт по фильтрации поисковых запросов для украинского рынка. Задача: отфильтровать поисковые запросы от мусора  парсинга. Регион украина Важно: - Грамматика может быть нарушена (это нормально для поисковых запросов) — оценивай по СМЫСЛУ - НЕ додумывай за пользователя. Если связь натянутая — TRASH
+SYSTEM_PROMPT = """Отфильтруй каждый запрос по его связи с темой сида и поставь ОДНО ЧИСЛО от 0 до 100.
 
-Ответь ТОЛЬКО списком через запятую: 1 = VALID, 0 = TRASH.
-Без пояснений. Без нумерации. Только цифры через запятую.
-Пример ответа: 1,0,1,1,0,1,0"""
+Тебе передаются:
+- Регион поиска
+- Язык поиска
+- Сид (тема)
+- Список запросов
+
+ПРИОРИТЕТ ПРАВИЛ:
+1. Несоответствие региону поиска приоритетнее всех других правил.
+2. Неуверенность применяется только при отсутствии явных нарушений.
+
+ЗАПРЕТЫ:
+- Не выдумывай факты о брендах, компаниях, сайтах, сервисах, законах, локациях, людях.
+- Если регион в запросе явно указан — учитывай. Если не указан — не домысливай.
+- Не додумывай за пользователя. Оценивай только то что написано.
+- Намерение покупки не влияет на оценку. Информационный, диагностический или зеркальный (продам, куплю) запрос оценивается по связи с темой.
+- Опечатки и грамматические ошибки не снижают score. Полностью нечитаемый запрос — score 0-9.
+
+ШКАЛА:
+| Score   | Решение                                                       |
+|---------|---------------------------------------------------------------|
+| 70-100  | Связано с темой сида (включая описывающие и расширяющие)      |
+| 40-69   | Сомнительно                                                   |
+| 10-39   | Не связано: другая ниша или несоответствие региону            |
+| 0-9     | Мусор, бессмыслица, обрывки                                   |
+
+ПРАВИЛО ШИРОТЫ ТЕМЫ:
+К теме относятся: характеристики, диагностика, способы, условия, сравнения, отзывы, противопоказания, аналоги, последствия, альтернативы, симптомы, обслуживание, обучение. Любой запрос, который помогает пользователю принять решение или разобраться в теме — score 70+.
+
+Если связь неясна — ставь 50-65, не угадывай.
+
+ФОРМАТ ОТВЕТА:
+Числа через запятую. Без пояснений, без нумерации.
+Пример: 85,15,72,50,90,10,75"""
 
 
-SYSTEM_PROMPT_EXPLAIN = """Ты — эксперт по фильтрации поисковых запросов для украинского рынка. Задача: отфильтровать поисковые запросы от мусора  парсинга. Регион украина Важно: - Грамматика может быть нарушена (это нормально для поисковых запросов) — оценивай по СМЫСЛУ - НЕ додумывай за пользователя. Если связь натянутая — TRASH
-
-Формат ответа СТРОГО двумя блоками:
-
-БЛОК 1 (одна строка): только цифры через запятую (1=VALID, 0=TRASH).
-Пример: 1,0,1,1,0
-
-БЛОК 2 (после строки ---): для КАЖДОГО запроса по строке вида:
-N. LABEL — причина в 5-15 словах
-Пример:
-1. VALID — релевантный запрос про услугу
-2. TRASH — российский город не Украина
-3. VALID — улица в целевом городе
-
-Никакого другого текста до БЛОКА 1 или после БЛОКА 2."""
-
-
-def _build_user_prompt(seed: str, keywords: List[str]) -> str:
-    lines = [f'Seed: "{seed}"', "", "Запросы:"]
+def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str]) -> str:
+    lines = [
+        f"Регион поиска: {region}",
+        f"Язык поиска: {language}",
+        f'Сид: "{seed}"',
+        "",
+        "Запросы:",
+    ]
     for i, kw in enumerate(keywords, 1):
         lines.append(f"{i}. {kw}")
-    lines.append(f"\nОтветь {len(keywords)} цифрами через запятую (1=VALID, 0=TRASH):")
-    return "\n".join(lines)
-
-
-def _build_user_prompt_explain(seed: str, keywords: List[str]) -> str:
-    lines = [f'Seed: "{seed}"', "", "Запросы:"]
-    for i, kw in enumerate(keywords, 1):
-        lines.append(f"{i}. {kw}")
-    lines.append(
-        f"\nОтветь СТРОГО в формате:\n"
-        f"Строка 1: {len(keywords)} цифр через запятую (1=VALID, 0=TRASH)\n"
-        f"Строка с ---\n"
-        f"{len(keywords)} строк объяснений вида: N. LABEL — причина"
-    )
+    lines.append(f"\nОтветь {len(keywords)} числами через запятую (0-100):")
     return "\n".join(lines)
 
 
@@ -82,7 +100,7 @@ def _call_gemini(api_key: str, system_prompt: str, user_prompt: str, timeout: in
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 16384,
+            "maxOutputTokens": 8192,
         }
     }
 
@@ -114,54 +132,47 @@ def _call_gemini(api_key: str, system_prompt: str, user_prompt: str, timeout: in
         raise Exception(f"Gemini unexpected response (finishReason={finish}): {str(data)[:400]}")
 
 
-def _parse_response(response: str, expected_count: int) -> List[str]:
-    # Берём только первую строку — после неё могут быть объяснения
+def _parse_scores(response: str, expected_count: int) -> List[Optional[int]]:
+    """
+    Парсит ответ модели в виде списка чисел через запятую.
+    Возвращает список int (score 0-100) или None для невалидных позиций.
+    """
+    # Берём только первую строку — на случай если модель добавила лишний текст
     first_line = response.split('\n', 1)[0].strip()
-    # На всякий случай отсекаем по ---
-    first_line = first_line.split('---', 1)[0].strip()
 
-    clean = ''.join(c for c in first_line if c in '01,')
+    # Оставляем только цифры, запятые, пробелы
+    clean = ''.join(c for c in first_line if c.isdigit() or c in ', ')
     parts = [p.strip() for p in clean.split(',') if p.strip()]
 
-    labels = []
+    scores: List[Optional[int]] = []
     for p in parts:
-        if p == '1':
-            labels.append('VALID')
-        elif p == '0':
-            labels.append('TRASH')
-
-    if len(labels) != expected_count:
-        logger.warning(f"[L3] Expected {expected_count} labels, got {len(labels)}. Response: {response[:200]}")
-        while len(labels) < expected_count:
-            labels.append('ERROR')
-        labels = labels[:expected_count]
-
-    return labels
-
-
-def _parse_explanations(response: str, expected_count: int) -> List[str]:
-    """Извлекает объяснения из второго блока (после ---). Возвращает список строк по индексам ключей."""
-    if '---' not in response:
-        return [''] * expected_count
-
-    explain_block = response.split('---', 1)[1].strip()
-    lines = [l.strip() for l in explain_block.split('\n') if l.strip()]
-
-    explanations = [''] * expected_count
-    for line in lines:
-        # Парсим формат "N. LABEL — текст"
-        # N может быть 1-3 цифры, дальше точка, потом текст
-        m = line.split('.', 1)
-        if len(m) != 2:
-            continue
         try:
-            idx = int(m[0].strip()) - 1
+            score = int(p)
+            if 0 <= score <= 100:
+                scores.append(score)
+            else:
+                scores.append(None)
         except ValueError:
-            continue
-        if 0 <= idx < expected_count:
-            explanations[idx] = m[1].strip()
+            scores.append(None)
 
-    return explanations
+    if len(scores) != expected_count:
+        logger.warning(f"[L3] Expected {expected_count} scores, got {len(scores)}. Response: {response[:200]}")
+        while len(scores) < expected_count:
+            scores.append(None)
+        scores = scores[:expected_count]
+
+    return scores
+
+
+def _score_to_label(score: Optional[int], config: L3Config) -> str:
+    """Преобразует score в метку VALID/GREY/TRASH/ERROR."""
+    if score is None:
+        return "ERROR"
+    if score >= config.score_valid_threshold:
+        return "VALID"
+    if score < config.score_trash_threshold:
+        return "TRASH"
+    return "GREY"
 
 
 def _extract_keyword_string(kw) -> str:
@@ -176,43 +187,36 @@ def _process_batch(
     seed: str,
     config: L3Config,
     total_batches: int,
-) -> Tuple[int, List[str], List[str], float]:
+) -> Tuple[int, List[Optional[int]], float]:
     batch_num = batch_idx + 1
-
-    if config.enable_explanations:
-        system_prompt = SYSTEM_PROMPT_EXPLAIN
-        user_prompt = _build_user_prompt_explain(seed, batch)
-    else:
-        system_prompt = SYSTEM_PROMPT
-        user_prompt = _build_user_prompt(seed, batch)
+    user_prompt = _build_user_prompt(config.region, config.language, seed, batch)
 
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
             response = _call_gemini(
-                config.api_key, system_prompt, user_prompt,
+                config.api_key, SYSTEM_PROMPT, user_prompt,
                 config.timeout, config.temperature
             )
             elapsed = time.time() - t0
 
-            labels = _parse_response(response, len(batch))
+            scores = _parse_scores(response, len(batch))
 
-            if config.enable_explanations:
-                explanations = _parse_explanations(response, len(batch))
-            else:
-                explanations = [''] * len(batch)
+            valid_count = sum(1 for s in scores if s is not None and s >= config.score_valid_threshold)
+            grey_count = sum(1 for s in scores if s is not None and config.score_trash_threshold <= s < config.score_valid_threshold)
+            trash_count = sum(1 for s in scores if s is not None and s < config.score_trash_threshold)
+            error_count = sum(1 for s in scores if s is None)
 
-            valid_count = labels.count('VALID')
-            trash_count = labels.count('TRASH')
             logger.info(
                 f"[L3] Batch {batch_num}/{total_batches} — "
-                f"VALID: {valid_count}, TRASH: {trash_count} ({elapsed:.1f}s)"
+                f"VALID: {valid_count}, GREY: {grey_count}, TRASH: {trash_count}, ERROR: {error_count} "
+                f"({elapsed:.1f}s)"
             )
-            return (batch_idx, labels, explanations, elapsed)
+            return (batch_idx, scores, elapsed)
 
         except Exception as e:
             if attempt < config.max_retries:
-                # Экспоненциальный backoff: 2 → 4 → 8 → 16 секунд
+                # Exponential backoff: 2 -> 4 -> 8 -> 16 секунд
                 backoff = 2 ** (attempt + 1)
                 logger.warning(
                     f"[L3] Batch {batch_num} attempt {attempt+1}/{config.max_retries+1} failed: {e}. "
@@ -221,7 +225,7 @@ def _process_batch(
                 time.sleep(backoff)
             else:
                 logger.error(f"[L3] Batch {batch_num} FAILED after {config.max_retries+1} attempts: {e}")
-                return (batch_idx, ['ERROR'] * len(batch), [''] * len(batch), 0.0)
+                return (batch_idx, [None] * len(batch), 0.0)
 
 
 def apply_l3_filter(
@@ -246,10 +250,6 @@ def apply_l3_filter(
     if env_key:
         config.api_key = env_key
 
-    # Опциональный режим объяснений через env L3_EXPLAIN=1 (для отладки промпта)
-    if os.environ.get("L3_EXPLAIN", "").strip() in ("1", "true", "True"):
-        config.enable_explanations = True
-
     if not config.api_key:
         logger.warning("[L3] No GEMINI_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
@@ -271,11 +271,12 @@ def apply_l3_filter(
 
     logger.info(
         f"[L3] Processing {len(kw_strings)} GREY keywords via {MODEL} "
-        f"({total_batches} batches, {workers} parallel)"
+        f"({total_batches} batches of {config.batch_size}, {workers} parallel) "
+        f"region={config.region} language={config.language} "
+        f"thresholds: VALID>={config.score_valid_threshold} TRASH<{config.score_trash_threshold}"
     )
 
-    batch_results: Dict[int, List[str]] = {}
-    batch_explanations: Dict[int, List[str]] = {}
+    batch_results: Dict[int, List[Optional[int]]] = {}
     api_time = 0.0
     t_wall_start = time.time()
 
@@ -285,39 +286,39 @@ def apply_l3_filter(
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(futures):
-            batch_idx, labels, explanations, elapsed = future.result()
-            batch_results[batch_idx] = labels
-            batch_explanations[batch_idx] = explanations
+            batch_idx, scores, elapsed = future.result()
+            batch_results[batch_idx] = scores
             api_time += elapsed
 
     wall_time = round(time.time() - t_wall_start, 2)
 
-    all_labels = []
-    all_explanations = []
+    all_scores: List[Optional[int]] = []
     for idx in range(total_batches):
-        all_labels.extend(batch_results[idx])
-        all_explanations.extend(batch_explanations[idx])
+        all_scores.extend(batch_results[idx])
 
     out = result.copy()
     l3_valid = []
+    l3_grey = []
     l3_trash = []
     l3_error = []
     l3_trace = []
 
-    for kw_obj, kw_str, label, reason in zip(kw_objects, kw_strings, all_labels, all_explanations):
-        trace_rec = {"keyword": kw_str, "label": label}
-        if reason:
-            trace_rec["reason"] = reason
+    for kw_obj, kw_str, score in zip(kw_objects, kw_strings, all_scores):
+        label = _score_to_label(score, config)
+
+        trace_rec = {"keyword": kw_str, "label": label, "score": score}
         if isinstance(kw_obj, dict):
             trace_rec["tail"] = kw_obj.get("tail", "")
             if "l2" in kw_obj:
                 trace_rec["l2_info"] = kw_obj["l2"]
         l3_trace.append(trace_rec)
 
+        l3_meta = {"label": label, "score": score, "source": MODEL}
+
         if label == "VALID":
             if isinstance(kw_obj, dict):
                 kw_out = kw_obj.copy()
-                kw_out["l3"] = {"label": "VALID", "source": MODEL}
+                kw_out["l3"] = l3_meta
             else:
                 kw_out = kw_str
             l3_valid.append(kw_out)
@@ -325,20 +326,30 @@ def apply_l3_filter(
             if isinstance(kw_obj, dict):
                 kw_out = kw_obj.copy()
                 kw_out["anchor_reason"] = "L3_TRASH"
-                kw_out["l3"] = {"label": "TRASH", "source": MODEL}
+                kw_out["l3"] = l3_meta
             else:
                 kw_out = {
                     "keyword": kw_str,
                     "anchor_reason": "L3_TRASH",
-                    "l3": {"label": "TRASH", "source": MODEL},
+                    "l3": l3_meta,
                 }
             l3_trash.append(kw_out)
-        else:
+        elif label == "GREY":
+            if isinstance(kw_obj, dict):
+                kw_out = kw_obj.copy()
+                kw_out["l3"] = l3_meta
+            else:
+                kw_out = {"keyword": kw_str, "l3": l3_meta}
+            l3_grey.append(kw_out)
+        else:  # ERROR
             l3_error.append(kw_obj)
 
+    # VALID идут в финальный список
     out["keywords"] = result.get("keywords", []) + l3_valid
+    # TRASH идут в anchors
     out["anchors"] = result.get("anchors", []) + l3_trash
-    out["keywords_grey"] = l3_error
+    # GREY и ERROR остаются в keywords_grey (для пользователя — желтым)
+    out["keywords_grey"] = l3_grey + l3_error
 
     kw_count = len(out["keywords"])
     if "count" in out:
@@ -351,19 +362,24 @@ def apply_l3_filter(
     out["l3_stats"] = {
         "input_grey": len(kw_strings),
         "l3_valid": len(l3_valid),
+        "l3_grey": len(l3_grey),
         "l3_trash": len(l3_trash),
         "l3_error": len(l3_error),
         "api_time": round(api_time, 2),
         "wall_time": wall_time,
         "batches": total_batches,
+        "batch_size": config.batch_size,
         "parallel": workers,
         "model": MODEL,
-        "explanations": config.enable_explanations,
+        "region": config.region,
+        "language": config.language,
+        "score_valid_threshold": config.score_valid_threshold,
+        "score_trash_threshold": config.score_trash_threshold,
     }
     out["_l3_trace"] = l3_trace
 
     logger.info(
-        f"[L3] Done: {len(l3_valid)} VALID, {len(l3_trash)} TRASH, "
+        f"[L3] Done: {len(l3_valid)} VALID, {len(l3_grey)} GREY, {len(l3_trash)} TRASH, "
         f"{len(l3_error)} ERROR | wall: {wall_time}s"
     )
 
