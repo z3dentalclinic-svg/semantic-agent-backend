@@ -24,7 +24,7 @@ class L3Config:
     batch_size: int = 50
     timeout: int = 120
     temperature: float = 0.0
-    max_retries: int = 2
+    max_retries: int = 4  # = 5 попыток с экспоненциальным backoff (2→4→8→16с)
     max_parallel: int = 5
     enable_explanations: bool = True  # диагностический режим: модель объясняет каждое решение
 
@@ -212,8 +212,13 @@ def _process_batch(
 
         except Exception as e:
             if attempt < config.max_retries:
-                logger.warning(f"[L3] Batch {batch_num} attempt {attempt+1} failed: {e}. Retrying...")
-                time.sleep(2)
+                # Экспоненциальный backoff: 2 → 4 → 8 → 16 секунд
+                backoff = 2 ** (attempt + 1)
+                logger.warning(
+                    f"[L3] Batch {batch_num} attempt {attempt+1}/{config.max_retries+1} failed: {e}. "
+                    f"Retrying in {backoff}s..."
+                )
+                time.sleep(backoff)
             else:
                 logger.error(f"[L3] Batch {batch_num} FAILED after {config.max_retries+1} attempts: {e}")
                 return (batch_idx, ['ERROR'] * len(batch), [''] * len(batch), 0.0)
