@@ -1,17 +1,23 @@
 """
-l3_filter.py — Слой 3: Together.ai GPT-OSS 20B классификатор для GREY-зоны.
+l3_filter.py — Слой 3: OpenAI GPT-5 Nano классификатор для GREY-зоны.
 
-Версия: score-based (0-100), 3 корзины, минимальный thinking.
+Версия: score-based (0-100), 3 корзины, reasoning=minimal (максимально быстро).
 
 Архитектура:
-- Модель: openai/gpt-oss-20b на Together.ai (NVIDIA H100/B200)
-- reasoning_effort="low" — минимизация thinking для max скорости
+- Модель: gpt-5-nano (OpenAI, GA, $0.05/$0.40 за 1M токенов)
+- reasoning_effort="minimal" — самый низкий уровень thinking, особенность GPT-5 Nano
 - batch_size=20, max_parallel=7
 - score 0-100, 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
 - exponential backoff (2->4->8->16с) на 5 попытках
 - Параметры region/language передаются в user-prompt
 
-Ключ: env TOGETHER_API_KEY
+ВАЖНО про API:
+- Endpoint: /v1/chat/completions (стандартный OpenAI формат)
+- max_completion_tokens (НЕ max_tokens) — обязательно для reasoning-моделей
+- temperature НЕ поддерживается у reasoning-моделей, убрана
+- reasoning_effort: minimal | low | medium | high
+
+Ключ: env OPENAI_API_KEY
 """
 
 import os
@@ -24,8 +30,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "openai/gpt-oss-20b"
-API_URL = "https://api.together.xyz/v1/chat/completions"
+MODEL = "gpt-5-nano"
+API_URL = "https://api.openai.com/v1/chat/completions"
 
 
 @dataclass
@@ -33,18 +39,17 @@ class L3Config:
     api_key: str = ""
     batch_size: int = 20
     timeout: int = 120
-    temperature: float = 0.0
     max_retries: int = 4            # = 5 попыток с exponential backoff
-    max_parallel: int = 7            # на Together нет жёсткого TPM-лимита
+    max_parallel: int = 7
     score_valid_threshold: int = 70 # score >= 70 -> VALID
     score_trash_threshold: int = 40 # score < 40 -> TRASH (между = GREY)
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "low"   # low | medium | high (none не поддерживается у gpt-oss)
+    reasoning_effort: str = "minimal"  # minimal | low | medium | high (minimal = самый быстрый у GPT-5)
 
 
 # =============================================================================
-# СИСТЕМНЫЙ ПРОМПТ (драфт 11 — тот же что для Gemini, для чистоты сравнения)
+# СИСТЕМНЫЙ ПРОМПТ (драфт 11 — тот же что для Gemini и Together, для чистого сравнения)
 # =============================================================================
 SYSTEM_PROMPT = """Отфильтруй каждый запрос по его связи с темой сида и поставь ОДНО ЧИСЛО от 0 до 100.
 
@@ -97,15 +102,20 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
-def _call_together(
+def _call_openai(
     api_key: str,
     system_prompt: str,
     user_prompt: str,
     timeout: int,
-    temperature: float,
     reasoning_effort: str,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}."""
+    """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}.
+    
+    ВАЖНО про reasoning-модели OpenAI (GPT-5 family):
+    - max_completion_tokens вместо max_tokens
+    - temperature, top_p, etc. НЕ поддерживаются
+    - reasoning_effort: minimal | low | medium | high
+    """
     import requests
 
     payload = {
@@ -114,8 +124,7 @@ def _call_together(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": temperature,
-        "max_tokens": 8192,
+        "max_completion_tokens": 8192,
         "stream": False,
         "reasoning_effort": reasoning_effort,
     }
@@ -131,15 +140,15 @@ def _call_together(
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Together network error: {type(e).__name__}: {e}")
+        raise Exception(f"OpenAI network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"Together API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"OpenAI API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"Together JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"OpenAI JSON parse error: {e}. Raw: {response.text[:300]}")
 
     try:
         choice = data['choices'][0]
@@ -157,10 +166,10 @@ def _call_together(
         return content, diag
     except (KeyError, IndexError, TypeError):
         if 'choices' not in data:
-            raise Exception(f"Together no choices: {str(data)[:400]}")
+            raise Exception(f"OpenAI no choices: {str(data)[:400]}")
         choice = data['choices'][0] if data.get('choices') else {}
         finish = choice.get('finish_reason', 'UNKNOWN')
-        raise Exception(f"Together unexpected response (finish_reason={finish}): {str(data)[:400]}")
+        raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
 
 
 def _parse_scores(response: str, expected_count: int) -> List[Optional[int]]:
@@ -222,9 +231,9 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response, diag = _call_together(
+            response, diag = _call_openai(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
-                config.timeout, config.temperature, config.reasoning_effort
+                config.timeout, config.reasoning_effort
             )
             elapsed = time.time() - t0
 
@@ -281,12 +290,12 @@ def apply_l3_filter(
         config = L3Config()
 
     # Всегда берём свежий ключ из env
-    env_key = os.environ.get("TOGETHER_API_KEY", "").strip()
+    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if env_key:
         config.api_key = env_key
 
     if not config.api_key:
-        logger.warning("[L3] No TOGETHER_API_KEY — skipping")
+        logger.warning("[L3] No OPENAI_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
