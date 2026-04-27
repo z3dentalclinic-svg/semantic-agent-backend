@@ -1,16 +1,18 @@
 """
-l3_filter.py — Слой 3: Gemini Flash-Lite классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Groq GPT-OSS 20B классификатор для GREY-зоны.
 
-Версия: score-based (0-100) с трехкорзинным распределением.
+Версия: score-based (0-100), 3 корзины, минимальный thinking.
 
 Архитектура:
-- batch_size=20, max_parallel=7 (снижение attention dilution в Flash-Lite)
-- score 0-100 вместо бинарки 0/1 (видна уверенность модели)
-- 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
-- exponential backoff (2->4->8->16с) на 5 попытках для защиты от 503
-- Параметры region/language передаются в user-prompt (не хардкор)
+- Модель: openai/gpt-oss-20b на Groq LPU (детерминированное железо)
+- reasoning_effort="low" — минимизация thinking для max скорости
+- include_reasoning=False — reasoning не возвращается в ответе (экономия токенов и парсинга)
+- batch_size=20, max_parallel=7
+- score 0-100, 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
+- exponential backoff (2->4->8->16с) на 5 попытках
+- Параметры region/language передаются в user-prompt
 
-Ключ: env GEMINI_API_KEY
+Ключ: env GROQ_API_KEY
 """
 
 import os
@@ -23,24 +25,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gemini-3.1-flash-lite-preview"
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+MODEL = "openai/gpt-oss-20b"
+API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 @dataclass
 class L3Config:
     api_key: str = ""
-    batch_size: int = 20            # снижено с 50: меньше attention dilution в Flash-Lite
+    batch_size: int = 20
     timeout: int = 120
     temperature: float = 0.0
-    max_retries: int = 4            # = 5 попыток с exponential backoff (2->4->8->16с)
-    max_parallel: int = 7           # увеличено с 5: компенсация уменьшения батча
+    max_retries: int = 4            # = 5 попыток с exponential backoff
+    max_parallel: int = 7
     score_valid_threshold: int = 70 # score >= 70 -> VALID
     score_trash_threshold: int = 40 # score < 40 -> TRASH (между = GREY)
-    region: str = "Украина"         # параметр в user-prompt
-    language: str = "русский"       # параметр в user-prompt
+    region: str = "Украина"
+    language: str = "русский"
+    reasoning_effort: str = "low"   # low | medium | high (none не поддерживается у gpt-oss)
 
 
+# =============================================================================
+# СИСТЕМНЫЙ ПРОМПТ (драфт 11 — тот же что для Gemini, для чистоты сравнения)
+# =============================================================================
 SYSTEM_PROMPT = """Отфильтруй каждый запрос по его связи с темой сида и поставь ОДНО ЧИСЛО от 0 до 100.
 
 Тебе передаются:
@@ -92,51 +98,75 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
-def _call_gemini(api_key: str, system_prompt: str, user_prompt: str, timeout: int, temperature: float) -> str:
+def _call_groq(
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int,
+    temperature: float,
+    reasoning_effort: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}."""
     import requests
 
     payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": 8192,
-        }
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_completion_tokens": 8192,
+        "stream": False,
+        "reasoning_effort": reasoning_effort,
+        "include_reasoning": False,  # не возвращать reasoning в ответе
     }
 
     try:
         response = requests.post(
-            f"{API_URL}?key={api_key}",
-            headers={"Content-Type": "application/json"},
+            API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
             json=payload,
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Gemini network error: {type(e).__name__}: {e}")
+        raise Exception(f"Groq network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"Gemini API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"Groq API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"Gemini JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"Groq JSON parse error: {e}. Raw: {response.text[:300]}")
 
     try:
-        return data['candidates'][0]['content']['parts'][0]['text'].strip()
+        choice = data['choices'][0]
+        message = choice['message']
+        content = (message.get('content') or '').strip()
+
+        usage = data.get('usage', {}) or {}
+        completion_details = usage.get('completion_tokens_details', {}) or {}
+        diag = {
+            "prompt_tokens": usage.get('prompt_tokens'),
+            "completion_tokens": usage.get('completion_tokens'),
+            "reasoning_tokens": completion_details.get('reasoning_tokens'),
+            "finish_reason": choice.get('finish_reason'),
+        }
+        return content, diag
     except (KeyError, IndexError, TypeError):
-        if 'candidates' not in data:
-            raise Exception(f"Gemini no candidates: {str(data)[:400]}")
-        cand = data['candidates'][0] if data.get('candidates') else {}
-        finish = cand.get('finishReason', 'UNKNOWN')
-        raise Exception(f"Gemini unexpected response (finishReason={finish}): {str(data)[:400]}")
+        if 'choices' not in data:
+            raise Exception(f"Groq no choices: {str(data)[:400]}")
+        choice = data['choices'][0] if data.get('choices') else {}
+        finish = choice.get('finish_reason', 'UNKNOWN')
+        raise Exception(f"Groq unexpected response (finish_reason={finish}): {str(data)[:400]}")
 
 
 def _parse_scores(response: str, expected_count: int) -> List[Optional[int]]:
-    """
-    Парсит ответ модели в виде списка чисел через запятую.
-    Возвращает список int (score 0-100) или None для невалидных позиций.
-    """
+    """Парсит ответ в список int 0-100 или None для невалидных."""
     # Берём только первую строку — на случай если модель добавила лишний текст
     first_line = response.split('\n', 1)[0].strip()
 
@@ -194,9 +224,9 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response = _call_gemini(
+            response, diag = _call_groq(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
-                config.timeout, config.temperature
+                config.timeout, config.temperature, config.reasoning_effort
             )
             elapsed = time.time() - t0
 
@@ -212,11 +242,18 @@ def _process_batch(
                 f"VALID: {valid_count}, GREY: {grey_count}, TRASH: {trash_count}, ERROR: {error_count} "
                 f"({elapsed:.1f}s)"
             )
+            # Диагностика thinking — увидим сколько reasoning токенов на самом деле сжигается
+            logger.info(
+                f"[L3-DIAG] Batch {batch_num}: "
+                f"prompt={diag.get('prompt_tokens')} "
+                f"completion={diag.get('completion_tokens')} "
+                f"reasoning_tokens={diag.get('reasoning_tokens')} "
+                f"finish={diag.get('finish_reason')}"
+            )
             return (batch_idx, scores, elapsed)
 
         except Exception as e:
             if attempt < config.max_retries:
-                # Exponential backoff: 2 -> 4 -> 8 -> 16 секунд
                 backoff = 2 ** (attempt + 1)
                 logger.warning(
                     f"[L3] Batch {batch_num} attempt {attempt+1}/{config.max_retries+1} failed: {e}. "
@@ -245,13 +282,13 @@ def apply_l3_filter(
     if config is None:
         config = L3Config()
 
-    # Всегда берём свежий ключ из env (игнорируем устаревший в config)
-    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    # Всегда берём свежий ключ из env
+    env_key = os.environ.get("GROQ_API_KEY", "").strip()
     if env_key:
         config.api_key = env_key
 
     if not config.api_key:
-        logger.warning("[L3] No GEMINI_API_KEY — skipping")
+        logger.warning("[L3] No GROQ_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
@@ -272,7 +309,7 @@ def apply_l3_filter(
     logger.info(
         f"[L3] Processing {len(kw_strings)} GREY keywords via {MODEL} "
         f"({total_batches} batches of {config.batch_size}, {workers} parallel) "
-        f"region={config.region} language={config.language} "
+        f"region={config.region} language={config.language} reasoning={config.reasoning_effort} "
         f"thresholds: VALID>={config.score_valid_threshold} TRASH<{config.score_trash_threshold}"
     )
 
@@ -344,11 +381,8 @@ def apply_l3_filter(
         else:  # ERROR
             l3_error.append(kw_obj)
 
-    # VALID идут в финальный список
     out["keywords"] = result.get("keywords", []) + l3_valid
-    # TRASH идут в anchors
     out["anchors"] = result.get("anchors", []) + l3_trash
-    # GREY и ERROR остаются в keywords_grey (для пользователя — желтым)
     out["keywords_grey"] = l3_grey + l3_error
 
     kw_count = len(out["keywords"])
@@ -373,6 +407,7 @@ def apply_l3_filter(
         "model": MODEL,
         "region": config.region,
         "language": config.language,
+        "reasoning_effort": config.reasoning_effort,
         "score_valid_threshold": config.score_valid_threshold,
         "score_trash_threshold": config.score_trash_threshold,
     }
