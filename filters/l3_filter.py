@@ -1,18 +1,17 @@
 """
-l3_filter.py — Слой 3: Groq GPT-OSS 20B классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Together.ai GPT-OSS 20B классификатор для GREY-зоны.
 
 Версия: score-based (0-100), 3 корзины, минимальный thinking.
 
 Архитектура:
-- Модель: openai/gpt-oss-20b на Groq LPU (детерминированное железо)
+- Модель: openai/gpt-oss-20b на Together.ai (NVIDIA H100/B200)
 - reasoning_effort="low" — минимизация thinking для max скорости
-- include_reasoning=False — reasoning не возвращается в ответе (экономия токенов и парсинга)
 - batch_size=20, max_parallel=7
 - score 0-100, 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
 - exponential backoff (2->4->8->16с) на 5 попытках
 - Параметры region/language передаются в user-prompt
 
-Ключ: env GROQ_API_KEY
+Ключ: env TOGETHER_API_KEY
 """
 
 import os
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 MODEL = "openai/gpt-oss-20b"
-API_URL = "https://api.groq.com/openai/v1/chat/completions"
+API_URL = "https://api.together.xyz/v1/chat/completions"
 
 
 @dataclass
@@ -36,7 +35,7 @@ class L3Config:
     timeout: int = 120
     temperature: float = 0.0
     max_retries: int = 4            # = 5 попыток с exponential backoff
-    max_parallel: int = 7
+    max_parallel: int = 7            # на Together нет жёсткого TPM-лимита
     score_valid_threshold: int = 70 # score >= 70 -> VALID
     score_trash_threshold: int = 40 # score < 40 -> TRASH (между = GREY)
     region: str = "Украина"
@@ -98,7 +97,7 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
-def _call_groq(
+def _call_together(
     api_key: str,
     system_prompt: str,
     user_prompt: str,
@@ -116,10 +115,9 @@ def _call_groq(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": temperature,
-        "max_completion_tokens": 8192,
+        "max_tokens": 8192,
         "stream": False,
         "reasoning_effort": reasoning_effort,
-        "include_reasoning": False,  # не возвращать reasoning в ответе
     }
 
     try:
@@ -133,15 +131,15 @@ def _call_groq(
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Groq network error: {type(e).__name__}: {e}")
+        raise Exception(f"Together network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"Groq API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"Together API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"Groq JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"Together JSON parse error: {e}. Raw: {response.text[:300]}")
 
     try:
         choice = data['choices'][0]
@@ -159,10 +157,10 @@ def _call_groq(
         return content, diag
     except (KeyError, IndexError, TypeError):
         if 'choices' not in data:
-            raise Exception(f"Groq no choices: {str(data)[:400]}")
+            raise Exception(f"Together no choices: {str(data)[:400]}")
         choice = data['choices'][0] if data.get('choices') else {}
         finish = choice.get('finish_reason', 'UNKNOWN')
-        raise Exception(f"Groq unexpected response (finish_reason={finish}): {str(data)[:400]}")
+        raise Exception(f"Together unexpected response (finish_reason={finish}): {str(data)[:400]}")
 
 
 def _parse_scores(response: str, expected_count: int) -> List[Optional[int]]:
@@ -224,7 +222,7 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response, diag = _call_groq(
+            response, diag = _call_together(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
                 config.timeout, config.temperature, config.reasoning_effort
             )
@@ -283,12 +281,12 @@ def apply_l3_filter(
         config = L3Config()
 
     # Всегда берём свежий ключ из env
-    env_key = os.environ.get("GROQ_API_KEY", "").strip()
+    env_key = os.environ.get("TOGETHER_API_KEY", "").strip()
     if env_key:
         config.api_key = env_key
 
     if not config.api_key:
-        logger.warning("[L3] No GROQ_API_KEY — skipping")
+        logger.warning("[L3] No TOGETHER_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
