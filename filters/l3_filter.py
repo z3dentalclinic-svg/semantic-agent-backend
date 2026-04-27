@@ -1,11 +1,11 @@
 """
-l3_filter.py — Слой 3: OpenAI GPT-5 Nano классификатор для GREY-зоны.
+l3_filter.py — Слой 3: OpenAI GPT-5.4 Mini классификатор для GREY-зоны.
 
-Версия: score-based (0-100), 3 корзины, reasoning=minimal (максимально быстро).
+Версия: score-based (0-100), 3 корзины, reasoning=low (минимум для gpt-5.4-mini).
 
 Архитектура:
-- Модель: gpt-5-nano (OpenAI, GA, $0.05/$0.40 за 1M токенов)
-- reasoning_effort="minimal" — самый низкий уровень thinking, особенность GPT-5 Nano
+- Модель: gpt-5.4-mini (OpenAI, GA, $0.75/$4.50 за 1M токенов)
+- reasoning_effort="low" — минимальный уровень thinking для gpt-5.4-mini (minimal не поддерживается!)
 - batch_size=20, max_parallel=7
 - score 0-100, 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
 - exponential backoff (2->4->8->16с) на 5 попытках
@@ -15,9 +15,9 @@ l3_filter.py — Слой 3: OpenAI GPT-5 Nano классификатор для
 - Endpoint: /v1/chat/completions (стандартный OpenAI формат)
 - max_completion_tokens (НЕ max_tokens) — обязательно для reasoning-моделей
 - temperature НЕ поддерживается у reasoning-моделей, убрана
-- reasoning_effort: minimal | low | medium | high
+- reasoning_effort: low | medium | high | xhigh (minimal только у nano)
 
-Ключ: env OPENAI_API_KEY
+Ключ: env OPENAI_API_KEY (тот же что для GPT-5 Nano)
 """
 
 import os
@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gpt-5-nano"
+MODEL = "gpt-5.4-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
 
 
@@ -45,7 +45,7 @@ class L3Config:
     score_trash_threshold: int = 40 # score < 40 -> TRASH (между = GREY)
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "minimal"  # minimal | low | medium | high (minimal = самый быстрый у GPT-5)
+    reasoning_effort: str = "low"  # low | medium | high | xhigh (gpt-5.4-mini НЕ поддерживает minimal)
 
 
 # =============================================================================
@@ -114,7 +114,7 @@ def _call_openai(
     ВАЖНО про reasoning-модели OpenAI (GPT-5 family):
     - max_completion_tokens вместо max_tokens
     - temperature, top_p, etc. НЕ поддерживаются
-    - reasoning_effort: minimal | low | medium | high
+    - reasoning_effort: low | medium | high | xhigh (для gpt-5.4-mini)
     """
     import requests
 
