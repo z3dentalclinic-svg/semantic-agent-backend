@@ -1,23 +1,26 @@
 """
-l3_filter.py — Слой 3: OpenAI GPT-5.4 Mini классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Anthropic Claude Haiku 4.5 классификатор для GREY-зоны.
 
-Версия: score-based (0-100), 3 корзины, reasoning=low (минимум для gpt-5.4-mini).
+Версия: score-based (0-100), 3 корзины, БЕЗ thinking (максимально дёшево).
 
 Архитектура:
-- Модель: gpt-5.4-mini (OpenAI, GA, $0.75/$4.50 за 1M токенов)
-- reasoning_effort="low" — минимальный уровень thinking для gpt-5.4-mini (minimal не поддерживается!)
+- Модель: claude-haiku-4-5 (Anthropic, GA, $1/$5 за 1M токенов)
+- thinking ВЫКЛЮЧЕН (не передаём параметр) — экономия на output токенах
 - batch_size=20, max_parallel=7
 - score 0-100, 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
 - exponential backoff (2->4->8->16с) на 5 попытках
 - Параметры region/language передаются в user-prompt
 
-ВАЖНО про API:
-- Endpoint: /v1/chat/completions (стандартный OpenAI формат)
-- max_completion_tokens (НЕ max_tokens) — обязательно для reasoning-моделей
-- temperature НЕ поддерживается у reasoning-моделей, убрана
-- reasoning_effort: low | medium | high | xhigh (minimal только у nano)
+ВАЖНО про Anthropic API (отличается от OpenAI):
+- URL: /v1/messages (не /chat/completions)
+- Headers: x-api-key (не Authorization Bearer), anthropic-version обязателен
+- system промпт — отдельным полем (не в messages)
+- max_tokens (не max_completion_tokens)
+- temperature 0.0 поддерживается (Haiku не reasoning-only)
+- Ответ в content[0].text (не в choices[0].message.content)
+- Без thinking — просто не передаём этот параметр
 
-Ключ: env OPENAI_API_KEY (тот же что для GPT-5 Nano)
+Ключ: env ANTHROPIC_API_KEY
 """
 
 import os
@@ -30,8 +33,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gpt-5.4-mini"
-API_URL = "https://api.openai.com/v1/chat/completions"
+MODEL = "claude-haiku-4-5"
+API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
 
 
 @dataclass
@@ -39,17 +43,17 @@ class L3Config:
     api_key: str = ""
     batch_size: int = 20
     timeout: int = 120
+    temperature: float = 0.0
     max_retries: int = 4            # = 5 попыток с exponential backoff
     max_parallel: int = 7
     score_valid_threshold: int = 70 # score >= 70 -> VALID
     score_trash_threshold: int = 40 # score < 40 -> TRASH (между = GREY)
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "low"  # low | medium | high | xhigh (gpt-5.4-mini НЕ поддерживает minimal)
 
 
 # =============================================================================
-# СИСТЕМНЫЙ ПРОМПТ (драфт 11 — тот же что для Gemini и Together, для чистого сравнения)
+# СИСТЕМНЫЙ ПРОМПТ (драфт 11 — тот же что использовали везде)
 # =============================================================================
 SYSTEM_PROMPT = """Отфильтруй каждый запрос по его связи с темой сида и поставь ОДНО ЧИСЛО от 0 до 100.
 
@@ -102,31 +106,32 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
-def _call_openai(
+def _call_anthropic(
     api_key: str,
     system_prompt: str,
     user_prompt: str,
     timeout: int,
-    reasoning_effort: str,
+    temperature: float,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}.
+    """Возвращает (content, diag).
     
-    ВАЖНО про reasoning-модели OpenAI (GPT-5 family):
-    - max_completion_tokens вместо max_tokens
-    - temperature, top_p, etc. НЕ поддерживаются
-    - reasoning_effort: low | medium | high | xhigh (для gpt-5.4-mini)
+    Anthropic API формат:
+    - URL: /v1/messages
+    - Headers: x-api-key, anthropic-version
+    - system - отдельным полем, не в messages
+    - max_tokens обязателен
+    - thinking НЕ передаём — отключен по умолчанию
     """
     import requests
 
     payload = {
         "model": MODEL,
+        "max_tokens": 1024,  # для нашей задачи: ~30 токенов на 20 чисел + запас
+        "temperature": temperature,
+        "system": system_prompt,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_prompt}
         ],
-        "max_completion_tokens": 8192,
-        "stream": False,
-        "reasoning_effort": reasoning_effort,
     }
 
     try:
@@ -134,42 +139,50 @@ def _call_openai(
             API_URL,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
             },
             json=payload,
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"OpenAI network error: {type(e).__name__}: {e}")
+        raise Exception(f"Anthropic network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"OpenAI API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"Anthropic API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"OpenAI JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"Anthropic JSON parse error: {e}. Raw: {response.text[:300]}")
 
     try:
-        choice = data['choices'][0]
-        message = choice['message']
-        content = (message.get('content') or '').strip()
+        # Anthropic возвращает content как список блоков
+        content_blocks = data.get('content', [])
+        if not content_blocks:
+            raise Exception(f"Anthropic empty content: {str(data)[:300]}")
+        
+        # Берём первый text-блок
+        text_content = ""
+        for block in content_blocks:
+            if block.get('type') == 'text':
+                text_content = block.get('text', '').strip()
+                break
+        
+        if not text_content:
+            raise Exception(f"Anthropic no text in content: {str(data)[:300]}")
 
         usage = data.get('usage', {}) or {}
-        completion_details = usage.get('completion_tokens_details', {}) or {}
         diag = {
-            "prompt_tokens": usage.get('prompt_tokens'),
-            "completion_tokens": usage.get('completion_tokens'),
-            "reasoning_tokens": completion_details.get('reasoning_tokens'),
-            "finish_reason": choice.get('finish_reason'),
+            "input_tokens": usage.get('input_tokens'),
+            "output_tokens": usage.get('output_tokens'),
+            "cache_creation": usage.get('cache_creation_input_tokens'),
+            "cache_read": usage.get('cache_read_input_tokens'),
+            "stop_reason": data.get('stop_reason'),
         }
-        return content, diag
-    except (KeyError, IndexError, TypeError):
-        if 'choices' not in data:
-            raise Exception(f"OpenAI no choices: {str(data)[:400]}")
-        choice = data['choices'][0] if data.get('choices') else {}
-        finish = choice.get('finish_reason', 'UNKNOWN')
-        raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
+        return text_content, diag
+    except KeyError as e:
+        raise Exception(f"Anthropic unexpected response format: {e}. Data: {str(data)[:400]}")
 
 
 def _parse_scores(response: str, expected_count: int) -> List[Optional[int]]:
@@ -231,9 +244,9 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response, diag = _call_openai(
+            response, diag = _call_anthropic(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
-                config.timeout, config.reasoning_effort
+                config.timeout, config.temperature
             )
             elapsed = time.time() - t0
 
@@ -249,13 +262,12 @@ def _process_batch(
                 f"VALID: {valid_count}, GREY: {grey_count}, TRASH: {trash_count}, ERROR: {error_count} "
                 f"({elapsed:.1f}s)"
             )
-            # Диагностика thinking — увидим сколько reasoning токенов на самом деле сжигается
+            # Anthropic диагностика: input/output токены отдельно (без скрытого reasoning)
             logger.info(
                 f"[L3-DIAG] Batch {batch_num}: "
-                f"prompt={diag.get('prompt_tokens')} "
-                f"completion={diag.get('completion_tokens')} "
-                f"reasoning_tokens={diag.get('reasoning_tokens')} "
-                f"finish={diag.get('finish_reason')}"
+                f"input={diag.get('input_tokens')} "
+                f"output={diag.get('output_tokens')} "
+                f"stop_reason={diag.get('stop_reason')}"
             )
             return (batch_idx, scores, elapsed)
 
@@ -290,17 +302,17 @@ def apply_l3_filter(
         config = L3Config()
 
     # Всегда берём свежий ключ из env
-    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if env_key:
         config.api_key = env_key
 
     if not config.api_key:
-        logger.warning("[L3] No OPENAI_API_KEY — skipping")
+        logger.warning("[L3] No ANTHROPIC_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
     logger.info(
-        f"[L3] key_len={len(config.api_key)} prefix={config.api_key[:6]!r} suffix={config.api_key[-4:]!r}"
+        f"[L3] key_len={len(config.api_key)} prefix={config.api_key[:10]!r} suffix={config.api_key[-4:]!r}"
     )
 
     kw_strings = []
@@ -316,7 +328,7 @@ def apply_l3_filter(
     logger.info(
         f"[L3] Processing {len(kw_strings)} GREY keywords via {MODEL} "
         f"({total_batches} batches of {config.batch_size}, {workers} parallel) "
-        f"region={config.region} language={config.language} reasoning={config.reasoning_effort} "
+        f"region={config.region} language={config.language} thinking=OFF "
         f"thresholds: VALID>={config.score_valid_threshold} TRASH<{config.score_trash_threshold}"
     )
 
@@ -414,7 +426,7 @@ def apply_l3_filter(
         "model": MODEL,
         "region": config.region,
         "language": config.language,
-        "reasoning_effort": config.reasoning_effort,
+        "thinking": "off",
         "score_valid_threshold": config.score_valid_threshold,
         "score_trash_threshold": config.score_trash_threshold,
     }
