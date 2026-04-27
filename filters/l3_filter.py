@@ -1,11 +1,11 @@
 """
-l3_filter.py — Слой 3: Anthropic Claude Haiku 4.5 классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Anthropic Claude Sonnet 4.6 классификатор для GREY-зоны.
 
-Версия: score-based (0-100), 3 корзины, БЕЗ thinking (максимально дёшево).
+Версия: score-based (0-100), 3 корзины, БЕЗ thinking.
 
 Архитектура:
-- Модель: claude-haiku-4-5 (Anthropic, GA, $1/$5 за 1M токенов)
-- thinking ВЫКЛЮЧЕН (не передаём параметр) — экономия на output токенах
+- Модель: claude-sonnet-4-6 (Anthropic, GA, $3/$15 за 1M токенов)
+- thinking ВЫКЛЮЧЕН (не передаём параметр)
 - batch_size=20, max_parallel=7
 - score 0-100, 3 корзины: VALID (>=70), GREY (40-69), TRASH (<40)
 - exponential backoff (2->4->8->16с) на 5 попытках
@@ -16,11 +16,15 @@ l3_filter.py — Слой 3: Anthropic Claude Haiku 4.5 классификато
 - Headers: x-api-key (не Authorization Bearer), anthropic-version обязателен
 - system промпт — отдельным полем (не в messages)
 - max_tokens (не max_completion_tokens)
-- temperature 0.0 поддерживается (Haiku не reasoning-only)
-- Ответ в content[0].text (не в choices[0].message.content)
+- temperature 0.0 поддерживается
+- Ответ в content[0].text
 - Без thinking — просто не передаём этот параметр
 
-Ключ: env ANTHROPIC_API_KEY
+Цена: ~$3/$15 за 1M токенов (в 3 раза дороже Haiku 4.5)
+Скорость: средняя (40-60 t/s vs 80-120 у Haiku)
+Прогноз: 5-8 секунд на 86 ключей, $0.05-0.07 за прогон, ~$57/мес на 2700 прогонов
+
+Ключ: env ANTHROPIC_API_KEY (тот же что для Haiku 4.5)
 """
 
 import os
@@ -33,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "claude-haiku-4-5"
+MODEL = "claude-sonnet-4-6"
 API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
