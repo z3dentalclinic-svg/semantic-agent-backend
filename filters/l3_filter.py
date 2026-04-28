@@ -1,11 +1,11 @@
 """
-l3_filter.py — Слой 3: OpenAI GPT-5.4 Mini классификатор для GREY-зоны.
+l3_filter.py — Слой 3: OpenAI GPT-5.5 классификатор для GREY-зоны.
 
 Версия: БИНАРНАЯ (0 или 1), 2 корзины, reasoning=low.
 
 Архитектура:
-- Модель: gpt-5.4-mini (OpenAI, GA, $0.75/$4.50 за 1M токенов)
-- reasoning_effort="low" — минимальный уровень thinking для gpt-5.4-mini
+- Модель: gpt-5.5 (OpenAI flagship, релиз апрель 2026, $5/$30 за 1M токенов)
+- reasoning_effort="low"
 - batch_size=20, max_parallel=7
 - Бинарная классификация: 1 → VALID, 0 → TRASH
 - exponential backoff (2->4->8->16с) на 5 попытках
@@ -15,7 +15,16 @@ l3_filter.py — Слой 3: OpenAI GPT-5.4 Mini классификатор дл
 - Endpoint: /v1/chat/completions
 - max_completion_tokens (НЕ max_tokens) — обязательно для reasoning-моделей
 - temperature НЕ поддерживается у reasoning-моделей, убрана
-- reasoning_effort: low | medium | high | xhigh (minimal только у nano)
+- reasoning_effort: none | low | medium | high | xhigh
+
+ИСТОРИЯ моделей в этом проекте:
+- Gemini 2.5 Flash-Lite preview — старт, отбросили (плохо UA)
+- Together GPT-OSS 20B (low) — 75% совпадение с Gemini
+- GPT-5 Nano (minimal) — клеит на 60-69, 50% совпадение
+- GPT-5.4 Mini (low) — 92% совпадение, $33/мес — финал на много дней
+- Claude Haiku 4.5 (no thinking) — слабая интент-фильтрация
+- Claude Sonnet 4.6 (no thinking) — пропускает мусор, режет review
+- GPT-5.5 — текущий тест на бренд-насыщенных коммерческих сидах
 
 Ключ: env OPENAI_API_KEY
 """
@@ -30,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gpt-5.4-mini"
+MODEL = "gpt-5.5"
 API_URL = "https://api.openai.com/v1/chat/completions"
 
 
