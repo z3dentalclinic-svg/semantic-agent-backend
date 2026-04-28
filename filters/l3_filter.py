@@ -5,7 +5,7 @@ l3_filter.py — Слой 3: OpenAI GPT-5.5 классификатор для GR
 
 Архитектура:
 - Модель: gpt-5.5 (OpenAI flagship, релиз апрель 2026, $5/$30 за 1M токенов)
-- reasoning_effort="low"
+- reasoning_effort="none" (минимум размышлений для быстрой классификации)
 - batch_size=20, max_parallel=7
 - Бинарная классификация: 1 → VALID, 0 → TRASH
 - exponential backoff (2->4->8->16с) на 5 попытках
@@ -52,7 +52,7 @@ class L3Config:
     max_parallel: int = 7
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "low"  # low | medium | high | xhigh (gpt-5.4-mini НЕ поддерживает minimal)
+    reasoning_effort: str = "none"  # none | low | medium | high | xhigh (GPT-5.5 поддерживает все)
 
 
 # =============================================================================
