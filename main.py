@@ -38,6 +38,7 @@ from parser.suffix_endpoint import register_suffix_endpoint, get_suffix_parser  
 from parser.prefix_endpoint import register_prefix_endpoint, get_prefix_parser  # ← Prefix Map парсер v1.0
 from parser.infix_endpoint import register_infix_endpoint, get_infix_parser    # ← Infix Map парсер v2.6
 from parser.morph_endpoint import register_morph_endpoint                       # ← Morph Map Parser v1.0
+from clustering_test.endpoint import register_clustering_test_endpoint          # ← Clustering Test (LLM-кластеризация хвостов)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +106,9 @@ register_infix_endpoint(app)
 
 # ═══ MORPH MAP PARSER v1.0 ═══
 register_morph_endpoint(app)
+
+# ═══ CLUSTERING TEST (LLM-кластеризация хвостов) ═══
+register_clustering_test_endpoint(app)
 
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
