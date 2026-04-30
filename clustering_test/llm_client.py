@@ -109,7 +109,6 @@ async def call_gemini(
         'systemInstruction': {'parts': [{'text': system_prompt}]},
         'contents': [{'role': 'user', 'parts': [{'text': user_prompt}]}],
         'generationConfig': {
-            'responseMimeType': 'application/json',
             'temperature': 0,
         },
     }
