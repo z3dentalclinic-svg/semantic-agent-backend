@@ -13,17 +13,27 @@ from .llm_client import call_llm, calc_cost
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит двухстрочный текстовый формат ответа модели:
+    Парсит блочный позиционный формат ответа модели:
 
-        A=гео_город;B=цена;C=бренд_сервис
-        1:A,2:B,3:C,4:A,5:B,6:A,7:C
+        A=гео;B=цена;C=бренд
+        1-40:ABCABACBABCABACBABCABACBABCABACBABCABACB
+        41-80:CABCABACB...
+        81-85:BCABA
 
-    Первая непустая строка — легенда (пары `КОД=имя` через `;`).
-    Вторая — присвоения (пары `номер_хвоста:КОД` через запятую).
+    - Первая непустая строка — легенда: пары `КОД=имя` через `;`.
+    - Каждая следующая строка — блок `START-END:КОДЫ`.
+      START и END (включительно) задают диапазон payload_id.
+      Коды — последовательность буквенных меток без разделителей.
+
+    Парсер терпим к расхождениям длины блока: коды привязываются к ID
+    последовательно от START к END. Если кодов больше чем (END-START+1)
+    или меньше — фиксируем warning, но валидную часть сохраняем.
+
+    Многобуквенные коды (AA, AB, ...) поддерживаются: если в строке кодов
+    встречается двухбуквенный код из легенды — он матчится жадно (longest-first).
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
-    имеет вид {payload_id_str: cluster_name_str} — формат, который
-    ожидает expand_clusters() ниже.
+    имеет вид {payload_id_str: cluster_name_str}.
 
     Имя `parse_llm_json` сохранено ради совместимости с вызывающим кодом.
     """
@@ -39,15 +49,12 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     if not s:
         return {}, 'Empty response'
 
-    # Берём первые две непустые строки
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
     if len(lines) < 2:
-        return {}, f'Expected 2 lines (legend + assignments), got {len(lines)}'
+        return {}, f'Expected legend + at least one block, got {len(lines)} non-empty line(s)'
 
+    # Парсим легенду: "A=имя;B=имя;..."
     legend_line = lines[0]
-    assignments_line = lines[1]
-
-    # Парсим легенду: "A=имя;B=имя;C=имя"
     label_to_name: dict[str, str] = {}
     bad_legend: list[str] = []
     for tok in legend_line.split(';'):
@@ -69,41 +76,102 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
         first = bad_legend[0] if bad_legend else legend_line[:80]
         return {}, f'No valid legend entries. First problem: {first!r}'
 
-    # Парсим присвоения: "1:A,2:B,3:A,..."
+    # Сортируем метки по убыванию длины — для жадного матчинга многобуквенных кодов
+    labels_sorted = sorted(label_to_name.keys(), key=len, reverse=True)
+
+    # Парсим блоки
     result: dict[str, str] = {}
     unknown_labels: set[str] = set()
-    bad_pairs: list[str] = []
     duplicate_ids: set[str] = set()
+    bad_blocks: list[str] = []
+    length_mismatch_blocks: list[str] = []
 
-    for tok in assignments_line.split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        colon_idx = tok.find(':')
+    for line in lines[1:]:
+        # Заголовок: "START-END:КОДЫ"
+        colon_idx = line.find(':')
         if colon_idx == -1:
-            bad_pairs.append(tok[:40])
+            bad_blocks.append(line[:60])
             continue
-        pid = tok[:colon_idx].strip()
-        label = tok[colon_idx + 1:].strip()
-        if not pid.isdigit() or not label:
-            bad_pairs.append(tok[:40])
+        header = line[:colon_idx].strip()
+        codes_str = line[colon_idx + 1:].strip()
+
+        dash_idx = header.find('-')
+        if dash_idx == -1:
+            bad_blocks.append(line[:60])
             continue
-        if pid in result:
-            duplicate_ids.add(pid)
+
+        start_str = header[:dash_idx].strip()
+        end_str = header[dash_idx + 1:].strip()
+        if not start_str.isdigit() or not end_str.isdigit():
+            bad_blocks.append(line[:60])
             continue
-        cluster_name = label_to_name.get(label)
-        if cluster_name is None:
-            unknown_labels.add(label)
+
+        start = int(start_str)
+        end = int(end_str)
+        if start < 1 or end < start:
+            bad_blocks.append(line[:60])
             continue
-        result[pid] = cluster_name
+
+        # Извлекаем коды из строки жадным матчингом
+        codes: list[str] = []
+        i = 0
+        bad_in_block = False
+        while i < len(codes_str):
+            ch = codes_str[i]
+            if ch.isspace():
+                i += 1
+                continue
+            matched = None
+            for label in labels_sorted:
+                if codes_str.startswith(label, i):
+                    matched = label
+                    break
+            if matched is None:
+                # Неизвестная метка — пробуем взять одиночный символ как метку и
+                # запомнить как unknown, продвигаемся на 1
+                unknown_labels.add(ch)
+                i += 1
+                bad_in_block = True
+                continue
+            codes.append(matched)
+            i += len(matched)
+
+        expected_len = end - start + 1
+        if len(codes) != expected_len:
+            length_mismatch_blocks.append(
+                f'block {start}-{end}: expected {expected_len} codes, got {len(codes)}'
+            )
+
+        # Привязываем коды к ID последовательно (даже если длина не совпала)
+        n_to_assign = min(len(codes), expected_len)
+        for offset in range(n_to_assign):
+            pid = str(start + offset)
+            label = codes[offset]
+            if pid in result:
+                duplicate_ids.add(pid)
+                continue
+            cluster_name = label_to_name.get(label)
+            if cluster_name is None:
+                # Уже учтено в unknown_labels выше
+                continue
+            result[pid] = cluster_name
+
+        if bad_in_block:
+            # Уже залогировано в unknown_labels
+            pass
 
     warnings: list[str] = []
     if unknown_labels:
         warnings.append(f'Unknown labels: {sorted(unknown_labels)[:5]}')
-    if bad_pairs:
-        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if length_mismatch_blocks:
+        warnings.append(
+            f'{len(length_mismatch_blocks)} block(s) with length mismatch. '
+            f'First: {length_mismatch_blocks[0]}'
+        )
     if duplicate_ids:
         warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
+    if bad_blocks:
+        warnings.append(f'Skipped {len(bad_blocks)} bad block(s). First: {bad_blocks[0]!r}')
     if bad_legend:
         warnings.append(f'Skipped {len(bad_legend)} bad legend entry(ies)')
 
