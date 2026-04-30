@@ -13,61 +13,104 @@ from .llm_client import call_llm, calc_cost
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Поддерживает два формата ответа модели:
+    Парсит двухстрочный текстовый формат ответа модели:
 
-    НОВЫЙ (компактный, ~3x меньше output):
-        {
-          "clusters": {"1": "имя_кластера", "2": "имя_другого", ...},
-          "assignments": {"1": 1, "2": 5, "3": 2, ...}
-        }
+        A=гео_город;B=цена;C=бренд_сервис
+        1:A,2:B,3:C,4:A,5:B,6:A,7:C
 
-    СТАРЫЙ (fallback, для обратной совместимости):
-        {"1": "имя_кластера", "2": "имя_кластера", ...}
+    Первая непустая строка — легенда (пары `КОД=имя` через `;`).
+    Вторая — присвоения (пары `номер_хвоста:КОД` через запятую).
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
-    имеет вид {payload_id_str: cluster_name_str} — это формат который
+    имеет вид {payload_id_str: cluster_name_str} — формат, который
     ожидает expand_clusters() ниже.
+
+    Имя `parse_llm_json` сохранено ради совместимости с вызывающим кодом.
     """
     s = raw.strip()
-    # На всякий случай удаляем markdown-обёртку если модель её добавила
+    # Срезаем markdown-обёртку если модель её добавила
     if s.startswith('```'):
         s = s.strip('`')
-        if s.startswith('json'):
-            s = s[4:]
+        first_nl = s.find('\n')
+        if first_nl != -1 and ' ' not in s[:first_nl]:
+            s = s[first_nl + 1:]
         s = s.strip()
-    try:
-        parsed = json.loads(s)
-        if not isinstance(parsed, dict):
-            return {}, f'Expected dict, got {type(parsed).__name__}'
 
-        # Новый формат: {"clusters": {...}, "assignments": {...}}
-        if 'clusters' in parsed and 'assignments' in parsed:
-            clusters = parsed.get('clusters') or {}
-            assignments = parsed.get('assignments') or {}
-            if not isinstance(clusters, dict) or not isinstance(assignments, dict):
-                return {}, 'clusters/assignments must be dicts'
+    if not s:
+        return {}, 'Empty response'
 
-            result = {}
-            unknown_cluster_ids = set()
-            for payload_id, cluster_id in assignments.items():
-                cid_str = str(cluster_id)
-                cluster_name = clusters.get(cid_str)
-                if cluster_name is None:
-                    unknown_cluster_ids.add(cid_str)
-                    continue
-                result[str(payload_id)] = str(cluster_name)
+    # Берём первые две непустые строки
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return {}, f'Expected 2 lines (legend + assignments), got {len(lines)}'
 
-            if unknown_cluster_ids and not result:
-                return {}, f'No valid assignments (unknown cluster ids: {sorted(unknown_cluster_ids)[:5]})'
-            return result, None
+    legend_line = lines[0]
+    assignments_line = lines[1]
 
-        # Старый формат: {"1": "имя_кластера", ...}
-        if all(isinstance(v, str) for v in parsed.values()):
-            return parsed, None
+    # Парсим легенду: "A=имя;B=имя;C=имя"
+    label_to_name: dict[str, str] = {}
+    bad_legend: list[str] = []
+    for tok in legend_line.split(';'):
+        tok = tok.strip()
+        if not tok:
+            continue
+        eq_idx = tok.find('=')
+        if eq_idx == -1:
+            bad_legend.append(tok[:60])
+            continue
+        label = tok[:eq_idx].strip()
+        name = tok[eq_idx + 1:].strip()
+        if not label or not name:
+            bad_legend.append(tok[:60])
+            continue
+        label_to_name[label] = name
 
-        return {}, 'Unknown response format (no clusters/assignments and values are not strings)'
-    except json.JSONDecodeError as e:
-        return {}, f'JSON parse error: {e}'
+    if not label_to_name:
+        first = bad_legend[0] if bad_legend else legend_line[:80]
+        return {}, f'No valid legend entries. First problem: {first!r}'
+
+    # Парсим присвоения: "1:A,2:B,3:A,..."
+    result: dict[str, str] = {}
+    unknown_labels: set[str] = set()
+    bad_pairs: list[str] = []
+    duplicate_ids: set[str] = set()
+
+    for tok in assignments_line.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        colon_idx = tok.find(':')
+        if colon_idx == -1:
+            bad_pairs.append(tok[:40])
+            continue
+        pid = tok[:colon_idx].strip()
+        label = tok[colon_idx + 1:].strip()
+        if not pid.isdigit() or not label:
+            bad_pairs.append(tok[:40])
+            continue
+        if pid in result:
+            duplicate_ids.add(pid)
+            continue
+        cluster_name = label_to_name.get(label)
+        if cluster_name is None:
+            unknown_labels.add(label)
+            continue
+        result[pid] = cluster_name
+
+    warnings: list[str] = []
+    if unknown_labels:
+        warnings.append(f'Unknown labels: {sorted(unknown_labels)[:5]}')
+    if bad_pairs:
+        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if duplicate_ids:
+        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
+    if bad_legend:
+        warnings.append(f'Skipped {len(bad_legend)} bad legend entry(ies)')
+
+    if not result:
+        return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
+
+    return result, ('; '.join(warnings) if warnings else None)
 
 
 def expand_clusters(
