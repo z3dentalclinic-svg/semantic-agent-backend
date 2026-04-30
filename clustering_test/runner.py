@@ -12,7 +12,22 @@ from .llm_client import call_llm, calc_cost
 
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
-    """Возвращает (parsed_dict, error_msg). При ошибке dict пустой."""
+    """
+    Поддерживает два формата ответа модели:
+
+    НОВЫЙ (компактный, ~3x меньше output):
+        {
+          "clusters": {"1": "имя_кластера", "2": "имя_другого", ...},
+          "assignments": {"1": 1, "2": 5, "3": 2, ...}
+        }
+
+    СТАРЫЙ (fallback, для обратной совместимости):
+        {"1": "имя_кластера", "2": "имя_кластера", ...}
+
+    Возвращает (assignments_dict, error_msg) где assignments_dict
+    имеет вид {payload_id_str: cluster_name_str} — это формат который
+    ожидает expand_clusters() ниже.
+    """
     s = raw.strip()
     # На всякий случай удаляем markdown-обёртку если модель её добавила
     if s.startswith('```'):
@@ -24,7 +39,33 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
         parsed = json.loads(s)
         if not isinstance(parsed, dict):
             return {}, f'Expected dict, got {type(parsed).__name__}'
-        return parsed, None
+
+        # Новый формат: {"clusters": {...}, "assignments": {...}}
+        if 'clusters' in parsed and 'assignments' in parsed:
+            clusters = parsed.get('clusters') or {}
+            assignments = parsed.get('assignments') or {}
+            if not isinstance(clusters, dict) or not isinstance(assignments, dict):
+                return {}, 'clusters/assignments must be dicts'
+
+            result = {}
+            unknown_cluster_ids = set()
+            for payload_id, cluster_id in assignments.items():
+                cid_str = str(cluster_id)
+                cluster_name = clusters.get(cid_str)
+                if cluster_name is None:
+                    unknown_cluster_ids.add(cid_str)
+                    continue
+                result[str(payload_id)] = str(cluster_name)
+
+            if unknown_cluster_ids and not result:
+                return {}, f'No valid assignments (unknown cluster ids: {sorted(unknown_cluster_ids)[:5]})'
+            return result, None
+
+        # Старый формат: {"1": "имя_кластера", ...}
+        if all(isinstance(v, str) for v in parsed.values()):
+            return parsed, None
+
+        return {}, 'Unknown response format (no clusters/assignments and values are not strings)'
     except json.JSONDecodeError as e:
         return {}, f'JSON parse error: {e}'
 
