@@ -11,22 +11,22 @@ from .prompts import build_prompts
 from .llm_client import call_llm, calc_cost
 
 
-def parse_llm_json(raw: str) -> tuple[dict, str | None]:
+def parse_llm_response(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит позиционный формат ответа:
+    Парсит ответ модели в формате:
 
         A=гео_город
         B=цена
         C=бренд_сервис
-        ---
-        A,B,C,A,B,A,C
+        ===
+        1:A,2:B,3:C,4:A,5:B,6:A,7:C
+
+    Блок 1 (до `===`) — маппинг буквенных меток на имена интентов.
+    Блок 2 (после `===`) — пары `payload_id:label` через запятую.
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
     имеет вид {payload_id_str: cluster_name_str} — формат, который
     ожидает expand_clusters() ниже.
-
-    Имя 'parse_llm_json' оставлено ради обратной совместимости с вызывающим
-    кодом. JSON больше не используется.
     """
     s = raw.strip()
     # Срезаем markdown-обёртку если модель её добавила
@@ -40,11 +40,10 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     if not s:
         return {}, 'Empty response'
 
-    # Делим ответ на блок маппинга и блок присвоений по строке "---"
-    if '---' not in s:
-        return {}, "Separator '---' not found in response"
+    if '===' not in s:
+        return {}, "Separator '===' not found in response"
 
-    sep_idx = s.find('---')
+    sep_idx = s.find('===')
     mapping_block = s[:sep_idx].strip()
     assignments_block = s[sep_idx + 3:].strip()
 
@@ -72,28 +71,47 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
         label_to_name[label] = name
 
     if not label_to_name:
-        return {}, f'No valid mapping lines. First problem: {bad_mapping_lines[0] if bad_mapping_lines else "?"!r}'
+        first = bad_mapping_lines[0] if bad_mapping_lines else '?'
+        return {}, f'No valid mapping lines. First problem: {first!r}'
 
-    # Парсим присвоения: одна строка из меток через запятую
-    # Сначала склеиваем всё в одну строку (на случай если модель добавила переносы)
+    # Парсим присвоения: "id:label,id:label,..."
+    # Склеиваем всё в одну строку (модель могла вставить переносы)
     assignments_flat = ''.join(assignments_block.split())
-    raw_labels = [tok.strip() for tok in assignments_flat.split(',') if tok.strip()]
-
-    if not raw_labels:
-        return {}, 'No labels in assignments block'
 
     result: dict[str, str] = {}
     unknown_labels: set[str] = set()
-    for i, label in enumerate(raw_labels, 1):
+    bad_pairs: list[str] = []
+    duplicate_ids: set[str] = set()
+
+    for tok in assignments_flat.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        colon_idx = tok.find(':')
+        if colon_idx == -1:
+            bad_pairs.append(tok[:40])
+            continue
+        pid = tok[:colon_idx].strip()
+        label = tok[colon_idx + 1:].strip()
+        if not pid.isdigit() or not label:
+            bad_pairs.append(tok[:40])
+            continue
+        if pid in result:
+            duplicate_ids.add(pid)
+            continue
         cluster_name = label_to_name.get(label)
         if cluster_name is None:
             unknown_labels.add(label)
             continue
-        result[str(i)] = cluster_name
+        result[pid] = cluster_name
 
     warnings: list[str] = []
     if unknown_labels:
-        warnings.append(f'Unknown labels (not in mapping): {sorted(unknown_labels)[:5]}')
+        warnings.append(f'Unknown labels: {sorted(unknown_labels)[:5]}')
+    if bad_pairs:
+        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if duplicate_ids:
+        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
     if bad_mapping_lines:
         warnings.append(f'Skipped {len(bad_mapping_lines)} bad mapping line(s)')
 
@@ -239,9 +257,9 @@ async def run_clustering(
             'wall_time_sec': round(time.time() - t_total_start, 3),
         }
     
-    # 4. Парсинг JSON
-    assignments, parse_error = parse_llm_json(llm_result['raw_response'])
-    json_parse_ok = parse_error is None
+    # 4. Парсинг ответа модели
+    assignments, parse_error = parse_llm_response(llm_result['raw_response'])
+    parse_ok = parse_error is None
     if parse_error:
         errors.append(parse_error)
     
@@ -278,7 +296,7 @@ async def run_clustering(
             'tokens_input': llm_result['tokens_in'],
             'tokens_output': llm_result['tokens_out'],
             'cost_usd': cost,
-            'json_parse_ok': json_parse_ok,
+            'json_parse_ok': parse_ok,
             'clusters_count': len(cluster_to_keywords),
             'unassigned_keywords': unassigned,
             'max_cluster_size': max_size,
