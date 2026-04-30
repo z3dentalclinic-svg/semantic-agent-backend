@@ -68,7 +68,6 @@ async def call_openai(
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},
         ],
-        'reasoning_effort': 'none',
     }
     
     t0 = time.time()
@@ -79,7 +78,9 @@ async def call_openai(
             json=payload,
         )
     api_time = time.time() - t0
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        body = resp.text[:500]
+        raise RuntimeError(f'OpenAI {resp.status_code}: {body}')
     data = resp.json()
     
     return {
