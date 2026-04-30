@@ -68,6 +68,7 @@ async def call_openai(
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},
         ],
+        'response_format': {'type': 'json_object'},
         'reasoning_effort': 'none',
     }
     
@@ -108,6 +109,7 @@ async def call_gemini(
         'systemInstruction': {'parts': [{'text': system_prompt}]},
         'contents': [{'role': 'user', 'parts': [{'text': user_prompt}]}],
         'generationConfig': {
+            'responseMimeType': 'application/json',
             'temperature': 0,
         },
     }
