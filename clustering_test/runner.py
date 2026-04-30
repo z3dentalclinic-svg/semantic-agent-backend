@@ -49,13 +49,23 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
 
             result = {}
             unknown_cluster_ids = set()
-            for payload_id, cluster_id in assignments.items():
-                cid_str = str(cluster_id)
-                cluster_name = clusters.get(cid_str)
-                if cluster_name is None:
-                    unknown_cluster_ids.add(cid_str)
-                    continue
-                result[str(payload_id)] = str(cluster_name)
+            for key, value in assignments.items():
+                # Формат A: {cluster_id: [payload_id, payload_id, ...]}
+                if isinstance(value, list):
+                    cluster_name = clusters.get(str(key))
+                    if cluster_name is None:
+                        unknown_cluster_ids.add(str(key))
+                        continue
+                    for pid in value:
+                        result[str(pid)] = str(cluster_name)
+                # Формат B (fallback): {payload_id: cluster_id}
+                else:
+                    cid_str = str(value)
+                    cluster_name = clusters.get(cid_str)
+                    if cluster_name is None:
+                        unknown_cluster_ids.add(cid_str)
+                        continue
+                    result[str(key)] = str(cluster_name)
 
             if unknown_cluster_ids and not result:
                 return {}, f'No valid assignments (unknown cluster ids: {sorted(unknown_cluster_ids)[:5]})'
