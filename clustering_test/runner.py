@@ -13,71 +13,94 @@ from .llm_client import call_llm, calc_cost
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Поддерживает два формата ответа модели:
+    Парсит позиционный формат ответа:
 
-    НОВЫЙ (компактный, ~3x меньше output):
-        {
-          "clusters": {"1": "имя_кластера", "2": "имя_другого", ...},
-          "assignments": {"1": 1, "2": 5, "3": 2, ...}
-        }
-
-    СТАРЫЙ (fallback, для обратной совместимости):
-        {"1": "имя_кластера", "2": "имя_кластера", ...}
+        A=гео_город
+        B=цена
+        C=бренд_сервис
+        ---
+        A,B,C,A,B,A,C
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
-    имеет вид {payload_id_str: cluster_name_str} — это формат который
+    имеет вид {payload_id_str: cluster_name_str} — формат, который
     ожидает expand_clusters() ниже.
+
+    Имя 'parse_llm_json' оставлено ради обратной совместимости с вызывающим
+    кодом. JSON больше не используется.
     """
     s = raw.strip()
-    # На всякий случай удаляем markdown-обёртку если модель её добавила
+    # Срезаем markdown-обёртку если модель её добавила
     if s.startswith('```'):
         s = s.strip('`')
-        if s.startswith('json'):
-            s = s[4:]
+        first_nl = s.find('\n')
+        if first_nl != -1 and ' ' not in s[:first_nl]:
+            s = s[first_nl + 1:]
         s = s.strip()
-    try:
-        parsed = json.loads(s)
-        if not isinstance(parsed, dict):
-            return {}, f'Expected dict, got {type(parsed).__name__}'
 
-        # Новый формат: {"clusters": {...}, "assignments": {...}}
-        if 'clusters' in parsed and 'assignments' in parsed:
-            clusters = parsed.get('clusters') or {}
-            assignments = parsed.get('assignments') or {}
-            if not isinstance(clusters, dict) or not isinstance(assignments, dict):
-                return {}, 'clusters/assignments must be dicts'
+    if not s:
+        return {}, 'Empty response'
 
-            result = {}
-            unknown_cluster_ids = set()
-            for key, value in assignments.items():
-                # Формат A: {cluster_id: [payload_id, payload_id, ...]}
-                if isinstance(value, list):
-                    cluster_name = clusters.get(str(key))
-                    if cluster_name is None:
-                        unknown_cluster_ids.add(str(key))
-                        continue
-                    for pid in value:
-                        result[str(pid)] = str(cluster_name)
-                # Формат B (fallback): {payload_id: cluster_id}
-                else:
-                    cid_str = str(value)
-                    cluster_name = clusters.get(cid_str)
-                    if cluster_name is None:
-                        unknown_cluster_ids.add(cid_str)
-                        continue
-                    result[str(key)] = str(cluster_name)
+    # Делим ответ на блок маппинга и блок присвоений по строке "---"
+    if '---' not in s:
+        return {}, "Separator '---' not found in response"
 
-            if unknown_cluster_ids and not result:
-                return {}, f'No valid assignments (unknown cluster ids: {sorted(unknown_cluster_ids)[:5]})'
-            return result, None
+    sep_idx = s.find('---')
+    mapping_block = s[:sep_idx].strip()
+    assignments_block = s[sep_idx + 3:].strip()
 
-        # Старый формат: {"1": "имя_кластера", ...}
-        if all(isinstance(v, str) for v in parsed.values()):
-            return parsed, None
+    if not mapping_block:
+        return {}, 'Empty mapping block'
+    if not assignments_block:
+        return {}, 'Empty assignments block'
 
-        return {}, 'Unknown response format (no clusters/assignments and values are not strings)'
-    except json.JSONDecodeError as e:
-        return {}, f'JSON parse error: {e}'
+    # Парсим маппинг: каждая строка "ЛЕЙБЛ=имя_кластера"
+    label_to_name: dict[str, str] = {}
+    bad_mapping_lines: list[str] = []
+    for line in mapping_block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        eq_idx = line.find('=')
+        if eq_idx == -1:
+            bad_mapping_lines.append(line[:80])
+            continue
+        label = line[:eq_idx].strip()
+        name = line[eq_idx + 1:].strip()
+        if not label or not name:
+            bad_mapping_lines.append(line[:80])
+            continue
+        label_to_name[label] = name
+
+    if not label_to_name:
+        return {}, f'No valid mapping lines. First problem: {bad_mapping_lines[0] if bad_mapping_lines else "?"!r}'
+
+    # Парсим присвоения: одна строка из меток через запятую
+    # Сначала склеиваем всё в одну строку (на случай если модель добавила переносы)
+    assignments_flat = ''.join(assignments_block.split())
+    raw_labels = [tok.strip() for tok in assignments_flat.split(',') if tok.strip()]
+
+    if not raw_labels:
+        return {}, 'No labels in assignments block'
+
+    result: dict[str, str] = {}
+    unknown_labels: set[str] = set()
+    for i, label in enumerate(raw_labels, 1):
+        cluster_name = label_to_name.get(label)
+        if cluster_name is None:
+            unknown_labels.add(label)
+            continue
+        result[str(i)] = cluster_name
+
+    warnings: list[str] = []
+    if unknown_labels:
+        warnings.append(f'Unknown labels (not in mapping): {sorted(unknown_labels)[:5]}')
+    if bad_mapping_lines:
+        warnings.append(f'Skipped {len(bad_mapping_lines)} bad mapping line(s)')
+
+    if not result:
+        return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
+
+    return result, ('; '.join(warnings) if warnings else None)
 
 
 def expand_clusters(
