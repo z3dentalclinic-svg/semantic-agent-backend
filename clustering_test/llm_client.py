@@ -18,9 +18,17 @@ class ModelConfig:
     api_model: str
     input_per_1m: float
     output_per_1m: float
+    # OpenAI reasoning_effort: None = не передавать (non-reasoning или модель отбивает параметр).
+    # Допустимые значения зависят от семейства:
+    #   gpt-5/gpt-5-mini: 'minimal' | 'low' | 'medium' | 'high'
+    #   gpt-5.5:          'none' | 'low' | 'medium' | 'high' | 'xhigh'
+    #   gpt-5-nano:       параметр не поддерживается (400 Bad Request) → None
+    #   gpt-4.x:          параметр не существует → None
+    reasoning_effort: str | None = None
 
 
 MODELS: dict[str, ModelConfig] = {
+    # ── Gemini ────────────────────────────────────────────────────────
     'gemini-2.5-flash-lite': ModelConfig(
         name='gemini-2.5-flash-lite',
         provider='gemini',
@@ -28,26 +36,85 @@ MODELS: dict[str, ModelConfig] = {
         input_per_1m=0.10,
         output_per_1m=0.40,
     ),
+    'gemini-2.5-flash': ModelConfig(
+        name='gemini-2.5-flash',
+        provider='gemini',
+        api_model='gemini-2.5-flash',
+        input_per_1m=0.30,
+        output_per_1m=2.50,
+    ),
+    'gemini-2.5-pro': ModelConfig(
+        name='gemini-2.5-pro',
+        provider='gemini',
+        api_model='gemini-2.5-pro',
+        input_per_1m=1.25,
+        output_per_1m=10.00,
+    ),
+    # ── OpenAI · non-reasoning (reasoning_effort не передаём) ─────────
+    'gpt-4.1-nano': ModelConfig(
+        name='gpt-4.1-nano',
+        provider='openai',
+        api_model='gpt-4.1-nano',
+        input_per_1m=0.10,
+        output_per_1m=0.40,
+    ),
+    'gpt-4o-mini': ModelConfig(
+        name='gpt-4o-mini',
+        provider='openai',
+        api_model='gpt-4o-mini',
+        input_per_1m=0.15,
+        output_per_1m=0.60,
+    ),
+    'gpt-4.1-mini': ModelConfig(
+        name='gpt-4.1-mini',
+        provider='openai',
+        api_model='gpt-4.1-mini',
+        input_per_1m=0.40,
+        output_per_1m=1.60,
+    ),
+    'gpt-4.1': ModelConfig(
+        name='gpt-4.1',
+        provider='openai',
+        api_model='gpt-4.1',
+        input_per_1m=2.00,
+        output_per_1m=8.00,
+    ),
+    # ── OpenAI · reasoning ────────────────────────────────────────────
+    # gpt-5-nano: параметр reasoning отбивается с 400 (см. OpenAI Community) → None.
     'gpt-5-nano': ModelConfig(
         name='gpt-5-nano',
         provider='openai',
         api_model='gpt-5-nano',
         input_per_1m=0.05,
         output_per_1m=0.40,
+        reasoning_effort=None,
     ),
+    # gpt-5-mini: 'minimal' — самый быстрый поддерживаемый режим.
     'gpt-5-mini': ModelConfig(
         name='gpt-5-mini',
         provider='openai',
         api_model='gpt-5-mini',
         input_per_1m=0.25,
         output_per_1m=2.00,
+        reasoning_effort='minimal',
     ),
+    # gpt-5: 'minimal' — самый быстрый поддерживаемый режим.
+    'gpt-5': ModelConfig(
+        name='gpt-5',
+        provider='openai',
+        api_model='gpt-5',
+        input_per_1m=1.25,
+        output_per_1m=10.00,
+        reasoning_effort='minimal',
+    ),
+    # gpt-5.5: 'none' — отключает reasoning полностью (поддерживается только этим семейством).
     'gpt-5.5': ModelConfig(
         name='gpt-5.5',
         provider='openai',
         api_model='gpt-5.5',
         input_per_1m=1.25,
         output_per_1m=10.00,
+        reasoning_effort='none',
     ),
 }
 
@@ -69,6 +136,8 @@ async def call_openai(
             {'role': 'user', 'content': user_prompt},
         ],
     }
+    if cfg.reasoning_effort is not None:
+        payload['reasoning_effort'] = cfg.reasoning_effort
     
     t0 = time.time()
     async with httpx.AsyncClient(timeout=timeout) as client:
