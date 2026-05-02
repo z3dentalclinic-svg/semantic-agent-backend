@@ -25,6 +25,12 @@ class ModelConfig:
     #   gpt-5-nano:       параметр не поддерживается (400 Bad Request) → None
     #   gpt-4.x:          параметр не существует → None
     reasoning_effort: str | None = None
+    # Gemini thinking_budget: None = не передавать (использовать default модели).
+    # Допустимые значения (для Gemini 2.5 series):
+    #   gemini-2.5-flash-lite: thinking off by default → None или 0
+    #   gemini-2.5-flash:      thinking on by default → 0 чтобы выключить, иначе медленнее
+    #   gemini-2.5-pro:        thinking ВСЕГДА on, нельзя 0 → минимум 128, максимум 32768, или -1 (dynamic)
+    thinking_budget: int | None = None
 
 
 MODELS: dict[str, ModelConfig] = {
@@ -42,6 +48,7 @@ MODELS: dict[str, ModelConfig] = {
         api_model='gemini-2.5-flash',
         input_per_1m=0.30,
         output_per_1m=2.50,
+        thinking_budget=0,  # выключаем thinking — иначе по дефолту включён, заметно медленнее
     ),
     'gemini-2.5-pro': ModelConfig(
         name='gemini-2.5-pro',
@@ -49,6 +56,7 @@ MODELS: dict[str, ModelConfig] = {
         api_model='gemini-2.5-pro',
         input_per_1m=1.25,
         output_per_1m=10.00,
+        thinking_budget=128,  # минимум для pro (нельзя 0); 128-32768 диапазон, или -1 для dynamic
     ),
     # ── OpenAI · non-reasoning (reasoning_effort не передаём) ─────────
     'gpt-4.1-nano': ModelConfig(
@@ -181,6 +189,10 @@ async def call_gemini(
             'temperature': 0,
         },
     }
+    if cfg.thinking_budget is not None:
+        payload['generationConfig']['thinkingConfig'] = {
+            'thinkingBudget': cfg.thinking_budget,
+        }
     
     t0 = time.time()
     async with httpx.AsyncClient(timeout=timeout) as client:
