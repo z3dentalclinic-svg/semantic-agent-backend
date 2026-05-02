@@ -13,34 +13,19 @@ from .llm_client import call_llm, calc_cost
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит блочный позиционный формат:
+    Парсит двухстрочный текстовый формат ответа модели:
 
         A=гео_город;B=цена;C=бренд_сервис
-        ---
-        1:ABCA
-        5:BACA
-        9:CB
+        1:A,2:B,3:C,4:A,5:B,6:A,7:C
 
     Первая непустая строка — легенда (пары `КОД=имя` через `;`).
-    Затем строка-разделитель `---`.
-    Далее блоки `СТАРТ:КОДЫ`, где СТАРТ — позиция первого хвоста в блоке (1-индексация),
-    КОДЫ — подряд без разделителей односимвольные коды для 4 хвостов
-    (последний блок может быть короче).
-
-    Стратегия восстановления при ошибках:
-      - Блоки-якоря (СТАРТ:) — главный ориентир. Если блок короче ожидаемого,
-        недостающие хвосты остаются неприсвоенными (locally bounded error).
-      - Если блок длиннее BLOCK_SIZE символов, лишние символы игнорируются — следующий
-        блок не сдвигается, потому что у него свой якорь.
-      - Неизвестные коды → unknown_labels, хвост остаётся неприсвоенным.
+    Вторая — присвоения (пары `номер_хвоста:КОД` через запятую).
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
     имеет вид {payload_id_str: cluster_name_str}.
 
     Имя `parse_llm_json` сохранено ради совместимости с вызывающим кодом.
     """
-    BLOCK_SIZE = 4
-
     s = raw.strip()
     # Срезаем markdown-обёртку если модель её добавила
     if s.startswith('```'):
@@ -55,19 +40,10 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
 
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
     if len(lines) < 2:
-        return {}, f'Expected legend + separator + blocks, got {len(lines)} non-empty line(s)'
+        return {}, f'Expected 2 lines (legend + assignments), got {len(lines)}'
 
     legend_line = lines[0]
-
-    # Ищем разделитель `---`. Он должен быть на второй строке, но допустим
-    # отсутствие если модель забыла — тогда блоки начинаются сразу со строки 2.
-    if len(lines) >= 2 and lines[1] == '---':
-        block_lines = lines[2:]
-    else:
-        block_lines = lines[1:]
-
-    if not block_lines:
-        return {}, 'No assignment blocks found after legend'
+    assignments_line = lines[1]
 
     # Парсим легенду: "A=имя;B=имя;C=имя"
     label_to_name: dict[str, str] = {}
@@ -91,57 +67,39 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
         first = bad_legend[0] if bad_legend else legend_line[:80]
         return {}, f'No valid legend entries. First problem: {first!r}'
 
-    # Парсим блоки присвоений: "СТАРТ:КОДЫ"
+    # Парсим присвоения: "1:A,2:B,3:A,..."
     result: dict[str, str] = {}
     unknown_labels: set[str] = set()
-    bad_blocks: list[str] = []
-    short_blocks = 0
-    long_blocks = 0
+    bad_pairs: list[str] = []
     duplicate_ids: set[str] = set()
 
-    # Сначала валидируем заголовки блоков, чтобы знать какой блок последний
-    parsed_blocks: list[tuple[int, str]] = []
-    for block in block_lines:
-        colon_idx = block.find(':')
+    for tok in assignments_line.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        colon_idx = tok.find(':')
         if colon_idx == -1:
-            bad_blocks.append(block[:40])
+            bad_pairs.append(tok[:40])
             continue
-        start_str = block[:colon_idx].strip()
-        codes = block[colon_idx + 1:].strip()
-        if not start_str.isdigit() or not codes:
-            bad_blocks.append(block[:40])
+        pid = tok[:colon_idx].strip()
+        label = tok[colon_idx + 1:].strip()
+        if not pid.isdigit() or not label:
+            bad_pairs.append(tok[:40])
             continue
-        parsed_blocks.append((int(start_str), codes))
-
-    last_idx = len(parsed_blocks) - 1
-    for idx, (start, codes) in enumerate(parsed_blocks):
-        is_last = idx == last_idx
-        if len(codes) < BLOCK_SIZE and not is_last:
-            short_blocks += 1
-        elif len(codes) > BLOCK_SIZE:
-            long_blocks += 1
-            codes = codes[:BLOCK_SIZE]  # берём ровно BLOCK_SIZE, лишнее игнорируем
-
-        for offset, label in enumerate(codes):
-            pid = str(start + offset)
-            if pid in result:
-                duplicate_ids.add(pid)
-                continue
-            cluster_name = label_to_name.get(label)
-            if cluster_name is None:
-                unknown_labels.add(label)
-                continue
-            result[pid] = cluster_name
+        if pid in result:
+            duplicate_ids.add(pid)
+            continue
+        cluster_name = label_to_name.get(label)
+        if cluster_name is None:
+            unknown_labels.add(label)
+            continue
+        result[pid] = cluster_name
 
     warnings: list[str] = []
     if unknown_labels:
         warnings.append(f'Unknown labels: {sorted(unknown_labels)[:5]}')
-    if bad_blocks:
-        warnings.append(f'Skipped {len(bad_blocks)} bad block(s). First: {bad_blocks[0]!r}')
-    if short_blocks:
-        warnings.append(f'{short_blocks} block(s) shorter than {BLOCK_SIZE}')
-    if long_blocks:
-        warnings.append(f'{long_blocks} block(s) longer than {BLOCK_SIZE}, truncated')
+    if bad_pairs:
+        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
     if duplicate_ids:
         warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
     if bad_legend:
