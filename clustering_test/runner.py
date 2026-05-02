@@ -13,13 +13,21 @@ from .llm_client import call_llm, calc_cost
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит двухстрочный текстовый формат ответа модели:
+    Парсит инвертированный формат ответа модели:
 
-        A=гео_город;B=цена;C=бренд_сервис
-        1:A,2:B,3:C,4:A,5:B,6:A,7:C
+        гео:1,4,6,12,15
+        цена:2,5,11,37
+        бренд_сервис:3,7,9
 
-    Первая непустая строка — легенда (пары `КОД=имя` через `;`).
-    Вторая — присвоения (пары `номер_хвоста:КОД` через запятую).
+    Каждая строка — один кластер. Формат: `имя_кластера:номер,номер,...`
+    - Имя кластера: произвольная строка без `:` (в основном кириллица + `_`)
+    - Номера: целые числа через запятую без пробелов
+
+    Стратегия восстановления при ошибках:
+      - Дубль pid (хвост в двух кластерах) → берём первое присвоение, warning
+      - Невалидный токен в списке номеров → пропуск с warning
+      - Строка без `:` или с пустым именем → пропуск с warning
+      - Пустое имя кластера → пропуск с warning
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
     имеет вид {payload_id_str: cluster_name_str}.
@@ -39,71 +47,52 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
         return {}, 'Empty response'
 
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-    if len(lines) < 2:
-        return {}, f'Expected 2 lines (legend + assignments), got {len(lines)}'
+    if not lines:
+        return {}, 'No non-empty lines in response'
 
-    legend_line = lines[0]
-    assignments_line = lines[1]
-
-    # Парсим легенду: "A=имя;B=имя;C=имя"
-    label_to_name: dict[str, str] = {}
-    bad_legend: list[str] = []
-    for tok in legend_line.split(';'):
-        tok = tok.strip()
-        if not tok:
-            continue
-        eq_idx = tok.find('=')
-        if eq_idx == -1:
-            bad_legend.append(tok[:60])
-            continue
-        label = tok[:eq_idx].strip()
-        name = tok[eq_idx + 1:].strip()
-        if not label or not name:
-            bad_legend.append(tok[:60])
-            continue
-        label_to_name[label] = name
-
-    if not label_to_name:
-        first = bad_legend[0] if bad_legend else legend_line[:80]
-        return {}, f'No valid legend entries. First problem: {first!r}'
-
-    # Парсим присвоения: "1:A,2:B,3:A,..."
     result: dict[str, str] = {}
-    unknown_labels: set[str] = set()
-    bad_pairs: list[str] = []
     duplicate_ids: set[str] = set()
+    bad_tokens: list[str] = []
+    bad_lines: list[str] = []
+    empty_clusters = 0
 
-    for tok in assignments_line.split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        colon_idx = tok.find(':')
+    for line in lines:
+        colon_idx = line.find(':')
         if colon_idx == -1:
-            bad_pairs.append(tok[:40])
+            bad_lines.append(line[:60])
             continue
-        pid = tok[:colon_idx].strip()
-        label = tok[colon_idx + 1:].strip()
-        if not pid.isdigit() or not label:
-            bad_pairs.append(tok[:40])
+        cluster_name = line[:colon_idx].strip()
+        pids_part = line[colon_idx + 1:].strip()
+        if not cluster_name:
+            bad_lines.append(line[:60])
             continue
-        if pid in result:
-            duplicate_ids.add(pid)
+        if not pids_part:
+            empty_clusters += 1
             continue
-        cluster_name = label_to_name.get(label)
-        if cluster_name is None:
-            unknown_labels.add(label)
-            continue
-        result[pid] = cluster_name
+
+        for tok in pids_part.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if not tok.isdigit():
+                bad_tokens.append(tok[:20])
+                continue
+            pid = tok  # храним как строку для совместимости с expand_clusters
+            if pid in result:
+                duplicate_ids.add(pid)
+                continue
+            result[pid] = cluster_name
 
     warnings: list[str] = []
-    if unknown_labels:
-        warnings.append(f'Unknown labels: {sorted(unknown_labels)[:5]}')
-    if bad_pairs:
-        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if bad_lines:
+        warnings.append(f'Skipped {len(bad_lines)} bad line(s). First: {bad_lines[0]!r}')
+    if bad_tokens:
+        warnings.append(f'Skipped {len(bad_tokens)} bad token(s). First: {bad_tokens[0]!r}')
     if duplicate_ids:
-        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
-    if bad_legend:
-        warnings.append(f'Skipped {len(bad_legend)} bad legend entry(ies)')
+        sample = sorted(duplicate_ids, key=lambda x: int(x))[:5]
+        warnings.append(f'{len(duplicate_ids)} duplicate pid(s). First: {sample}')
+    if empty_clusters:
+        warnings.append(f'{empty_clusters} cluster(s) with empty payload list')
 
     if not result:
         return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
