@@ -1,6 +1,11 @@
 """
 Runner: оркестрирует пайплайн extract → validate → LLM → expand.
+
+C1-архитектура: входные хвосты режутся на чанки по CHUNK_SIZE, каждый чанк
+обрабатывается параллельно через call_llm. Имена кластеров между чанками
+объединяются дополнительным дешёвым merge-вызовом через MERGE_MODEL.
 """
+import asyncio
 import json
 import re
 import time
@@ -12,30 +17,42 @@ from .prompts import build_prompts
 from .llm_client import call_llm, calc_cost
 
 
-# Регулярка для одной буквы кода (одна или несколько A-Z подряд).
-_CODE_RE = re.compile(r'^[A-Z]+$')
+# === C1 параметры ===
+# Размер чанка (хвостов на один LLM-вызов). 100 — компромисс между параллелизмом
+# и качеством кластеризации внутри чанка.
+CHUNK_SIZE = 100
 
-# Регулярка для записи легенды `КОД=имя кластера`.
-_LEGEND_ENTRY_RE = re.compile(r'^([A-Z]+)\s*=\s*(.+)$')
+# Модель для merge-вызова. Дешёвая и быстрая — задача простая (склеить синонимы).
+MERGE_MODEL = 'gemini-2.5-flash-lite'
+
+# Ретраи параметры
+CHUNK_RETRY_DELAY_SEC = 1.0
+CHUNK_MAX_RETRIES = 1  # сначала первая попытка, потом 1 retry
 
 
-def parse_llm_json(raw: str, n_payloads: int) -> tuple[dict, str | None]:
+# Регулярка для пары вида `A(имя_кластера)`: захватывает код и имя.
+# Имя может содержать кириллицу, латиницу, цифры, подчёркивания, пробелы, дефисы.
+_CODE_WITH_NAME_RE = re.compile(r'^([A-Z]+)\(([^)]+)\)$')
+
+
+def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит формат Path 4: чистая разметка буквами + легенда.
+    Парсит динамический однострочный формат:
 
-        A,B,A,C,B,A
-        A=гео_город;B=коммерция;C=инфо_отзывы
+        1:A(гео_город),2:B(коммерция),3:A,4:C(инфо_отзывы),5:B,6:A
 
-    Жёсткая проверка: длина разметки ДОЛЖНА равняться n_payloads.
-    Если не совпадает — это сдвиг позиций, разметку использовать нельзя,
-    возвращаем пусто + ошибка с деталями.
+    Каждая пара — это `НОМЕР:КОД` или `НОМЕР:КОД(ИМЯ)`.
+    Имя кластера указывается в скобках только при первом использовании кода;
+    при повторных использованиях — только буква.
 
-    Аргументы:
-        raw: сырой ответ от LLM.
-        n_payloads: ожидаемое количество хвостов = ожидаемая длина разметки.
+    Стратегия восстановления при ошибках:
+      - Код встречен без имени до того как был определён → unknown_code, хвост unassigned
+      - Битая пара (без `:`, без числа, без буквы) → пропуск с warning
+      - Дубль pid → берётся первое присвоение, warning
+      - Markdown-обёртка ``` → срезается
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
-    имеет вид {payload_id_str: cluster_name_str} с pid от '1' до 'n_payloads'.
+    имеет вид {payload_id_str: cluster_name_str}.
 
     Имя `parse_llm_json` сохранено ради совместимости с вызывающим кодом.
     """
@@ -51,135 +68,91 @@ def parse_llm_json(raw: str, n_payloads: int) -> tuple[dict, str | None]:
     if not s:
         return {}, 'Empty response'
 
-    # Разбиваем на непустые строки
-    lines = [ln.strip() for ln in s.replace('\r', '').split('\n') if ln.strip()]
-    if not lines:
-        return {}, 'No content lines in response'
+    # Удаляем переносы строк (формат должен быть одной строкой, но модель может
+    # пропустить эту инструкцию)
+    s = s.replace('\n', '').replace('\r', '').strip()
 
-    # Классифицируем строки.
-    # Признак легенды: содержит запись `БУКВА=`.
-    # Признак разметки: НЕ содержит '=', содержит хотя бы одну букву A-Z.
-    # Склеенный случай (модель забыла \n): всё в одной строке —
-    # разделим по `,БУКВА=`.
-    assignment_line: str | None = None
-    legend_line: str | None = None
-
-    has_legend_re = re.compile(r'\b[A-Z]+\s*=')
-
-    for ln in lines:
-        has_legend = bool(has_legend_re.search(ln))
-        # Разметка — строка БЕЗ '=' и с хотя бы одной A-Z буквой
-        if not has_legend and assignment_line is None and re.search(r'[A-Z]', ln):
-            assignment_line = ln
-            continue
-        if has_legend and legend_line is None:
-            # Может быть и склеенным случаем — обработаем ниже
-            if assignment_line is None:
-                # Это либо чистая легенда, либо склеенная разметка+легенда
-                # Попробуем найти границу по `,БУКВА=`
-                m = re.search(r',([A-Z]+\s*=)', ln)
-                if m:
-                    split_pos = m.start()
-                    assignment_line = ln[:split_pos]
-                    legend_line = ln[split_pos + 1:]
-                else:
-                    legend_line = ln
-            else:
-                legend_line = ln
-            continue
-
-    warnings: list[str] = []
-
-    # === Парсинг легенды ===
-    code_to_name: dict[str, str] = {}
-    duplicate_legend_codes: set[str] = set()
-
-    if legend_line:
-        # Разделитель — ';' (предпочтительно) или ',' как фолбэк
-        if ';' in legend_line:
-            entries = [e.strip() for e in legend_line.split(';') if e.strip()]
+    # Разбиваем по запятым на пары. ВАЖНО: запятая может быть внутри имени
+    # кластера в скобках, поэтому считаем глубину скобок.
+    pairs: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth = max(0, depth - 1)
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            if current:
+                pairs.append(''.join(current).strip())
+                current = []
         else:
-            entries = [e.strip() for e in legend_line.split(',') if e.strip()]
+            current.append(ch)
+    if current:
+        pairs.append(''.join(current).strip())
 
-        bad_legend_entries: list[str] = []
-        for entry in entries:
-            m = _LEGEND_ENTRY_RE.match(entry)
-            if not m:
-                bad_legend_entries.append(entry[:40])
-                continue
+    if not pairs:
+        return {}, 'No pairs found in response'
+
+    code_to_name: dict[str, str] = {}
+    pid_to_code: dict[str, str] = {}
+    bad_pairs: list[str] = []
+    duplicate_ids: set[str] = set()
+
+    for pair in pairs:
+        if not pair:
+            continue
+        colon_idx = pair.find(':')
+        if colon_idx == -1:
+            bad_pairs.append(pair[:40])
+            continue
+        pid = pair[:colon_idx].strip()
+        rest = pair[colon_idx + 1:].strip()
+        if not pid.isdigit() or not rest:
+            bad_pairs.append(pair[:40])
+            continue
+
+        # rest может быть либо `A` (только код), либо `A(имя_кластера)`
+        m = _CODE_WITH_NAME_RE.match(rest)
+        if m:
             code = m.group(1)
             name = m.group(2).strip()
-            if not name:
-                bad_legend_entries.append(entry[:40])
-                continue
-            if code in code_to_name:
-                duplicate_legend_codes.add(code)
-                continue
-            code_to_name[code] = name
-
-        if bad_legend_entries:
-            warnings.append(
-                f'Skipped {len(bad_legend_entries)} bad legend entry(s). '
-                f'First: {bad_legend_entries[0]!r}'
-            )
-        if duplicate_legend_codes:
-            warnings.append(
-                f'Duplicate legend codes: {sorted(duplicate_legend_codes)[:5]}'
-            )
-    else:
-        warnings.append('No legend line found')
-
-    # === Парсинг разметки ===
-    if not assignment_line:
-        return {}, 'No assignment line found'
-
-    # Разбиваем по запятым, тримим
-    raw_codes = [c.strip() for c in assignment_line.split(',') if c.strip()]
-
-    # Валидируем каждую запись — должна быть только буквой A-Z
-    codes: list[str] = []
-    bad_codes: list[str] = []
-    for c in raw_codes:
-        if _CODE_RE.match(c):
-            codes.append(c)
+            # Если код уже определён с другим именем — оставляем первое определение
+            if code not in code_to_name and name:
+                code_to_name[code] = name
         else:
-            bad_codes.append(c[:20])
+            # Только код без скобок: должна быть валидной буквенной группой A-Z
+            if not rest.isalpha() or not rest.isupper():
+                bad_pairs.append(pair[:40])
+                continue
+            code = rest
 
-    if bad_codes:
-        warnings.append(
-            f'Skipped {len(bad_codes)} bad code(s). First: {bad_codes[0]!r}'
-        )
+        if pid in pid_to_code:
+            duplicate_ids.add(pid)
+            continue
+        pid_to_code[pid] = code
 
-    # === ЖЁСТКАЯ ПРОВЕРКА ДЛИНЫ ===
-    if len(codes) != n_payloads:
-        return (
-            {},
-            f'Length mismatch: got {len(codes)} codes, expected {n_payloads}. '
-            f'Position shift detected — markup unusable. '
-            + ('; '.join(warnings) if warnings else '')
-        )
-
-    # === Соединение pos → code → cluster_name ===
-    if not code_to_name:
-        return (
-            {},
-            'No legend entries parsed — cannot resolve codes to names. '
-            + ('; '.join(warnings) if warnings else '')
-        )
-
+    # Преобразуем pid → code в pid → cluster_name через legend
     result: dict[str, str] = {}
     unknown_codes: set[str] = set()
-    for i, code in enumerate(codes, 1):
+    for pid, code in pid_to_code.items():
         cluster_name = code_to_name.get(code)
         if cluster_name is None:
             unknown_codes.add(code)
             continue
-        result[str(i)] = cluster_name
+        result[pid] = cluster_name
 
+    warnings: list[str] = []
     if unknown_codes:
-        warnings.append(
-            f'Codes used in markup but missing in legend: {sorted(unknown_codes)[:5]}'
-        )
+        warnings.append(f'Codes used without name definition: {sorted(unknown_codes)[:5]}')
+    if bad_pairs:
+        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if duplicate_ids:
+        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
+    if not code_to_name:
+        warnings.append('No legend entries (no code with name found)')
 
     if not result:
         return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
@@ -286,93 +259,369 @@ async def run_debug_payloads(light_search_result: dict) -> dict:
     }
 
 
+# ============================================================
+# C1 helpers: чанкинг, параллельный вызов с ретраем, merge имён
+# ============================================================
+
+def _chunk_payloads(payloads: list[str], size: int) -> list[list[str]]:
+    """Нарезает список хвостов на чанки фиксированного размера.
+    Последний чанк может быть короче."""
+    return [payloads[i:i + size] for i in range(0, len(payloads), size)]
+
+
+async def _call_chunk_with_retry(
+    chunk_idx: int,
+    chunk_payloads: list[str],
+    seed: str,
+    region: str,
+    language: str,
+    model: str,
+) -> dict:
+    """
+    Вызывает LLM для одного чанка с одним ретраем при ошибке.
+    Возвращает структуру с assignments (local pid → cluster_name) и диагностикой.
+
+    Никогда не бросает исключение — все ошибки упаковываются в поле 'error'.
+    """
+    diag = {
+        'chunk_idx': chunk_idx,
+        'tokens_in': 0,
+        'tokens_out': 0,
+        'api_time_sec': 0.0,
+        'json_parse_ok': False,
+        'clusters_count': 0,
+        'retries': 0,
+        'raw_response': '',
+        'parse_error': None,
+    }
+
+    system_prompt, user_prompt = build_prompts(
+        seed=seed,
+        region=region,
+        language=language,
+        payloads=chunk_payloads,
+    )
+
+    last_error: str | None = None
+    llm_result: dict | None = None
+    for attempt in range(CHUNK_MAX_RETRIES + 1):
+        diag['retries'] = attempt  # Записываем номер попытки независимо от исхода
+        try:
+            llm_result = await call_llm(model, system_prompt, user_prompt)
+            last_error = None
+            break
+        except Exception as e:
+            last_error = f'{type(e).__name__}: {e}'
+            if attempt < CHUNK_MAX_RETRIES:
+                await asyncio.sleep(CHUNK_RETRY_DELAY_SEC)
+
+    if llm_result is None:
+        return {
+            'chunk_idx': chunk_idx,
+            'assignments': {},
+            'diag': diag,
+            'error': f'LLM call failed after {CHUNK_MAX_RETRIES + 1} attempts: {last_error}',
+        }
+
+    diag['tokens_in'] = llm_result['tokens_in']
+    diag['tokens_out'] = llm_result['tokens_out']
+    diag['api_time_sec'] = llm_result['api_time_sec']
+    diag['raw_response'] = llm_result['raw_response']
+
+    # Парсим — формат тот же что в проде (1:A(имя),2:B,...)
+    assignments, parse_error = parse_llm_json(llm_result['raw_response'])
+    diag['json_parse_ok'] = parse_error is None
+    diag['parse_error'] = parse_error
+    diag['clusters_count'] = len(set(assignments.values())) if assignments else 0
+
+    return {
+        'chunk_idx': chunk_idx,
+        'assignments': assignments,
+        'diag': diag,
+        'error': None,
+    }
+
+
+async def _merge_cluster_names(
+    prefixed_names: list[str],
+    seed: str,
+    language: str,
+    merge_model: str,
+) -> tuple[dict[str, str], dict]:
+    """
+    Делает один LLM-вызов в дешёвую модель: группирует синонимы среди имён
+    кластеров, пришедших из разных чанков.
+
+    Args:
+        prefixed_names: список имён вида ['c0:цена_общая', 'c1:стоимость_имплантов', ...].
+        seed: исходный сид (для контекста модели).
+        language: язык (для имён).
+        merge_model: модель для merge-вызова (обычно flash-lite).
+
+    Returns:
+        (remap, meta) где
+          remap: dict prefixed_name → canonical_name
+          meta: {'tokens_in', 'tokens_out', 'cost_usd'}
+
+    Если LLM вернёт некорректный JSON — фолбэк: каждое имя само себе каноническое
+    (без префикса). Это означает merge не сработал, но пайплайн не падает.
+    """
+    # Уникализируем входной список (на всякий случай) с сохранением порядка
+    seen = set()
+    unique_names = []
+    for n in prefixed_names:
+        if n not in seen:
+            seen.add(n)
+            unique_names.append(n)
+
+    # Промпт: просим вернуть JSON-объект {prefixed_name: canonical_name}
+    # Каноническое имя — короткое (1-3 слова на нужном языке), без префикса.
+    sys_prompt = (
+        'Ты группируешь синонимичные названия кластеров поисковых запросов. '
+        'На вход — список названий с префиксом cN: (где N — номер чанка). '
+        'Названия из разных чанков, описывающие один и тот же интент, нужно '
+        'объединить под одним каноническим именем. Каноническое имя — короткое '
+        f'(1-3 слова на {language}), без префикса cN:.\n\n'
+        'Формат ответа — СТРОГО валидный JSON-объект, без markdown, без пояснений:\n'
+        '{"cN:исходное_имя": "каноническое_имя", ...}\n\n'
+        'Каждое исходное имя из входного списка должно присутствовать как ключ. '
+        'Синонимы получают ОДИНАКОВОЕ каноническое имя. Не-синонимы — РАЗНЫЕ.'
+    )
+    user_prompt = (
+        f'Сид: {seed}\n'
+        f'Язык: {language}\n\n'
+        f'Имена кластеров ({len(unique_names)}):\n'
+        + '\n'.join(unique_names)
+    )
+
+    llm_result = await call_llm(merge_model, sys_prompt, user_prompt)
+    cost = calc_cost(merge_model, llm_result['tokens_in'], llm_result['tokens_out'])
+    meta = {
+        'tokens_in': llm_result['tokens_in'],
+        'tokens_out': llm_result['tokens_out'],
+        'cost_usd': cost,
+    }
+
+    raw = llm_result['raw_response'].strip()
+    # Срезаем markdown
+    if raw.startswith('```'):
+        raw = raw.strip('`')
+        first_nl = raw.find('\n')
+        if first_nl != -1 and ' ' not in raw[:first_nl]:
+            raw = raw[first_nl + 1:]
+        raw = raw.strip()
+    # Иногда модель оборачивает в ```json
+    if raw.lower().startswith('json'):
+        raw = raw[4:].strip()
+
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError('merge response is not a JSON object')
+    except Exception:
+        # Фолбэк: каждое имя само себе каноническое (без префикса)
+        remap = {n: (n.split(':', 1)[1] if ':' in n else n) for n in unique_names}
+        return remap, meta
+
+    # Применяем remap. Если каких-то имён нет в ответе — фолбэк на их имя без префикса.
+    remap: dict[str, str] = {}
+    for n in unique_names:
+        canonical = parsed.get(n)
+        if isinstance(canonical, str) and canonical.strip():
+            remap[n] = canonical.strip()
+        else:
+            remap[n] = n.split(':', 1)[1] if ':' in n else n
+
+    return remap, meta
+
+
 async def run_clustering(
     light_search_result: dict,
     model: str,
 ) -> dict:
     """
-    Полный пайплайн: extract → LLM → expand.
+    Полный пайплайн (C1: chunked parallel + merge):
+      extract → 6 параллельных LLM вызовов → merge имён → expand.
     """
     t_total_start = time.time()
     inputs = extract_inputs_from_light_search(light_search_result)
     seed = inputs['seed']
     keywords = inputs['keywords']
-    
+    region = inputs['region']
+    language = inputs['language']
+
     # 1. Извлечение хвостов
     t0 = time.time()
     unique_payloads, payload_to_keywords = build_payload_mapping(keywords, seed)
     t_extract = time.time() - t0
-    
-    # 2. Промпт
-    system_prompt, user_prompt = build_prompts(
-        seed=seed,
-        region=inputs['region'],
-        language=inputs['language'],
-        payloads=unique_payloads,
-    )
-    
-    # 3. LLM
-    errors = []
-    try:
-        llm_result = await call_llm(model, system_prompt, user_prompt)
-    except Exception as e:
-        return {
-            'model': model,
-            'seed': seed,
-            'errors': [f'LLM call failed: {type(e).__name__}: {e}'],
-            'wall_time_sec': round(time.time() - t_total_start, 3),
-        }
-    
-    # 4. Парсинг JSON
-    assignments, parse_error = parse_llm_json(
-        llm_result['raw_response'],
-        n_payloads=len(unique_payloads),
-    )
-    json_parse_ok = parse_error is None
-    if parse_error:
-        errors.append(parse_error)
-    
-    # 5. Разворот на ключи
+
+    # 2. Нарезка на чанки
+    chunks = _chunk_payloads(unique_payloads, CHUNK_SIZE)
+
+    # 3. Параллельные LLM вызовы по всем чанкам
+    t_chunks_start = time.time()
+    chunk_tasks = [
+        _call_chunk_with_retry(
+            chunk_idx=i,
+            chunk_payloads=chunk,
+            seed=seed,
+            region=region,
+            language=language,
+            model=model,
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+    chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=False)
+    t_chunks = time.time() - t_chunks_start
+
+    # 4. Сборка глобального assignments (offset по индексам внутри чанка)
+    # и сбор всех уникальных имён кластеров с префиксом чанка.
+    global_assignments: dict[str, str] = {}  # global_pid → prefixed_name
+    all_prefixed_names: list[str] = []  # для merge-вызова
+    chunk_diag: list[dict] = []
+    chunk_errors: list[str] = []
+    failed_chunks = 0
+
+    for cr in chunk_results:
+        chunk_diag.append(cr['diag'])
+        if cr['error']:
+            chunk_errors.append(f"chunk {cr['chunk_idx']}: {cr['error']}")
+            failed_chunks += 1
+            continue
+
+        offset = cr['chunk_idx'] * CHUNK_SIZE
+        for local_pid, name in cr['assignments'].items():
+            prefixed = f"c{cr['chunk_idx']}:{name}"
+            if prefixed not in all_prefixed_names:
+                all_prefixed_names.append(prefixed)
+            global_pid = str(offset + int(local_pid))
+            global_assignments[global_pid] = prefixed
+
+    # 5. Merge имён кластеров через дешёвый LLM-вызов
+    t_merge_start = time.time()
+    merge_diag: dict = {
+        'attempted': False,
+        'names_before': len(all_prefixed_names),
+        'names_after': len(all_prefixed_names),
+        'merge_time_sec': 0.0,
+        'merge_tokens_in': 0,
+        'merge_tokens_out': 0,
+        'merge_cost_usd': 0.0,
+        'merge_error': None,
+    }
+    name_remap: dict[str, str] = {}  # prefixed_name → canonical_name
+    if len(all_prefixed_names) > 1:
+        merge_diag['attempted'] = True
+        try:
+            name_remap, merge_meta = await _merge_cluster_names(
+                prefixed_names=all_prefixed_names,
+                seed=seed,
+                language=language,
+                merge_model=MERGE_MODEL,
+            )
+            merge_diag['merge_tokens_in'] = merge_meta['tokens_in']
+            merge_diag['merge_tokens_out'] = merge_meta['tokens_out']
+            merge_diag['merge_cost_usd'] = merge_meta['cost_usd']
+            merge_diag['names_after'] = len(set(name_remap.values()))
+        except Exception as e:
+            merge_diag['merge_error'] = f'{type(e).__name__}: {e}'
+            # Фолбэк: каждое имя само себе каноническое (без чанк-префикса)
+            for n in all_prefixed_names:
+                name_remap[n] = n.split(':', 1)[1] if ':' in n else n
+    else:
+        # Один кластер на всё — нечего мерджить
+        for n in all_prefixed_names:
+            name_remap[n] = n.split(':', 1)[1] if ':' in n else n
+    merge_diag['merge_time_sec'] = round(time.time() - t_merge_start, 3)
+
+    # Применяем remap к global_assignments
+    final_assignments: dict[str, str] = {}
+    for gpid, prefixed in global_assignments.items():
+        final_assignments[gpid] = name_remap.get(
+            prefixed, prefixed.split(':', 1)[1] if ':' in prefixed else prefixed
+        )
+
+    # 6. Разворот на ключи
     cluster_to_keywords, unassigned = expand_clusters(
-        assignments, unique_payloads, payload_to_keywords,
+        final_assignments, unique_payloads, payload_to_keywords,
     )
-    
+
     cluster_sizes = {c: len(kws) for c, kws in cluster_to_keywords.items()}
     sorted_sizes = sorted(cluster_sizes.items(), key=lambda x: -x[1])
-    
-    cost = calc_cost(model, llm_result['tokens_in'], llm_result['tokens_out'])
+
+    # Агрегаты по чанкам
+    total_tokens_in = sum(d['tokens_in'] for d in chunk_diag) + merge_diag['merge_tokens_in']
+    total_tokens_out = sum(d['tokens_out'] for d in chunk_diag) + merge_diag['merge_tokens_out']
+    chunk_cost = sum(
+        calc_cost(model, d['tokens_in'], d['tokens_out']) for d in chunk_diag
+    )
+    total_cost = round(chunk_cost + merge_diag['merge_cost_usd'], 6)
+
+    chunk_api_times = [d['api_time_sec'] for d in chunk_diag]
+    max_chunk_api = max(chunk_api_times) if chunk_api_times else 0.0
+    json_parse_ok = all(d['json_parse_ok'] for d in chunk_diag) and not failed_chunks
+
     wall_time = time.time() - t_total_start
-    
     max_size = sorted_sizes[0][1] if sorted_sizes else 0
     max_pct = round(100 * max_size / len(keywords), 1) if keywords else 0
-    
+
+    # Собираем ошибки из всех источников
+    all_errors: list[str] = []
+    all_errors.extend(chunk_errors)
+    if merge_diag['merge_error']:
+        all_errors.append(f'merge: {merge_diag["merge_error"]}')
+    for d in chunk_diag:
+        if d.get('parse_error'):
+            all_errors.append(f"chunk {d['chunk_idx']} parse: {d['parse_error']}")
+
+    # Сырые ответы чанков для отладки
+    raw_responses = {
+        f'chunk_{d["chunk_idx"]}': d.get('raw_response', '')
+        for d in chunk_diag
+    }
+
     return {
         'model': model,
         'seed': seed,
-        'region': inputs['region'],
-        'language': inputs['language'],
-        
+        'region': region,
+        'language': language,
+
         'input_keywords_count': len(keywords),
         'unique_payloads_count': len(unique_payloads),
-        
+
         'clusters': cluster_to_keywords,
         'cluster_sizes': dict(sorted_sizes),
-        
+
         'metrics': {
             'wall_time_sec': round(wall_time, 3),
             'extract_time_sec': round(t_extract, 3),
-            'api_time_sec': llm_result['api_time_sec'],
-            'tokens_input': llm_result['tokens_in'],
-            'tokens_output': llm_result['tokens_out'],
-            'cost_usd': cost,
+            'chunks_phase_time_sec': round(t_chunks, 3),
+            'max_chunk_api_time_sec': round(max_chunk_api, 3),
+            'merge_time_sec': merge_diag['merge_time_sec'],
+            'api_time_sec': round(t_chunks + merge_diag['merge_time_sec'], 3),
+
+            'tokens_input': total_tokens_in,
+            'tokens_output': total_tokens_out,
+            'cost_usd': total_cost,
+
             'json_parse_ok': json_parse_ok,
             'clusters_count': len(cluster_to_keywords),
             'unassigned_keywords': unassigned,
             'max_cluster_size': max_size,
             'max_cluster_pct': max_pct,
-            'estimated_input_tokens': estimate_tokens(system_prompt + user_prompt),
+
+            # === C1-специфичная диагностика ===
+            'chunks_count': len(chunks),
+            'chunk_size': CHUNK_SIZE,
+            'failed_chunks': failed_chunks,
+            'chunk_api_times_sec': [round(t, 3) for t in chunk_api_times],
+            'chunk_tokens_in': [d['tokens_in'] for d in chunk_diag],
+            'chunk_tokens_out': [d['tokens_out'] for d in chunk_diag],
+            'chunk_clusters_count': [d.get('clusters_count', 0) for d in chunk_diag],
+            'chunk_retries': [d.get('retries', 0) for d in chunk_diag],
+            'merge_diag': merge_diag,
         },
-        
-        'raw_llm_response': llm_result['raw_response'],
-        'errors': errors,
+
+        'raw_llm_responses_per_chunk': raw_responses,
+        'errors': all_errors,
     }
