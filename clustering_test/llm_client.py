@@ -31,6 +31,11 @@ class ModelConfig:
     #   gemini-2.5-flash:      thinking on by default → 0 чтобы выключить, иначе медленнее
     #   gemini-2.5-pro:        thinking ВСЕГДА on, нельзя 0 → минимум 128, максимум 32768, или -1 (dynamic)
     thinking_budget: int | None = None
+    # Gemini thinking_level: новый параметр для 3.x моделей. None = не передавать (default high).
+    # Допустимые значения: 'minimal' | 'low' | 'medium' | 'high'.
+    # Для аналога thinking_budget=0 в 2.5 → используй thinking_level='minimal'.
+    # ВАЖНО: нельзя одновременно с thinking_budget — модель отбьёт запрос. Используй ровно один.
+    thinking_level: str | None = None
 
 
 MODELS: dict[str, ModelConfig] = {
@@ -57,6 +62,33 @@ MODELS: dict[str, ModelConfig] = {
         input_per_1m=1.25,
         output_per_1m=10.00,
         thinking_budget=128,  # минимум для pro (нельзя 0); 128-32768 диапазон, или -1 для dynamic
+    ),
+    # ── Gemini 3.x · preview, используют thinking_level вместо thinking_budget ──
+    # API field: thinkingConfig.thinkingLevel = 'minimal'|'low'|'medium'|'high' (default: 'high').
+    # Для скорости ставим 'minimal' — аналог thinking_budget=0 в 2.5 series.
+    'gemini-3.1-flash-lite-preview': ModelConfig(
+        name='gemini-3.1-flash-lite-preview',
+        provider='gemini',
+        api_model='gemini-3.1-flash-lite-preview',
+        input_per_1m=0.25,
+        output_per_1m=1.50,
+        thinking_level='minimal',
+    ),
+    'gemini-3-flash-preview': ModelConfig(
+        name='gemini-3-flash-preview',
+        provider='gemini',
+        api_model='gemini-3-flash-preview',
+        input_per_1m=0.50,
+        output_per_1m=3.00,
+        thinking_level='minimal',
+    ),
+    'gemini-3.1-pro-preview': ModelConfig(
+        name='gemini-3.1-pro-preview',
+        provider='gemini',
+        api_model='gemini-3.1-pro-preview',
+        input_per_1m=2.00,
+        output_per_1m=12.00,
+        thinking_level='minimal',  # минимум для скорости, иначе reasoning будет долгим
     ),
     # ── OpenAI · non-reasoning (reasoning_effort не передаём) ─────────
     'gpt-4.1-nano': ModelConfig(
@@ -189,7 +221,19 @@ async def call_gemini(
             'temperature': 0,
         },
     }
-    if cfg.thinking_budget is not None:
+    # thinking_budget (старый, 2.5 series) и thinking_level (новый, 3.x series) —
+    # взаимоисключающие. Передаём ровно один. Если конфиг содержит оба —
+    # это ошибка конфигурации, отбиваем явно.
+    if cfg.thinking_budget is not None and cfg.thinking_level is not None:
+        raise ValueError(
+            f'Model {cfg.name}: cannot use thinking_budget and thinking_level '
+            f'simultaneously. Use one of them.'
+        )
+    if cfg.thinking_level is not None:
+        payload['generationConfig']['thinkingConfig'] = {
+            'thinkingLevel': cfg.thinking_level,
+        }
+    elif cfg.thinking_budget is not None:
         payload['generationConfig']['thinkingConfig'] = {
             'thinkingBudget': cfg.thinking_budget,
         }
