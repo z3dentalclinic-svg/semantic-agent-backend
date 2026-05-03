@@ -2,7 +2,6 @@
 Runner: оркестрирует пайплайн extract → validate → LLM → expand.
 """
 import json
-import re
 import time
 from collections import Counter
 
@@ -12,26 +11,23 @@ from .prompts import build_prompts
 from .llm_client import call_llm, calc_cost
 
 
-# Регулярка для пары вида `A(имя_кластера)`: захватывает код и имя.
-# Имя может содержать кириллицу, латиницу, цифры, подчёркивания, пробелы, дефисы.
-_CODE_WITH_NAME_RE = re.compile(r'^([A-Z]+)\(([^)]+)\)$')
-
-
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит динамический однострочный формат:
+    Парсит инвертированный формат ответа модели:
 
-        1:A(гео_город),2:B(коммерция),3:A,4:C(инфо_отзывы),5:B,6:A
+        гео:1,4,6,12,15
+        цена:2,5,11,37
+        бренд_сервис:3,7,9
 
-    Каждая пара — это `НОМЕР:КОД` или `НОМЕР:КОД(ИМЯ)`.
-    Имя кластера указывается в скобках только при первом использовании кода;
-    при повторных использованиях — только буква.
+    Каждая строка — один кластер. Формат: `имя_кластера:номер,номер,...`
+    - Имя кластера: произвольная строка без `:` (в основном кириллица + `_`)
+    - Номера: целые числа через запятую без пробелов
 
     Стратегия восстановления при ошибках:
-      - Код встречен без имени до того как был определён → unknown_code, хвост unassigned
-      - Битая пара (без `:`, без числа, без буквы) → пропуск с warning
-      - Дубль pid → берётся первое присвоение, warning
-      - Markdown-обёртка ``` → срезается
+      - Дубль pid (хвост в двух кластерах) → берём первое присвоение, warning
+      - Невалидный токен в списке номеров → пропуск с warning
+      - Строка без `:` или с пустым именем → пропуск с warning
+      - Пустое имя кластера → пропуск с warning
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
     имеет вид {payload_id_str: cluster_name_str}.
@@ -50,91 +46,53 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     if not s:
         return {}, 'Empty response'
 
-    # Удаляем переносы строк (формат должен быть одной строкой, но модель может
-    # пропустить эту инструкцию)
-    s = s.replace('\n', '').replace('\r', '').strip()
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if not lines:
+        return {}, 'No non-empty lines in response'
 
-    # Разбиваем по запятым на пары. ВАЖНО: запятая может быть внутри имени
-    # кластера в скобках, поэтому считаем глубину скобок.
-    pairs: list[str] = []
-    current: list[str] = []
-    depth = 0
-    for ch in s:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth = max(0, depth - 1)
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            if current:
-                pairs.append(''.join(current).strip())
-                current = []
-        else:
-            current.append(ch)
-    if current:
-        pairs.append(''.join(current).strip())
-
-    if not pairs:
-        return {}, 'No pairs found in response'
-
-    code_to_name: dict[str, str] = {}
-    pid_to_code: dict[str, str] = {}
-    bad_pairs: list[str] = []
-    duplicate_ids: set[str] = set()
-
-    for pair in pairs:
-        if not pair:
-            continue
-        colon_idx = pair.find(':')
-        if colon_idx == -1:
-            bad_pairs.append(pair[:40])
-            continue
-        pid = pair[:colon_idx].strip()
-        rest = pair[colon_idx + 1:].strip()
-        if not pid.isdigit() or not rest:
-            bad_pairs.append(pair[:40])
-            continue
-
-        # rest может быть либо `A` (только код), либо `A(имя_кластера)`
-        m = _CODE_WITH_NAME_RE.match(rest)
-        if m:
-            code = m.group(1)
-            name = m.group(2).strip()
-            # Если код уже определён с другим именем — оставляем первое определение
-            if code not in code_to_name and name:
-                code_to_name[code] = name
-        else:
-            # Только код без скобок: должна быть валидной буквенной группой A-Z
-            if not rest.isalpha() or not rest.isupper():
-                bad_pairs.append(pair[:40])
-                continue
-            code = rest
-
-        if pid in pid_to_code:
-            duplicate_ids.add(pid)
-            continue
-        pid_to_code[pid] = code
-
-    # Преобразуем pid → code в pid → cluster_name через legend
     result: dict[str, str] = {}
-    unknown_codes: set[str] = set()
-    for pid, code in pid_to_code.items():
-        cluster_name = code_to_name.get(code)
-        if cluster_name is None:
-            unknown_codes.add(code)
+    duplicate_ids: set[str] = set()
+    bad_tokens: list[str] = []
+    bad_lines: list[str] = []
+    empty_clusters = 0
+
+    for line in lines:
+        colon_idx = line.find(':')
+        if colon_idx == -1:
+            bad_lines.append(line[:60])
             continue
-        result[pid] = cluster_name
+        cluster_name = line[:colon_idx].strip()
+        pids_part = line[colon_idx + 1:].strip()
+        if not cluster_name:
+            bad_lines.append(line[:60])
+            continue
+        if not pids_part:
+            empty_clusters += 1
+            continue
+
+        for tok in pids_part.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if not tok.isdigit():
+                bad_tokens.append(tok[:20])
+                continue
+            pid = tok  # храним как строку для совместимости с expand_clusters
+            if pid in result:
+                duplicate_ids.add(pid)
+                continue
+            result[pid] = cluster_name
 
     warnings: list[str] = []
-    if unknown_codes:
-        warnings.append(f'Codes used without name definition: {sorted(unknown_codes)[:5]}')
-    if bad_pairs:
-        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if bad_lines:
+        warnings.append(f'Skipped {len(bad_lines)} bad line(s). First: {bad_lines[0]!r}')
+    if bad_tokens:
+        warnings.append(f'Skipped {len(bad_tokens)} bad token(s). First: {bad_tokens[0]!r}')
     if duplicate_ids:
-        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
-    if not code_to_name:
-        warnings.append('No legend entries (no code with name found)')
+        sample = sorted(duplicate_ids, key=lambda x: int(x))[:5]
+        warnings.append(f'{len(duplicate_ids)} duplicate pid(s). First: {sample}')
+    if empty_clusters:
+        warnings.append(f'{empty_clusters} cluster(s) with empty payload list')
 
     if not result:
         return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
