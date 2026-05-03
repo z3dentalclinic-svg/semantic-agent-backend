@@ -12,35 +12,26 @@ from .prompts import build_prompts
 from .llm_client import call_llm, calc_cost
 
 
-# Регулярка для пары вида `НОМЕР:КОД` (где КОД — буква A-Z, обычно одна).
-_PAIR_RE = re.compile(r'^(\d+):([A-Z]+)$')
-
-# Регулярка для записи легенды `КОД=имя кластера`.
-# Имя — любые непустые символы до конца записи.
-_LEGEND_ENTRY_RE = re.compile(r'^([A-Z]+)\s*=\s*(.+)$')
+# Регулярка для пары вида `A(имя_кластера)`: захватывает код и имя.
+# Имя может содержать кириллицу, латиницу, цифры, подчёркивания, пробелы, дефисы.
+_CODE_WITH_NAME_RE = re.compile(r'^([A-Z]+)\(([^)]+)\)$')
 
 
 def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     """
-    Парсит двухстрочный формат A2: сначала разметка, потом легенда.
+    Парсит динамический однострочный формат:
 
-        1:A,2:B,3:A,4:C,5:B,6:A
-        A=гео_город;B=коммерция;C=инфо_отзывы
+        1:A(гео_город),2:B(коммерция),3:A,4:C(инфо_отзывы),5:B,6:A
 
-    Стратегия:
-      - Срезаем markdown-обёртку ``` если есть.
-      - Разбиваем ответ на непустые строки.
-      - Строка-разметка: содержит пары `N:БУКВА` через запятую (НЕ содержит '=').
-      - Строка-легенда: содержит `БУКВА=имя` через ';' (или ',' как фолбэк).
-        Распознаётся по наличию '=' в строке.
-      - Если модель прислала всё одной строкой (склеенный формат) — пытаемся
-        разделить по первому символу '=' назад до ближайшего токена `БУКВА`.
+    Каждая пара — это `НОМЕР:КОД` или `НОМЕР:КОД(ИМЯ)`.
+    Имя кластера указывается в скобках только при первом использовании кода;
+    при повторных использованиях — только буква.
 
-    Восстановление при ошибках:
-      - Битая пара → пропуск с warning.
-      - Код в разметке без записи в легенде → unassigned для этих pid + warning.
-      - Дубль pid → первое присвоение, warning.
-      - Дубль кода в легенде → первое определение, warning.
+    Стратегия восстановления при ошибках:
+      - Код встречен без имени до того как был определён → unknown_code, хвост unassigned
+      - Битая пара (без `:`, без числа, без буквы) → пропуск с warning
+      - Дубль pid → берётся первое присвоение, warning
+      - Markdown-обёртка ``` → срезается
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
     имеет вид {payload_id_str: cluster_name_str}.
@@ -59,133 +50,73 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     if not s:
         return {}, 'Empty response'
 
-    # Разбиваем на непустые строки
-    lines = [ln.strip() for ln in s.replace('\r', '').split('\n') if ln.strip()]
-    if not lines:
-        return {}, 'No content lines in response'
+    # Удаляем переносы строк (формат должен быть одной строкой, но модель может
+    # пропустить эту инструкцию)
+    s = s.replace('\n', '').replace('\r', '').strip()
 
-    # Классифицируем строки.
-    # Признак разметки: строка содержит хотя бы одну пару `N:БУКВА`.
-    # Признак легенды: строка содержит запись `БУКВА=`, и НЕ содержит пар `N:`.
-    # Склеенный случай: строка содержит и пары и записи легенды → разметка
-    # с последующим фолбэк-разделением.
-    assignment_line: str | None = None
-    legend_line: str | None = None
-
-    has_pair_re = re.compile(r'\b\d+:[A-Z]')
-    has_legend_re = re.compile(r'\b[A-Z]+\s*=')
-
-    for ln in lines:
-        has_pair = bool(has_pair_re.search(ln))
-        has_legend = bool(has_legend_re.search(ln))
-
-        if has_pair and assignment_line is None:
-            # Строка с парами — это разметка (возможно со склеенной легендой)
-            assignment_line = ln
-            continue
-        if has_legend and legend_line is None:
-            legend_line = ln
-            continue
-
-    # Фолбэк: если ничего не классифицировалось — пытаемся работать с первой строкой
-    if assignment_line is None and legend_line is None:
-        assignment_line = lines[0]
-
-    # Фолбэк склейки: если в строке-разметке есть '=' — это значит модель
-    # склеила всё в одну строку. Разделим по первой букве, после которой идёт '=',
-    # отделённой от предыдущей пары.
-    if assignment_line and '=' in assignment_line and legend_line is None:
-        # Ищем границу: точка где заканчивается разметка и начинается легенда.
-        # Разметка состоит из токенов `N:БУКВА` через запятую.
-        # Легенда начинается с `БУКВА=...`.
-        # Граница — первый матч `,БУКВА=` или начало строки `БУКВА=`.
-        m = re.search(r',([A-Z]+=)', assignment_line)
-        if m:
-            split_pos = m.start()
-            legend_line = assignment_line[split_pos + 1:]
-            assignment_line = assignment_line[:split_pos]
+    # Разбиваем по запятым на пары. ВАЖНО: запятая может быть внутри имени
+    # кластера в скобках, поэтому считаем глубину скобок.
+    pairs: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth = max(0, depth - 1)
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            if current:
+                pairs.append(''.join(current).strip())
+                current = []
         else:
-            # Совсем странный случай: '=' есть но не в виде `,БУКВА=`.
-            # Оставляем как есть, парсер пар отбракует.
-            pass
+            current.append(ch)
+    if current:
+        pairs.append(''.join(current).strip())
 
-    warnings: list[str] = []
+    if not pairs:
+        return {}, 'No pairs found in response'
 
-    # === Парсинг легенды ===
     code_to_name: dict[str, str] = {}
-    duplicate_legend_codes: set[str] = set()
-
-    if legend_line:
-        # Разделитель — ';' (предпочтительно) или ',' как фолбэк
-        if ';' in legend_line:
-            entries = [e.strip() for e in legend_line.split(';') if e.strip()]
-        else:
-            entries = [e.strip() for e in legend_line.split(',') if e.strip()]
-
-        bad_legend_entries: list[str] = []
-        for entry in entries:
-            m = _LEGEND_ENTRY_RE.match(entry)
-            if not m:
-                bad_legend_entries.append(entry[:40])
-                continue
-            code = m.group(1)
-            name = m.group(2).strip()
-            if not name:
-                bad_legend_entries.append(entry[:40])
-                continue
-            if code in code_to_name:
-                duplicate_legend_codes.add(code)
-                continue
-            code_to_name[code] = name
-
-        if bad_legend_entries:
-            warnings.append(
-                f'Skipped {len(bad_legend_entries)} bad legend entry(s). '
-                f'First: {bad_legend_entries[0]!r}'
-            )
-        if duplicate_legend_codes:
-            warnings.append(
-                f'Duplicate legend codes: {sorted(duplicate_legend_codes)[:5]}'
-            )
-
-    if not code_to_name:
-        warnings.append('No legend entries parsed')
-
-    # === Парсинг разметки ===
     pid_to_code: dict[str, str] = {}
     bad_pairs: list[str] = []
     duplicate_ids: set[str] = set()
 
-    if assignment_line:
-        # Разбиваем по запятым (никаких скобок здесь нет, простой split)
-        pairs = [p.strip() for p in assignment_line.split(',') if p.strip()]
+    for pair in pairs:
+        if not pair:
+            continue
+        colon_idx = pair.find(':')
+        if colon_idx == -1:
+            bad_pairs.append(pair[:40])
+            continue
+        pid = pair[:colon_idx].strip()
+        rest = pair[colon_idx + 1:].strip()
+        if not pid.isdigit() or not rest:
+            bad_pairs.append(pair[:40])
+            continue
 
-        for pair in pairs:
-            m = _PAIR_RE.match(pair)
-            if not m:
+        # rest может быть либо `A` (только код), либо `A(имя_кластера)`
+        m = _CODE_WITH_NAME_RE.match(rest)
+        if m:
+            code = m.group(1)
+            name = m.group(2).strip()
+            # Если код уже определён с другим именем — оставляем первое определение
+            if code not in code_to_name and name:
+                code_to_name[code] = name
+        else:
+            # Только код без скобок: должна быть валидной буквенной группой A-Z
+            if not rest.isalpha() or not rest.isupper():
                 bad_pairs.append(pair[:40])
                 continue
-            pid = m.group(1)
-            code = m.group(2)
+            code = rest
 
-            if pid in pid_to_code:
-                duplicate_ids.add(pid)
-                continue
-            pid_to_code[pid] = code
+        if pid in pid_to_code:
+            duplicate_ids.add(pid)
+            continue
+        pid_to_code[pid] = code
 
-        if bad_pairs:
-            warnings.append(
-                f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}'
-            )
-        if duplicate_ids:
-            warnings.append(
-                f'Duplicate payload ids: '
-                f'{sorted(duplicate_ids, key=lambda x: int(x))[:5]}'
-            )
-    else:
-        warnings.append('No assignment line found')
-
-    # === Соединение pid → code → cluster_name ===
+    # Преобразуем pid → code в pid → cluster_name через legend
     result: dict[str, str] = {}
     unknown_codes: set[str] = set()
     for pid, code in pid_to_code.items():
@@ -195,10 +126,15 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
             continue
         result[pid] = cluster_name
 
+    warnings: list[str] = []
     if unknown_codes:
-        warnings.append(
-            f'Codes used in markup but missing in legend: {sorted(unknown_codes)[:5]}'
-        )
+        warnings.append(f'Codes used without name definition: {sorted(unknown_codes)[:5]}')
+    if bad_pairs:
+        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
+    if duplicate_ids:
+        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
+    if not code_to_name:
+        warnings.append('No legend entries (no code with name found)')
 
     if not result:
         return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
