@@ -88,7 +88,7 @@ MODELS: dict[str, ModelConfig] = {
         api_model='gemini-3.1-pro-preview',
         input_per_1m=2.00,
         output_per_1m=12.00,
-        thinking_level='minimal',  # минимум для скорости, иначе reasoning будет долгим
+        thinking_level='low',  # для pro поддерживаются только low/medium/high; 'minimal' даёт 400
     ),
     # ── OpenAI · non-reasoning (reasoning_effort не передаём) ─────────
     'gpt-4.1-nano': ModelConfig(
