@@ -12,29 +12,30 @@ from .prompts import build_prompts
 from .llm_client import call_llm, calc_cost
 
 
-# Регулярка для пары вида `A(имя_кластера)`: захватывает код и имя.
-# Имя может содержать кириллицу, латиницу, цифры, подчёркивания, пробелы, дефисы.
-_CODE_WITH_NAME_RE = re.compile(r'^([A-Z]+)\(([^)]+)\)$')
+# Регулярка для одной буквы кода (одна или несколько A-Z подряд).
+_CODE_RE = re.compile(r'^[A-Z]+$')
+
+# Регулярка для записи легенды `КОД=имя кластера`.
+_LEGEND_ENTRY_RE = re.compile(r'^([A-Z]+)\s*=\s*(.+)$')
 
 
-def parse_llm_json(raw: str) -> tuple[dict, str | None]:
+def parse_llm_json(raw: str, n_payloads: int) -> tuple[dict, str | None]:
     """
-    Парсит динамический однострочный формат:
+    Парсит формат Path 4: чистая разметка буквами + легенда.
 
-        1:A(гео_город),2:B(коммерция),3:A,4:C(инфо_отзывы),5:B,6:A
+        A,B,A,C,B,A
+        A=гео_город;B=коммерция;C=инфо_отзывы
 
-    Каждая пара — это `НОМЕР:КОД` или `НОМЕР:КОД(ИМЯ)`.
-    Имя кластера указывается в скобках только при первом использовании кода;
-    при повторных использованиях — только буква.
+    Жёсткая проверка: длина разметки ДОЛЖНА равняться n_payloads.
+    Если не совпадает — это сдвиг позиций, разметку использовать нельзя,
+    возвращаем пусто + ошибка с деталями.
 
-    Стратегия восстановления при ошибках:
-      - Код встречен без имени до того как был определён → unknown_code, хвост unassigned
-      - Битая пара (без `:`, без числа, без буквы) → пропуск с warning
-      - Дубль pid → берётся первое присвоение, warning
-      - Markdown-обёртка ``` → срезается
+    Аргументы:
+        raw: сырой ответ от LLM.
+        n_payloads: ожидаемое количество хвостов = ожидаемая длина разметки.
 
     Возвращает (assignments_dict, error_msg) где assignments_dict
-    имеет вид {payload_id_str: cluster_name_str}.
+    имеет вид {payload_id_str: cluster_name_str} с pid от '1' до 'n_payloads'.
 
     Имя `parse_llm_json` сохранено ради совместимости с вызывающим кодом.
     """
@@ -50,91 +51,135 @@ def parse_llm_json(raw: str) -> tuple[dict, str | None]:
     if not s:
         return {}, 'Empty response'
 
-    # Удаляем переносы строк (формат должен быть одной строкой, но модель может
-    # пропустить эту инструкцию)
-    s = s.replace('\n', '').replace('\r', '').strip()
+    # Разбиваем на непустые строки
+    lines = [ln.strip() for ln in s.replace('\r', '').split('\n') if ln.strip()]
+    if not lines:
+        return {}, 'No content lines in response'
 
-    # Разбиваем по запятым на пары. ВАЖНО: запятая может быть внутри имени
-    # кластера в скобках, поэтому считаем глубину скобок.
-    pairs: list[str] = []
-    current: list[str] = []
-    depth = 0
-    for ch in s:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth = max(0, depth - 1)
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            if current:
-                pairs.append(''.join(current).strip())
-                current = []
-        else:
-            current.append(ch)
-    if current:
-        pairs.append(''.join(current).strip())
+    # Классифицируем строки.
+    # Признак легенды: содержит запись `БУКВА=`.
+    # Признак разметки: НЕ содержит '=', содержит хотя бы одну букву A-Z.
+    # Склеенный случай (модель забыла \n): всё в одной строке —
+    # разделим по `,БУКВА=`.
+    assignment_line: str | None = None
+    legend_line: str | None = None
 
-    if not pairs:
-        return {}, 'No pairs found in response'
+    has_legend_re = re.compile(r'\b[A-Z]+\s*=')
 
+    for ln in lines:
+        has_legend = bool(has_legend_re.search(ln))
+        # Разметка — строка БЕЗ '=' и с хотя бы одной A-Z буквой
+        if not has_legend and assignment_line is None and re.search(r'[A-Z]', ln):
+            assignment_line = ln
+            continue
+        if has_legend and legend_line is None:
+            # Может быть и склеенным случаем — обработаем ниже
+            if assignment_line is None:
+                # Это либо чистая легенда, либо склеенная разметка+легенда
+                # Попробуем найти границу по `,БУКВА=`
+                m = re.search(r',([A-Z]+\s*=)', ln)
+                if m:
+                    split_pos = m.start()
+                    assignment_line = ln[:split_pos]
+                    legend_line = ln[split_pos + 1:]
+                else:
+                    legend_line = ln
+            else:
+                legend_line = ln
+            continue
+
+    warnings: list[str] = []
+
+    # === Парсинг легенды ===
     code_to_name: dict[str, str] = {}
-    pid_to_code: dict[str, str] = {}
-    bad_pairs: list[str] = []
-    duplicate_ids: set[str] = set()
+    duplicate_legend_codes: set[str] = set()
 
-    for pair in pairs:
-        if not pair:
-            continue
-        colon_idx = pair.find(':')
-        if colon_idx == -1:
-            bad_pairs.append(pair[:40])
-            continue
-        pid = pair[:colon_idx].strip()
-        rest = pair[colon_idx + 1:].strip()
-        if not pid.isdigit() or not rest:
-            bad_pairs.append(pair[:40])
-            continue
+    if legend_line:
+        # Разделитель — ';' (предпочтительно) или ',' как фолбэк
+        if ';' in legend_line:
+            entries = [e.strip() for e in legend_line.split(';') if e.strip()]
+        else:
+            entries = [e.strip() for e in legend_line.split(',') if e.strip()]
 
-        # rest может быть либо `A` (только код), либо `A(имя_кластера)`
-        m = _CODE_WITH_NAME_RE.match(rest)
-        if m:
+        bad_legend_entries: list[str] = []
+        for entry in entries:
+            m = _LEGEND_ENTRY_RE.match(entry)
+            if not m:
+                bad_legend_entries.append(entry[:40])
+                continue
             code = m.group(1)
             name = m.group(2).strip()
-            # Если код уже определён с другим именем — оставляем первое определение
-            if code not in code_to_name and name:
-                code_to_name[code] = name
-        else:
-            # Только код без скобок: должна быть валидной буквенной группой A-Z
-            if not rest.isalpha() or not rest.isupper():
-                bad_pairs.append(pair[:40])
+            if not name:
+                bad_legend_entries.append(entry[:40])
                 continue
-            code = rest
+            if code in code_to_name:
+                duplicate_legend_codes.add(code)
+                continue
+            code_to_name[code] = name
 
-        if pid in pid_to_code:
-            duplicate_ids.add(pid)
-            continue
-        pid_to_code[pid] = code
+        if bad_legend_entries:
+            warnings.append(
+                f'Skipped {len(bad_legend_entries)} bad legend entry(s). '
+                f'First: {bad_legend_entries[0]!r}'
+            )
+        if duplicate_legend_codes:
+            warnings.append(
+                f'Duplicate legend codes: {sorted(duplicate_legend_codes)[:5]}'
+            )
+    else:
+        warnings.append('No legend line found')
 
-    # Преобразуем pid → code в pid → cluster_name через legend
+    # === Парсинг разметки ===
+    if not assignment_line:
+        return {}, 'No assignment line found'
+
+    # Разбиваем по запятым, тримим
+    raw_codes = [c.strip() for c in assignment_line.split(',') if c.strip()]
+
+    # Валидируем каждую запись — должна быть только буквой A-Z
+    codes: list[str] = []
+    bad_codes: list[str] = []
+    for c in raw_codes:
+        if _CODE_RE.match(c):
+            codes.append(c)
+        else:
+            bad_codes.append(c[:20])
+
+    if bad_codes:
+        warnings.append(
+            f'Skipped {len(bad_codes)} bad code(s). First: {bad_codes[0]!r}'
+        )
+
+    # === ЖЁСТКАЯ ПРОВЕРКА ДЛИНЫ ===
+    if len(codes) != n_payloads:
+        return (
+            {},
+            f'Length mismatch: got {len(codes)} codes, expected {n_payloads}. '
+            f'Position shift detected — markup unusable. '
+            + ('; '.join(warnings) if warnings else '')
+        )
+
+    # === Соединение pos → code → cluster_name ===
+    if not code_to_name:
+        return (
+            {},
+            'No legend entries parsed — cannot resolve codes to names. '
+            + ('; '.join(warnings) if warnings else '')
+        )
+
     result: dict[str, str] = {}
     unknown_codes: set[str] = set()
-    for pid, code in pid_to_code.items():
+    for i, code in enumerate(codes, 1):
         cluster_name = code_to_name.get(code)
         if cluster_name is None:
             unknown_codes.add(code)
             continue
-        result[pid] = cluster_name
+        result[str(i)] = cluster_name
 
-    warnings: list[str] = []
     if unknown_codes:
-        warnings.append(f'Codes used without name definition: {sorted(unknown_codes)[:5]}')
-    if bad_pairs:
-        warnings.append(f'Skipped {len(bad_pairs)} bad pair(s). First: {bad_pairs[0]!r}')
-    if duplicate_ids:
-        warnings.append(f'Duplicate payload ids: {sorted(duplicate_ids, key=lambda x: int(x))[:5]}')
-    if not code_to_name:
-        warnings.append('No legend entries (no code with name found)')
+        warnings.append(
+            f'Codes used in markup but missing in legend: {sorted(unknown_codes)[:5]}'
+        )
 
     if not result:
         return {}, '; '.join(warnings) if warnings else 'No valid assignments parsed'
@@ -279,7 +324,10 @@ async def run_clustering(
         }
     
     # 4. Парсинг JSON
-    assignments, parse_error = parse_llm_json(llm_result['raw_response'])
+    assignments, parse_error = parse_llm_json(
+        llm_result['raw_response'],
+        n_payloads=len(unique_payloads),
+    )
     json_parse_ok = parse_error is None
     if parse_error:
         errors.append(parse_error)
