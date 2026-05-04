@@ -212,3 +212,57 @@ def get_category_detector() -> CategoryMismatchDetector:
 def detect_category_mismatch(seed: str, tail: str) -> Tuple[bool, str]:
     """Функция для вызова из L0. Интерфейс не изменился."""
     return get_category_detector().detect_mismatch(seed, tail)
+
+
+def warmup() -> bool:
+    """
+    Принудительная загрузка MiniLM при старте сервера.
+
+    Без warmup() модель грузится лениво при первом вызове pre_batch() —
+    это даёт +8 секунд на первый запрос после старта/простоя. После 30
+    минут idle некоторые runtime'ы выгружают модель из памяти, и снова
+    «холодный старт».
+
+    warmup() вызывается:
+      1. На import модуля (см. блок ниже) — гарантированная загрузка
+         сразу когда L0-пайплайн готов к работе.
+      2. По желанию из startup-хука FastAPI.
+
+    Делает один синтетический embed на коротком слове — это достаточно
+    чтобы FastEmbed/SentenceTransformer полностью инициализировал модель
+    (загрузил веса, скомпилировал ONNX runtime, подготовил токенайзер).
+
+    Returns:
+        True если модель успешно загружена, False при ошибке (warmup
+        никогда не валит импорт — мы только логируем).
+    """
+    try:
+        det = get_category_detector()
+        model = det._get_model()
+        if model is None:
+            logger.warning("[CategoryMismatch] warmup: model unavailable")
+            return False
+        # Один синтетический embed форсирует полную инициализацию.
+        # Сохраняем результат в seed_embedding_cache как побочный эффект —
+        # в реальной работе этот ключ не пересечётся с настоящими seeds.
+        embs = list(model.embed(["warmup"]))
+        if embs:
+            logger.info("[CategoryMismatch] warmup: model loaded (dim=%d)", len(embs[0]))
+            return True
+        logger.warning("[CategoryMismatch] warmup: empty embed result")
+        return False
+    except Exception as e:
+        logger.warning("[CategoryMismatch] warmup failed: %s", e)
+        return False
+
+
+# ============================================================
+# Eager инициализация при импорте модуля.
+# Цель: исключить ленивую загрузку MiniLM на первый запрос пользователя.
+# Без этого первый запрос после старта сервера или простоя даёт +8 секунд.
+#
+# Безопасность: warmup() обёрнут в try/except и не валит импорт даже если
+# модель недоступна. В этом случае поведение возвращается к ленивому
+# (как было раньше).
+# ============================================================
+warmup()
