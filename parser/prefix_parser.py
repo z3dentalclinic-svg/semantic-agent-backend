@@ -549,7 +549,11 @@ class PrefixParser:
 
         # Семафор для research — параллелизм по всему пулу
         # (не на IP — на общий пул, чтобы не задавить локальную сеть)
-        research_sem = asyncio.Semaphore(max(BATCH_SIZE, len(research_clients) // 2))
+        # research_sem = 10 — фиксированный лимит параллельных research запросов.
+        # Webshare прокси не выдерживают залп 20+ запросов одновременно (отдают 500).
+        # При 42 IP в пуле и 10 параллельных запросов: каждый IP получает запрос
+        # редко, прокси не перегружаются. Прогон дольше (~10-15 мин), но стабильно.
+        research_sem = asyncio.Semaphore(10)
 
         async def run_research(pq: PrefixQuery, agent: str, idx: int):
             """
