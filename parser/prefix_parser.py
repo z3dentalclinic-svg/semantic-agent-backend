@@ -98,6 +98,15 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
+# UA по типу клиента для подмены User-Agent в заголовках в зависимости от
+# google_client параметра. Используется в PD/PDL research структурах где
+# в одной матрице запросов есть chrome/firefox/safari одновременно.
+UA_BY_CLIENT = {
+    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+}
+
 # Batch size для non-PA запросов (G+PC через semaphore)
 BATCH_SIZE = 5
 DELAY = 0.3  # seconds — задержка между запросами
@@ -261,7 +270,11 @@ class PrefixParser:
             params["cp"] = len(query)
 
         # [FIREFOX-ONLY EXPERIMENT] headers = {"User-Agent": random.choice(USER_AGENTS)}
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"}
+        # UA выбирается под google_client (chrome/firefox/safari).
+        # Для PD/PDL research структур это критично — несоответствие UA и
+        # client= параметра может привести к игнорированию запроса Google.
+        ua = UA_BY_CLIENT.get(google_client, UA_BY_CLIENT["firefox"])
+        headers = {"User-Agent": ua}
 
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
@@ -383,8 +396,15 @@ class PrefixParser:
             proxy_chr = _PP.get("prefix_chrome")
             proxy_ff  = _PP.get("prefix_firefox")
             proxy_npa = _PP.get("prefix_nonpa")
+            # Safari для research структур (PD/PDL). Используем тот же IP
+            # что и nonpa — отдельный прокси не критичен, но если в пуле
+            # есть "prefix_safari" — берём его.
+            try:
+                proxy_safari = _PP.get("prefix_safari")
+            except Exception:
+                proxy_safari = proxy_npa
         else:
-            proxy_chr = proxy_ff = proxy_npa = _proxy_chrome
+            proxy_chr = proxy_ff = proxy_npa = proxy_safari = _proxy_chrome
 
         # uule: city=None → столица страны, city="Lviv" → конкретный город
         _uule = get_uule(country, city)
@@ -465,29 +485,41 @@ class PrefixParser:
                 await fetch_one(pq, agent, client)
 
         # Разбиваем матрицу
+        # Для multi-agent PrefixQuery (PD/PDL — research, имеют ("chrome",
+        # "firefox", "safari")) каждый агент даёт отдельный AC-запрос.
         pa_chr_by_letter: Dict[str, List[PrefixQuery]] = {}
         pa_ff_by_letter:  Dict[str, List[PrefixQuery]] = {}
         nonpa_chr: List[PrefixQuery] = []
         nonpa_ff:  List[PrefixQuery] = []
+        nonpa_safari: List[PrefixQuery] = []
 
         for pq in matrix:
-            is_ff = "firefox" in pq.agents and "chrome" not in pq.agents
+            agents_set = set(pq.agents)
+            # Старая логика: PrefixQuery имел один агент (chrome ИЛИ firefox).
+            # PA-группа разбивается по буквам.
             if pq.group == "PA" and pq.letter:
-                if is_ff:
+                if "firefox" in agents_set and "chrome" not in agents_set:
                     pa_ff_by_letter.setdefault(pq.letter, []).append(pq)
                 else:
                     pa_chr_by_letter.setdefault(pq.letter, []).append(pq)
-            else:
-                if is_ff:
-                    nonpa_ff.append(pq)
-                else:
-                    nonpa_chr.append(pq)
+                continue
+
+            # Новая логика для multi-agent (PD/PDL): каждый агент → отдельная очередь.
+            if "chrome" in agents_set:
+                nonpa_chr.append(pq)
+            if "firefox" in agents_set:
+                nonpa_ff.append(pq)
+            if "safari" in agents_set:
+                nonpa_safari.append(pq)
 
         nonpa_sem = asyncio.Semaphore(BATCH_SIZE)
+        # Safari имеет свою семафору — чтобы не делить лимит с chrome non-PA
+        safari_sem = asyncio.Semaphore(BATCH_SIZE)
 
         async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
                    httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
-                   httpx.AsyncClient(proxy=proxy_npa) as npa_client:
+                   httpx.AsyncClient(proxy=proxy_npa) as npa_client, \
+                   httpx.AsyncClient(proxy=proxy_safari) as safari_client:
 
             await asyncio.gather(
                 # PA Chrome — все буквы параллельно, внутри буквы последовательно
@@ -496,12 +528,15 @@ class PrefixParser:
                 # PA FF — аналогично
                 *[run_letter(qs, "firefox", ff_client)
                   for qs in pa_ff_by_letter.values()],
-                # Non-PA Chrome (G+PC) — через semaphore на отдельном IP
+                # Non-PA Chrome (G+PC + PD/PDL chrome) — через semaphore на отдельном IP
                 *[run_nonpa(pq, "chrome", npa_client, nonpa_sem)
                   for pq in nonpa_chr],
-                # Non-PA FF
+                # Non-PA FF (PD/PDL firefox)
                 *[run_nonpa(pq, "firefox", ff_client, nonpa_sem)
                   for pq in nonpa_ff],
+                # Non-PA Safari (только PD/PDL — research)
+                *[run_nonpa(pq, "safari", safari_client, safari_sem)
+                  for pq in nonpa_safari],
             )
 
         # Ротация батча после прогона
@@ -535,6 +570,7 @@ class PrefixParser:
                 kws_in_group.update(k.lower().strip() for k in e.results)
             ge_chrome  = [e for e in ge if e.agent == "chrome"]
             ge_firefox = [e for e in ge if e.agent == "firefox"]
+            ge_safari  = [e for e in ge if e.agent == "safari"]
             summary_by_group[g] = {
                 "total_queries":   len(ge),
                 "with_results":    sum(1 for e in ge if e.status == "ok"),
@@ -546,6 +582,7 @@ class PrefixParser:
                 "by_agent": {
                     "chrome":  {"queries": len(ge_chrome),  "hits": sum(1 for e in ge_chrome  if e.status == "ok")},
                     "firefox": {"queries": len(ge_firefox), "hits": sum(1 for e in ge_firefox if e.status == "ok")},
+                    "safari":  {"queries": len(ge_safari),  "hits": sum(1 for e in ge_safari  if e.status == "ok")},
                 },
             }
 
