@@ -39,7 +39,7 @@ import json
 import re
 import logging
 import argparse
-from typing import Set, List, Dict, Optional
+from typing import Set, List, Dict, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 
 
@@ -403,8 +403,18 @@ class PrefixParser:
                 proxy_safari = _PP.get("prefix_safari")
             except Exception:
                 proxy_safari = proxy_npa
+
+            # Research pool — все IP из пула (роль "prefix_research"
+            # отдаёт IP round-robin, не привязан к активному батчу).
+            # Используется для PD/PDL запросов: каждый запрос идёт через
+            # свой IP, нагрузка распределяется между десятками IP.
+            try:
+                _research_proxies = _PP.get_all_proxies()
+            except Exception:
+                _research_proxies = []
         else:
             proxy_chr = proxy_ff = proxy_npa = proxy_safari = _proxy_chrome
+            _research_proxies = []
 
         # uule: city=None → столица страны, city="Lviv" → конкретный город
         _uule = get_uule(country, city)
@@ -485,18 +495,29 @@ class PrefixParser:
                 await fetch_one(pq, agent, client)
 
         # Разбиваем матрицу
-        # Для multi-agent PrefixQuery (PD/PDL — research, имеют ("chrome",
-        # "firefox", "safari")) каждый агент даёт отдельный AC-запрос.
+        # Старая логика — PA / non-PA — для не-research структур.
+        # Research структуры (PD/PDL, флаг is_new_research) идут отдельно
+        # через research_pool — каждый запрос на своём IP.
         pa_chr_by_letter: Dict[str, List[PrefixQuery]] = {}
         pa_ff_by_letter:  Dict[str, List[PrefixQuery]] = {}
         nonpa_chr: List[PrefixQuery] = []
         nonpa_ff:  List[PrefixQuery] = []
-        nonpa_safari: List[PrefixQuery] = []
+
+        # Research-запросы — отдельный список (агент учитывается per-query).
+        # Каждый research PrefixQuery превращаем в N запросов
+        # (по одному на каждый агент в pq.agents).
+        research_queries: List[Tuple[PrefixQuery, str]] = []  # (pq, agent)
 
         for pq in matrix:
             agents_set = set(pq.agents)
-            # Старая логика: PrefixQuery имел один агент (chrome ИЛИ firefox).
-            # PA-группа разбивается по буквам.
+
+            # Research структуры (PD/PDL) — в research-пул
+            if getattr(pq, "is_new_research", False):
+                for agent in pq.agents:
+                    research_queries.append((pq, agent))
+                continue
+
+            # Старая логика: PA-группа разбивается по буквам.
             if pq.group == "PA" and pq.letter:
                 if "firefox" in agents_set and "chrome" not in agents_set:
                     pa_ff_by_letter.setdefault(pq.letter, []).append(pq)
@@ -504,40 +525,75 @@ class PrefixParser:
                     pa_chr_by_letter.setdefault(pq.letter, []).append(pq)
                 continue
 
-            # Новая логика для multi-agent (PD/PDL): каждый агент → отдельная очередь.
-            if "chrome" in agents_set:
-                nonpa_chr.append(pq)
-            if "firefox" in agents_set:
+            # Старая логика для не-research non-PA (G/PC) — один агент.
+            if "firefox" in agents_set and "chrome" not in agents_set:
                 nonpa_ff.append(pq)
-            if "safari" in agents_set:
-                nonpa_safari.append(pq)
+            else:
+                nonpa_chr.append(pq)
 
         nonpa_sem = asyncio.Semaphore(BATCH_SIZE)
-        # Safari имеет свою семафору — чтобы не делить лимит с chrome non-PA
-        safari_sem = asyncio.Semaphore(BATCH_SIZE)
 
-        async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
-                   httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
-                   httpx.AsyncClient(proxy=proxy_npa) as npa_client, \
-                   httpx.AsyncClient(proxy=proxy_safari) as safari_client:
-
-            await asyncio.gather(
-                # PA Chrome — все буквы параллельно, внутри буквы последовательно
-                *[run_letter(qs, "chrome", chr_client)
-                  for qs in pa_chr_by_letter.values()],
-                # PA FF — аналогично
-                *[run_letter(qs, "firefox", ff_client)
-                  for qs in pa_ff_by_letter.values()],
-                # Non-PA Chrome (G+PC + PD/PDL chrome) — через semaphore на отдельном IP
-                *[run_nonpa(pq, "chrome", npa_client, nonpa_sem)
-                  for pq in nonpa_chr],
-                # Non-PA FF (PD/PDL firefox)
-                *[run_nonpa(pq, "firefox", ff_client, nonpa_sem)
-                  for pq in nonpa_ff],
-                # Non-PA Safari (только PD/PDL — research)
-                *[run_nonpa(pq, "safari", safari_client, safari_sem)
-                  for pq in nonpa_safari],
+        # ── Research pool: N httpx-клиентов, по одному на каждый IP ──────
+        # Распределяем research-запросы round-robin между этими клиентами.
+        # Каждый research-IP получает: total_research_queries / N запросов.
+        # При 17000 research × 42 IP = ~400 на IP — безопасно для AC.
+        research_clients: List[httpx.AsyncClient] = []
+        if _research_proxies:
+            for proxy_url in _research_proxies:
+                research_clients.append(httpx.AsyncClient(proxy=proxy_url))
+            logger.info(
+                f"[Prefix] Research pool: {len(research_clients)} httpx-клиентов "
+                f"для {len(research_queries)} запросов "
+                f"(~{len(research_queries) // max(len(research_clients), 1)} запросов на IP)"
             )
+
+        # Семафор для research — параллелизм по всему пулу
+        # (не на IP — на общий пул, чтобы не задавить локальную сеть)
+        research_sem = asyncio.Semaphore(max(BATCH_SIZE, len(research_clients) // 2))
+
+        async def run_research(pq: PrefixQuery, agent: str, idx: int):
+            """
+            Один research-запрос на одном из IP пула (round-robin по индексу).
+            idx — порядковый номер запроса в research_queries (для распределения IP).
+            """
+            if not research_clients:
+                # Fallback — нет research-пула, использовать nonpa
+                async with nonpa_sem:
+                    await fetch_one(pq, agent, npa_client)
+                return
+            client = research_clients[idx % len(research_clients)]
+            async with research_sem:
+                await fetch_one(pq, agent, client)
+
+        try:
+            async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
+                       httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
+                       httpx.AsyncClient(proxy=proxy_npa) as npa_client:
+
+                await asyncio.gather(
+                    # PA Chrome — все буквы параллельно, внутри буквы последовательно
+                    *[run_letter(qs, "chrome", chr_client)
+                      for qs in pa_chr_by_letter.values()],
+                    # PA FF — аналогично
+                    *[run_letter(qs, "firefox", ff_client)
+                      for qs in pa_ff_by_letter.values()],
+                    # Non-PA Chrome (G+PC) — через semaphore на отдельном IP
+                    *[run_nonpa(pq, "chrome", npa_client, nonpa_sem)
+                      for pq in nonpa_chr],
+                    # Non-PA FF (G+PC firefox)
+                    *[run_nonpa(pq, "firefox", ff_client, nonpa_sem)
+                      for pq in nonpa_ff],
+                    # Research (PD/PDL) — каждый запрос на своём IP из пула
+                    *[run_research(pq, agent, i)
+                      for i, (pq, agent) in enumerate(research_queries)],
+                )
+        finally:
+            # Закрываем research-клиенты
+            for c in research_clients:
+                try:
+                    await c.aclose()
+                except Exception:
+                    pass
 
         # Ротация батча после прогона
         try:
