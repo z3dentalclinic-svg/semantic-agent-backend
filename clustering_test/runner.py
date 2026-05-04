@@ -27,14 +27,19 @@ CHUNK_SIZE = 185
 # 3-flash должен дать промежуточный результат: ~10-12 кластеров за ~3-4с.
 MERGE_MODEL = 'gemini-3-flash-preview'
 
-# Fallback модель для чанков, когда и primary и hedge упали.
-# Берём 2.5-flash-lite — стабильная не-preview модель, проверена в продакшне.
-CHUNK_FALLBACK_MODEL = 'gemini-2.5-flash-lite'
+# Fallback модель для чанков, когда primary провалился (parse_error или оба запроса упали).
+# 2.5-flash: non-preview (стабильнее preview), умнее flash-lite (лучше парсится и кластеризуется).
+CHUNK_FALLBACK_MODEL = 'gemini-2.5-flash'
 
 # Hedged request: если primary не вернулся за HEDGE_DELAY_SEC, пускаем hedge параллельно.
 # Берём первый успешный ответ. Orphan task отменяется чтобы не жечь токены.
 # 3.5 — выбран потому что нормальный чанк отвечает за ~2.6с, оставляем запас в 0.9с.
 HEDGE_DELAY_SEC = 3.5
+
+# Жёсткий потолок ожидания primary+hedge. Если ни один не успешен за MAX_HEDGE_WAIT_SEC —
+# уходим в fallback. Защита от моделей которые висят 20+ секунд (например gpt-5-nano).
+# 8.0 = HEDGE_DELAY (3.5) + ~4.5с на ответ hedge. Если всё ещё нет — это аномалия.
+MAX_HEDGE_WAIT_SEC = 8.0
 
 
 # Регулярка для пары вида `A(имя_кластера)`: захватывает код и имя.
@@ -283,13 +288,21 @@ async def _attempt_chunk(
 ) -> dict:
     """
     Одна попытка вызвать модель + распарсить.
-    Возвращает структуру с success/assignments/raw/tokens/api_time/error.
+    Возвращает структуру с success/assignments/raw/tokens/api_time/error/error_kind.
     Никогда не бросает исключение.
 
     Считается успехом если:
       - LLM вернул ответ без exception
       - И parse_llm_json вернул непустой dict без parse_error
     Любой не-успех (HTTP error, network, невалидный JSON) → success=False.
+
+    error_kind:
+      - 'http'  = exception на стороне HTTP/network (модель не ответила).
+                  Имеет смысл повторять — возможно временная проблема.
+      - 'parse' = модель ответила, но формат несовместим с парсером.
+                  ПОВТОРЯТЬ БЕССМЫСЛЕННО — модель структурно несовместима,
+                  нужен сразу fallback на другую модель.
+      - None    = success.
     """
     out = {
         'success': False,
@@ -299,6 +312,7 @@ async def _attempt_chunk(
         'tokens_out': 0,
         'api_time_sec': 0.0,
         'error': None,
+        'error_kind': None,
     }
     try:
         llm_result = await call_llm(model, system_prompt, user_prompt)
@@ -308,11 +322,13 @@ async def _attempt_chunk(
         out['raw'] = llm_result['raw_response']
     except Exception as e:
         out['error'] = f'{type(e).__name__}: {e}'
+        out['error_kind'] = 'http'
         return out
 
     assignments, parse_error = parse_llm_json(llm_result['raw_response'])
     if parse_error is not None or not assignments:
         out['error'] = f'parse_failed: {parse_error}' if parse_error else 'parse_empty'
+        out['error_kind'] = 'parse'
         return out
 
     out['success'] = True
@@ -361,6 +377,61 @@ async def _cancel_orphans(orphans: list[asyncio.Task]) -> None:
     # но добавляет минимальную задержку. Для прода важнее не блокировать wall.
 
 
+async def _do_fallback(
+    chunk_idx: int,
+    system_prompt: str,
+    user_prompt: str,
+    diag: dict,
+    primary_err: str | None,
+    hedge_err: str | None,
+    hedge_used: bool,
+) -> dict:
+    """
+    Выполняет fallback вызов на CHUNK_FALLBACK_MODEL.
+    Возвращает либо успешный chunk_response, либо catastrophe error.
+    """
+    diag['fallback_used'] = True
+    diag['used_model'] = CHUNK_FALLBACK_MODEL
+    diag['primary_error'] = primary_err
+    diag['hedge_error'] = hedge_err
+
+    fallback_result = await _attempt_chunk(
+        CHUNK_FALLBACK_MODEL, system_prompt, user_prompt
+    )
+
+    if fallback_result['success']:
+        diag['fallback_won'] = True
+        return _build_chunk_response(
+            chunk_idx=chunk_idx,
+            used_result=fallback_result,
+            diag=diag,
+            hedge_used=hedge_used,
+            hedge_won=False,
+            fallback_used=True,
+            fallback_won=True,
+            primary_error=primary_err,
+            hedge_error=hedge_err,
+            fallback_error=None,
+            used_model=CHUNK_FALLBACK_MODEL,
+        )
+
+    # Catastrophe: всё упало
+    diag['fallback_error'] = fallback_result['error']
+    diag['tokens_in'] = fallback_result['tokens_in']
+    diag['tokens_out'] = fallback_result['tokens_out']
+    diag['api_time_sec'] = fallback_result['api_time_sec']
+    diag['raw_response'] = fallback_result['raw']
+    return {
+        'chunk_idx': chunk_idx,
+        'assignments': {},
+        'diag': diag,
+        'error': (
+            f'all attempts failed | primary: {primary_err} | '
+            f'hedge: {hedge_err} | fallback: {fallback_result["error"]}'
+        ),
+    }
+
+
 async def _call_chunk_with_hedge(
     chunk_idx: int,
     chunk_payloads: list[str],
@@ -373,14 +444,18 @@ async def _call_chunk_with_hedge(
     Вызывает LLM для одного чанка с hedged retry архитектурой:
 
     Шаг 1: запускаем primary вызов на `model`.
-    Шаг 2: ждём HEDGE_DELAY_SEC. Если primary вернулся успехом — отдаём его.
-            Если primary упал явно (exception/parse error) до HEDGE_DELAY_SEC —
-            запускаем hedge сразу.
-            Если HEDGE_DELAY_SEC прошло а primary не успел — запускаем hedge параллельно.
-    Шаг 3: ждём первый success из {primary, hedge}. Победивший возвращаем.
-            Проигравший orphan task отменяется (cancel) — не жжём токены.
-    Шаг 4: если оба упали → fallback на CHUNK_FALLBACK_MODEL без таймаута.
-    Шаг 5: если и fallback упал → возвращаем чанк с error (UNASSIGNED для хвостов).
+    Шаг 2: ждём primary до HEDGE_DELAY_SEC.
+       (a) primary success за <HEDGE_DELAY → готово, никаких доп. вызовов.
+       (b) primary error_kind='parse' → СРАЗУ fallback (модель несовместима,
+           hedge на той же модели не поможет).
+       (c) primary error_kind='http' → запускаем hedge параллельно.
+       (d) primary timeout по HEDGE_DELAY → запускаем hedge параллельно.
+    Шаг 3: ждём первый success из {primary, hedge}, но не дольше MAX_HEDGE_WAIT_SEC.
+       Победивший возвращаем. Проигравший orphan task отменяется.
+       Если истёк MAX_HEDGE_WAIT — оба orphan'а отменяем, идём в fallback.
+    Шаг 4: fallback на CHUNK_FALLBACK_MODEL.
+       Если fallback success → возвращаем.
+       Если fallback failed → возвращаем chunk с error (UNASSIGNED для хвостов).
 
     Никогда не бросает exception.
     """
@@ -417,15 +492,18 @@ async def _call_chunk_with_hedge(
         _attempt_chunk(model, system_prompt, user_prompt)
     )
 
-    # Ждём primary до HEDGE_DELAY_SEC. Если primary вернулся раньше с success — берём.
-    # Если primary упал раньше с error — сразу пускаем hedge.
-    # Если истёк таймер — пускаем hedge параллельно.
+    # Ждём primary до HEDGE_DELAY_SEC. Возможные исходы:
+    #  (a) success за <HEDGE_DELAY → готово.
+    #  (b) error_kind='parse' за <HEDGE_DELAY → СРАЗУ fallback (модель несовместима).
+    #  (c) error_kind='http' за <HEDGE_DELAY → запускаем hedge (может временно).
+    #  (d) timeout HEDGE_DELAY → запускаем hedge параллельно.
+    primary_finished_early = False
     try:
         await asyncio.wait_for(asyncio.shield(primary_task), timeout=HEDGE_DELAY_SEC)
-        # primary завершился до таймера — проверяем результат
+        primary_finished_early = True
         primary_result = primary_task.result()
         if primary_result['success']:
-            # Удача за один вызов
+            # (a) Удача за один вызов
             return _build_chunk_response(
                 chunk_idx=chunk_idx,
                 used_result=primary_result,
@@ -439,11 +517,22 @@ async def _call_chunk_with_hedge(
                 fallback_error=None,
                 used_model=model,
             )
-        # Primary упал явно — фиксируем ошибку, идём в hedge
+        # primary упал — фиксируем ошибку
         diag['primary_error'] = primary_result['error']
+        # (b) parse_error → НЕ запускаем hedge на той же модели, идём сразу в fallback
+        if primary_result['error_kind'] == 'parse':
+            return await _do_fallback(
+                chunk_idx=chunk_idx,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                diag=diag,
+                primary_err=primary_result['error'],
+                hedge_err=None,
+                hedge_used=False,
+            )
+        # (c) http error → продолжаем в hedge
     except asyncio.TimeoutError:
-        # Primary не успел за HEDGE_DELAY_SEC — он продолжает работать в фоне.
-        # В диагностику попадёт error только если он упадёт окончательно.
+        # (d) primary висит, продолжает работать в фоне
         pass
 
     # === Шаг 2: hedge ===
@@ -452,20 +541,27 @@ async def _call_chunk_with_hedge(
         _attempt_chunk(model, system_prompt, user_prompt)
     )
 
-    # Ждём первого success из {primary, hedge} БЕЗ таймаута.
-    winner, pending = await _await_first_success([primary_task, hedge_task])
+    # Ждём первого success из {primary, hedge}, но не дольше MAX_HEDGE_WAIT_SEC.
+    # Защита от моделей которые висят надолго.
+    try:
+        winner, pending = await asyncio.wait_for(
+            _await_first_success([primary_task, hedge_task]),
+            timeout=MAX_HEDGE_WAIT_SEC,
+        )
+    except asyncio.TimeoutError:
+        # Ни primary ни hedge не успели за MAX_HEDGE_WAIT_SEC.
+        # Отменяем оба, идём в fallback.
+        winner = None
+        pending = [t for t in (primary_task, hedge_task) if not t.done()]
+
     # Отменяем проигравший(ие) — экономим токены
     await _cancel_orphans(pending)
 
     if winner is not None:
         winner_result = winner.result()
         diag['hedge_won'] = (winner is hedge_task)
-        # Если primary всё-таки победил (например, он отвалился чуть позже hedge но
-        # успел распарситься первым) — обновляем primary_error на None
-        # ...нет, primary_error фиксируется выше только если он упал. Если primary
-        # выиграл — error там был None (мы его в TimeoutError-ветку отправили
-        # потому что не дождались, а он завершился успехом).
         if winner is primary_task:
+            # primary всё-таки победил — error там был None
             diag['primary_error'] = None
         return _build_chunk_response(
             chunk_idx=chunk_idx,
@@ -481,60 +577,34 @@ async def _call_chunk_with_hedge(
             used_model=model,
         )
 
-    # Оба упали — собираем ошибки для диагностики
-    primary_err = None
+    # Оба упали или истёк MAX_HEDGE_WAIT — собираем ошибки
+    primary_err = diag['primary_error']
     hedge_err = None
     if primary_task.done():
         try:
-            primary_err = primary_task.result().get('error')
+            r = primary_task.result()
+            primary_err = r.get('error') or primary_err
         except Exception as e:
             primary_err = f'{type(e).__name__}: {e}'
+    else:
+        primary_err = primary_err or 'timeout (>MAX_HEDGE_WAIT_SEC)'
     if hedge_task.done():
         try:
             hedge_err = hedge_task.result().get('error')
         except Exception as e:
             hedge_err = f'{type(e).__name__}: {e}'
-    diag['primary_error'] = primary_err
-    diag['hedge_error'] = hedge_err
+    else:
+        hedge_err = 'timeout (>MAX_HEDGE_WAIT_SEC)'
 
-    # === Шаг 3: fallback ===
-    diag['fallback_used'] = True
-    diag['used_model'] = CHUNK_FALLBACK_MODEL
-    fallback_result = await _attempt_chunk(
-        CHUNK_FALLBACK_MODEL, system_prompt, user_prompt
+    return await _do_fallback(
+        chunk_idx=chunk_idx,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        diag=diag,
+        primary_err=primary_err,
+        hedge_err=hedge_err,
+        hedge_used=True,
     )
-
-    if fallback_result['success']:
-        diag['fallback_won'] = True
-        return _build_chunk_response(
-            chunk_idx=chunk_idx,
-            used_result=fallback_result,
-            diag=diag,
-            hedge_used=True,
-            hedge_won=False,
-            fallback_used=True,
-            fallback_won=True,
-            primary_error=primary_err,
-            hedge_error=hedge_err,
-            fallback_error=None,
-            used_model=CHUNK_FALLBACK_MODEL,
-        )
-
-    # === Шаг 4: всё упало — катастрофа ===
-    diag['fallback_error'] = fallback_result['error']
-    diag['tokens_in'] = fallback_result['tokens_in']
-    diag['tokens_out'] = fallback_result['tokens_out']
-    diag['api_time_sec'] = fallback_result['api_time_sec']
-    diag['raw_response'] = fallback_result['raw']
-    return {
-        'chunk_idx': chunk_idx,
-        'assignments': {},
-        'diag': diag,
-        'error': (
-            f'all attempts failed | primary: {primary_err} | '
-            f'hedge: {hedge_err} | fallback: {fallback_result["error"]}'
-        ),
-    }
 
 
 def _build_chunk_response(
