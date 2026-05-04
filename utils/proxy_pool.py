@@ -1,5 +1,5 @@
 """
-Proxy Pool Manager v1.0
+Proxy Pool Manager v1.1
 
 Управляет пулом IP-адресов для всех парсеров.
 Конфигурация через env переменную PROXY_POOL (список через запятую).
@@ -9,6 +9,11 @@ Proxy Pool Manager v1.0
   index 1 → infix_firefox
   index 2-9 → suffix/prefix (общий пул)
 
+Дополнительная роль для research структур (PD/PDL prefix):
+  prefix_research → round-robin по ВСЕМ IP из ВСЕХ батчей
+                    (не привязан к текущему активному батчу — для разовых
+                    research-прогонов с большой нагрузкой нужно много IP)
+
 Карусель батчей:
   - Один батч активен, остальные остывают
   - После каждого прогона батч уходит в конец очереди
@@ -16,9 +21,8 @@ Proxy Pool Manager v1.0
 
 Использование в парсере:
   from proxy_pool import ProxyPool
-  proxy = ProxyPool.get("infix_chrome")   # → "http://user:pass@ip:port" или None
-  proxy = ProxyPool.get("infix_firefox")
-  proxy = ProxyPool.get("suffix")
+  proxy = ProxyPool.get("infix_chrome")     # → IP из активного батча
+  proxy = ProxyPool.get("prefix_research")  # → round-robin по всем IP
 """
 
 import os
@@ -41,6 +45,12 @@ ROLE_MAP = {
 GENERAL_ROLES = {"suffix", "morph"}
 GENERAL_START = 5   # IP с этого индекса идут на общие парсеры
 
+# Research роль — для разовых широких прогонов PD/PDL.
+# Берёт IP из ВСЕГО пула (все батчи), round-robin.
+# Не привязана к текущему активному батчу — research-прогон нагружает
+# 30-40 IP параллельно, и карусель батчей здесь не нужна.
+RESEARCH_ROLES = {"prefix_research"}
+
 
 class ProxyPool:
     _lock = threading.Lock()
@@ -49,6 +59,7 @@ class ProxyPool:
     _current_batch: int = 0      # индекс активного батча
     _last_rotation: float = 0    # время последней ротации
     _general_counter: int = 0    # round-robin счётчик для suffix/prefix
+    _research_counter: int = 0   # round-robin счётчик для research (по всему пулу)
     _initialized: bool = False
 
     @classmethod
@@ -105,8 +116,28 @@ class ProxyPool:
                 cls._general_counter += 1
                 return ip
 
+            # Research роль — round-robin по ВСЕМУ пулу (все IP, все батчи).
+            # Используется для разовых прогонов PD/PDL prefix research.
+            # Игнорирует карусель батчей — нагрузка распределяется по всему пулу.
+            if role in RESEARCH_ROLES:
+                if not cls._proxies:
+                    return None
+                ip = cls._proxies[cls._research_counter % len(cls._proxies)]
+                cls._research_counter += 1
+                return ip
+
             logger.warning(f"[ProxyPool] Неизвестная роль: {role}")
             return None
+
+    @classmethod
+    def get_all_proxies(cls) -> list:
+        """
+        Возвращает копию всего списка IP (без привязки к батчам).
+        Используется research-парсером для создания пула httpx-клиентов.
+        """
+        with cls._lock:
+            cls._init()
+            return list(cls._proxies)
 
     # Минимальный интервал между ротациями — защита от тройного вызова
     # при параллельном запуске suffix+prefix+infix.
@@ -140,6 +171,7 @@ class ProxyPool:
             cls._current_batch = (cls._current_batch + 1) % len(cls._batches)
             cls._last_rotation = now
             cls._general_counter = 0
+            cls._research_counter = 0
             logger.info(
                 f"[ProxyPool] Ротация: батч {prev} → {cls._current_batch} "
                 f"(всего {len(cls._batches)} батчей)"
