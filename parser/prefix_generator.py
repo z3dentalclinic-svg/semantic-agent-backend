@@ -36,7 +36,7 @@ Total: Chrome 272 + Firefox 38 = 310 запросов на сид
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 # ══════════════════════════════════════════════
@@ -50,8 +50,12 @@ LETTERS_RU = list("абвгдеёжзийклмнопрстуфхцчшщэюя"
 # Вопросы для Type PC
 QUESTIONS_RU = ["как", "какой", "где", "сколько", "почему"]
 
+# ── PD: цифровой перебор ────────────────────────────────────────────
+# Только 0-9 одиночные. Двузначные числа AC расширит из одиночного якоря.
+DIGITS_PD = [str(i) for i in range(10)]
+
 # Группы для удобства итерации
-ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC"]
+ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC", "PD"]
 
 
 # ══════════════════════════════════════════════
@@ -76,6 +80,8 @@ class PrefixQuery:
     is_alpha: bool = False       # Входит в алфавитный перебор
     is_question: bool = False    # Вопросительный оператор
     letter: Optional[str] = None # Буква для PA группы
+    is_new_research: bool = False  # ← True для экспериментальных структур (PD и новые).
+                                    # Старые структуры всегда False — не трогать.
 
 
 # ══════════════════════════════════════════════
@@ -357,6 +363,148 @@ class PrefixGenerator:
                              op_val=L, op_t="letter",
                              is_alpha=True, letter=L,
                              agents=FF if f"{L}_L_hyp" in PA_FF_STRUCTS else CHROME))
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PD — Цифровой перебор (NEW RESEARCH, is_new_research=True)
+        #
+        # Цель: широкое покрытие для разовой разведки. Все структурные
+        # варианты × только осмысленные позиции cp (границы токенов).
+        # По отчёту первого прогона увидим какие структуры дают валид/
+        # мусор/пусто и зажмём.
+        #
+        # Ключи из gap-списка которые целимся закрыть:
+        #   "8 марта доставка цветов", "4 сезона доставка цветов",
+        #   "7 роз доставка цветов", "13 роз доставка цветов",
+        #   "21 век купить айфон 16", "all on 4 имплантация зубов",
+        #   "11 больница имплантация зубов", "32 дент имплантация зубов".
+        #
+        # Цифры: 0-9 (двузначные расширятся из одиночного якоря).
+        # Все структуры помечены is_new_research=True — старые не трогаются.
+        #
+        # Дубли с другими парсерами:
+        #   - Suffix A_num шлёт "{S} * {N}" (цифра ПОСЛЕ сида). PD ставит
+        #     цифру ПЕРЕД сидом — другая семантика, не дубль.
+        #   - Infix цифр не использует.
+        #
+        # Структурные классы (28):
+        #   1. Plain:        plain, plain_nosp, plain_trail
+        #   2. WC слева:     wcL, wcL_nosp1, wcL_nosp2
+        #   3. WC справа:    wcR, wcR_nosp, wcR_S2star, wcR_trail
+        #   4. WC середина:  wcM, wcM_nosp1, wcM_nosp2, wcM_nosp3
+        #   5. WC обе:       wcLR, wcLM, wcMR, wcLMR
+        #   6. Двойной WC:   dwcL, dwcM, dwcR
+        #   7. Дефис:        hyp, hyp_wc, hyp_nosp, hyp_nosp_wc
+        #   8. Двоеточие:    col, col_nosp, col_wc
+        #
+        # CP позиции — только осмысленные:
+        #   - границы токенов (начало/конец слова, до/после спецсимвола)
+        #   - крайние позиции (0, len(base))
+        #   - "без cp" (-1)
+        # CP внутри слов S не добавляем — AC видит их как эквивалентные.
+        # ─────────────────────────────────────────────────────────────────────
+        if "PD" in grp:
+            def _meaningful_cps(base: str) -> List[Tuple[int, str]]:
+                """
+                Возвращает только осмысленные cp позиции для строки base:
+                границы токенов (после каждого пробела/спецсимвола), 0 и len.
+                Внутри слов сида cp не добавляются — AC даёт идентичную выдачу.
+                """
+                cps: List[Tuple[int, str]] = [(-1, "без cp")]
+
+                # 0 — начало строки
+                cps.append((0, "cp=0 начало"))
+
+                # Границы: после каждого пробела или после каждого спецсимвола
+                # (* - :), и сразу перед спецсимволом
+                for i, ch in enumerate(base):
+                    # после спец/пробела
+                    if ch in " *-:":
+                        # cp прямо за этим символом
+                        if i + 1 <= len(base):
+                            note = f"cp={i+1} после '{ch}'"
+                            cps.append((i + 1, note))
+                        # cp прямо на этом символе (перед ним)
+                        cps.append((i, f"cp={i} перед '{ch}'"))
+
+                # len(base) — конец строки
+                cps.append((len(base), f"cp={len(base)} конец"))
+
+                # Дедуп по позиции, сохраняем первое описание
+                seen = {}
+                for cp, note in cps:
+                    if cp not in seen:
+                        seen[cp] = note
+                return [(cp, note) for cp, note in seen.items()]
+
+            def _pd(struct_name: str, base: str, cp: int, cp_note: str,
+                    digit: str) -> PrefixQuery:
+                """Helper для PD структур — все is_new_research=True, Chrome only."""
+                return PrefixQuery(
+                    query=base, group="PD", struct=struct_name,
+                    operator=digit, op_type="digit", cp=cp, cp_note=cp_note,
+                    agents=CHROME,
+                    is_alpha=False, is_question=False, letter=digit,
+                    is_new_research=True,
+                )
+
+            for D in DIGITS_PD:
+                pd_bases = [
+                    # ── 1. Plain ─────────────────────────────────────────
+                    ("plain",        f"{D} {S}"),
+                    ("plain_nosp",   f"{D}{S}"),
+                    ("plain_trail",  f"{D} {S} "),
+
+                    # ── 2. WC слева ──────────────────────────────────────
+                    ("wcL",          f"* {D} {S}"),
+                    ("wcL_nosp1",    f"*{D} {S}"),
+                    ("wcL_nosp2",    f"* {D}{S}"),
+
+                    # ── 3. WC справа ─────────────────────────────────────
+                    ("wcR",          f"{D} {S} *"),
+                    ("wcR_nosp",     f"{D}{S}*"),
+                    ("wcR_S2star",   f"{D} {S}*"),
+                    ("wcR_trail",    f"{D} {S} * "),
+
+                    # ── 4. WC середина ───────────────────────────────────
+                    ("wcM",          f"{D} * {S}"),
+                    ("wcM_nosp1",    f"{D}* {S}"),
+                    ("wcM_nosp2",    f"{D} *{S}"),
+                    ("wcM_nosp3",    f"{D}*{S}"),
+
+                    # ── 5. WC с обеих сторон ─────────────────────────────
+                    ("wcLR",         f"* {D} {S} *"),
+                    ("wcLM",         f"* {D} * {S}"),
+                    ("wcMR",         f"{D} * {S} *"),
+                    ("wcLMR",        f"* {D} * {S} *"),
+
+                    # ── 6. Двойной WC ────────────────────────────────────
+                    ("dwcL",         f"** {D} {S}"),
+                    ("dwcM",         f"{D} ** {S}"),
+                    ("dwcR",         f"{D} {S} **"),
+
+                    # ── 7. Дефис ─────────────────────────────────────────
+                    ("hyp",          f"{D} - {S}"),
+                    ("hyp_wc",       f"{D} - {S} *"),
+                    ("hyp_nosp",     f"{D}-{S}"),
+                    ("hyp_nosp_wc",  f"{D}-{S}*"),
+
+                    # ── 8. Двоеточие ─────────────────────────────────────
+                    ("col",          f"{D}: {S}"),
+                    ("col_nosp",     f"{D}:{S}"),
+                    ("col_wc",       f"{D}: {S} *"),
+                ]
+
+                for class_name, base in pd_bases:
+                    for cp_pos, cp_note in _meaningful_cps(base):
+                        if cp_pos == -1:
+                            tag = "nocp"
+                        else:
+                            tag = f"cp{cp_pos}"
+                        out.append(_pd(
+                            f"{D}_{class_name}_{tag}",
+                            base, cp_pos, cp_note,
+                            D,
+                        ))
 
         # ─────────────────────────────────────────────────────────────
         # PC — Вопросы: 5 вопросов × 2-3 cp = 11 запросов
