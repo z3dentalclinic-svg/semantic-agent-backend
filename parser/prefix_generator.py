@@ -50,12 +50,14 @@ LETTERS_RU = list("абвгдеёжзийклмнопрстуфхцчшщэюя"
 # Вопросы для Type PC
 QUESTIONS_RU = ["как", "какой", "где", "сколько", "почему"]
 
-# ── PD: цифровой перебор ────────────────────────────────────────────
+# ── PD: цифровой перебор (NEW RESEARCH) ──────────────────────────────
 # Только 0-9 одиночные. Двузначные числа AC расширит из одиночного якоря.
 DIGITS_PD = [str(i) for i in range(10)]
 
 # Группы для удобства итерации
-ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC", "PD"]
+# PD  — цифровой перебор (research)
+# PDL — цифра + буква + сид (research, для случаев типа "8 м доставка цветов" → "8 марта ...")
+ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC", "PD", "PDL"]
 
 
 # ══════════════════════════════════════════════
@@ -80,7 +82,7 @@ class PrefixQuery:
     is_alpha: bool = False       # Входит в алфавитный перебор
     is_question: bool = False    # Вопросительный оператор
     letter: Optional[str] = None # Буква для PA группы
-    is_new_research: bool = False  # ← True для экспериментальных структур (PD и новые).
+    is_new_research: bool = False  # ← True для экспериментальных структур (PD/PDL).
                                     # Старые структуры всегда False — не трогать.
 
 
@@ -369,67 +371,34 @@ class PrefixGenerator:
         #
         # Цель: широкое покрытие для разовой разведки. Все структурные
         # варианты × только осмысленные позиции cp (границы токенов).
-        # По отчёту первого прогона увидим какие структуры дают валид/
-        # мусор/пусто и зажмём.
+        # Прогоняется на ВСЕХ ТРЁХ АГЕНТАХ (chrome+firefox+safari) — чтобы
+        # увидеть какой источник самый богатый и зажать по итогу.
         #
-        # Ключи из gap-списка которые целимся закрыть:
-        #   "8 марта доставка цветов", "4 сезона доставка цветов",
-        #   "7 роз доставка цветов", "13 роз доставка цветов",
-        #   "21 век купить айфон 16", "all on 4 имплантация зубов",
-        #   "11 больница имплантация зубов", "32 дент имплантация зубов".
-        #
-        # Цифры: 0-9 (двузначные расширятся из одиночного якоря).
-        # Все структуры помечены is_new_research=True — старые не трогаются.
-        #
-        # Дубли с другими парсерами:
-        #   - Suffix A_num шлёт "{S} * {N}" (цифра ПОСЛЕ сида). PD ставит
-        #     цифру ПЕРЕД сидом — другая семантика, не дубль.
-        #   - Infix цифр не использует.
-        #
-        # Структурные классы (28):
-        #   1. Plain:        plain, plain_nosp, plain_trail
-        #   2. WC слева:     wcL, wcL_nosp1, wcL_nosp2
-        #   3. WC справа:    wcR, wcR_nosp, wcR_S2star, wcR_trail
-        #   4. WC середина:  wcM, wcM_nosp1, wcM_nosp2, wcM_nosp3
-        #   5. WC обе:       wcLR, wcLM, wcMR, wcLMR
-        #   6. Двойной WC:   dwcL, dwcM, dwcR
-        #   7. Дефис:        hyp, hyp_wc, hyp_nosp, hyp_nosp_wc
-        #   8. Двоеточие:    col, col_nosp, col_wc
-        #
-        # CP позиции — только осмысленные:
-        #   - границы токенов (начало/конец слова, до/после спецсимвола)
-        #   - крайние позиции (0, len(base))
-        #   - "без cp" (-1)
-        # CP внутри слов S не добавляем — AC видит их как эквивалентные.
+        # Цифры: 0-9. Все структуры помечены is_new_research=True.
         # ─────────────────────────────────────────────────────────────────────
+        # Все 3 агента для research структур
+        ALL_AGENTS = ("chrome", "firefox", "safari")
+
         if "PD" in grp:
             def _meaningful_cps(base: str) -> List[Tuple[int, str]]:
                 """
                 Возвращает только осмысленные cp позиции для строки base:
-                границы токенов (после каждого пробела/спецсимвола), 0 и len.
-                Внутри слов сида cp не добавляются — AC даёт идентичную выдачу.
+                границы токенов (после/перед каждым пробелом/спецсимволом),
+                0 и len. Внутри слов сида cp не добавляются — AC даёт
+                идентичную выдачу.
                 """
                 cps: List[Tuple[int, str]] = [(-1, "без cp")]
-
-                # 0 — начало строки
                 cps.append((0, "cp=0 начало"))
 
-                # Границы: после каждого пробела или после каждого спецсимвола
-                # (* - :), и сразу перед спецсимволом
                 for i, ch in enumerate(base):
-                    # после спец/пробела
                     if ch in " *-:":
-                        # cp прямо за этим символом
                         if i + 1 <= len(base):
-                            note = f"cp={i+1} после '{ch}'"
-                            cps.append((i + 1, note))
-                        # cp прямо на этом символе (перед ним)
+                            cps.append((i + 1, f"cp={i+1} после '{ch}'"))
                         cps.append((i, f"cp={i} перед '{ch}'"))
 
-                # len(base) — конец строки
                 cps.append((len(base), f"cp={len(base)} конец"))
 
-                # Дедуп по позиции, сохраняем первое описание
+                # Дедуп по позиции
                 seen = {}
                 for cp, note in cps:
                     if cp not in seen:
@@ -438,57 +407,50 @@ class PrefixGenerator:
 
             def _pd(struct_name: str, base: str, cp: int, cp_note: str,
                     digit: str) -> PrefixQuery:
-                """Helper для PD структур — все is_new_research=True, Chrome only."""
+                """PD структура — на всех 3 агентах, is_new_research=True."""
                 return PrefixQuery(
                     query=base, group="PD", struct=struct_name,
                     operator=digit, op_type="digit", cp=cp, cp_note=cp_note,
-                    agents=CHROME,
+                    agents=ALL_AGENTS,
                     is_alpha=False, is_question=False, letter=digit,
                     is_new_research=True,
                 )
 
             for D in DIGITS_PD:
                 pd_bases = [
-                    # ── 1. Plain ─────────────────────────────────────────
+                    # 1. Plain
                     ("plain",        f"{D} {S}"),
                     ("plain_nosp",   f"{D}{S}"),
                     ("plain_trail",  f"{D} {S} "),
-
-                    # ── 2. WC слева ──────────────────────────────────────
+                    # 2. WC слева
                     ("wcL",          f"* {D} {S}"),
                     ("wcL_nosp1",    f"*{D} {S}"),
                     ("wcL_nosp2",    f"* {D}{S}"),
-
-                    # ── 3. WC справа ─────────────────────────────────────
+                    # 3. WC справа
                     ("wcR",          f"{D} {S} *"),
                     ("wcR_nosp",     f"{D}{S}*"),
                     ("wcR_S2star",   f"{D} {S}*"),
                     ("wcR_trail",    f"{D} {S} * "),
-
-                    # ── 4. WC середина ───────────────────────────────────
+                    # 4. WC середина
                     ("wcM",          f"{D} * {S}"),
                     ("wcM_nosp1",    f"{D}* {S}"),
                     ("wcM_nosp2",    f"{D} *{S}"),
                     ("wcM_nosp3",    f"{D}*{S}"),
-
-                    # ── 5. WC с обеих сторон ─────────────────────────────
+                    # 5. WC с обеих сторон
                     ("wcLR",         f"* {D} {S} *"),
                     ("wcLM",         f"* {D} * {S}"),
                     ("wcMR",         f"{D} * {S} *"),
                     ("wcLMR",        f"* {D} * {S} *"),
-
-                    # ── 6. Двойной WC ────────────────────────────────────
+                    # 6. Двойной WC
                     ("dwcL",         f"** {D} {S}"),
                     ("dwcM",         f"{D} ** {S}"),
                     ("dwcR",         f"{D} {S} **"),
-
-                    # ── 7. Дефис ─────────────────────────────────────────
+                    # 7. Дефис
                     ("hyp",          f"{D} - {S}"),
                     ("hyp_wc",       f"{D} - {S} *"),
                     ("hyp_nosp",     f"{D}-{S}"),
                     ("hyp_nosp_wc",  f"{D}-{S}*"),
-
-                    # ── 8. Двоеточие ─────────────────────────────────────
+                    # 8. Двоеточие
                     ("col",          f"{D}: {S}"),
                     ("col_nosp",     f"{D}:{S}"),
                     ("col_wc",       f"{D}: {S} *"),
@@ -496,14 +458,89 @@ class PrefixGenerator:
 
                 for class_name, base in pd_bases:
                     for cp_pos, cp_note in _meaningful_cps(base):
-                        if cp_pos == -1:
-                            tag = "nocp"
-                        else:
-                            tag = f"cp{cp_pos}"
+                        tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
                         out.append(_pd(
                             f"{D}_{class_name}_{tag}",
                             base, cp_pos, cp_note,
                             D,
+                        ))
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PDL — Цифра + буква + сид (NEW RESEARCH, is_new_research=True)
+        #
+        # Гипотеза: голая цифра не всегда расширяется AC в нужное число/слово
+        # ("7 доставка цветов" не даёт "7 роз доставка цветов"). Но цифра
+        # вместе с одной буквой образует более конкретный якорь —
+        # "7 р доставка цветов" может расшириться в "7 роз доставка цветов",
+        # "8 м" → "8 марта", "4 с" → "4 сезона" и т.д.
+        #
+        # Структура: {D} {L} {S} с минимальным набором cp.
+        # Прогон на 3 агентах (chrome+firefox+safari).
+        #
+        # Цифры: 0-9. Буквы: 30 (русский алфавит без ъ ы ь).
+        # CP позиции: 4 ключевые точки + nocp.
+        # ─────────────────────────────────────────────────────────────────────
+        if "PDL" in grp:
+            def _pdl(struct_name: str, base: str, cp: int, cp_note: str,
+                     digit: str, letter: str) -> PrefixQuery:
+                """PDL структура — на всех 3 агентах, is_new_research=True."""
+                return PrefixQuery(
+                    query=base, group="PDL", struct=struct_name,
+                    operator=f"{digit}_{letter}", op_type="digit_letter",
+                    cp=cp, cp_note=cp_note,
+                    agents=ALL_AGENTS,
+                    is_alpha=False, is_question=False, letter=letter,
+                    is_new_research=True,
+                )
+
+            for D in DIGITS_PD:
+                for L in LETTERS_RU:
+                    # База 1: {D} {L} {S} — цифра + буква + сид
+                    base = f"{D} {L} {S}"
+                    # CP позиции:
+                    #   -1 (без cp)
+                    #   0 (начало)
+                    #   1 (после цифры)
+                    #   3 (после буквы — len(D)+1+len(L)+0)
+                    #   3+1=4 (после пробела перед сидом — len(D)+1+len(L)+1)
+                    #   len (конец)
+                    after_digit = 1
+                    after_letter = 1 + 1 + 1  # D + space + L = 3
+                    before_seed = after_letter + 1  # = 4
+                    end = len(base)
+
+                    cp_variants = [
+                        (-1, "без cp", "nocp"),
+                        (0, "cp=0 начало", "cp0"),
+                        (after_digit, f"cp={after_digit} после цифры", f"cp{after_digit}"),
+                        (after_letter, f"cp={after_letter} после буквы", f"cp{after_letter}"),
+                        (before_seed, f"cp={before_seed} перед сидом", f"cp{before_seed}"),
+                        (end, f"cp={end} конец", f"cp{end}"),
+                    ]
+
+                    for cp, note, tag in cp_variants:
+                        out.append(_pdl(
+                            f"{D}_{L}_plain_{tag}",
+                            base, cp, note, D, L,
+                        ))
+
+                    # База 2: {D} {L} {S} * — то же с trailing wildcard
+                    base_wc = f"{D} {L} {S} *"
+                    end_wc = len(base_wc)
+                    before_wc = len(base) + 1  # позиция перед *
+
+                    cp_variants_wc = [
+                        (-1, "без cp", "nocp"),
+                        (after_letter, f"cp={after_letter} после буквы", f"cp{after_letter}"),
+                        (before_seed, f"cp={before_seed} перед сидом", f"cp{before_seed}"),
+                        (before_wc, f"cp={before_wc} перед *", f"cp{before_wc}"),
+                        (end_wc, f"cp={end_wc} конец", f"cp{end_wc}"),
+                    ]
+
+                    for cp, note, tag in cp_variants_wc:
+                        out.append(_pdl(
+                            f"{D}_{L}_wcR_{tag}",
+                            base_wc, cp, note, D, L,
                         ))
 
         # ─────────────────────────────────────────────────────────────
