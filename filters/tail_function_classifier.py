@@ -231,6 +231,12 @@ class TailFunctionClassifier:
         negative_signals = []
         reasons = []
 
+        # Стадии classify — для диагностики
+        # (агрегируются в self.classify_stages, читаются из l0_filter)
+        if not hasattr(self, 'classify_stages'):
+            self.classify_stages: Dict[str, float] = {}
+        _stage_t0 = time.perf_counter()
+
         # ===== ПОЗИТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_positive = [
             ('geo',           lambda: detect_geo(tail, self.geo_db, self.target_country, tp=tp)),
@@ -260,6 +266,9 @@ class TailFunctionClassifier:
             if detected:
                 positive_signals.append(signal_name)
                 reasons.append(f"✅ {reason}")
+
+        self.classify_stages['positive_loop'] = self.classify_stages.get('positive_loop', 0.0) + (time.perf_counter() - _stage_t0)
+        _stage_t0 = time.perf_counter()
 
         # Commerce-инфинитив на ТОВАРНОМ seed = валидный purchase intent.
         # detect_commerce держит "купить/заказать" как weak (нужен контекст из 2+ слов).
@@ -298,6 +307,9 @@ class TailFunctionClassifier:
                 if _p and _p[0].tag.POS == 'INFN' and 'perf' in _p[0].tag:
                     positive_signals.append('commerce')
                     reasons.append(f"✅ Коммит-интент (сервисный seed): '{_p[0].normal_form}'")
+
+        self.classify_stages['commerce_extra'] = self.classify_stages.get('commerce_extra', 0.0) + (time.perf_counter() - _stage_t0)
+        _stage_t0 = time.perf_counter()
 
         # ===== НЕГАТИВНЫЕ ДЕТЕКТОРЫ =====
         detectors_negative = [
@@ -340,6 +352,9 @@ class TailFunctionClassifier:
             if detected:
                 negative_signals.append(signal_name)
                 reasons.append(f"❌ {reason}")
+
+        self.classify_stages['negative_loop'] = self.classify_stages.get('negative_loop', 0.0) + (time.perf_counter() - _stage_t0)
+        _stage_t0 = time.perf_counter()
         
         # ===== ПРОВЕРКА КОНФЛИКТА ИНТЕНТОВ =====
         # Два типа конфликтов:
@@ -416,7 +431,9 @@ class TailFunctionClassifier:
         label, confidence, pos_score, neg_score = self._arbitrate(
             positive_signals, negative_signals
         )
-        
+
+        self.classify_stages['post_processing_and_arb'] = self.classify_stages.get('post_processing_and_arb', 0.0) + (time.perf_counter() - _stage_t0)
+
         return {
             'label': label,
             'positive_signals': positive_signals,
