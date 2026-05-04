@@ -26,7 +26,10 @@ import re
 import time
 from typing import Dict, List, Set, Any, Optional
 
-from .tail_extractor import extract_tail, build_seed_ctx, _all_top_lemmas
+from .tail_extractor import (
+    extract_tail, build_seed_ctx, _all_top_lemmas,
+    _reset_extract_timings, _get_extract_timings,
+)
 from .tail_function_classifier import TailFunctionClassifier
 
 logger = logging.getLogger(__name__)
@@ -549,19 +552,26 @@ def apply_l0_filter(
     t_classify_total = 0.0
 
     # Первый проход: собрать все хвосты и уникальные слова
+    _reset_extract_timings()  # сбрасываем счётчики extract_tail перед батчем
     _t = time.perf_counter()
     _kw_tail_pairs = []
     _all_tail_words: set = set()
     _fallback_used_count = 0  # счётчик для логов
+    _t_extract_primary = 0.0  # время основного extract_tail
+    _t_extract_fallback = 0.0  # время fallback extract_tail (с укороченным seed)
+    _t_extract_lemma_guard = 0.0  # время lemma-guard проверки
+    _slow_kw_top: list = []  # топ-20 самых медленных kw для анализа
     for kw_item in keywords:
         kw = kw_item.strip() if isinstance(kw_item, str) else kw_item.get("query", "").strip()
         if not kw:
             continue
         _t0 = time.perf_counter()
+        _t_primary_start = _t0
         tail = extract_tail(
             kw, seed, seed_ctx=seed_ctx,
             geo_db=geo_db, target_country=target_country,
         )
+        _t_extract_primary += time.perf_counter() - _t_primary_start
 
         # Fallback: если основной extract не нашёл seed и критерий eligibility
         # выполнен, пробуем укороченный seed (без последнего слова). Это ловит
@@ -580,23 +590,52 @@ def apply_l0_filter(
         # На полном seed такие кейсы отсеиваются (там ещё 'цена' нужна), но
         # fallback с коротким seed их пропускает. Guard закрывает эту дыру.
         if tail is None and _skip_last_eligible:
+            _t_fb_start = time.perf_counter()
             _tail_fb = extract_tail(
                 kw, _short_seed, seed_ctx=_short_seed_ctx,
                 geo_db=geo_db, target_country=target_country,
             )
+            _t_extract_fallback += time.perf_counter() - _t_fb_start
             if _tail_fb is not None:
                 # Lemma-guard: все леммы укороченного seed должны быть в kw.
+                _t_lg_start = time.perf_counter()
                 _kw_lemmas = {_morph.parse(w)[0].normal_form for w in kw.lower().split()}
+                _t_extract_lemma_guard += time.perf_counter() - _t_lg_start
                 if _short_seed_lemmas_set.issubset(_kw_lemmas):
                     tail = _tail_fb
                     _fallback_used_count += 1
 
-        t_extract_total += time.perf_counter() - _t0
+        _kw_dt = time.perf_counter() - _t0
+        t_extract_total += _kw_dt
+        # топ медленных
+        if len(_slow_kw_top) < 20:
+            _slow_kw_top.append((_kw_dt, kw))
+            _slow_kw_top.sort(reverse=True)
+        elif _kw_dt > _slow_kw_top[-1][0]:
+            _slow_kw_top[-1] = (_kw_dt, kw)
+            _slow_kw_top.sort(reverse=True)
         _kw_tail_pairs.append((kw_item, kw, tail))
         if tail:
             _all_tail_words.update(tail.lower().split())
     _t_stage['collect_tails_loop'] = time.perf_counter() - _t
+    _t_stage['extract_primary'] = _t_extract_primary
+    _t_stage['extract_fallback'] = _t_extract_fallback
+    _t_stage['extract_lemma_guard'] = _t_extract_lemma_guard
     _t_stage['fallback_used'] = _fallback_used_count
+
+    # Топ-10 самых медленных ключей для extract_tail
+    _slow_str = " | ".join(f"{dt*1000:.1f}ms '{k[:40]}'" for dt, k in _slow_kw_top[:10])
+    logger.info("[L0_SLOW_EXTRACT] %s", _slow_str)
+    print(f"[L0_SLOW_EXTRACT] {_slow_str}", flush=True)
+
+    # Per-stage extract_tail тайминги (Шаг 0/1/2/3/4)
+    _ex_timings, _ex_counts = _get_extract_timings()
+    _ex_str = " | ".join(f"{k}={v:.3f}s" for k, v in sorted(_ex_timings.items(), key=lambda x: -x[1]))
+    _ex_cnt_str = " | ".join(f"{k}={v}" for k, v in _ex_counts.items())
+    logger.info("[L0_EXTRACT_STAGES] %s", _ex_str)
+    logger.info("[L0_EXTRACT_COUNTS] %s", _ex_cnt_str)
+    print(f"[L0_EXTRACT_STAGES] {_ex_str}", flush=True)
+    print(f"[L0_EXTRACT_COUNTS] {_ex_cnt_str}", flush=True)
 
     # Один проход morph.parse для всех уникальных слов
     _t = time.perf_counter()
@@ -652,6 +691,11 @@ def apply_l0_filter(
 
     # Замер всего основного цикла (включая classify, UA check, NO_SEED, etc.)
     _t_loop_start = time.perf_counter()
+    _slow_classify_top: list = []
+    _classify_count = 0
+    _ua_skip_count = 0
+    _no_seed_count = 0
+    _empty_tail_count = 0
     for kw_item, kw, tail in _kw_tail_pairs:
 
         # ── UA-язык → TRASH (ДО любой другой классификации) ───────────────
@@ -668,6 +712,7 @@ def apply_l0_filter(
         #   - чистую латиницу (all on 6, straumann) — свои детекторы
         #   - смешанный алфавит (рrice) — detect_mixed_alphabet
         if _UA_EXCLUSIVE_LETTERS.intersection(kw):
+            _ua_skip_count += 1
             trash_keywords.append(kw_item)
             trace_records.append({
                 "keyword": kw,
@@ -703,6 +748,7 @@ def apply_l0_filter(
         # Если ни A ни B не сработали — оставляем GREY как раньше
         # (возможные валидные синонимы, перестановки, частичные совпадения).
         if tail is None:
+            _no_seed_count += 1
             _kw_lower = kw.lower()
             _kw_words_set = set(_kw_lower.split())
 
@@ -759,6 +805,7 @@ def apply_l0_filter(
 
         # Пустой хвост = запрос совпадает с seed → VALID
         if not tail:
+            _empty_tail_count += 1
             valid_keywords.append(kw_item)
             trace_records.append({
                 "keyword": kw,
@@ -773,7 +820,16 @@ def apply_l0_filter(
         # ── classify с глобальным tail_parses ───────────────────────────────
         t0 = time.perf_counter()
         r = clf.classify(tail, tail_parses=tail_parses, kw=kw)
-        t_classify_total += time.perf_counter() - t0
+        _classify_dt = time.perf_counter() - t0
+        t_classify_total += _classify_dt
+        _classify_count += 1
+        # топ медленных classify
+        if len(_slow_classify_top) < 20:
+            _slow_classify_top.append((_classify_dt, kw, tail))
+            _slow_classify_top.sort(reverse=True)
+        elif _classify_dt > _slow_classify_top[-1][0]:
+            _slow_classify_top[-1] = (_classify_dt, kw, tail)
+            _slow_classify_top.sort(reverse=True)
 
         label = r["label"]
         all_signals = r["positive_signals"] + [f"-{s}" for s in r["negative_signals"]]
@@ -798,6 +854,18 @@ def apply_l0_filter(
 
     # ── Обновляем result ─────────────────────────────────────────────────────
     _t_stage['main_loop'] = time.perf_counter() - _t_loop_start
+    _t_stage['classify_count'] = _classify_count
+    _t_stage['ua_skip_count'] = _ua_skip_count
+    _t_stage['no_seed_count'] = _no_seed_count
+    _t_stage['empty_tail_count'] = _empty_tail_count
+
+    # Топ-10 самых медленных classify
+    _slow_clf_str = " | ".join(
+        f"{dt*1000:.1f}ms tail='{t[:30]}' kw='{k[:30]}'"
+        for dt, k, t in _slow_classify_top[:10]
+    )
+    logger.info("[L0_SLOW_CLASSIFY] %s", _slow_clf_str)
+    print(f"[L0_SLOW_CLASSIFY] {_slow_clf_str}", flush=True)
 
     # ── SANITY CHECK: демотируем ложные VALID в GREY ────────────────────────
     # Для LATN-heavy сидов (samsung galaxy s21 ремонт, ремонт macbook pro и т.п.)
@@ -809,17 +877,24 @@ def apply_l0_filter(
     # пропускает всё (len>=3 soft), либо требует все леммы (len==2 строго).
     _t_sanity_start = time.perf_counter()
     _sanity_demoted_count = 0
+    _sanity_check_count = 0
+    _t_sanity_inner = 0.0
+    _t_sanity_trace_lookup = 0.0
     if _sanity_ctx is not None:
         _kept_valid = []
         for kw_item in valid_keywords:
             kw = kw_item if isinstance(kw_item, str) else kw_item.get("query", "")
+            _t_si = time.perf_counter()
             reason = _sanity_check_valid(kw, _sanity_ctx, brand_db, _morph)
+            _t_sanity_inner += time.perf_counter() - _t_si
+            _sanity_check_count += 1
             if reason is None:
                 _kept_valid.append(kw_item)
                 continue
             # Демотируем: добавляем в GREY, обновляем trace_record
             grey_keywords.append(kw_item)
             _sanity_demoted_count += 1
+            _t_tl = time.perf_counter()
             for tr in trace_records:
                 if tr.get("keyword") == kw and tr.get("label") == "VALID":
                     tr["label"] = "GREY"
@@ -827,8 +902,12 @@ def apply_l0_filter(
                     tr["reason"] = f"sanity_mismatch: {reason}"
                     tr["signals"] = tr.get("signals", []) + ["-sanity_mismatch"]
                     break
+            _t_sanity_trace_lookup += time.perf_counter() - _t_tl
         valid_keywords = _kept_valid
     _t_stage['sanity_check'] = time.perf_counter() - _t_sanity_start
+    _t_stage['sanity_inner_only'] = _t_sanity_inner
+    _t_stage['sanity_trace_lookup'] = _t_sanity_trace_lookup
+    _t_stage['sanity_check_count'] = _sanity_check_count
     _t_stage['sanity_demoted'] = _sanity_demoted_count
 
     result["keywords"] = valid_keywords
@@ -877,6 +956,7 @@ def apply_l0_filter(
     _stages_str = " | ".join(f"{k}={v:.3f}s" if isinstance(v, float) else f"{k}={v}"
                               for k, v in _t_stage.items())
     logger.info("[L0_STAGES] %s", _stages_str)
+    print(f"[L0_STAGES] {_stages_str}", flush=True)  # дублирующий print для диагностики
 
     # ── Лог итогов ──────────────────────────────────────────────────────────
     total = len(trace_records)
@@ -895,15 +975,42 @@ def apply_l0_filter(
         "[L0_PROFILE] n=%d | extract_tail=%.3fs | classify=%.3fs | total=%.3fs",
         total, t_extract_total, t_classify_total, t_l0_total,
     )
+    print(
+        f"[L0_PROFILE] n={total} | extract_tail={t_extract_total:.3f}s | "
+        f"classify={t_classify_total:.3f}s | total={t_l0_total:.3f}s",
+        flush=True,
+    )
+
+    # ── Sanity: сумма этапов vs реальный total ─────────────────────────────
+    # Если стадии сложились в X, а общее = X+Δ, то Δ — потерянное время
+    # вне инструментированных блоков (что-то на стыке этапов или import).
+    _stage_sum = sum(v for v in _t_stage.values() if isinstance(v, float))
+    _missing = t_l0_total - _stage_sum
+    print(
+        f"[L0_BUDGET] stage_sum={_stage_sum:.3f}s | total={t_l0_total:.3f}s | "
+        f"missing={_missing:.3f}s",
+        flush=True,
+    )
 
     # ── Per-detector тайминги (топ по убыванию) ─────────────────────────────
     if clf.detector_timings:
         sorted_det = sorted(clf.detector_timings.items(), key=lambda x: -x[1])
-        logger.info(
-            "[L0_DETECTORS] %s",
-            " | ".join(f"{k}={v:.3f}s" for k, v in sorted_det)
-        )
+        _det_str = " | ".join(f"{k}={v:.3f}s" for k, v in sorted_det)
+        logger.info("[L0_DETECTORS] %s", _det_str)
+        print(f"[L0_DETECTORS] {_det_str}", flush=True)
+        _det_total = sum(clf.detector_timings.values())
+        print(f"[L0_DETECTORS_SUM] total={_det_total:.3f}s", flush=True)
         clf.detector_timings.clear()  # сброс после батча
+
+    # ── Per-classify-stage тайминги (positive_loop / commerce_extra / negative_loop / arb) ─
+    if hasattr(clf, 'classify_stages') and clf.classify_stages:
+        sorted_cs = sorted(clf.classify_stages.items(), key=lambda x: -x[1])
+        _cs_str = " | ".join(f"{k}={v:.3f}s" for k, v in sorted_cs)
+        logger.info("[L0_CLASSIFY_STAGES] %s", _cs_str)
+        print(f"[L0_CLASSIFY_STAGES] {_cs_str}", flush=True)
+        _cs_total = sum(clf.classify_stages.values())
+        print(f"[L0_CLASSIFY_STAGES_SUM] total={_cs_total:.3f}s", flush=True)
+        clf.classify_stages.clear()
 
     return result
 
