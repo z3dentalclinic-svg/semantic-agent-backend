@@ -24,6 +24,43 @@ from .shared_morph import morph
 ENABLE_GEO_FIRST = True
 
 
+# === ДИАГНОСТИКА: модульные счётчики времени по шагам extract_tail. ===
+# Сбрасываются вызывающим кодом (l0_filter) до батча, читаются после.
+# Не влияют на логику.
+_EXTRACT_STAGE_TIMINGS: dict = {
+    'step0_geo_first': 0.0,
+    'step0_lemmatize': 0.0,
+    'step1_substring': 0.0,
+    'step1_3_query_lemmatize': 0.0,
+    'step2_fuzzy_ordered': 0.0,
+    'step3_unordered': 0.0,
+    'step4_partial': 0.0,
+}
+_EXTRACT_STAGE_COUNTS: dict = {
+    'step0_geo_first_called': 0,
+    'step0_geo_first_returned': 0,
+    'step1_returned': 0,
+    'step2_returned': 0,
+    'step3_returned': 0,
+    'step4_returned': 0,
+    'returned_none': 0,
+}
+
+
+def _reset_extract_timings():
+    """Сбрасывает счётчики extract_tail (вызывается из l0_filter перед батчем)."""
+    global _EXTRACT_STAGE_TIMINGS, _EXTRACT_STAGE_COUNTS
+    for k in _EXTRACT_STAGE_TIMINGS:
+        _EXTRACT_STAGE_TIMINGS[k] = 0.0
+    for k in _EXTRACT_STAGE_COUNTS:
+        _EXTRACT_STAGE_COUNTS[k] = 0
+
+
+def _get_extract_timings():
+    """Возвращает текущие тайминги extract_tail (для лога после батча)."""
+    return dict(_EXTRACT_STAGE_TIMINGS), dict(_EXTRACT_STAGE_COUNTS)
+
+
 def _all_top_lemmas(word: str) -> set:
     """
     Возвращает множество лемм со score ≥ 0.9 × top_score.
@@ -369,6 +406,8 @@ def extract_tail(
     if seed_ctx is None:
         seed_ctx = build_seed_ctx(s)
 
+    import time as _time
+
     # === Шаг 0 (Fix 2): Geo-first для CYR-сидов без LATN/NUMB ===
     # Активируется только при всех условиях одновременно:
     #   - ENABLE_GEO_FIRST = True
@@ -382,15 +421,21 @@ def extract_tail(
     if (ENABLE_GEO_FIRST and geo_db and target_country
             and not any(seed_ctx['is_lat'])
             and not any(seed_ctx['is_number'])):
+        _t0 = _time.perf_counter()
         _query_words_pre = q.split()
         _query_lemmas_all_pre = [
             _all_top_lemmas(w) for w in _query_words_pre
         ]
+        _EXTRACT_STAGE_TIMINGS['step0_lemmatize'] += _time.perf_counter() - _t0
+        _t1 = _time.perf_counter()
+        _EXTRACT_STAGE_COUNTS['step0_geo_first_called'] += 1
         _geo_first_result = _extract_geo_first(
             _query_words_pre, _query_lemmas_all_pre,
             seed_ctx, geo_db, target_country,
         )
+        _EXTRACT_STAGE_TIMINGS['step0_geo_first'] += _time.perf_counter() - _t1
         if _geo_first_result is not None:
+            _EXTRACT_STAGE_COUNTS['step0_geo_first_returned'] += 1
             return _geo_first_result
 
     # === Шаг 1: Точный split ===
@@ -400,6 +445,7 @@ def extract_tail(
     # и не должен разрываться. Разделяем только на word-boundary:
     # после последнего символа seed должна быть НЕ буква и НЕ цифра
     # (или конец строки). Универсально для 16е, 16e, 16gb, 16s, 160, 2016.
+    _t1 = _time.perf_counter()
     if s in q:
         import re as _re
         _matched = False
@@ -423,31 +469,49 @@ def extract_tail(
             if before:
                 before = ' '.join(_strip_trailing_preps(before.split()))
 
+            _EXTRACT_STAGE_TIMINGS['step1_substring'] += _time.perf_counter() - _t1
+            _EXTRACT_STAGE_COUNTS['step1_returned'] += 1
             return ' '.join([before, after]).strip()
         # Нет корректной boundary — идём к шагу 2 (он работает по токенам,
         # а не по подстроке, там '16е' не равно '16' и не даст ложный матч)
+    _EXTRACT_STAGE_TIMINGS['step1_substring'] += _time.perf_counter() - _t1
 
     # Pre-compute query data ОДИН РАЗ для шагов 2-4
     # (если точный матч не сработал — нужны леммы для fuzzy/unordered)
+    _t2 = _time.perf_counter()
     query_words = q.split()
     query_lemmas = [morph.parse(w)[0].normal_form for w in query_words]
     # Multi-lemma: все гипотезы с score ≥ 0.9×top для каждого query-слова.
     # Используется через пересечение с seed_ctx['lemmas_all'] — решает
     # лемма-ловушку pymorphy3 (см. _all_top_lemmas).
     query_lemmas_all = [_all_top_lemmas(w) for w in query_words]
+    _EXTRACT_STAGE_TIMINGS['step1_3_query_lemmatize'] += _time.perf_counter() - _t2
 
     # === Шаг 2: Нечёткий поиск (по порядку) ===
+    _t3 = _time.perf_counter()
     result = _extract_fuzzy_ordered(query_words, query_lemmas, query_lemmas_all, seed_ctx)
+    _EXTRACT_STAGE_TIMINGS['step2_fuzzy_ordered'] += _time.perf_counter() - _t3
     if result is not None:
+        _EXTRACT_STAGE_COUNTS['step2_returned'] += 1
         return result
 
     # === Шаг 3: Неупорядоченный поиск (fallback) ===
+    _t4 = _time.perf_counter()
     result = _extract_tail_unordered(query_words, query_lemmas, query_lemmas_all, seed_ctx)
+    _EXTRACT_STAGE_TIMINGS['step3_unordered'] += _time.perf_counter() - _t4
     if result is not None:
+        _EXTRACT_STAGE_COUNTS['step3_returned'] += 1
         return result
 
     # === Шаг 4: Частичный матч ===
-    return _extract_partial_match(query_words, query_lemmas, query_lemmas_all, seed_ctx)
+    _t5 = _time.perf_counter()
+    result = _extract_partial_match(query_words, query_lemmas, query_lemmas_all, seed_ctx)
+    _EXTRACT_STAGE_TIMINGS['step4_partial'] += _time.perf_counter() - _t5
+    if result is not None:
+        _EXTRACT_STAGE_COUNTS['step4_returned'] += 1
+    else:
+        _EXTRACT_STAGE_COUNTS['returned_none'] += 1
+    return result
 
 
 def _extract_fuzzy_ordered(
