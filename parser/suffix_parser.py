@@ -424,10 +424,7 @@ class SuffixParser:
                     echelon: int = 0, google_client: str = "firefox",
                     cursor_position: int = None,
                     include_letters: bool = False,
-                    city: str = None,
-                    include_research: bool = False,
-                    include_lat_sweep: bool = False,
-                    use_full_ru_sweep: bool = False) -> SuffixParseResult:
+                    city: str = None) -> SuffixParseResult:
         """
         Main parse method.
 
@@ -435,9 +432,9 @@ class SuffixParser:
         - A/B/C/D queries: run concurrently with semaphore
         - E queries: grouped by letter; all letters run in parallel,
           each letter's 14 queries are sequential (avoids Google rate limiting)
-        - SD/SDL research queries (if include_research=True): run via
-          research_pool of all IPs from ProxyPool, round-robin distribution.
-          Each research query runs on 3 agents (chrome+firefox+safari) in parallel.
+        - SD/SDL research queries (всегда включены): идут через research_pool
+          из всех IP пула, round-robin. Каждый research-запрос на 3 агентах
+          (chrome+firefox+safari).
         """
         total_start = time.time()
 
@@ -460,9 +457,6 @@ class SuffixParser:
             include_numbers=include_numbers,
             include_letters=include_letters,
             region=region,
-            include_research=include_research,
-            include_lat_sweep=include_lat_sweep,
-            use_full_ru_sweep=use_full_ru_sweep,
         )
         analysis_summary = self.generator.summary(analysis, all_queries)
 
@@ -956,7 +950,7 @@ class SuffixParser:
         # — три запроса через ОДИН и тот же IP (последовательно).
         # ═══════════════════════════════════════════════════════════════════
         research_clients: List[httpx.AsyncClient] = []
-        if include_research and ProxyPool and research_queries:
+        if ProxyPool and research_queries:
             try:
                 _research_proxies = ProxyPool.get_all_proxies()
             except Exception:
