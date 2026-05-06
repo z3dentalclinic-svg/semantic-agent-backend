@@ -707,6 +707,13 @@ class SuffixGenerator:
                 ("col",          f"{seed_lower}: {D}"),
                 ("col_nosp",     f"{seed_lower}:{D}"),
                 ("col_wc",       f"{seed_lower}: {D} *"),
+                # ── НОВЫЕ структуры по результатам Gemini-консультации ─────────
+                # Цель: вытащить терминалы многозначных цифр (купить айфон 16 128).
+                # AC отбрасывает голый терминал т.к. видит цифру D как "уже введённую".
+                # Эти структуры заставляют AC обработать D в новом контексте.
+                ("dstar_nosp",   f"{seed_lower} {D}**"),  # две звезды БЕЗ пробела
+                ("paren_open",   f"{seed_lower} ({D}"),   # открывающая скобка
+                ("dot",          f"{seed_lower} {D}."),   # точка после цифры
             ]
             for class_name, base in sd_bases:
                 for cp_pos, cp_note in self._meaningful_cps(base):
@@ -762,6 +769,59 @@ class SuffixGenerator:
                         suffix_type="SDL", priority=1,
                         markers=["research"], cp_override=cp,
                         variant="wcR", is_new_research=True,
+                        agents=ALL_AGENTS_RESEARCH,
+                    ))
+
+        # SDL_REVERSE — Суффикс {цифра} {буква} (паразитный суффикс, идея Gemini).
+        # Гипотеза: AC видит цифру + букву после неё → расширяет в виде
+        # "сид {многозначное} {буква-расширение}". Например для "купить айфон 16 1 г"
+        # AC может вернуть "купить айфон 16 128 гб". Терминал 128 вытаскивается
+        # "прицепом" к букве.
+        # 10 цифр × 30 рус. букв × 5 cp = 1500 запросов на 1 агент.
+        # Все 3 агента (chrome+firefox+safari).
+        for D in DIGITS_SD:
+            for L in LETTERS_RU_FULL:
+                # База 1: {S} {D} {L} — цифра + буква
+                base = f"{seed_lower} {D} {L}"
+                after_seed = len(seed_lower)              # позиция после сида (на пробеле)
+                after_digit = len(seed_lower) + 1 + 1     # сид + " " + D
+                after_digit_space = after_digit + 1        # сид + " " + D + " "
+                end = len(base)
+
+                for cp, tag in [
+                    (-1, "nocp"),
+                    (after_seed, f"cp{after_seed}"),
+                    (after_digit, f"cp{after_digit}"),
+                    (after_digit_space, f"cp{after_digit_space}"),
+                    (end, f"cp{end}"),
+                ]:
+                    results.append(SuffixQuery(
+                        query=base, suffix_val=f"{D}_{L}",
+                        suffix_label=f"{D}_{L}_rev_plain_{tag}",
+                        suffix_type="SDL_REV", priority=1,
+                        markers=["research"], cp_override=cp,
+                        variant="rev_plain", is_new_research=True,
+                        agents=ALL_AGENTS_RESEARCH,
+                    ))
+
+                # База 2: {S} {D} {L} * — то же с trailing wildcard
+                base_wc = f"{seed_lower} {D} {L} *"
+                end_wc = len(base_wc)
+                before_wc = len(base) + 1  # позиция перед *
+
+                for cp, tag in [
+                    (-1, "nocp"),
+                    (after_digit, f"cp{after_digit}"),
+                    (after_digit_space, f"cp{after_digit_space}"),
+                    (before_wc, f"cp{before_wc}"),
+                    (end_wc, f"cp{end_wc}"),
+                ]:
+                    results.append(SuffixQuery(
+                        query=base_wc, suffix_val=f"{D}_{L}",
+                        suffix_label=f"{D}_{L}_rev_wcR_{tag}",
+                        suffix_type="SDL_REV", priority=1,
+                        markers=["research"], cp_override=cp,
+                        variant="rev_wcR", is_new_research=True,
                         agents=ALL_AGENTS_RESEARCH,
                     ))
 
