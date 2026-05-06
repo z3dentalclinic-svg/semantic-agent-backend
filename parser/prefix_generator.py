@@ -36,7 +36,7 @@ Total: Chrome 272 + Firefox 38 = 310 запросов на сид
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 
 # ══════════════════════════════════════════════
@@ -50,14 +50,8 @@ LETTERS_RU = list("абвгдеёжзийклмнопрстуфхцчшщэюя"
 # Вопросы для Type PC
 QUESTIONS_RU = ["как", "какой", "где", "сколько", "почему"]
 
-# ── PD: цифровой перебор (NEW RESEARCH) ──────────────────────────────
-# Только 0-9 одиночные. Двузначные числа AC расширит из одиночного якоря.
-DIGITS_PD = [str(i) for i in range(10)]
-
 # Группы для удобства итерации
-# PD  — цифровой перебор (research)
-# PDL — цифра + буква + сид (research, для случаев типа "8 м доставка цветов" → "8 марта ...")
-ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC", "PD", "PDL"]
+ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC"]
 
 
 # ══════════════════════════════════════════════
@@ -82,8 +76,6 @@ class PrefixQuery:
     is_alpha: bool = False       # Входит в алфавитный перебор
     is_question: bool = False    # Вопросительный оператор
     letter: Optional[str] = None # Буква для PA группы
-    is_new_research: bool = False  # ← True для экспериментальных структур (PD/PDL).
-                                    # Старые структуры всегда False — не трогать.
 
 
 # ══════════════════════════════════════════════
@@ -365,183 +357,6 @@ class PrefixGenerator:
                              op_val=L, op_t="letter",
                              is_alpha=True, letter=L,
                              agents=FF if f"{L}_L_hyp" in PA_FF_STRUCTS else CHROME))
-
-        # ─────────────────────────────────────────────────────────────────────
-        # PD — Цифровой перебор (NEW RESEARCH, is_new_research=True)
-        #
-        # Цель: широкое покрытие для разовой разведки. Все структурные
-        # варианты × только осмысленные позиции cp (границы токенов).
-        # Прогоняется на ВСЕХ ТРЁХ АГЕНТАХ (chrome+firefox+safari) — чтобы
-        # увидеть какой источник самый богатый и зажать по итогу.
-        #
-        # Цифры: 0-9. Все структуры помечены is_new_research=True.
-        # ─────────────────────────────────────────────────────────────────────
-        # Все 3 агента для research структур
-        ALL_AGENTS = ("chrome", "firefox", "safari")
-
-        if "PD" in grp:
-            def _meaningful_cps(base: str) -> List[Tuple[int, str]]:
-                """
-                Возвращает только осмысленные cp позиции для строки base:
-                границы токенов (после/перед каждым пробелом/спецсимволом),
-                0 и len. Внутри слов сида cp не добавляются — AC даёт
-                идентичную выдачу.
-                """
-                cps: List[Tuple[int, str]] = [(-1, "без cp")]
-                cps.append((0, "cp=0 начало"))
-
-                for i, ch in enumerate(base):
-                    if ch in " *-:":
-                        if i + 1 <= len(base):
-                            cps.append((i + 1, f"cp={i+1} после '{ch}'"))
-                        cps.append((i, f"cp={i} перед '{ch}'"))
-
-                cps.append((len(base), f"cp={len(base)} конец"))
-
-                # Дедуп по позиции
-                seen = {}
-                for cp, note in cps:
-                    if cp not in seen:
-                        seen[cp] = note
-                return [(cp, note) for cp, note in seen.items()]
-
-            def _pd(struct_name: str, base: str, cp: int, cp_note: str,
-                    digit: str) -> PrefixQuery:
-                """PD структура — на всех 3 агентах, is_new_research=True."""
-                return PrefixQuery(
-                    query=base, group="PD", struct=struct_name,
-                    operator=digit, op_type="digit", cp=cp, cp_note=cp_note,
-                    agents=ALL_AGENTS,
-                    is_alpha=False, is_question=False, letter=digit,
-                    is_new_research=True,
-                )
-
-            for D in DIGITS_PD:
-                pd_bases = [
-                    # 1. Plain
-                    ("plain",        f"{D} {S}"),
-                    ("plain_nosp",   f"{D}{S}"),
-                    ("plain_trail",  f"{D} {S} "),
-                    # 2. WC слева
-                    ("wcL",          f"* {D} {S}"),
-                    ("wcL_nosp1",    f"*{D} {S}"),
-                    ("wcL_nosp2",    f"* {D}{S}"),
-                    # 3. WC справа
-                    ("wcR",          f"{D} {S} *"),
-                    ("wcR_nosp",     f"{D}{S}*"),
-                    ("wcR_S2star",   f"{D} {S}*"),
-                    ("wcR_trail",    f"{D} {S} * "),
-                    # 4. WC середина
-                    ("wcM",          f"{D} * {S}"),
-                    ("wcM_nosp1",    f"{D}* {S}"),
-                    ("wcM_nosp2",    f"{D} *{S}"),
-                    ("wcM_nosp3",    f"{D}*{S}"),
-                    # 5. WC с обеих сторон
-                    ("wcLR",         f"* {D} {S} *"),
-                    ("wcLM",         f"* {D} * {S}"),
-                    ("wcMR",         f"{D} * {S} *"),
-                    ("wcLMR",        f"* {D} * {S} *"),
-                    # 6. Двойной WC
-                    ("dwcL",         f"** {D} {S}"),
-                    ("dwcM",         f"{D} ** {S}"),
-                    ("dwcR",         f"{D} {S} **"),
-                    # 7. Дефис
-                    ("hyp",          f"{D} - {S}"),
-                    ("hyp_wc",       f"{D} - {S} *"),
-                    ("hyp_nosp",     f"{D}-{S}"),
-                    ("hyp_nosp_wc",  f"{D}-{S}*"),
-                    # 8. Двоеточие
-                    ("col",          f"{D}: {S}"),
-                    ("col_nosp",     f"{D}:{S}"),
-                    ("col_wc",       f"{D}: {S} *"),
-                ]
-
-                for class_name, base in pd_bases:
-                    for cp_pos, cp_note in _meaningful_cps(base):
-                        tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
-                        out.append(_pd(
-                            f"{D}_{class_name}_{tag}",
-                            base, cp_pos, cp_note,
-                            D,
-                        ))
-
-        # ─────────────────────────────────────────────────────────────────────
-        # PDL — Цифра + буква + сид (NEW RESEARCH, is_new_research=True)
-        #
-        # Гипотеза: голая цифра не всегда расширяется AC в нужное число/слово
-        # ("7 доставка цветов" не даёт "7 роз доставка цветов"). Но цифра
-        # вместе с одной буквой образует более конкретный якорь —
-        # "7 р доставка цветов" может расшириться в "7 роз доставка цветов",
-        # "8 м" → "8 марта", "4 с" → "4 сезона" и т.д.
-        #
-        # Структура: {D} {L} {S} с минимальным набором cp.
-        # Прогон на 3 агентах (chrome+firefox+safari).
-        #
-        # Цифры: 0-9. Буквы: 30 (русский алфавит без ъ ы ь).
-        # CP позиции: 4 ключевые точки + nocp.
-        # ─────────────────────────────────────────────────────────────────────
-        if "PDL" in grp:
-            def _pdl(struct_name: str, base: str, cp: int, cp_note: str,
-                     digit: str, letter: str) -> PrefixQuery:
-                """PDL структура — на всех 3 агентах, is_new_research=True."""
-                return PrefixQuery(
-                    query=base, group="PDL", struct=struct_name,
-                    operator=f"{digit}_{letter}", op_type="digit_letter",
-                    cp=cp, cp_note=cp_note,
-                    agents=ALL_AGENTS,
-                    is_alpha=False, is_question=False, letter=letter,
-                    is_new_research=True,
-                )
-
-            for D in DIGITS_PD:
-                for L in LETTERS_RU:
-                    # База 1: {D} {L} {S} — цифра + буква + сид
-                    base = f"{D} {L} {S}"
-                    # CP позиции:
-                    #   -1 (без cp)
-                    #   0 (начало)
-                    #   1 (после цифры)
-                    #   3 (после буквы — len(D)+1+len(L)+0)
-                    #   3+1=4 (после пробела перед сидом — len(D)+1+len(L)+1)
-                    #   len (конец)
-                    after_digit = 1
-                    after_letter = 1 + 1 + 1  # D + space + L = 3
-                    before_seed = after_letter + 1  # = 4
-                    end = len(base)
-
-                    cp_variants = [
-                        (-1, "без cp", "nocp"),
-                        (0, "cp=0 начало", "cp0"),
-                        (after_digit, f"cp={after_digit} после цифры", f"cp{after_digit}"),
-                        (after_letter, f"cp={after_letter} после буквы", f"cp{after_letter}"),
-                        (before_seed, f"cp={before_seed} перед сидом", f"cp{before_seed}"),
-                        (end, f"cp={end} конец", f"cp{end}"),
-                    ]
-
-                    for cp, note, tag in cp_variants:
-                        out.append(_pdl(
-                            f"{D}_{L}_plain_{tag}",
-                            base, cp, note, D, L,
-                        ))
-
-                    # База 2: {D} {L} {S} * — то же с trailing wildcard
-                    base_wc = f"{D} {L} {S} *"
-                    end_wc = len(base_wc)
-                    before_wc = len(base) + 1  # позиция перед *
-
-                    cp_variants_wc = [
-                        (-1, "без cp", "nocp"),
-                        (after_letter, f"cp={after_letter} после буквы", f"cp{after_letter}"),
-                        (before_seed, f"cp={before_seed} перед сидом", f"cp{before_seed}"),
-                        (before_wc, f"cp={before_wc} перед *", f"cp{before_wc}"),
-                        (end_wc, f"cp={end_wc} конец", f"cp{end_wc}"),
-                    ]
-
-                    for cp, note, tag in cp_variants_wc:
-                        out.append(_pdl(
-                            f"{D}_{L}_wcR_{tag}",
-                            base_wc, cp, note, D, L,
-                        ))
 
         # ─────────────────────────────────────────────────────────────
         # PC — Вопросы: 5 вопросов × 2-3 cp = 11 запросов
