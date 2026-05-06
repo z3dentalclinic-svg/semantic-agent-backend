@@ -442,17 +442,21 @@ class SuffixGenerator:
         if any(c.isdigit() for c in seed_lower):
             include_numbers = True
 
-        # L6+: only symbols (A_ua + A_ru), v1 only
+        # L6+: для базовой части — только symbols (A_ua + A_ru), v1 only.
+        # Research-блок (SD/SDL/E_LAT) выполняется ВСЕГДА — для исследования
+        # нужны все структуры на всех сидах независимо от длины.
+        # Это означает: для L6+ возвращаем A_ua+A_ru + research-блок, без B/C/D/E.
         if analysis.l_level == "L6+":
-            queries = []
+            results = []
             for stype in ["A_ua", "A_ru"]:
                 for s in self.suffixes.get(stype, []):
                     q = f"{seed_lower} {s['val']}".strip()
-                    queries.append(SuffixQuery(
+                    results.append(SuffixQuery(
                         query=q, suffix_val=s["val"], suffix_label=s["label"],
                         suffix_type=stype, priority=1, markers=[analysis.l_level]
                     ))
-            return analysis, queries
+            # Прыжок к research-блоку
+            return self._append_research_block(seed_lower, results, analysis_obj=analysis)
 
         # Collect active markers for matrix lookup
         active_markers = []
@@ -615,149 +619,9 @@ class SuffixGenerator:
             for letter in LETTERS_RU_FULL:
                 results.extend(self._build_letter_structures(seed_lower, letter))
 
-        # ════════════════════════════════════════════════════════════════
-        # RESEARCH BLOCK — E_LAT, SD, SDL (всегда включены)
-        # SD/SDL помечены is_new_research=True → парсер направит их
-        # в research-пул всех IP (round-robin) с 3 агентами.
-        # E_LAT — обычный Letter Sweep но латиницей, Chrome only.
-        # После research-прогона неэффективные структуры комментируются
-        # через SKIP-листы (как FF_BCD_SKIP_VARIANTS).
-        # ════════════════════════════════════════════════════════════════
-
-        # E_LAT — Latin Letter Sweep (26 букв × 13 структур).
-        # Chrome only, по аналогии с E_RU. Цель: ловить хвосты вида
-        # "сид pro 400", "сид m1102w", "сид mfp ...".
-        for letter in LETTERS_LAT:
-            lat_queries = self._build_letter_structures(seed_lower, letter)
-            for lq in lat_queries:
-                lq.suffix_type = "E_LAT"
-                lq.suffix_label = f"lat_{lq.suffix_label}"
-                lq.agents = ("chrome",)
-            results.extend(lat_queries)
-
-        # SD — Цифровой суффиксный перебор (зеркало PD из prefix-research).
-        # 10 цифр × 28 структурных вариантов × meaningful cp ≈ 2450 запросов.
-        # Все 3 агента (chrome+firefox+safari).
-        for D in DIGITS_SD:
-            sd_bases = [
-                # 1. Plain
-                ("plain",        f"{seed_lower} {D}"),
-                ("plain_nosp",   f"{seed_lower}{D}"),
-                ("plain_trail",  f"{seed_lower} {D} "),
-                # 2. WC слева (между сидом и цифрой)
-                ("wcL",          f"{seed_lower} * {D}"),
-                ("wcL_nosp1",    f"{seed_lower}* {D}"),
-                ("wcL_nosp2",    f"{seed_lower} *{D}"),
-                # 3. WC справа (после цифры)
-                ("wcR",          f"{seed_lower} {D} *"),
-                ("wcR_nosp",     f"{seed_lower} {D}*"),
-                ("wcR_S2star",   f"{seed_lower} {D}*"),
-                ("wcR_trail",    f"{seed_lower} {D} * "),
-                # 4. WC перед сидом
-                ("wcM",          f"* {seed_lower} {D}"),
-                ("wcM_nosp1",    f"*{seed_lower} {D}"),
-                ("wcM_nosp2",    f"* {seed_lower}{D}"),
-                ("wcM_nosp3",    f"*{seed_lower}{D}"),
-                # 5. WC с обеих сторон
-                ("wcLR",         f"* {seed_lower} {D} *"),
-                ("wcLM",         f"* {seed_lower} * {D}"),
-                ("wcMR",         f"{seed_lower} * {D} *"),
-                ("wcLMR",        f"* {seed_lower} * {D} *"),
-                # 6. Двойной WC
-                ("dwcL",         f"** {seed_lower} {D}"),
-                ("dwcM",         f"{seed_lower} ** {D}"),
-                ("dwcR",         f"{seed_lower} {D} **"),
-                # 7. Дефис
-                ("hyp",          f"{seed_lower} - {D}"),
-                ("hyp_wc",       f"{seed_lower} - {D} *"),
-                ("hyp_nosp",     f"{seed_lower}-{D}"),
-                ("hyp_nosp_wc",  f"{seed_lower}-{D}*"),
-                # 8. Двоеточие
-                ("col",          f"{seed_lower}: {D}"),
-                ("col_nosp",     f"{seed_lower}:{D}"),
-                ("col_wc",       f"{seed_lower}: {D} *"),
-            ]
-            for class_name, base in sd_bases:
-                for cp_pos, cp_note in self._meaningful_cps(base):
-                    tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
-                    results.append(SuffixQuery(
-                        query=base,
-                        suffix_val=D,
-                        suffix_label=f"{D}_{class_name}_{tag}",
-                        suffix_type="SD",
-                        priority=1,
-                        markers=["research"],
-                        cp_override=cp_pos,
-                        variant=class_name,
-                        is_new_research=True,
-                        agents=ALL_AGENTS_RESEARCH,
-                    ))
-
-        # SDL — Суффикс {буква} {цифра} (зеркало PDL).
-        # 10 цифр × 30 рус. букв × 11 cp = 3300 запросов на 1 агент.
-        # Гипотеза: "сид р 7" → AC расширит "роз 7" / "роз 7 шт".
-        # Все 3 агента (chrome+firefox+safari).
-        for D in DIGITS_SD:
-            for L in LETTERS_RU_FULL:
-                # База 1: {S} {L} {D}
-                base = f"{seed_lower} {L} {D}"
-                after_seed = len(seed_lower)              # позиция после сида (на пробеле)
-                after_letter = len(seed_lower) + 1 + 1    # сид + " " + L
-                after_letter_space = after_letter + 1      # сид + " " + L + " "
-                end = len(base)
-
-                cp_variants = [
-                    (-1, "без cp", "nocp"),
-                    (after_seed, f"cp={after_seed} перед буквой", f"cp{after_seed}"),
-                    (after_letter, f"cp={after_letter} после буквы", f"cp{after_letter}"),
-                    (after_letter_space, f"cp={after_letter_space} перед цифрой", f"cp{after_letter_space}"),
-                    (end, f"cp={end} конец", f"cp{end}"),
-                ]
-
-                for cp, note, tag in cp_variants:
-                    results.append(SuffixQuery(
-                        query=base,
-                        suffix_val=f"{L}_{D}",
-                        suffix_label=f"{D}_{L}_plain_{tag}",
-                        suffix_type="SDL",
-                        priority=1,
-                        markers=["research"],
-                        cp_override=cp,
-                        variant="plain",
-                        is_new_research=True,
-                        agents=ALL_AGENTS_RESEARCH,
-                    ))
-
-                # База 2: {S} {L} {D} * — то же с trailing wildcard
-                base_wc = f"{seed_lower} {L} {D} *"
-                end_wc = len(base_wc)
-                before_wc = len(base) + 1  # позиция перед *
-
-                cp_variants_wc = [
-                    (-1, "без cp", "nocp"),
-                    (after_letter, f"cp={after_letter} после буквы", f"cp{after_letter}"),
-                    (after_letter_space, f"cp={after_letter_space} перед цифрой", f"cp{after_letter_space}"),
-                    (before_wc, f"cp={before_wc} перед *", f"cp{before_wc}"),
-                    (end_wc, f"cp={end_wc} конец", f"cp{end_wc}"),
-                ]
-
-                for cp, note, tag in cp_variants_wc:
-                    results.append(SuffixQuery(
-                        query=base_wc,
-                        suffix_val=f"{L}_{D}",
-                        suffix_label=f"{D}_{L}_wcR_{tag}",
-                        suffix_type="SDL",
-                        priority=1,
-                        markers=["research"],
-                        cp_override=cp,
-                        variant="wcR",
-                        is_new_research=True,
-                        agents=ALL_AGENTS_RESEARCH,
-                    ))
-
-        # ════════════════════════════════════════════════════════════════
-        # END RESEARCH BLOCK
-        # ════════════════════════════════════════════════════════════════
+        # Research-блок (E_LAT + SD + SDL) — вынесен в отдельный метод
+        # чтобы можно было вызвать его и из L6+ early return.
+        analysis, results = self._append_research_block(seed_lower, results, analysis_obj=analysis)
 
         # Double-space suffix always gets +1 (but max 2)
         for r in results:
@@ -793,6 +657,115 @@ class SuffixGenerator:
             if cp not in seen:
                 seen[cp] = note
         return [(cp, note) for cp, note in seen.items()]
+
+    def _append_research_block(self, seed_lower: str, results: list, analysis_obj=None):
+        """
+        Добавляет research-структуры (E_LAT + SD + SDL) к results.
+        Вызывается из generate() в основной ветке и в L6+ early return.
+
+        Возвращает (analysis_obj, results) для совместимости с обоими callsite.
+        """
+        # E_LAT — Latin Letter Sweep (26 букв × 13 структур). Chrome only.
+        for letter in LETTERS_LAT:
+            lat_queries = self._build_letter_structures(seed_lower, letter)
+            for lq in lat_queries:
+                lq.suffix_type = "E_LAT"
+                lq.suffix_label = f"lat_{lq.suffix_label}"
+                lq.agents = ("chrome",)
+            results.extend(lat_queries)
+
+        # SD — Цифровой суффиксный перебор (зеркало PD из prefix-research).
+        # 10 цифр × 28 структурных вариантов × meaningful cp ≈ 2450 запросов.
+        # Все 3 агента (chrome+firefox+safari).
+        for D in DIGITS_SD:
+            sd_bases = [
+                ("plain",        f"{seed_lower} {D}"),
+                ("plain_nosp",   f"{seed_lower}{D}"),
+                ("plain_trail",  f"{seed_lower} {D} "),
+                ("wcL",          f"{seed_lower} * {D}"),
+                ("wcL_nosp1",    f"{seed_lower}* {D}"),
+                ("wcL_nosp2",    f"{seed_lower} *{D}"),
+                ("wcR",          f"{seed_lower} {D} *"),
+                ("wcR_nosp",     f"{seed_lower} {D}*"),
+                ("wcR_S2star",   f"{seed_lower} {D}*"),
+                ("wcR_trail",    f"{seed_lower} {D} * "),
+                ("wcM",          f"* {seed_lower} {D}"),
+                ("wcM_nosp1",    f"*{seed_lower} {D}"),
+                ("wcM_nosp2",    f"* {seed_lower}{D}"),
+                ("wcM_nosp3",    f"*{seed_lower}{D}"),
+                ("wcLR",         f"* {seed_lower} {D} *"),
+                ("wcLM",         f"* {seed_lower} * {D}"),
+                ("wcMR",         f"{seed_lower} * {D} *"),
+                ("wcLMR",        f"* {seed_lower} * {D} *"),
+                ("dwcL",         f"** {seed_lower} {D}"),
+                ("dwcM",         f"{seed_lower} ** {D}"),
+                ("dwcR",         f"{seed_lower} {D} **"),
+                ("hyp",          f"{seed_lower} - {D}"),
+                ("hyp_wc",       f"{seed_lower} - {D} *"),
+                ("hyp_nosp",     f"{seed_lower}-{D}"),
+                ("hyp_nosp_wc",  f"{seed_lower}-{D}*"),
+                ("col",          f"{seed_lower}: {D}"),
+                ("col_nosp",     f"{seed_lower}:{D}"),
+                ("col_wc",       f"{seed_lower}: {D} *"),
+            ]
+            for class_name, base in sd_bases:
+                for cp_pos, cp_note in self._meaningful_cps(base):
+                    tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
+                    results.append(SuffixQuery(
+                        query=base, suffix_val=D,
+                        suffix_label=f"{D}_{class_name}_{tag}",
+                        suffix_type="SD", priority=1,
+                        markers=["research"], cp_override=cp_pos,
+                        variant=class_name, is_new_research=True,
+                        agents=ALL_AGENTS_RESEARCH,
+                    ))
+
+        # SDL — Суффикс {буква} {цифра} (зеркало PDL).
+        for D in DIGITS_SD:
+            for L in LETTERS_RU_FULL:
+                base = f"{seed_lower} {L} {D}"
+                after_seed = len(seed_lower)
+                after_letter = len(seed_lower) + 1 + 1
+                after_letter_space = after_letter + 1
+                end = len(base)
+
+                for cp, tag in [
+                    (-1, "nocp"),
+                    (after_seed, f"cp{after_seed}"),
+                    (after_letter, f"cp{after_letter}"),
+                    (after_letter_space, f"cp{after_letter_space}"),
+                    (end, f"cp{end}"),
+                ]:
+                    results.append(SuffixQuery(
+                        query=base, suffix_val=f"{L}_{D}",
+                        suffix_label=f"{D}_{L}_plain_{tag}",
+                        suffix_type="SDL", priority=1,
+                        markers=["research"], cp_override=cp,
+                        variant="plain", is_new_research=True,
+                        agents=ALL_AGENTS_RESEARCH,
+                    ))
+
+                base_wc = f"{seed_lower} {L} {D} *"
+                end_wc = len(base_wc)
+                before_wc = len(base) + 1
+
+                for cp, tag in [
+                    (-1, "nocp"),
+                    (after_letter, f"cp{after_letter}"),
+                    (after_letter_space, f"cp{after_letter_space}"),
+                    (before_wc, f"cp{before_wc}"),
+                    (end_wc, f"cp{end_wc}"),
+                ]:
+                    results.append(SuffixQuery(
+                        query=base_wc, suffix_val=f"{L}_{D}",
+                        suffix_label=f"{D}_{L}_wcR_{tag}",
+                        suffix_type="SDL", priority=1,
+                        markers=["research"], cp_override=cp,
+                        variant="wcR", is_new_research=True,
+                        agents=ALL_AGENTS_RESEARCH,
+                    ))
+
+        return analysis_obj, results
 
     def _build_letter_structures(self, seed_lower: str, letter: str) -> List["SuffixQuery"]:
         """
