@@ -113,3 +113,74 @@ def register_suffix_endpoint(app: FastAPI):
                 "summary_by_suffix": result.summary_by_suffix,
             },
         }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # RESEARCH ENDPOINT — разовый широкий прогон с SD + SDL + E_LAT + полный E_RU
+    # Зеркало /api/prefix-map с research-структурами.
+    #
+    # Объём на 1 сид:
+    #   ~17 200 запросов (базовая часть + E_LAT + SD×3 агента + SDL×3 агента)
+    #   Время прогона: ~1.5-2 часа на сид (50 IP пул)
+    #
+    # Использование:
+    #   GET /api/suffix-research?seed=доставка цветов&country=ua&language=ru
+    #   → возвращает полный trace с агрегированными ключами и source-pointers.
+    #   Запускать ПО ОДНОМУ СИДУ — 7 раз для 7 сидов GAP-анализа.
+    #
+    # is_new_research=True помечает каждый SD/SDL запрос —
+    # парсер направит их в research-пул (все IP пула round-robin)
+    # и прогонит на 3 агентах (chrome+firefox+safari).
+    # ═══════════════════════════════════════════════════════════════════
+    @app.get("/api/suffix-research")
+    async def suffix_research_endpoint(
+        seed: str = Query(..., description="Базовый сид для research-прогона"),
+        country: str = Query("ua", description="Код страны"),
+        language: str = Query("ru", description="Язык"),
+        city: str = Query(None, description="Город для uule. None = столица страны."),
+    ):
+        """
+        SUFFIX RESEARCH: разовый широкий прогон с SD/SDL/E_LAT/full E_RU.
+        Зеркало /api/prefix-map с research структурами.
+
+        Возвращает полный trace в HTTP-response (~10 МБ JSON).
+        Запускать ПО ОДНОМУ СИДУ за раз.
+        """
+        sp = get_suffix_parser()
+        result = await sp.parse(
+            seed=seed,
+            country=country,
+            language=language,
+            parallel_limit=5,
+            include_numbers=True,        # A_num включён
+            echelon=0,                    # все priority levels
+            cursor_position=None,         # auto
+            include_letters=True,         # E_RU
+            city=city,
+            include_research=True,        # ← SD + SDL
+            include_lat_sweep=True,       # ← E_LAT
+            use_full_ru_sweep=True,       # ← E_RU full 30 букв
+        )
+
+        return {
+            "method": "suffix-research",
+            "seed": seed,
+            "country": country,
+            "language": language,
+            "total_queries": result.total_queries,
+            "total_keywords": len(result.all_keywords),
+            "successful_queries": result.successful_queries,
+            "empty_queries": result.empty_queries,
+            "time": f"{result.total_time_ms:.0f}ms",
+            "suffix_trace": {
+                "analysis": result.analysis,
+                "total_time_ms": result.total_time_ms,
+                "total_queries": result.total_queries,
+                "successful_queries": result.successful_queries,
+                "empty_queries": result.empty_queries,
+                "blocked_queries": result.blocked_queries,
+                "trace": result.trace,
+                "summary_by_type": result.summary_by_type,
+                "summary_by_suffix": result.summary_by_suffix,
+                "all_keywords": result.all_keywords,
+            },
+        }
