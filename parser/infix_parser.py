@@ -28,28 +28,32 @@ logger = logging.getLogger(__name__)
 
 UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 UA_FIREFOX = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+UA_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
 
 DELAY_LOCAL  = 0.3
 DELAY_SERVER = 0.3
 BATCH_SIZE   = 5
 
-# Два отдельных IP: Chrome и Firefox идут на разные прокси
-# Если INFIX_PROXY_CHROME/FF не заданы — fallback на GOOGLE_PROXY_URL
+# Три отдельных IP: Chrome, Firefox, Safari идут на разные прокси
+# Если INFIX_PROXY_CHROME/FF/SAFARI не заданы — fallback на GOOGLE_PROXY_URL
 try:
     from utils.proxy_pool import ProxyPool
     _proxy_chrome  = ProxyPool.get("infix_chrome")
     _proxy_firefox = ProxyPool.get("infix_firefox")
+    _proxy_safari  = ProxyPool.get("infix_safari")
 except ImportError:
     try:
         from proxy_pool import ProxyPool
         _proxy_chrome  = ProxyPool.get("infix_chrome")
         _proxy_firefox = ProxyPool.get("infix_firefox")
+        _proxy_safari  = ProxyPool.get("infix_safari")
     except ImportError:
         _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
         _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
+        _proxy_safari  = os.getenv("INFIX_PROXY_SAFARI") or os.getenv("GOOGLE_PROXY_URL") or None
 
 _google_proxy = _proxy_chrome  # для обратной совместимости
-DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
+DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox or _proxy_safari) else DELAY_LOCAL
 
 try:
     from utils.geo_uule import get_uule
@@ -160,7 +164,12 @@ class InfixParser:
         else:
             params["cp"] = len(query)
 
-        ua = UA_FIREFOX if google_client == "firefox" else UA_CHROME
+        if google_client == "firefox":
+            ua = UA_FIREFOX
+        elif google_client == "safari":
+            ua = UA_SAFARI
+        else:
+            ua = UA_CHROME
         headers = {"User-Agent": ua}
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
@@ -226,8 +235,8 @@ class InfixParser:
 
         non_e_sem = asyncio.Semaphore(BATCH_SIZE)
 
-        async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
-            agent = iq.agents[0]
+        async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient, agent_override: Optional[str] = None):
+            agent = agent_override if agent_override is not None else iq.agents[0]
             await asyncio.sleep(DELAY)
             t0 = time.time()
             try:
@@ -242,9 +251,12 @@ class InfixParser:
                 results = [kw for kw in raw_results if not _is_garbage_keyword(kw)]
 
                 status = "ok" if results else "empty"
+                # Для research-запросов добавляем суффикс агента в struct,
+                # чтобы в трейсе разделить вклад каждого агента
+                struct_label = f"{iq.struct}__{agent}" if iq.is_new_research else iq.struct
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=iq.struct,
+                    group=iq.group, struct=struct_label,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -258,15 +270,16 @@ class InfixParser:
                             continue
                         if k not in kw_map:
                             kw_map[k] = []
-                        kw_map[k].append(f"{agent}:{iq.struct}")
+                        kw_map[k].append(f"{agent}:{struct_label}")
                         if seed.lower() not in k:
                             alt_seed_set.add(k)
 
             except Exception as e:
                 elapsed = (time.time() - t0) * 1000
+                struct_label = f"{iq.struct}__{agent}" if iq.is_new_research else iq.struct
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=iq.struct,
+                    group=iq.group, struct=struct_label,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -289,26 +302,106 @@ class InfixParser:
             async with non_e_sem:
                 await fetch_one(iq, client)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # RESEARCH POOL — для is_new_research=True запросов
+        # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
+        # распределяем research-запросы round-robin между клиентами.
+        # Каждый research-запрос идёт на агентах из iq.agents
+        # (chrome+firefox+safari или только chrome для E_LAT) —
+        # несколько запросов через ОДИН и тот же IP (последовательно).
+        # ═══════════════════════════════════════════════════════════════════
+        research_clients: List[httpx.AsyncClient] = []
+        research_queries = [iq for iq in matrix if iq.is_new_research]
+        if research_queries:
+            # Забираем все IP пула МИНУС 3 слота занятые боевой матрицей инфикса.
+            # В режиме research работает один пользователь, остальные ~47 IP
+            # (при пуле 5 батчей × 10) идут на распараллеливание research-прогона.
+            try:
+                from utils.proxy_pool import ProxyPool
+                _research_proxies = ProxyPool.get_research_pool(
+                    exclude_roles={"infix_chrome", "infix_firefox", "infix_safari"}
+                )
+            except ImportError:
+                try:
+                    from proxy_pool import ProxyPool
+                    _research_proxies = ProxyPool.get_research_pool(
+                        exclude_roles={"infix_chrome", "infix_firefox", "infix_safari"}
+                    )
+                except ImportError:
+                    _research_proxies = []
+            except Exception:
+                _research_proxies = []
+
+            if not _research_proxies:
+                # Fallback: используем доступные прокси (минимум 1)
+                _research_proxies = [p for p in [_proxy_chrome, _proxy_firefox, _proxy_safari] if p]
+                if not _research_proxies:
+                    _research_proxies = [None]  # без прокси (локально)
+
+            for proxy_url in _research_proxies:
+                research_clients.append(
+                    httpx.AsyncClient(proxy=proxy_url) if proxy_url
+                    else httpx.AsyncClient()
+                )
+            logger.info(
+                f"[Infix Research] Pool: {len(research_clients)} httpx-клиентов "
+                f"для {len(research_queries)} запросов × агенты "
+                f"= ~{sum(len(iq.agents) for iq in research_queries)} реальных запросов "
+                f"(~{sum(len(iq.agents) for iq in research_queries) // max(len(research_clients), 1)} на IP)"
+            )
+
+        # Семафор для research — ограничивает параллелизм по всему пулу
+        research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
+
+        async def run_research_one(iq: InfixQuery, idx: int):
+            """
+            Один research-запрос: для каждого агента в iq.agents
+            делаем отдельный fetch через round-robin клиент пула.
+            """
+            if not research_clients:
+                return
+            client = research_clients[idx % len(research_clients)]
+            async with research_sem:
+                for agent in iq.agents:
+                    await fetch_one(iq, client, agent_override=agent)
+
         async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
-                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
+                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
+                   httpx.AsyncClient(proxy=_proxy_safari) as safari_client:
             from collections import defaultdict
             e_by_letter_chr = defaultdict(list)
             e_by_letter_ff  = defaultdict(list)
             non_e_chr = []
             non_e_ff  = []
             for iq in matrix:
+                # research-запросы маршрутизируем через research_pool
+                if iq.is_new_research:
+                    continue
                 is_ff = "firefox" in iq.agents
                 if iq.group == "E" and iq.letter:
                     (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
                 else:
                     (non_e_ff if is_ff else non_e_chr).append(iq)
 
-            await asyncio.gather(
+            tasks = [
                 *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
                 *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
                 *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
                 *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+            ]
+            # Research-задачи: round-robin по research_clients, каждый на своих агентах
+            tasks.extend(
+                run_research_one(iq, idx) for idx, iq in enumerate(research_queries)
             )
+
+            await asyncio.gather(*tasks)
+
+            # Закрываем research-клиенты
+            for rc in research_clients:
+                try:
+                    await rc.aclose()
+                except Exception:
+                    pass
 
         total_time = (time.time() - total_start) * 1000
 
