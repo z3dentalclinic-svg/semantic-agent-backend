@@ -45,12 +45,11 @@ ROLE_MAP = {
 GENERAL_ROLES = {"suffix", "morph"}
 GENERAL_START = 5   # IP с этого индекса идут на общие парсеры
 
-# Research роль — для разовых широких прогонов PD/PDL prefix
-# и SD/SDL suffix.
+# Research роль — для разовых широких прогонов PD/PDL.
 # Берёт IP из ВСЕГО пула (все батчи), round-robin.
 # Не привязана к текущему активному батчу — research-прогон нагружает
 # 30-40 IP параллельно, и карусель батчей здесь не нужна.
-RESEARCH_ROLES = {"prefix_research", "suffix_research"}
+RESEARCH_ROLES = {"prefix_research"}
 
 
 class ProxyPool:
