@@ -15,11 +15,8 @@ import random
 import json
 import re
 import os
-import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
-
-logger = logging.getLogger(__name__)
 
 try:
     from parser.suffix_generator import SuffixGenerator, SuffixQuery, SeedAnalysis, FF_BCD_SKIP_VARIANTS
@@ -88,16 +85,6 @@ USER_AGENTS_FF = [
 ]
 # Backward compat
 USER_AGENTS = USER_AGENTS_FF
-
-# UA по типу клиента — для подмены User-Agent в зависимости от google_client.
-# Используется в SD/SDL research структурах где chrome/firefox/safari
-# идут одновременно через research-пул. Несоответствие UA и client= параметра
-# может привести к игнорированию запроса Google.
-UA_BY_CLIENT = {
-    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-}
 
 
 class AdaptiveDelay:
@@ -263,17 +250,11 @@ class SuffixParser:
             params["cp"] = cursor_position
         else:
             params["cp"] = len(query)
-        # UA подменяем по google_client. Для SD/SDL research где
-        # chrome/firefox/safari идут одновременно — UA должен совпадать
-        # с client= параметром, иначе Google может проигнорировать запрос.
-        ua = UA_BY_CLIENT.get(google_client)
-        if ua is None:
-            # Fallback на старую логику (для обратной совместимости)
-            if "chrome" in google_client:
-                ua = random.choice(USER_AGENTS_CHROME)
-            else:
-                ua = random.choice(USER_AGENTS_FF)
-        headers = {"User-Agent": ua}
+        # Выбираем UA в зависимости от агента
+        if "chrome" in google_client:
+            headers = {"User-Agent": random.choice(USER_AGENTS_CHROME)}
+        else:
+            headers = {"User-Agent": random.choice(USER_AGENTS_FF)}
 
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
@@ -432,9 +413,6 @@ class SuffixParser:
         - A/B/C/D queries: run concurrently with semaphore
         - E queries: grouped by letter; all letters run in parallel,
           each letter's 14 queries are sequential (avoids Google rate limiting)
-        - SD/SDL research queries (всегда включены): идут через research_pool
-          из всех IP пула, round-robin. Каждый research-запрос на 3 агентах
-          (chrome+firefox+safari).
         """
         total_start = time.time()
 
@@ -470,27 +448,15 @@ class SuffixParser:
 
         blocked_queries = [q for q in all_queries if q.priority == 0]
 
-        # Step 3: Separate E / E_LAT / research / other types.
-        # Research (SD/SDL) идут через research_pool на 3 агентах — отдельно от Chrome/FF потоков.
-        # E_LAT — Chrome only, идёт как обычный E но с латинским sweep_letter.
+        # Step 3: Separate E from other types
         e_queries_by_letter: Dict[str, List] = {}
-        e_lat_queries_by_letter: Dict[str, List] = {}
-        research_queries: List = []  # SD/SDL — пойдут через research_pool
         other_queries = []
         for q in queries_to_send:
-            if q.is_new_research:
-                # SD / SDL — отдельная ветка через research_pool на 3 агентах
-                research_queries.append(q)
-            elif q.suffix_type == "E":
+            if q.suffix_type == "E":
                 letter = q.suffix_val
                 if letter not in e_queries_by_letter:
                     e_queries_by_letter[letter] = []
                 e_queries_by_letter[letter].append(q)
-            elif q.suffix_type == "E_LAT":
-                letter = q.suffix_val
-                if letter not in e_lat_queries_by_letter:
-                    e_lat_queries_by_letter[letter] = []
-                e_lat_queries_by_letter[letter].append(q)
             else:
                 other_queries.append(q)
 
@@ -942,115 +908,12 @@ class SuffixParser:
         proxy_chr1, proxy_chr2, proxy_chr3 = proxies[0], proxies[1], proxies[2]
         proxy_ff1,  proxy_ff2              = proxies[3], proxies[4]
 
-        # ═══════════════════════════════════════════════════════════════════
-        # RESEARCH POOL — для SD/SDL запросов (is_new_research=True)
-        # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
-        # распределяем research-запросы round-robin между клиентами.
-        # Каждый research-запрос идёт на 3 агентах (chrome+firefox+safari)
-        # — три запроса через ОДИН и тот же IP (последовательно).
-        # ═══════════════════════════════════════════════════════════════════
-        research_clients: List[httpx.AsyncClient] = []
-        if ProxyPool and research_queries:
-            try:
-                _research_proxies = ProxyPool.get_all_proxies()
-            except Exception:
-                _research_proxies = []
-            if _research_proxies:
-                for proxy_url in _research_proxies:
-                    research_clients.append(httpx.AsyncClient(proxy=proxy_url))
-                logger.info(
-                    f"[Suffix Research] Pool: {len(research_clients)} httpx-клиентов "
-                    f"для {len(research_queries)} запросов × 3 агента "
-                    f"= {len(research_queries) * 3} реальных запросов "
-                    f"(~{(len(research_queries) * 3) // max(len(research_clients), 1)} запросов на IP)"
-                )
-
-        # Семафор для research — ограничивает параллелизм по всему пулу
-        research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
-
-        async def run_research_one(sq: "SuffixQuery", agent: str, idx: int):
-            """
-            Один research-запрос на одном из IP пула (round-robin по индексу).
-            agent — chrome/firefox/safari.
-            """
-            if not research_clients:
-                return
-            client = research_clients[idx % len(research_clients)]
-            async with research_sem:
-                t0 = time.time()
-                cp = sq.cp_override if sq.cp_override is not None else len(sq.query)
-                try:
-                    results = await self.fetch_suggestions(
-                        query=sq.query, country=country, language=language,
-                        client=client, google_client=agent,
-                        cursor_position=cp, uule=_uule,
-                    )
-                    elapsed_ms = (time.time() - t0) * 1000
-                    # Вешаем агента на label чтобы потом разделить в trace
-                    sq_tagged = SuffixQuery(
-                        query=sq.query, suffix_val=sq.suffix_val,
-                        suffix_label=f"{sq.suffix_label}__{agent}",
-                        suffix_type=sq.suffix_type, priority=sq.priority,
-                        markers=list(sq.markers) + [agent],
-                        cp_override=sq.cp_override, variant=sq.variant,
-                        is_new_research=True, agents=(agent,),
-                    )
-                    _record_results(sq_tagged, results, elapsed_ms)
-                except Exception as e:
-                    elapsed_ms = (time.time() - t0) * 1000
-                    trace_entries.append(SuffixTraceEntry(
-                        suffix_val=sq.suffix_val,
-                        suffix_label=f"{sq.suffix_label}__{agent}",
-                        suffix_type=sq.suffix_type, priority=sq.priority,
-                        query_sent=sq.query,
-                        time_ms=round(elapsed_ms, 1),
-                        status="error", error=str(e),
-                    ))
-
-        async def run_research_all():
-            """Запускает все research-запросы × 3 агента параллельно через research_pool."""
-            if not research_clients:
-                return
-            tasks = []
-            for i, sq in enumerate(research_queries):
-                # Каждый запрос идёт на 3 агентах через тот же IP (по индексу запроса).
-                # Параллельно по агентам в пределах одного запроса.
-                for agent in sq.agents:  # ("chrome", "firefox", "safari")
-                    tasks.append(run_research_one(sq, agent, i))
-            await asyncio.gather(*tasks)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # E_LAT — Latin Letter Sweep (Chrome only). Идёт через обычный suffix-пул.
-        # Зеркало run_e_chrome но для e_lat_queries_by_letter.
-        # ═══════════════════════════════════════════════════════════════════
-        async def run_e_lat_chrome(client: httpx.AsyncClient):
-            """Latin Letter Sweep — 26 букв × 13 структур. Chrome only."""
-            if not e_lat_queries_by_letter:
-                return
-            tasks = []
-            for letter, letter_qs in e_lat_queries_by_letter.items():
-                async def run_letter(qs):
-                    for sq in qs:
-                        await fetch_one_tracked(sq, client, force_client="chrome")
-                tasks.append(run_letter(letter_qs))
-            await asyncio.gather(*tasks)
-
         async with httpx.AsyncClient(proxy=proxy_chr1) as chr_c1,                    httpx.AsyncClient(proxy=proxy_chr2) as chr_c2,                    httpx.AsyncClient(proxy=proxy_chr3) as chr_c3,                    httpx.AsyncClient(proxy=proxy_ff1)  as ff_c1,                     httpx.AsyncClient(proxy=proxy_ff2)  as ff_c2:
-            try:
-                await asyncio.gather(
-                    run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
-                    run_e_lat_chrome(chr_c1),  # E_LAT через первый Chrome IP
-                    run_research_all(),         # SD/SDL через research_pool на 3 агентах
-                    # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
-                    # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
-                )
-            finally:
-                # Закрываем research-клиенты
-                for c in research_clients:
-                    try:
-                        await c.aclose()
-                    except Exception:
-                        pass
+            await asyncio.gather(
+                run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
+                # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
+                # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
+            )
 
         # Ротация батча после прогона
         if ProxyPool:
@@ -1165,3 +1028,214 @@ class SuffixParser:
             summary_by_type=summary_by_type,
             summary_by_suffix=summary_by_suffix,
         )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ЗАКОММЕНТИРОВАННЫЙ RESEARCH-БЛОК (parser)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ниже сохранены добавки из сессии 2026-05-06 для запуска research через
+# pool из всех IP с тремя агентами (chrome+firefox+safari).
+#
+# Чтобы восстановить:
+#  1. Раскомментировать UA_BY_CLIENT (заменить логику UA в fetch_suggestions)
+#  2. В parse() добавить разделение research_queries из queries_to_send
+#  3. Добавить research-pool секцию в parse() (создание httpx-клиентов на каждый IP)
+#  4. Добавить run_research_all() в asyncio.gather в основном async with блоке
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# --- 1. UA_BY_CLIENT (для подмены UA по google_client) ---
+# UA_BY_CLIENT = {
+#     "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+#     "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+#     "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+# }
+
+# --- 2. fetch_suggestions: заменить выбор UA на ---
+# ua = UA_BY_CLIENT.get(google_client)
+# if ua is None:
+#     if 'chrome' in google_client:
+#         ua = random.choice(USER_AGENTS_CHROME)
+#     else:
+#         ua = random.choice(USER_AGENTS_FF)
+# headers = {'User-Agent': ua}
+
+# --- 3. RESEARCH POOL логика в parse() ---
+#         # ═══════════════════════════════════════════════════════════════════
+#         # RESEARCH POOL — для SD/SDL запросов (is_new_research=True)
+#         # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
+#         # распределяем research-запросы round-robin между клиентами.
+#         # Каждый research-запрос идёт на 3 агентах (chrome+firefox+safari)
+#         # — три запроса через ОДИН и тот же IP (последовательно).
+#         # ═══════════════════════════════════════════════════════════════════
+#         research_clients: List[httpx.AsyncClient] = []
+#         if ProxyPool and research_queries:
+#             try:
+#                 _research_proxies = ProxyPool.get_all_proxies()
+#             except Exception:
+#                 _research_proxies = []
+#             if _research_proxies:
+#                 for proxy_url in _research_proxies:
+#                     research_clients.append(httpx.AsyncClient(proxy=proxy_url))
+#                 logger.info(
+#                     f"[Suffix Research] Pool: {len(research_clients)} httpx-клиентов "
+#                     f"для {len(research_queries)} запросов × 3 агента "
+#                     f"= {len(research_queries) * 3} реальных запросов "
+#                     f"(~{(len(research_queries) * 3) // max(len(research_clients), 1)} запросов на IP)"
+#                 )
+#
+#         # Семафор для research — ограничивает параллелизм по всему пулу
+#         research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
+#
+#         async def run_research_one(sq: "SuffixQuery", agent: str, idx: int):
+#             """
+#             Один research-запрос на одном из IP пула (round-robin по индексу).
+#             agent — chrome/firefox/safari.
+#             """
+#             if not research_clients:
+#                 return
+#             client = research_clients[idx % len(research_clients)]
+#             async with research_sem:
+#                 t0 = time.time()
+#                 cp = sq.cp_override if sq.cp_override is not None else len(sq.query)
+#                 try:
+#                     results = await self.fetch_suggestions(
+#                         query=sq.query, country=country, language=language,
+#                         client=client, google_client=agent,
+#                         cursor_position=cp, uule=_uule,
+#                     )
+#                     elapsed_ms = (time.time() - t0) * 1000
+#                     # Вешаем агента на label чтобы потом разделить в trace
+#                     sq_tagged = SuffixQuery(
+#                         query=sq.query, suffix_val=sq.suffix_val,
+#                         suffix_label=f"{sq.suffix_label}__{agent}",
+#                         suffix_type=sq.suffix_type, priority=sq.priority,
+#                         markers=list(sq.markers) + [agent],
+#                         cp_override=sq.cp_override, variant=sq.variant,
+#                         is_new_research=True, agents=(agent,),
+#                     )
+#                     _record_results(sq_tagged, results, elapsed_ms)
+#                 except Exception as e:
+#                     elapsed_ms = (time.time() - t0) * 1000
+#                     trace_entries.append(SuffixTraceEntry(
+#                         suffix_val=sq.suffix_val,
+#                         suffix_label=f"{sq.suffix_label}__{agent}",
+#                         suffix_type=sq.suffix_type, priority=sq.priority,
+#                         query_sent=sq.query,
+#                         time_ms=round(elapsed_ms, 1),
+#                         status="error", error=str(e),
+#                     ))
+#
+#         async def run_research_all():
+#             """Запускает все research-запросы × 3 агента параллельно через research_pool."""
+#             if not research_clients:
+#                 return
+#             tasks = []
+#             for i, sq in enumerate(research_queries):
+#                 # Каждый запрос идёт на 3 агентах через тот же IP (по индексу запроса).
+#                 # Параллельно по агентам в пределах одного запроса.
+#                 for agent in sq.agents:  # ("chrome", "firefox", "safari")
+#                     tasks.append(run_research_one(sq, agent, i))
+#             await asyncio.gather(*tasks)
+
+# --- 4. run_e_lat_chrome для Latin Sweep ---
+#         # ═══════════════════════════════════════════════════════════════════
+#         # RESEARCH POOL — для SD/SDL запросов (is_new_research=True)
+#         # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
+#         # распределяем research-запросы round-robin между клиентами.
+#         # Каждый research-запрос идёт на 3 агентах (chrome+firefox+safari)
+#         # — три запроса через ОДИН и тот же IP (последовательно).
+#         # ═══════════════════════════════════════════════════════════════════
+#         research_clients: List[httpx.AsyncClient] = []
+#         if ProxyPool and research_queries:
+#             try:
+#                 _research_proxies = ProxyPool.get_all_proxies()
+#             except Exception:
+#                 _research_proxies = []
+#             if _research_proxies:
+#                 for proxy_url in _research_proxies:
+#                     research_clients.append(httpx.AsyncClient(proxy=proxy_url))
+#                 logger.info(
+#                     f"[Suffix Research] Pool: {len(research_clients)} httpx-клиентов "
+#                     f"для {len(research_queries)} запросов × 3 агента "
+#                     f"= {len(research_queries) * 3} реальных запросов "
+#                     f"(~{(len(research_queries) * 3) // max(len(research_clients), 1)} запросов на IP)"
+#                 )
+#
+#         # Семафор для research — ограничивает параллелизм по всему пулу
+#         research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
+#
+#         async def run_research_one(sq: "SuffixQuery", agent: str, idx: int):
+#             """
+#             Один research-запрос на одном из IP пула (round-robin по индексу).
+#             agent — chrome/firefox/safari.
+#             """
+#             if not research_clients:
+#                 return
+#             client = research_clients[idx % len(research_clients)]
+#             async with research_sem:
+#                 t0 = time.time()
+#                 cp = sq.cp_override if sq.cp_override is not None else len(sq.query)
+#                 try:
+#                     results = await self.fetch_suggestions(
+#                         query=sq.query, country=country, language=language,
+#                         client=client, google_client=agent,
+#                         cursor_position=cp, uule=_uule,
+#                     )
+#                     elapsed_ms = (time.time() - t0) * 1000
+#                     # Вешаем агента на label чтобы потом разделить в trace
+#                     sq_tagged = SuffixQuery(
+#                         query=sq.query, suffix_val=sq.suffix_val,
+#                         suffix_label=f"{sq.suffix_label}__{agent}",
+#                         suffix_type=sq.suffix_type, priority=sq.priority,
+#                         markers=list(sq.markers) + [agent],
+#                         cp_override=sq.cp_override, variant=sq.variant,
+#                         is_new_research=True, agents=(agent,),
+#                     )
+#                     _record_results(sq_tagged, results, elapsed_ms)
+#                 except Exception as e:
+#                     elapsed_ms = (time.time() - t0) * 1000
+#                     trace_entries.append(SuffixTraceEntry(
+#                         suffix_val=sq.suffix_val,
+#                         suffix_label=f"{sq.suffix_label}__{agent}",
+#                         suffix_type=sq.suffix_type, priority=sq.priority,
+#                         query_sent=sq.query,
+#                         time_ms=round(elapsed_ms, 1),
+#                         status="error", error=str(e),
+#                     ))
+#
+#         async def run_research_all():
+#             """Запускает все research-запросы × 3 агента параллельно через research_pool."""
+#             if not research_clients:
+#                 return
+#             tasks = []
+#             for i, sq in enumerate(research_queries):
+#                 # Каждый запрос идёт на 3 агентах через тот же IP (по индексу запроса).
+#                 # Параллельно по агентам в пределах одного запроса.
+#                 for agent in sq.agents:  # ("chrome", "firefox", "safari")
+#                     tasks.append(run_research_one(sq, agent, i))
+#             await asyncio.gather(*tasks)
+#
+#         # ═══════════════════════════════════════════════════════════════════
+#         # E_LAT — Latin Letter Sweep (Chrome only). Идёт через обычный suffix-пул.
+#         # Зеркало run_e_chrome но для e_lat_queries_by_letter.
+#         # ═══════════════════════════════════════════════════════════════════
+#         async def run_e_lat_chrome(client: httpx.AsyncClient):
+#             """Latin Letter Sweep — 26 букв × 13 структур. Chrome only."""
+#             if not e_lat_queries_by_letter:
+#                 return
+#             tasks = []
+#             for letter, letter_qs in e_lat_queries_by_letter.items():
+#                 async def run_letter(qs):
+#                     for sq in qs:
+#                         await fetch_one_tracked(sq, client, force_client="chrome")
+#                 tasks.append(run_letter(letter_qs))
+#             await asyncio.gather(*tasks)
+
+# --- 5. В parse() Step 3 нужно разделить очереди ---
+# research_queries = [q for q in queries_to_send if q.is_new_research]
+# e_lat_queries_by_letter = {} (по аналогии с e_queries_by_letter)
+# other_queries исключают research и E_LAT
+
+# --- 6. В asyncio.gather добавить ---
+# run_research_all(),
+# run_e_lat_chrome(chr_c1),
+
