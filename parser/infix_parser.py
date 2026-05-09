@@ -338,17 +338,33 @@ class InfixParser:
                 if not _research_proxies:
                     _research_proxies = [None]  # без прокси (локально)
 
-            for proxy_url in _research_proxies:
-                research_clients.append(
-                    httpx.AsyncClient(proxy=proxy_url) if proxy_url
-                    else httpx.AsyncClient()
-                )
+            # Активный пул: 30 IP параллельно. HTTP/2 multiplexing — позволяет
+            # гнать много запросов через одно TCP-соединение, даёт серьёзный
+            # буст пропускной способности при keep-alive (Google AC поддерживает).
+            # HTTP/2 опционален — если пакет h2 не установлен, работаем на HTTP/1.1.
+            MAX_ACTIVE_CLIENTS = 30
+            _active_proxies = _research_proxies[:MAX_ACTIVE_CLIENTS]
+            try:
+                import h2  # проверка что пакет установлен
+                _h2_available = True
+            except ImportError:
+                _h2_available = False
+                logger.info("[Infix Research] HTTP/2 недоступен (нет пакета h2), работаем на HTTP/1.1. "
+                            "Для x2 буста: pip install 'httpx[http2]'")
+
+            for proxy_url in _active_proxies:
+                kwargs = {"http2": True} if _h2_available else {}
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                research_clients.append(httpx.AsyncClient(**kwargs))
             total_real = sum(len(iq.agents) for iq in research_queries)
             logger.info(
-                f"[Infix Research] Pool: {len(research_clients)} httpx-клиентов "
+                f"[Infix Research] Pool: {len(research_clients)} активных "
+                f"{'http/2' if _h2_available else 'http/1.1'}-клиентов "
+                f"(из {len(_research_proxies)} доступных IP) "
                 f"для {len(research_queries)} запросов × агенты "
                 f"= {total_real} реальных запросов "
-                f"(~{total_real // max(len(research_clients), 1)} на IP)"
+                f"(~{total_real // max(len(research_clients), 1)} на клиент)"
             )
 
         # Семафор для research — без `// 2`, как в суффиксе.
@@ -441,13 +457,39 @@ class InfixParser:
                 *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
                 *[run_non_e(iq, ff_client)      for iq in non_e_ff],
             ]
-            # Research-задачи: КАЖДЫЙ агент — отдельный таск (3× запросов в gather).
-            # Все 3 агента одного запроса идут через ТОТ ЖЕ IP (research_clients[idx]).
-            for idx, iq in enumerate(research_queries):
-                for agent in iq.agents:
-                    tasks.append(run_research_one(iq, agent, idx))
-
+            # Боевая матрица — стартует параллельно как раньше
             await asyncio.gather(*tasks)
+
+            # ─────────────────────────────────────────────────────────────
+            # Research-задачи: chunked dispatch для контроля памяти.
+            # Render лимит 2GB, MiniLM+pymorphy+GEO_DB занимают ~1.5GB,
+            # остаётся ~500MB. Если запустить все 81к корутин одним gather —
+            # OOM. Разбиваем на блоки, между блоками GC.
+            # ─────────────────────────────────────────────────────────────
+            if research_queries:
+                import gc
+                RESEARCH_CHUNK = 5000  # ~5000 параллельных корутин = ~50-80MB peak
+                research_task_specs = [
+                    (iq, agent, idx)
+                    for idx, iq in enumerate(research_queries)
+                    for agent in iq.agents
+                ]
+                total_chunks = (len(research_task_specs) + RESEARCH_CHUNK - 1) // RESEARCH_CHUNK
+                logger.info(
+                    f"[Infix Research] Chunked dispatch: "
+                    f"{len(research_task_specs)} запросов / {RESEARCH_CHUNK} = {total_chunks} блоков"
+                )
+                for chunk_n in range(0, len(research_task_specs), RESEARCH_CHUNK):
+                    chunk = research_task_specs[chunk_n:chunk_n + RESEARCH_CHUNK]
+                    chunk_tasks = [run_research_one(iq, agent, idx) for iq, agent, idx in chunk]
+                    await asyncio.gather(*chunk_tasks)
+                    # GC между блоками — освобождаем response buffers, корутины
+                    gc.collect()
+                    if chunk_n % (RESEARCH_CHUNK * 5) == 0:
+                        logger.info(
+                            f"[Infix Research] Прогресс: "
+                            f"{min(chunk_n + RESEARCH_CHUNK, len(research_task_specs))}/{len(research_task_specs)}"
+                        )
 
             # Закрываем research-клиенты
             for rc in research_clients:
