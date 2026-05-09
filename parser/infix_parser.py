@@ -313,20 +313,25 @@ class InfixParser:
         research_clients: List[httpx.AsyncClient] = []
         research_queries = [iq for iq in matrix if iq.is_new_research]
         if research_queries:
-            # Забираем все IP пула МИНУС 3 слота занятые боевой матрицей инфикса.
-            # В режиме research работает один пользователь, остальные ~47 IP
-            # (при пуле 5 батчей × 10) идут на распараллеливание research-прогона.
+            # combined_parser.html запускает suffix+prefix+infix параллельно
+            # через Promise.all — активный батч полностью занят боевыми матрицами
+            # всех трёх парсеров. Под research отдаём всё что НЕ занято в активном
+            # батче (минус собственные боевые слоты инфикса).
+            #
+            # Расчёт (5 батчей × 10 IP = 50 IP):
+            #   50 - 3 (инфикс боевые) - 3 (префикс) - 4 (суффикс/general) = 40 IP
+            _research_excludes = {
+                "infix_chrome", "infix_firefox", "infix_safari",       # свои боевые слоты
+                "prefix_chrome", "prefix_firefox", "prefix_nonpa",     # параллельный префикс
+                "suffix",                                                # параллельный суффикс (общий пул)
+            }
             try:
                 from utils.proxy_pool import ProxyPool
-                _research_proxies = ProxyPool.get_research_pool(
-                    exclude_roles={"infix_chrome", "infix_firefox", "infix_safari"}
-                )
+                _research_proxies = ProxyPool.get_research_pool(exclude_roles=_research_excludes)
             except ImportError:
                 try:
                     from proxy_pool import ProxyPool
-                    _research_proxies = ProxyPool.get_research_pool(
-                        exclude_roles={"infix_chrome", "infix_firefox", "infix_safari"}
-                    )
+                    _research_proxies = ProxyPool.get_research_pool(exclude_roles=_research_excludes)
                 except ImportError:
                     _research_proxies = []
             except Exception:
