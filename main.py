@@ -16,6 +16,18 @@ import re
 import logging
 from difflib import SequenceMatcher
 
+# ════════════════════════════════════════════════════════════════════
+# RESEARCH_MODE — отключает тяжёлые фильтры (MiniLM, Natasha, BatchPostFilter)
+# для разовых research-прогонов парсеров. Экономит ~700 MB RAM на Render.
+# Активация: env RESEARCH_MODE=1, redeploy.
+# Откат: убрать переменную и redeploy.
+# Парсеры (suffix/prefix/infix), геобазы, pymorphy остаются рабочими.
+# ════════════════════════════════════════════════════════════════════
+_RESEARCH_MODE = os.getenv("RESEARCH_MODE", "0") == "1"
+if _RESEARCH_MODE:
+    logging.warning("[RESEARCH_MODE] Активен — фильтры (BPF/L0/L2/L3/Natasha) отключены, "
+                    "только парсинг. Для прода убрать RESEARCH_MODE из env и redeploy.")
+
 from filters import (
     BatchPostFilter, 
     DISTRICTS_EXTENDED,
@@ -289,7 +301,7 @@ class GoogleAutocompleteParser:
         self.morph_ru = pymorphy3.MorphAnalyzer(lang='ru')
         self.morph_uk = pymorphy3.MorphAnalyzer(lang='uk')
         
-        if NATASHA_AVAILABLE:
+        if NATASHA_AVAILABLE and not _RESEARCH_MODE:
             try:
                 self.segmenter = Segmenter()
                 self.morph_vocab = MorphVocab()
@@ -302,6 +314,8 @@ class GoogleAutocompleteParser:
                 self.natasha_ready = False
         else:
             self.natasha_ready = False
+            if _RESEARCH_MODE:
+                logger.info("[RESEARCH_MODE] Natasha NER пропущена")
         
         self.forbidden_geo = FORBIDDEN_GEO
 
@@ -339,16 +353,20 @@ class GoogleAutocompleteParser:
         }
         
         # Исправлена критическая ошибка: раньше передавался пустой словарь {}
-        self.post_filter = BatchPostFilter(
-            all_cities_global=ALL_CITIES_GLOBAL,  # ✅ ИСПРАВЛЕНО: передаём загруженную базу
-            forbidden_geo=self.forbidden_geo,
-            districts=DISTRICTS_EXTENDED,
-            population_threshold=5000,
-            population_cache=_GEO_POPULATION_CACHE,  # из geo_garbage_filter — строится при старте
-        )
-        logger.info("✅ Batch Post-Filter v7.9 initialized with REAL cities database")
-        logger.info(f"   Database contains {len(ALL_CITIES_GLOBAL)} cities")
-        logger.info("   GEO DATABASE = PRIMARY, morphology = secondary")
+        if _RESEARCH_MODE:
+            self.post_filter = None
+            logger.info("[RESEARCH_MODE] BatchPostFilter пропущен")
+        else:
+            self.post_filter = BatchPostFilter(
+                all_cities_global=ALL_CITIES_GLOBAL,  # ✅ ИСПРАВЛЕНО: передаём загруженную базу
+                forbidden_geo=self.forbidden_geo,
+                districts=DISTRICTS_EXTENDED,
+                population_threshold=5000,
+                population_cache=_GEO_POPULATION_CACHE,  # из geo_garbage_filter — строится при старте
+            )
+            logger.info("✅ Batch Post-Filter v7.9 initialized with REAL cities database")
+            logger.info(f"   Database contains {len(ALL_CITIES_GLOBAL)} cities")
+            logger.info("   GEO DATABASE = PRIMARY, morphology = secondary")
 
         # Трассировщик фильтрации
         self.tracer = FilterTracer(enabled=True)
@@ -1140,7 +1158,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         before_set = after_set
     
     # BATCH POST-FILTER
-    if run_bpf:
+    if run_bpf and parser.post_filter is not None:
         parser.tracer.before_filter("batch_post_filter", result.get("keywords", []))
         _t0 = time.time()
         bpf_result = parser.post_filter.filter_batch(
@@ -1157,6 +1175,8 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
         for kw in (before_set - after_set):
             result["anchors"].append(kw)
+    elif run_bpf and parser.post_filter is None:
+        logger.info("[RESEARCH_MODE] BPF skip — parser.post_filter=None")
     
     # ДЕДУПЛИКАЦИЯ (опционально)
     if deduplicate:
