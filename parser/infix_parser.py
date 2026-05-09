@@ -495,18 +495,50 @@ class InfixParser:
 
         exclusive_kw = {kw: structs[0] for kw, structs in kw_map.items() if len(structs) == 1}
 
+        # Сборка trace без asdict — он рекурсивно копирует все поля и на 80k+
+        # entries даёт 400-600 MB пик памяти (OOM на Render 2GB).
+        # Для research-entries (которых обычно >95% от всего trace) results и unique
+        # уже учтены в kw_map / exclusive_kw, поэтому НЕ дублируем их в trace.
+        trace_list = []
+        for e in trace_entries:
+            d = {
+                "gap_index": e.gap_index, "w1": e.w1, "w2": e.w2,
+                "group": e.group, "struct": e.struct,
+                "insert_val": e.insert_val, "insert_type": e.insert_type,
+                "orientation": e.orientation,
+                "query_sent": e.query_sent, "cp": e.cp, "cp_note": e.cp_note,
+                "agent": e.agent,
+                "results_count": e.results_count,
+                "time_ms": e.time_ms, "status": e.status,
+                "letter": e.letter,
+            }
+            if e.error:
+                d["error"] = e.error
+            # results/unique только для боевой матрицы (struct без __agent суффикса)
+            # research-entries имеют struct вида "0_а_rev_plain_cp5__chrome"
+            if "__" not in e.struct:
+                d["results"] = e.results
+                d["unique"] = e.unique
+            trace_list.append(d)
+
+        # Освобождаем тяжёлые объекты до return — GC соберёт raw dataclasses,
+        # results/unique строки уже скопированы по ссылке (shared, без дубликата)
+        trace_entries.clear()
+        import gc
+        gc.collect()
+
         return InfixParseResult(
             seed=seed, country=country, language=language,
-            groups_used=list(set(e.group for e in trace_entries)),
+            groups_used=list(set(e["group"] for e in trace_list)),
             all_keywords=kw_map, alt_seed_keywords=alt_seed_set,
             exclusive_keywords=exclusive_kw,
             total_queries=len(matrix),
-            with_results=sum(1 for e in trace_entries if e.status == "ok"),
-            empty_queries=sum(1 for e in trace_entries if e.status == "empty"),
-            error_queries=sum(1 for e in trace_entries if e.status == "error"),
+            with_results=sum(1 for e in trace_list if e["status"] == "ok"),
+            empty_queries=sum(1 for e in trace_list if e["status"] == "empty"),
+            error_queries=sum(1 for e in trace_list if e["status"] == "error"),
             total_keywords=len(kw_map), exclusive_count=len(exclusive_kw),
             total_time_ms=round(total_time, 1),
-            trace=[asdict(e) for e in trace_entries],
+            trace=trace_list,
             summary_by_gap=summary_by_gap, summary_by_group=summary_by_group,
             timestamp=timestamp,
         )
