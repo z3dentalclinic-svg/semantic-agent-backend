@@ -3,11 +3,20 @@ Shared Embedding Models — singletons для L2 и CategoryMismatch.
 
 Модели:
 1. MiniLM (основная) — multilingual embeddings для KNN, CategoryMismatch
+
+RESEARCH_MODE=1 в env — модель НЕ загружается, get_embedding_model() возвращает None.
+Используется для разовых research-прогонов парсеров когда фильтры не нужны.
+Откат: убрать RESEARCH_MODE в env и redeploy.
 """
 
+import os
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Research-режим: парсеры работают, фильтры (L2/L3/CategoryMismatch) — нет.
+# Экономит ~500 MB RAM на Render.
+_RESEARCH_MODE = os.getenv("RESEARCH_MODE", "0") == "1"
 
 _model = None
 _model_loading = False
@@ -15,10 +24,14 @@ _model_loading = False
 
 def get_embedding_model():
     global _model, _model_loading
-    
+
+    # RESEARCH_MODE — модель не грузим, фильтры опираются на None и должны skip'ать
+    if _RESEARCH_MODE:
+        return None
+
     if _model is not None:
         return _model
-    
+
     if _model_loading:
         import time
         for _ in range(30):
@@ -26,9 +39,9 @@ def get_embedding_model():
             if _model is not None:
                 return _model
         return None
-    
+
     _model_loading = True
-    
+
     try:
         from fastembed import TextEmbedding
         logger.info("[SharedModel] Loading MiniLM embedding model...")
@@ -39,7 +52,7 @@ def get_embedding_model():
         _model = None
     finally:
         _model_loading = False
-    
+
     return _model
 
 
