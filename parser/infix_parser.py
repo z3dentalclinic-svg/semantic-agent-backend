@@ -300,84 +300,49 @@ class InfixParser:
 
         # ═══════════════════════════════════════════════════════════════════
         # RESEARCH POOL — для is_new_research=True запросов
-        # Берём ВСЕ свободные IP (минус активный батч), создаём по httpx-клиенту
-        # на каждый IP. Каждый research-запрос идёт на 3 агентах ПАРАЛЛЕЛЬНО
-        # через ОДИН и тот же IP (3 отдельных таска).
-        # Зеркало suffix-research архитектуры — без DELAY, только семафор.
+        # 1-в-1 архитектура suffix-research: пул httpx-клиентов на все IP
+        # из get_research_pool, семафор max(5, len/2), 3 агента одного запроса
+        # идут параллельно через тот же IP (3 отдельных таска).
         # ═══════════════════════════════════════════════════════════════════
         research_clients: List[httpx.AsyncClient] = []
         research_queries = [iq for iq in matrix if iq.is_new_research]
         if research_queries:
-            # combined_parser.html запускает suffix+prefix+infix параллельно
-            # через Promise.all — активный батч полностью занят боевыми матрицами
-            # всех трёх парсеров. Под research отдаём всё что НЕ занято в активном
-            # батче (минус собственные боевые слоты инфикса).
-            #
-            # Расчёт (5 батчей × 10 IP = 50 IP):
-            #   50 - 3 (инфикс боевые) - 3 (префикс) - 4 (суффикс/general) = 40 IP
+            # combined_parser.html запускает suffix+prefix+infix параллельно.
+            # Под research отдаём всё что НЕ занято в активном батче.
             _research_excludes = {
-                "infix_chrome", "infix_firefox", "infix_safari",       # свои боевые слоты
-                "prefix_chrome", "prefix_firefox", "prefix_nonpa",     # параллельный префикс
-                "suffix",                                                # параллельный суффикс (общий пул)
+                "infix_chrome", "infix_firefox", "infix_safari",
+                "prefix_chrome", "prefix_firefox", "prefix_nonpa",
+                "suffix",
             }
             try:
-                from utils.proxy_pool import ProxyPool
-                _research_proxies = ProxyPool.get_research_pool(exclude_roles=_research_excludes)
+                from utils.proxy_pool import ProxyPool as _PP
+                _research_proxies = _PP.get_research_pool(exclude_roles=_research_excludes)
             except ImportError:
                 try:
-                    from proxy_pool import ProxyPool
-                    _research_proxies = ProxyPool.get_research_pool(exclude_roles=_research_excludes)
+                    from proxy_pool import ProxyPool as _PP
+                    _research_proxies = _PP.get_research_pool(exclude_roles=_research_excludes)
                 except ImportError:
                     _research_proxies = []
             except Exception:
                 _research_proxies = []
 
-            if not _research_proxies:
-                # Fallback: используем доступные прокси (минимум 1)
-                _research_proxies = [p for p in [_proxy_chrome, _proxy_firefox, _proxy_safari] if p]
-                if not _research_proxies:
-                    _research_proxies = [None]  # без прокси (локально)
+            if _research_proxies:
+                for proxy_url in _research_proxies:
+                    research_clients.append(httpx.AsyncClient(proxy=proxy_url))
+                logger.info(
+                    f"[Infix Research] Pool: {len(research_clients)} httpx-клиентов "
+                    f"для {len(research_queries)} запросов × агенты "
+                    f"= {sum(len(iq.agents) for iq in research_queries)} реальных запросов "
+                    f"(~{sum(len(iq.agents) for iq in research_queries) // max(len(research_clients), 1)} запросов на IP)"
+                )
 
-            # Активный пул: 30 IP параллельно. HTTP/2 multiplexing — позволяет
-            # гнать много запросов через одно TCP-соединение, даёт серьёзный
-            # буст пропускной способности при keep-alive (Google AC поддерживает).
-            # HTTP/2 опционален — если пакет h2 не установлен, работаем на HTTP/1.1.
-            MAX_ACTIVE_CLIENTS = 30
-            _active_proxies = _research_proxies[:MAX_ACTIVE_CLIENTS]
-            try:
-                import h2  # проверка что пакет установлен
-                _h2_available = True
-            except ImportError:
-                _h2_available = False
-                logger.info("[Infix Research] HTTP/2 недоступен (нет пакета h2), работаем на HTTP/1.1. "
-                            "Для x2 буста: pip install 'httpx[http2]'")
-
-            for proxy_url in _active_proxies:
-                kwargs = {"http2": True} if _h2_available else {}
-                if proxy_url:
-                    kwargs["proxy"] = proxy_url
-                research_clients.append(httpx.AsyncClient(**kwargs))
-            total_real = sum(len(iq.agents) for iq in research_queries)
-            logger.info(
-                f"[Infix Research] Pool: {len(research_clients)} активных "
-                f"{'http/2' if _h2_available else 'http/1.1'}-клиентов "
-                f"(из {len(_research_proxies)} доступных IP) "
-                f"для {len(research_queries)} запросов × агенты "
-                f"= {total_real} реальных запросов "
-                f"(~{total_real // max(len(research_clients), 1)} на клиент)"
-            )
-
-        # Семафор для research — без `// 2`, как в суффиксе.
-        # Поднят до полного пула чтобы не упираться в искусственный лимит.
-        research_sem = asyncio.Semaphore(len(research_clients)) if research_clients else None
+        # Семафор для research — точно как в суффиксе
+        research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
 
         async def run_research_one(iq: InfixQuery, agent: str, idx: int):
             """
-            Один research-запрос — один fetch на одном агенте через один IP
-            (round-robin по индексу запроса). 3 агента одного запроса = 3 отдельных
-            таска через ТОТ ЖЕ IP (httpx параллелит через один клиент).
-            БЕЗ DELAY — семафор research_sem ограничивает параллелизм.
-            Зеркало suffix-research run_research_one.
+            Один research-запрос на одном из IP пула (round-robin по индексу запроса).
+            agent — chrome/firefox/safari. Зеркало suffix-research run_research_one.
             """
             if not research_clients:
                 return
@@ -433,6 +398,16 @@ class InfixParser:
                 if progress_callback:
                     await progress_callback(done_count[0], len(matrix), entry)
 
+        async def run_research_all():
+            """Запускает все research-запросы × агенты параллельно. Зеркало suffix."""
+            if not research_clients:
+                return
+            tasks = []
+            for i, iq in enumerate(research_queries):
+                for agent in iq.agents:
+                    tasks.append(run_research_one(iq, agent, i))
+            await asyncio.gather(*tasks)
+
         async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
                    httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
                    httpx.AsyncClient(proxy=_proxy_safari) as safari_client:
@@ -442,7 +417,6 @@ class InfixParser:
             non_e_chr = []
             non_e_ff  = []
             for iq in matrix:
-                # research-запросы маршрутизируем через research_pool
                 if iq.is_new_research:
                     continue
                 is_ff = "firefox" in iq.agents
@@ -451,52 +425,21 @@ class InfixParser:
                 else:
                     (non_e_ff if is_ff else non_e_chr).append(iq)
 
-            tasks = [
-                *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
-                *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
-                *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
-                *[run_non_e(iq, ff_client)      for iq in non_e_ff],
-            ]
-            # Боевая матрица — стартует параллельно как раньше
-            await asyncio.gather(*tasks)
-
-            # ─────────────────────────────────────────────────────────────
-            # Research-задачи: chunked dispatch для контроля памяти.
-            # Render лимит 2GB, MiniLM+pymorphy+GEO_DB занимают ~1.5GB,
-            # остаётся ~500MB. Если запустить все 81к корутин одним gather —
-            # OOM. Разбиваем на блоки, между блоками GC.
-            # ─────────────────────────────────────────────────────────────
-            if research_queries:
-                import gc
-                RESEARCH_CHUNK = 5000  # ~5000 параллельных корутин = ~50-80MB peak
-                research_task_specs = [
-                    (iq, agent, idx)
-                    for idx, iq in enumerate(research_queries)
-                    for agent in iq.agents
-                ]
-                total_chunks = (len(research_task_specs) + RESEARCH_CHUNK - 1) // RESEARCH_CHUNK
-                logger.info(
-                    f"[Infix Research] Chunked dispatch: "
-                    f"{len(research_task_specs)} запросов / {RESEARCH_CHUNK} = {total_chunks} блоков"
+            try:
+                await asyncio.gather(
+                    *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
+                    *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
+                    *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
+                    *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+                    run_research_all(),
                 )
-                for chunk_n in range(0, len(research_task_specs), RESEARCH_CHUNK):
-                    chunk = research_task_specs[chunk_n:chunk_n + RESEARCH_CHUNK]
-                    chunk_tasks = [run_research_one(iq, agent, idx) for iq, agent, idx in chunk]
-                    await asyncio.gather(*chunk_tasks)
-                    # GC между блоками — освобождаем response buffers, корутины
-                    gc.collect()
-                    if chunk_n % (RESEARCH_CHUNK * 5) == 0:
-                        logger.info(
-                            f"[Infix Research] Прогресс: "
-                            f"{min(chunk_n + RESEARCH_CHUNK, len(research_task_specs))}/{len(research_task_specs)}"
-                        )
-
-            # Закрываем research-клиенты
-            for rc in research_clients:
-                try:
-                    await rc.aclose()
-                except Exception:
-                    pass
+            finally:
+                # Закрываем research-клиенты (как в суффиксе)
+                for c in research_clients:
+                    try:
+                        await c.aclose()
+                    except Exception:
+                        pass
 
         total_time = (time.time() - total_start) * 1000
 
