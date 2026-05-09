@@ -235,8 +235,8 @@ class InfixParser:
 
         non_e_sem = asyncio.Semaphore(BATCH_SIZE)
 
-        async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient, agent_override: Optional[str] = None):
-            agent = agent_override if agent_override is not None else iq.agents[0]
+        async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
+            agent = iq.agents[0]
             await asyncio.sleep(DELAY)
             t0 = time.time()
             try:
@@ -251,12 +251,9 @@ class InfixParser:
                 results = [kw for kw in raw_results if not _is_garbage_keyword(kw)]
 
                 status = "ok" if results else "empty"
-                # Для research-запросов добавляем суффикс агента в struct,
-                # чтобы в трейсе разделить вклад каждого агента
-                struct_label = f"{iq.struct}__{agent}" if iq.is_new_research else iq.struct
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=struct_label,
+                    group=iq.group, struct=iq.struct,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -270,16 +267,15 @@ class InfixParser:
                             continue
                         if k not in kw_map:
                             kw_map[k] = []
-                        kw_map[k].append(f"{agent}:{struct_label}")
+                        kw_map[k].append(f"{agent}:{iq.struct}")
                         if seed.lower() not in k:
                             alt_seed_set.add(k)
 
             except Exception as e:
                 elapsed = (time.time() - t0) * 1000
-                struct_label = f"{iq.struct}__{agent}" if iq.is_new_research else iq.struct
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=struct_label,
+                    group=iq.group, struct=iq.struct,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -304,11 +300,10 @@ class InfixParser:
 
         # ═══════════════════════════════════════════════════════════════════
         # RESEARCH POOL — для is_new_research=True запросов
-        # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
-        # распределяем research-запросы round-robin между клиентами.
-        # Каждый research-запрос идёт на агентах из iq.agents
-        # (chrome+firefox+safari или только chrome для E_LAT) —
-        # несколько запросов через ОДИН и тот же IP (последовательно).
+        # Берём ВСЕ свободные IP (минус активный батч), создаём по httpx-клиенту
+        # на каждый IP. Каждый research-запрос идёт на 3 агентах ПАРАЛЛЕЛЬНО
+        # через ОДИН и тот же IP (3 отдельных таска).
+        # Зеркало suffix-research архитектуры — без DELAY, только семафор.
         # ═══════════════════════════════════════════════════════════════════
         research_clients: List[httpx.AsyncClient] = []
         research_queries = [iq for iq in matrix if iq.is_new_research]
@@ -348,27 +343,79 @@ class InfixParser:
                     httpx.AsyncClient(proxy=proxy_url) if proxy_url
                     else httpx.AsyncClient()
                 )
+            total_real = sum(len(iq.agents) for iq in research_queries)
             logger.info(
                 f"[Infix Research] Pool: {len(research_clients)} httpx-клиентов "
                 f"для {len(research_queries)} запросов × агенты "
-                f"= ~{sum(len(iq.agents) for iq in research_queries)} реальных запросов "
-                f"(~{sum(len(iq.agents) for iq in research_queries) // max(len(research_clients), 1)} на IP)"
+                f"= {total_real} реальных запросов "
+                f"(~{total_real // max(len(research_clients), 1)} на IP)"
             )
 
-        # Семафор для research — ограничивает параллелизм по всему пулу
-        research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
+        # Семафор для research — без `// 2`, как в суффиксе.
+        # Поднят до полного пула чтобы не упираться в искусственный лимит.
+        research_sem = asyncio.Semaphore(len(research_clients)) if research_clients else None
 
-        async def run_research_one(iq: InfixQuery, idx: int):
+        async def run_research_one(iq: InfixQuery, agent: str, idx: int):
             """
-            Один research-запрос: для каждого агента в iq.agents
-            делаем отдельный fetch через round-robin клиент пула.
+            Один research-запрос — один fetch на одном агенте через один IP
+            (round-robin по индексу запроса). 3 агента одного запроса = 3 отдельных
+            таска через ТОТ ЖЕ IP (httpx параллелит через один клиент).
+            БЕЗ DELAY — семафор research_sem ограничивает параллелизм.
+            Зеркало suffix-research run_research_one.
             """
             if not research_clients:
                 return
             client = research_clients[idx % len(research_clients)]
             async with research_sem:
-                for agent in iq.agents:
-                    await fetch_one(iq, client, agent_override=agent)
+                t0 = time.time()
+                try:
+                    raw_results = await self.fetch_suggestions(
+                        query=iq.query, country=country, language=language,
+                        client=client, google_client=agent, cursor_position=iq.cp,
+                        uule=_uule,
+                    )
+                    elapsed = (time.time() - t0) * 1000
+                    results = [kw for kw in raw_results if not _is_garbage_keyword(kw)]
+                    status = "ok" if results else "empty"
+                    struct_label = f"{iq.struct}__{agent}"
+                    entry = InfixTraceEntry(
+                        gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
+                        group=iq.group, struct=struct_label,
+                        insert_val=iq.insert_val, insert_type=iq.insert_type,
+                        orientation=iq.orientation,
+                        query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
+                        agent=agent, results=results, results_count=len(results),
+                        time_ms=round(elapsed, 1), status=status, letter=iq.letter,
+                    )
+                    async with lock:
+                        for kw in results:
+                            k = kw.lower().strip()
+                            if not k:
+                                continue
+                            if k not in kw_map:
+                                kw_map[k] = []
+                            kw_map[k].append(f"{agent}:{struct_label}")
+                            if seed.lower() not in k:
+                                alt_seed_set.add(k)
+                except Exception as e:
+                    elapsed = (time.time() - t0) * 1000
+                    struct_label = f"{iq.struct}__{agent}"
+                    entry = InfixTraceEntry(
+                        gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
+                        group=iq.group, struct=struct_label,
+                        insert_val=iq.insert_val, insert_type=iq.insert_type,
+                        orientation=iq.orientation,
+                        query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
+                        agent=agent, time_ms=round(elapsed, 1),
+                        status="error", error=str(e), letter=iq.letter,
+                    )
+
+                async with lock:
+                    trace_entries.append(entry)
+                    done_count[0] += 1
+
+                if progress_callback:
+                    await progress_callback(done_count[0], len(matrix), entry)
 
         async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
                    httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
@@ -394,10 +441,11 @@ class InfixParser:
                 *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
                 *[run_non_e(iq, ff_client)      for iq in non_e_ff],
             ]
-            # Research-задачи: round-robin по research_clients, каждый на своих агентах
-            tasks.extend(
-                run_research_one(iq, idx) for idx, iq in enumerate(research_queries)
-            )
+            # Research-задачи: КАЖДЫЙ агент — отдельный таск (3× запросов в gather).
+            # Все 3 агента одного запроса идут через ТОТ ЖЕ IP (research_clients[idx]).
+            for idx, iq in enumerate(research_queries):
+                for agent in iq.agents:
+                    tasks.append(run_research_one(iq, agent, idx))
 
             await asyncio.gather(*tasks)
 
