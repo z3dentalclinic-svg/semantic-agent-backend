@@ -371,7 +371,16 @@ class InfixGenerator:
         # non-anchor токенами (остаются в строке, gap'ы между ними не строятся).
         # Агенты: chrome+firefox+safari (E_LAT — chrome only).
         # Закомментировать одной правкой после завершения research-прогона.
-        self._append_research_block(seed, out)
+        # ОТКЛЮЧЕНО ПОСЛЕ GAP-АНАЛИЗА 8 СИДОВ (300 GAP'ов). Полный research давал
+        # ~26k запросов на сид; минимальная добавка для покрытия 64 пропущенных
+        # боевой GAP'ов укомплектована в _append_battle_addon (10 cp×agent комбинаций).
+        # Чтобы вернуть research-режим — раскомментировать строку ниже:
+        # self._append_research_block(seed, out)
+
+        # Минимальная research-добавка к боевой матрице.
+        # Покрывает 64/64 GAP'ов через chrome+firefox (set cover по 8 сидам).
+        # 11 GAP'ов требуют safari — отложено до подключения safari в прод.
+        self._append_battle_addon(seed, out)
 
         return out
 
@@ -990,6 +999,128 @@ class InfixGenerator:
                 agents=ALL_AGENTS_RESEARCH, letter=L,
                 is_new_research=True,
             ))
+
+    def _append_battle_addon(self, seed: str, results: List[InfixQuery]):
+        """
+        Минимальная research-добавка к боевой матрице (FINAL v3).
+
+        Источник: GAP-анализ 8 сидов (300 GAP'ов). Cost-weighted greedy set cover
+        на (struct × agent × letter) с дедупликацией дублей между структурами.
+
+        Результат: 14 уникальных unit'ов, 95 запросов на anchor-пару,
+        покрывает 77/77 GAP'ов (chrome+firefox, без safari).
+
+        SD-структуры (6 типов, все chrome кроме wcL_nosp2):
+          - paren_open  chrome  `{s} ({D}`     +53 GAP'ов (главный универсал)
+          - wcR_nosp    chrome  `{s} {D}*`     +1 эксклюзив
+          - dwcL        chrome  `** {s} {D}`   +1 эксклюзив
+          - hyp_wc      chrome  `{s}-{D} *`    +1 эксклюзив
+          - wcL_nosp1   chrome  `{s}* {D}`     +1 эксклюзив
+          - wcL_nosp2   firefox `{s} *{D}`     +1 эксклюзив
+
+        SDL (2 буквы из 30 — только с, ц дали эксклюзивы):
+          - с, ц        chrome  `{s} {D}{L}`   +3 GAP'а суммарно
+
+        SDL_REV (1 буква — только е дала эксклюзивы):
+          - е           chrome  `{D}{L} {s}`   +2 GAP'а
+
+        E_LAT (5 букв из 26 — только a,m,o,p,s дали эксклюзивы):
+          - a,m,o,p,s   chrome  `{s} {L} *`    +14 GAP'ов
+
+        Итого: 6×10 + 2×10 + 1×10 + 5×1 = 95 запросов на anchor-пару.
+        Это абсолютный минимум при котором нет потерь — каждый unit
+        имеет хотя бы 1 эксклюзивный GAP на 8 сидах анализа.
+
+        Цифры: полный перебор 0-9 (каждая имеет эксклюзив на каком-то сиде).
+        """
+        tokens, anchor_indices = self._research_anchors(seed)
+        if len(anchor_indices) < 2:
+            return
+
+        CHR = ("chrome",)
+        FF  = ("firefox",)
+
+        # Буквы доказавшие эксклюзивы по 8 сидам
+        SDL_LETTERS     = list("сц")        # 2 буквы
+        SDL_REV_LETTERS = list("е")         # 1 буква
+        ELAT_LETTERS    = list("ampso")     # 5 букв
+
+        for gap_n, (i_left, i_right) in enumerate(
+            zip(anchor_indices[:-1], anchor_indices[1:])
+        ):
+            left_block  = " ".join(tokens[:i_left + 1])
+            right_block = " ".join(tokens[i_left + 1:])
+            w1_val = tokens[i_left]
+            w2_val = tokens[i_right]
+            s  = left_block
+            rs = right_block
+
+            def _full(base: str) -> str:
+                return f"{base} {rs}".strip() if rs else base
+
+            def emit(group, struct, base, cp, cp_note, agents,
+                     insert_val, insert_type, letter=None):
+                results.append(InfixQuery(
+                    query=_full(base), gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group=group, struct=struct,
+                    insert_val=insert_val, insert_type=insert_type,
+                    orientation="N", cp=cp, cp_note=cp_note,
+                    agents=agents, letter=letter,
+                    is_new_research=True,
+                ))
+
+            # ── SD: 6 структур × 10 цифр ──────────────────────────────
+            for D in DIGITS_SD:
+                # 1. paren_open chrome — главный универсал (+53 GAP'ов)
+                base = f"{s} ({D}"
+                emit("SD", f"{D}_paren_open", base, len(base),
+                     "SD_paren_open_end", CHR, D, "research_digit")
+
+                # 2. wcR_nosp chrome (+1 эксклюзив)
+                base = f"{s} {D}*"
+                emit("SD", f"{D}_wcR_nosp", base, len(base),
+                     "SD_wcR_nosp_end", CHR, D, "research_digit")
+
+                # 3. dwcL chrome (+1 эксклюзив)
+                base = f"** {s} {D}"
+                emit("SD", f"{D}_dwcL", base, len(base),
+                     "SD_dwcL_end", CHR, D, "research_digit")
+
+                # 4. hyp_wc chrome (+1 эксклюзив)
+                base = f"{s}-{D} *"
+                emit("SD", f"{D}_hyp_wc", base, len(base),
+                     "SD_hyp_wc_end", CHR, D, "research_digit")
+
+                # 5. wcL_nosp1 chrome (+1 эксклюзив)
+                base = f"{s}* {D}"
+                emit("SD", f"{D}_wcL_nosp1", base, len(base),
+                     "SD_wcL_nosp1_end", CHR, D, "research_digit")
+
+                # 6. wcL_nosp2 firefox (+1 эксклюзив)
+                base = f"{s} *{D}"
+                emit("SD", f"{D}_wcL_nosp2", base, len(base),
+                     "SD_wcL_nosp2_end", FF, D, "research_digit")
+
+            # ── SDL: 2 буквы × 10 цифр chrome ─────────────────────────
+            for D in DIGITS_SD:
+                for L in SDL_LETTERS:
+                    base = f"{s} {D}{L}"
+                    emit("SDL", f"{D}_{L}_plain", base, len(base),
+                         "SDL_plain_end", CHR, D, "research_digit", letter=L)
+
+            # ── SDL_REV: 1 буква × 10 цифр chrome ─────────────────────
+            for D in DIGITS_SD:
+                for L in SDL_REV_LETTERS:
+                    base = f"{D}{L} {s}"
+                    emit("SDL_REV", f"{D}_{L}_rev", base, len(base),
+                         "SDL_REV_end", CHR, D, "research_digit", letter=L)
+
+            # ── E_LAT: 5 букв chrome, `{s} {L} *` cp=после L ──────────
+            for L in ELAT_LETTERS:
+                base = f"{s} {L} *"
+                cp_AL = len(s) + 1 + len(L) + 1
+                emit("E_LAT", f"{L}_Lwc_cpAL", base, cp_AL,
+                     "E_LAT_Lwc_cpAL", CHR, L, "research_letter", letter=L)
 
     def _append_research_block(self, seed: str, results: List[InfixQuery]):
         """
