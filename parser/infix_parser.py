@@ -465,6 +465,22 @@ class InfixParser:
                     await fetch_one(iq, ff_clients[slot])
 
             try:
+                t_gather_start = time.time()
+                unique_proxies = len(set(p for p in _proxies_infix if p))
+                if unique_proxies < 2:
+                    logger.warning(
+                        f"[Infix] ВНИМАНИЕ: все 5 слотов используют один IP — "
+                        f"параллелизм не работает! proxies={_proxies_infix}"
+                    )
+                logger.info(
+                    f"[Infix] START gather | seed='{seed}' | "
+                    f"non_e_chr={len(non_e_chr)} non_e_ff={len(non_e_ff)} "
+                    f"E_chr={sum(len(v) for v in e_by_letter_chr.values())} "
+                    f"E_ff={sum(len(v) for v in e_by_letter_ff.values())} "
+                    f"addon_chr={len(addon_chr)} addon_ff={len(addon_ff)} "
+                    f"unique_ips={unique_proxies}/5 "
+                    f"proxies={[p[:40] if p else None for p in _proxies_infix]}"
+                )
                 await asyncio.gather(
                     *[run_letter(qs, chr_c1)  for qs in e_by_letter_chr.values()],
                     *[run_letter(qs, ff_c1)   for qs in e_by_letter_ff.values()],
@@ -473,6 +489,11 @@ class InfixParser:
                     *[run_chr(iq, i)          for i, iq in enumerate(addon_chr)],
                     *[run_ff(iq, i)           for i, iq in enumerate(addon_ff)],
                     run_research_all(),
+                )
+                logger.info(
+                    f"[Infix] END gather | seed='{seed}' | "
+                    f"elapsed={round(time.time()-t_gather_start, 2)}s | "
+                    f"keywords={len(kw_map)}"
                 )
             finally:
                 for c in research_clients:
