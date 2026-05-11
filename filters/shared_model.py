@@ -1,5 +1,5 @@
 """
-Shared Embedding Models — singletons для L2 и CategoryMismatch.
+Shared Embedding Models 11 — singletons для L2 и CategoryMismatch.
 
 Модели:
 1. MiniLM (основная) — multilingual embeddings для KNN, CategoryMismatch
