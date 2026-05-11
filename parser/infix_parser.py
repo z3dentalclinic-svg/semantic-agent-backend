@@ -32,7 +32,7 @@ UA_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.1
 
 DELAY_LOCAL  = 0.3
 DELAY_SERVER = 0.15   # Снижен с 0.3 до 0.15 — 5 IP × Semaphore(5) = 25 concurrent
-BATCH_SIZE   = 5      # Семафор на каждый IP (5 IP × 5 = 25 concurrent суммарно)
+BATCH_SIZE   = 5      # Семафор на каждый IP (как в суффиксе)
 
 # 5 IP: по одному из каждого батча (index 0 каждого батча × 5 батчей = 5 разных IP)
 # ProxyPool.get("infix_chrome") всегда возвращает index 0 ТЕКУЩЕГО батча — один и тот же IP.
@@ -458,12 +458,19 @@ class InfixParser:
             addon_chr = [iq for iq in matrix if iq.is_new_research and "firefox" not in iq.agents]
             addon_ff  = [iq for iq in matrix if iq.is_new_research and "firefox" in iq.agents]
 
+            async def run_non_e(iq, client):
+                """Боевые non-E запросы — оригинальный путь через non_e_sem (как в v1.0)."""
+                async with non_e_sem:
+                    await fetch_one(iq, client)
+
             async def run_chr(iq, idx):
+                """Addon-запросы chrome — round-robin по 3 IP."""
                 slot = idx % 3
                 async with chr_sems[slot]:
                     await fetch_one(iq, chr_clients[slot])
 
             async def run_ff(iq, idx):
+                """Addon-запросы firefox — round-robin по 2 IP."""
                 slot = idx % 2
                 async with ff_sems[slot]:
                     await fetch_one(iq, ff_clients[slot])
@@ -472,12 +479,14 @@ class InfixParser:
                 t_gather_start = time.time()
                 unique_proxies = len(set(p for p in _proxies_infix if p))
                 await asyncio.gather(
-                    *[run_letter(qs, chr_c1)  for qs in e_by_letter_chr.values()],
-                    *[run_letter(qs, ff_c1)   for qs in e_by_letter_ff.values()],
-                    *[run_chr(iq, i)          for i, iq in enumerate(non_e_chr)],
-                    *[run_ff(iq, i)           for i, iq in enumerate(non_e_ff)],
-                    *[run_chr(iq, i)          for i, iq in enumerate(addon_chr)],
-                    *[run_ff(iq, i)           for i, iq in enumerate(addon_ff)],
+                    # Боевые — оригинальный путь (даёт 4с как раньше)
+                    *[run_letter(qs, chr_c1)    for qs in e_by_letter_chr.values()],
+                    *[run_letter(qs, ff_c1)     for qs in e_by_letter_ff.values()],
+                    *[run_non_e(iq, chr_c1)     for iq in non_e_chr],
+                    *[run_non_e(iq, ff_c1)      for iq in non_e_ff],
+                    # Addon — round-robin по 5 IP
+                    *[run_chr(iq, i)            for i, iq in enumerate(addon_chr)],
+                    *[run_ff(iq, i)             for i, iq in enumerate(addon_ff)],
                     run_research_all(),
                 )
                 pass  # итоговый лог — ниже после сборки результатов
