@@ -248,6 +248,10 @@ class InfixParser:
         chr_sems = [asyncio.Semaphore(BATCH_SIZE) for _ in range(3)]
         ff_sems  = [asyncio.Semaphore(BATCH_SIZE) for _ in range(2)]
 
+        # Для финального лога
+        _gather_elapsed = 0.0
+        unique_proxies = len(set(p for p in _proxies_infix if p))
+
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
             await asyncio.sleep(DELAY)
@@ -467,20 +471,6 @@ class InfixParser:
             try:
                 t_gather_start = time.time()
                 unique_proxies = len(set(p for p in _proxies_infix if p))
-                if unique_proxies < 2:
-                    logger.warning(
-                        f"[Infix] ВНИМАНИЕ: все 5 слотов используют один IP — "
-                        f"параллелизм не работает! proxies={_proxies_infix}"
-                    )
-                logger.info(
-                    f"[Infix] START gather | seed='{seed}' | "
-                    f"non_e_chr={len(non_e_chr)} non_e_ff={len(non_e_ff)} "
-                    f"E_chr={sum(len(v) for v in e_by_letter_chr.values())} "
-                    f"E_ff={sum(len(v) for v in e_by_letter_ff.values())} "
-                    f"addon_chr={len(addon_chr)} addon_ff={len(addon_ff)} "
-                    f"unique_ips={unique_proxies}/5 "
-                    f"proxies={[p[:40] if p else None for p in _proxies_infix]}"
-                )
                 await asyncio.gather(
                     *[run_letter(qs, chr_c1)  for qs in e_by_letter_chr.values()],
                     *[run_letter(qs, ff_c1)   for qs in e_by_letter_ff.values()],
@@ -490,11 +480,8 @@ class InfixParser:
                     *[run_ff(iq, i)           for i, iq in enumerate(addon_ff)],
                     run_research_all(),
                 )
-                logger.info(
-                    f"[Infix] END gather | seed='{seed}' | "
-                    f"elapsed={round(time.time()-t_gather_start, 2)}s | "
-                    f"keywords={len(kw_map)}"
-                )
+                pass  # итоговый лог — ниже после сборки результатов
+                _gather_elapsed = time.time() - t_gather_start
             finally:
                 for c in research_clients:
                     try:
@@ -587,6 +574,18 @@ class InfixParser:
         trace_entries.clear()
         import gc
         gc.collect()
+
+        print(
+            f"[Infix] DONE | seed='{seed}' | "
+            f"total={round(total_time/1000, 2)}s "
+            f"gather={round(_gather_elapsed, 2)}s | "
+            f"queries={len(trace_list)} ok={sum(1 for e in trace_list if e['status']=='ok')} "
+            f"empty={sum(1 for e in trace_list if e['status']=='empty')} "
+            f"err={sum(1 for e in trace_list if e['status']=='error')} | "
+            f"keywords={len(kw_map)} | "
+            f"unique_ips={unique_proxies}/5 | "
+            f"proxies={[p.split('@')[-1][:20] if p and '@' in p else (p[:20] if p else None) for p in _proxies_infix]}"
+        )
 
         return InfixParseResult(
             seed=seed, country=country, language=language,
