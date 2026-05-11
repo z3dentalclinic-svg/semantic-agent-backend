@@ -14,37 +14,33 @@ _model_loading = False
 
 
 def get_embedding_model():
-    # ОТКЛЮЧЕНО для research-прогонов (экономия ~500 MB).
-    # Откат: удалить return None и раскомментировать тело функции ниже.
-    return None
-
-    # global _model, _model_loading
-    #
-    # if _model is not None:
-    #     return _model
-    #
-    # if _model_loading:
-    #     import time
-    #     for _ in range(30):
-    #         time.sleep(1)
-    #         if _model is not None:
-    #             return _model
-    #     return None
-    #
-    # _model_loading = True
-    #
-    # try:
-    #     from fastembed import TextEmbedding
-    #     logger.info("[SharedModel] Loading MiniLM embedding model...")
-    #     _model = TextEmbedding("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-    #     logger.info("[SharedModel] MiniLM loaded successfully")
-    # except Exception as e:
-    #     logger.error(f"[SharedModel] Failed to load MiniLM: {e}")
-    #     _model = None
-    # finally:
-    #     _model_loading = False
-    #
-    # return _model
+    global _model, _model_loading
+    
+    if _model is not None:
+        return _model
+    
+    if _model_loading:
+        import time
+        for _ in range(30):
+            time.sleep(1)
+            if _model is not None:
+                return _model
+        return None
+    
+    _model_loading = True
+    
+    try:
+        from fastembed import TextEmbedding
+        logger.info("[SharedModel] Loading MiniLM embedding model...")
+        _model = TextEmbedding("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        logger.info("[SharedModel] MiniLM loaded successfully")
+    except Exception as e:
+        logger.error(f"[SharedModel] Failed to load MiniLM: {e}")
+        _model = None
+    finally:
+        _model_loading = False
+    
+    return _model
 
 
 def is_model_loaded() -> bool:
