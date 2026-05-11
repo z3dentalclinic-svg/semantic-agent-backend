@@ -28,41 +28,28 @@ logger = logging.getLogger(__name__)
 
 UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 UA_FIREFOX = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-UA_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
 
 DELAY_LOCAL  = 0.3
 DELAY_SERVER = 0.3
-BATCH_SIZE   = 5      # Семафор на каждый IP (как в суффиксе)
+BATCH_SIZE   = 5
 
-# 5 IP: по одному из каждого батча (index 0 каждого батча × 5 батчей = 5 разных IP)
-# ProxyPool.get("infix_chrome") всегда возвращает index 0 ТЕКУЩЕГО батча — один и тот же IP.
-# Правильно: взять get_all_proxies() и взять index 0 из каждого батча.
-def _get_5_infix_proxies(PP) -> list:
-    all_p = PP.get_all_proxies()
-    ips = [all_p[i * 10] for i in range(min(5, len(all_p) // 10))]
-    if not ips:
-        return [None] * 5
-    while len(ips) < 5:
-        ips.append(ips[-1])
-    return ips
-
+# Два отдельных IP: Chrome и Firefox идут на разные прокси
+# Если INFIX_PROXY_CHROME/FF не заданы — fallback на GOOGLE_PROXY_URL
 try:
     from utils.proxy_pool import ProxyPool
-    _proxies_infix = _get_5_infix_proxies(ProxyPool)
+    _proxy_chrome  = ProxyPool.get("infix_chrome")
+    _proxy_firefox = ProxyPool.get("infix_firefox")
 except ImportError:
     try:
         from proxy_pool import ProxyPool
-        _proxies_infix = _get_5_infix_proxies(ProxyPool)
+        _proxy_chrome  = ProxyPool.get("infix_chrome")
+        _proxy_firefox = ProxyPool.get("infix_firefox")
     except ImportError:
-        _fb = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
-        _proxies_infix = [_fb] * 5
-
-_proxy_chrome  = _proxies_infix[0]
-_proxy_firefox = _proxies_infix[1]
-_proxy_safari  = os.getenv("INFIX_PROXY_SAFARI") or os.getenv("GOOGLE_PROXY_URL") or None
+        _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
+        _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
 
 _google_proxy = _proxy_chrome  # для обратной совместимости
-DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox or _proxy_safari) else DELAY_LOCAL
+DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
 
 try:
     from utils.geo_uule import get_uule
@@ -173,12 +160,7 @@ class InfixParser:
         else:
             params["cp"] = len(query)
 
-        if google_client == "firefox":
-            ua = UA_FIREFOX
-        elif google_client == "safari":
-            ua = UA_SAFARI
-        else:
-            ua = UA_CHROME
+        ua = UA_FIREFOX if google_client == "firefox" else UA_CHROME
         headers = {"User-Agent": ua}
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
@@ -242,24 +224,12 @@ class InfixParser:
         lock = asyncio.Lock()
         done_count = [0]
 
-        non_e_sem = asyncio.Semaphore(BATCH_SIZE)  # fallback если один клиент
-
-        # 5-IP семафоры: 3 Chrome + 2 Firefox
-        chr_sems = [asyncio.Semaphore(BATCH_SIZE) for _ in range(3)]
-        ff_sems  = [asyncio.Semaphore(BATCH_SIZE) for _ in range(2)]
-
-        # Для финального лога
-        _gather_elapsed = 0.0
-        unique_proxies = len(set(p for p in _proxies_infix if p))
+        non_e_sem = asyncio.Semaphore(BATCH_SIZE)
 
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
-            # Addon-запросы на отдельных IP — можно короче задержку
-            delay = 0.15 if getattr(iq, 'is_new_research', False) else DELAY
-            await asyncio.sleep(delay)
+            await asyncio.sleep(DELAY)
             t0 = time.time()
-            # Addon-запросы получают __agent суффикс в struct чтобы отличаться от боевых
-            struct_label = f"{iq.struct}__{agent}" if getattr(iq, 'is_new_research', False) else iq.struct
             try:
                 raw_results = await self.fetch_suggestions(
                     query=iq.query, country=country, language=language,
@@ -274,7 +244,7 @@ class InfixParser:
                 status = "ok" if results else "empty"
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=struct_label,
+                    group=iq.group, struct=iq.struct,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -288,7 +258,7 @@ class InfixParser:
                             continue
                         if k not in kw_map:
                             kw_map[k] = []
-                        kw_map[k].append(f"{agent}:{struct_label}")
+                        kw_map[k].append(f"{agent}:{iq.struct}")
                         if seed.lower() not in k:
                             alt_seed_set.add(k)
 
@@ -296,7 +266,7 @@ class InfixParser:
                 elapsed = (time.time() - t0) * 1000
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=struct_label,
+                    group=iq.group, struct=iq.struct,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -312,200 +282,33 @@ class InfixParser:
                 await progress_callback(done_count[0], len(matrix), entry)
 
         async def run_letter(letter_queries, client):
-            # Параллельно внутри буквы (было последовательно — главный хвост)
-            await asyncio.gather(*[fetch_one(iq, client) for iq in letter_queries])
-
-        non_e_chr_sem = asyncio.Semaphore(BATCH_SIZE)
-        non_e_ff_sem  = asyncio.Semaphore(BATCH_SIZE)
-
-        async def run_non_e_chr(iq, client):
-            async with non_e_chr_sem:
+            for iq in letter_queries:
                 await fetch_one(iq, client)
 
-        async def run_non_e_ff(iq, client):
-            async with non_e_ff_sem:
+        async def run_non_e(iq, client):
+            async with non_e_sem:
                 await fetch_one(iq, client)
 
-        # ═══════════════════════════════════════════════════════════════════
-        # RESEARCH POOL — для is_new_research=True запросов
-        # 1-в-1 архитектура suffix-research: пул httpx-клиентов на все IP
-        # из get_research_pool, семафор max(5, len/2), 3 агента одного запроса
-        # идут параллельно через тот же IP (3 отдельных таска).
-        # ═══════════════════════════════════════════════════════════════════
-        research_clients: List[httpx.AsyncClient] = []
-        research_queries = [iq for iq in matrix if iq.is_new_research]
-        if research_queries:
-            # combined_parser.html запускает suffix+prefix+infix параллельно.
-            # Под research отдаём всё что НЕ занято в активном батче.
-            _research_excludes = {
-                "infix_chrome", "infix_firefox", "infix_safari",
-                "prefix_chrome", "prefix_firefox", "prefix_nonpa",
-                "suffix",
-            }
-            try:
-                from utils.proxy_pool import ProxyPool as _PP
-                _research_proxies = _PP.get_research_pool(exclude_roles=_research_excludes)
-            except ImportError:
-                try:
-                    from proxy_pool import ProxyPool as _PP
-                    _research_proxies = _PP.get_research_pool(exclude_roles=_research_excludes)
-                except ImportError:
-                    _research_proxies = []
-            except Exception:
-                _research_proxies = []
-
-            if _research_proxies:
-                for proxy_url in _research_proxies:
-                    research_clients.append(httpx.AsyncClient(proxy=proxy_url))
-                logger.info(
-                    f"[Infix Research] Pool: {len(research_clients)} httpx-клиентов "
-                    f"для {len(research_queries)} запросов × агенты "
-                    f"= {sum(len(iq.agents) for iq in research_queries)} реальных запросов "
-                    f"(~{sum(len(iq.agents) for iq in research_queries) // max(len(research_clients), 1)} запросов на IP)"
-                )
-
-        # Семафор для research — точно как в суффиксе
-        research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
-
-        async def run_research_one(iq: InfixQuery, agent: str, idx: int):
-            """
-            Один research-запрос на одном из IP пула (round-robin по индексу запроса).
-            agent — chrome/firefox/safari. Зеркало suffix-research run_research_one.
-            """
-            if not research_clients:
-                return
-            client = research_clients[idx % len(research_clients)]
-            async with research_sem:
-                t0 = time.time()
-                try:
-                    raw_results = await self.fetch_suggestions(
-                        query=iq.query, country=country, language=language,
-                        client=client, google_client=agent, cursor_position=iq.cp,
-                        uule=_uule,
-                    )
-                    elapsed = (time.time() - t0) * 1000
-                    results = [kw for kw in raw_results if not _is_garbage_keyword(kw)]
-                    status = "ok" if results else "empty"
-                    struct_label = f"{iq.struct}__{agent}"
-                    entry = InfixTraceEntry(
-                        gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                        group=iq.group, struct=struct_label,
-                        insert_val=iq.insert_val, insert_type=iq.insert_type,
-                        orientation=iq.orientation,
-                        query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
-                        agent=agent, results=results, results_count=len(results),
-                        time_ms=round(elapsed, 1), status=status, letter=iq.letter,
-                    )
-                    async with lock:
-                        for kw in results:
-                            k = kw.lower().strip()
-                            if not k:
-                                continue
-                            if k not in kw_map:
-                                kw_map[k] = []
-                            kw_map[k].append(f"{agent}:{struct_label}")
-                            if seed.lower() not in k:
-                                alt_seed_set.add(k)
-                except Exception as e:
-                    elapsed = (time.time() - t0) * 1000
-                    struct_label = f"{iq.struct}__{agent}"
-                    entry = InfixTraceEntry(
-                        gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                        group=iq.group, struct=struct_label,
-                        insert_val=iq.insert_val, insert_type=iq.insert_type,
-                        orientation=iq.orientation,
-                        query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
-                        agent=agent, time_ms=round(elapsed, 1),
-                        status="error", error=str(e), letter=iq.letter,
-                    )
-
-                async with lock:
-                    trace_entries.append(entry)
-                    done_count[0] += 1
-
-                if progress_callback:
-                    await progress_callback(done_count[0], len(matrix), entry)
-
-        async def run_research_all():
-            """Запускает все research-запросы × агенты параллельно. Зеркало suffix."""
-            if not research_clients:
-                return
-            tasks = []
-            for i, iq in enumerate(research_queries):
-                for agent in iq.agents:
-                    tasks.append(run_research_one(iq, agent, i))
-            await asyncio.gather(*tasks)
-
-        # 5 IP: 3 Chrome + 2 Firefox (как в суффиксе)
-        # 3×Semaphore(5)=15 concurrent Chrome, 2×Semaphore(5)=10 concurrent FF = 25 total
-        async with \
-            httpx.AsyncClient(proxy=_proxies_infix[0]) as chr_c1, \
-            httpx.AsyncClient(proxy=_proxies_infix[1]) as chr_c2, \
-            httpx.AsyncClient(proxy=_proxies_infix[2]) as chr_c3, \
-            httpx.AsyncClient(proxy=_proxies_infix[3]) as ff_c1,  \
-            httpx.AsyncClient(proxy=_proxies_infix[4]) as ff_c2,  \
-            httpx.AsyncClient(proxy=_proxy_safari)     as safari_client:
-
-            chr_clients = [chr_c1, chr_c2, chr_c3]
-            ff_clients  = [ff_c1, ff_c2]
-
+        async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
+                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
             from collections import defaultdict
             e_by_letter_chr = defaultdict(list)
             e_by_letter_ff  = defaultdict(list)
             non_e_chr = []
             non_e_ff  = []
             for iq in matrix:
-                if iq.is_new_research:
-                    continue
                 is_ff = "firefox" in iq.agents
                 if iq.group == "E" and iq.letter:
                     (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
                 else:
                     (non_e_ff if is_ff else non_e_chr).append(iq)
 
-            # Addon-запросы (is_new_research=True) через те же клиенты
-            addon_chr = [iq for iq in matrix if iq.is_new_research and "firefox" not in iq.agents]
-            addon_ff  = [iq for iq in matrix if iq.is_new_research and "firefox" in iq.agents]
-
-            async def run_non_e(iq, client):
-                """Боевые non-E запросы — оригинальный путь через non_e_sem (как в v1.0)."""
-                async with non_e_sem:
-                    await fetch_one(iq, client)
-
-            async def run_chr(iq, idx):
-                """Addon chrome — на chr_c2/chr_c3 (не мешают боевым на chr_c1)."""
-                slot = (idx % 2) + 1  # slots 1,2 → chr_c2, chr_c3
-                async with chr_sems[slot]:
-                    await fetch_one(iq, chr_clients[slot])
-
-            async def run_ff(iq, idx):
-                """Addon firefox — на ff_c1/ff_c2."""
-                slot = idx % 2
-                async with ff_sems[slot]:
-                    await fetch_one(iq, ff_clients[slot])
-
-            try:
-                t_gather_start = time.time()
-                unique_proxies = len(set(p for p in _proxies_infix if p))
-                await asyncio.gather(
-                    # Боевые — оригинальный путь (даёт 4с как раньше)
-                    *[run_letter(qs, chr_c1)    for qs in e_by_letter_chr.values()],
-                    *[run_letter(qs, ff_c1)     for qs in e_by_letter_ff.values()],
-                    *[run_non_e_chr(iq, chr_c1) for iq in non_e_chr],
-                    *[run_non_e_ff(iq, ff_c1)   for iq in non_e_ff],
-                    # Addon — отдельные IP не мешают боевым
-                    *[run_chr(iq, i)            for i, iq in enumerate(addon_chr)],
-                    *[run_ff(iq, i)             for i, iq in enumerate(addon_ff)],
-                    run_research_all(),
-                )
-                pass  # итоговый лог — ниже после сборки результатов
-                _gather_elapsed = time.time() - t_gather_start
-            finally:
-                for c in research_clients:
-                    try:
-                        await c.aclose()
-                    except Exception:
-                        pass
+            await asyncio.gather(
+                *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
+                *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
+                *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
+                *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+            )
 
         total_time = (time.time() - total_start) * 1000
 
@@ -561,62 +364,18 @@ class InfixParser:
 
         exclusive_kw = {kw: structs[0] for kw, structs in kw_map.items() if len(structs) == 1}
 
-        # Сборка trace без asdict — он рекурсивно копирует все поля и на 80k+
-        # entries даёт 400-600 MB пик памяти (OOM на Render 2GB).
-        # Для research-entries (которых обычно >95% от всего trace) results и unique
-        # уже учтены в kw_map / exclusive_kw, поэтому НЕ дублируем их в trace.
-        trace_list = []
-        for e in trace_entries:
-            d = {
-                "gap_index": e.gap_index, "w1": e.w1, "w2": e.w2,
-                "group": e.group, "struct": e.struct,
-                "insert_val": e.insert_val, "insert_type": e.insert_type,
-                "orientation": e.orientation,
-                "query_sent": e.query_sent, "cp": e.cp, "cp_note": e.cp_note,
-                "agent": e.agent,
-                "results_count": e.results_count,
-                "time_ms": e.time_ms, "status": e.status,
-                "letter": e.letter,
-            }
-            if e.error:
-                d["error"] = e.error
-            # results/unique только для боевой матрицы (struct без __agent суффикса)
-            # research-entries имеют struct вида "0_а_rev_plain_cp5__chrome"
-            if "__" not in e.struct:
-                d["results"] = e.results
-                d["unique"] = e.unique
-            trace_list.append(d)
-
-        # Освобождаем тяжёлые объекты до return — GC соберёт raw dataclasses,
-        # results/unique строки уже скопированы по ссылке (shared, без дубликата)
-        trace_entries.clear()
-        import gc
-        gc.collect()
-
-        print(
-            f"[Infix] DONE | seed='{seed}' | "
-            f"total={round(total_time/1000, 2)}s "
-            f"gather={round(_gather_elapsed, 2)}s | "
-            f"queries={len(trace_list)} ok={sum(1 for e in trace_list if e['status']=='ok')} "
-            f"empty={sum(1 for e in trace_list if e['status']=='empty')} "
-            f"err={sum(1 for e in trace_list if e['status']=='error')} | "
-            f"keywords={len(kw_map)} | "
-            f"unique_ips={unique_proxies}/5 | "
-            f"proxies={[p.split('@')[-1][:20] if p and '@' in p else (p[:20] if p else None) for p in _proxies_infix]}"
-        )
-
         return InfixParseResult(
             seed=seed, country=country, language=language,
-            groups_used=list(set(e["group"] for e in trace_list)),
+            groups_used=list(set(e.group for e in trace_entries)),
             all_keywords=kw_map, alt_seed_keywords=alt_seed_set,
             exclusive_keywords=exclusive_kw,
-            total_queries=len(trace_list),  # реальное число fetch'ей (3 агента × research = ×3)
-            with_results=sum(1 for e in trace_list if e["status"] == "ok"),
-            empty_queries=sum(1 for e in trace_list if e["status"] == "empty"),
-            error_queries=sum(1 for e in trace_list if e["status"] == "error"),
+            total_queries=len(matrix),
+            with_results=sum(1 for e in trace_entries if e.status == "ok"),
+            empty_queries=sum(1 for e in trace_entries if e.status == "empty"),
+            error_queries=sum(1 for e in trace_entries if e.status == "error"),
             total_keywords=len(kw_map), exclusive_count=len(exclusive_kw),
             total_time_ms=round(total_time, 1),
-            trace=trace_list,
+            trace=[asdict(e) for e in trace_entries],
             summary_by_gap=summary_by_gap, summary_by_group=summary_by_group,
             timestamp=timestamp,
         )
