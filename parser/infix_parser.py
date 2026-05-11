@@ -31,26 +31,25 @@ UA_FIREFOX = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101
 UA_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
 
 DELAY_LOCAL  = 0.3
-DELAY_SERVER = 0.3
-BATCH_SIZE   = 5
+DELAY_SERVER = 0.15   # Снижен с 0.3 до 0.15 — 5 IP × Semaphore(5) = 25 concurrent
+BATCH_SIZE   = 5      # Семафор на каждый IP (5 IP × 5 = 25 concurrent суммарно)
 
-# Три отдельных IP: Chrome, Firefox, Safari идут на разные прокси
-# Если INFIX_PROXY_CHROME/FF/SAFARI не заданы — fallback на GOOGLE_PROXY_URL
+# 5 IP: 3 Chrome + 2 Firefox — как в суффикс-парсере
+# 3×Semaphore(5)=15 concurrent Chrome, 2×Semaphore(5)=10 concurrent FF = 25 total
 try:
     from utils.proxy_pool import ProxyPool
-    _proxy_chrome  = ProxyPool.get("infix_chrome")
-    _proxy_firefox = ProxyPool.get("infix_firefox")
-    _proxy_safari  = ProxyPool.get("infix_safari")
+    _proxies_infix = [ProxyPool.get("infix_chrome") for _ in range(5)]
 except ImportError:
     try:
         from proxy_pool import ProxyPool
-        _proxy_chrome  = ProxyPool.get("infix_chrome")
-        _proxy_firefox = ProxyPool.get("infix_firefox")
-        _proxy_safari  = ProxyPool.get("infix_safari")
+        _proxies_infix = [ProxyPool.get("infix_chrome") for _ in range(5)]
     except ImportError:
-        _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
-        _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
-        _proxy_safari  = os.getenv("INFIX_PROXY_SAFARI") or os.getenv("GOOGLE_PROXY_URL") or None
+        _fb = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
+        _proxies_infix = [_fb] * 5
+
+_proxy_chrome  = _proxies_infix[0]   # для обратной совместимости
+_proxy_firefox = _proxies_infix[3]
+_proxy_safari  = os.getenv("INFIX_PROXY_SAFARI") or os.getenv("GOOGLE_PROXY_URL") or None
 
 _google_proxy = _proxy_chrome  # для обратной совместимости
 DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox or _proxy_safari) else DELAY_LOCAL
@@ -233,12 +232,18 @@ class InfixParser:
         lock = asyncio.Lock()
         done_count = [0]
 
-        non_e_sem = asyncio.Semaphore(BATCH_SIZE)
+        non_e_sem = asyncio.Semaphore(BATCH_SIZE)  # fallback если один клиент
+
+        # 5-IP семафоры: 3 Chrome + 2 Firefox
+        chr_sems = [asyncio.Semaphore(BATCH_SIZE) for _ in range(3)]
+        ff_sems  = [asyncio.Semaphore(BATCH_SIZE) for _ in range(2)]
 
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
             await asyncio.sleep(DELAY)
             t0 = time.time()
+            # Addon-запросы получают __agent суффикс в struct чтобы отличаться от боевых
+            struct_label = f"{iq.struct}__{agent}" if getattr(iq, 'is_new_research', False) else iq.struct
             try:
                 raw_results = await self.fetch_suggestions(
                     query=iq.query, country=country, language=language,
@@ -253,7 +258,7 @@ class InfixParser:
                 status = "ok" if results else "empty"
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=iq.struct,
+                    group=iq.group, struct=struct_label,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -267,7 +272,7 @@ class InfixParser:
                             continue
                         if k not in kw_map:
                             kw_map[k] = []
-                        kw_map[k].append(f"{agent}:{iq.struct}")
+                        kw_map[k].append(f"{agent}:{struct_label}")
                         if seed.lower() not in k:
                             alt_seed_set.add(k)
 
@@ -275,7 +280,7 @@ class InfixParser:
                 elapsed = (time.time() - t0) * 1000
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=iq.struct,
+                    group=iq.group, struct=struct_label,
                     insert_val=iq.insert_val, insert_type=iq.insert_type,
                     orientation=iq.orientation,
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
@@ -408,9 +413,19 @@ class InfixParser:
                     tasks.append(run_research_one(iq, agent, i))
             await asyncio.gather(*tasks)
 
-        async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
-                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
-                   httpx.AsyncClient(proxy=_proxy_safari) as safari_client:
+        # 5 IP: 3 Chrome + 2 Firefox (как в суффиксе)
+        # 3×Semaphore(5)=15 concurrent Chrome, 2×Semaphore(5)=10 concurrent FF = 25 total
+        async with \
+            httpx.AsyncClient(proxy=_proxies_infix[0]) as chr_c1, \
+            httpx.AsyncClient(proxy=_proxies_infix[1]) as chr_c2, \
+            httpx.AsyncClient(proxy=_proxies_infix[2]) as chr_c3, \
+            httpx.AsyncClient(proxy=_proxies_infix[3]) as ff_c1,  \
+            httpx.AsyncClient(proxy=_proxies_infix[4]) as ff_c2,  \
+            httpx.AsyncClient(proxy=_proxy_safari)     as safari_client:
+
+            chr_clients = [chr_c1, chr_c2, chr_c3]
+            ff_clients  = [ff_c1, ff_c2]
+
             from collections import defaultdict
             e_by_letter_chr = defaultdict(list)
             e_by_letter_ff  = defaultdict(list)
@@ -425,16 +440,31 @@ class InfixParser:
                 else:
                     (non_e_ff if is_ff else non_e_chr).append(iq)
 
+            # Addon-запросы (is_new_research=True) через те же клиенты
+            addon_chr = [iq for iq in matrix if iq.is_new_research and "firefox" not in iq.agents]
+            addon_ff  = [iq for iq in matrix if iq.is_new_research and "firefox" in iq.agents]
+
+            async def run_chr(iq, idx):
+                slot = idx % 3
+                async with chr_sems[slot]:
+                    await fetch_one(iq, chr_clients[slot])
+
+            async def run_ff(iq, idx):
+                slot = idx % 2
+                async with ff_sems[slot]:
+                    await fetch_one(iq, ff_clients[slot])
+
             try:
                 await asyncio.gather(
-                    *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
-                    *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
-                    *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
-                    *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+                    *[run_letter(qs, chr_c1)  for qs in e_by_letter_chr.values()],
+                    *[run_letter(qs, ff_c1)   for qs in e_by_letter_ff.values()],
+                    *[run_chr(iq, i)          for i, iq in enumerate(non_e_chr)],
+                    *[run_ff(iq, i)           for i, iq in enumerate(non_e_ff)],
+                    *[run_chr(iq, i)          for i, iq in enumerate(addon_chr)],
+                    *[run_ff(iq, i)           for i, iq in enumerate(addon_ff)],
                     run_research_all(),
                 )
             finally:
-                # Закрываем research-клиенты (как в суффиксе)
                 for c in research_clients:
                     try:
                         await c.aclose()
@@ -532,7 +562,7 @@ class InfixParser:
             groups_used=list(set(e["group"] for e in trace_list)),
             all_keywords=kw_map, alt_seed_keywords=alt_seed_set,
             exclusive_keywords=exclusive_kw,
-            total_queries=len(matrix),
+            total_queries=len(trace_list),  # реальное число fetch'ей (3 агента × research = ×3)
             with_results=sum(1 for e in trace_list if e["status"] == "ok"),
             empty_queries=sum(1 for e in trace_list if e["status"] == "empty"),
             error_queries=sum(1 for e in trace_list if e["status"] == "error"),
