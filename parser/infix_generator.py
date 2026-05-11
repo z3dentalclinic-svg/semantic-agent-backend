@@ -1106,6 +1106,11 @@ class InfixGenerator:
                 emit("SD", f"{D}_plain_nosp", base, len(base),
                      "SD_plain_nosp_end", CHR, D, "research_digit")
 
+                # 8. dwcM firefox — `{s} ** {D}` (даёт 512, длинные числовые хвосты)
+                base = f"{s} ** {D}"
+                emit("SD", f"{D}_dwcM", base, len(base),
+                     "SD_dwcM_end", FF, D, "research_digit")
+
             # ── SDL: 2 буквы × 10 цифр chrome ─────────────────────────
             for D in DIGITS_SD:
                 for L in SDL_LETTERS:
@@ -1129,12 +1134,21 @@ class InfixGenerator:
                     emit("SDL_REV", f"{D}_{L}_rev", base, len(base),
                          "SDL_REV_end", CHR, D, "research_digit", letter=L)
 
-            # ── E_LAT: 5 букв chrome, `{s} {L} *` cp=после L ──────────
+            # ── E_LAT: 8 букв chrome, 3 структуры ─────────────────────
             for L in ELAT_LETTERS:
+                # Lwc_cpAL — `{s} {L} *` cp=после L
                 base = f"{s} {L} *"
                 cp_AL = len(s) + 1 + len(L) + 1
                 emit("E_LAT", f"{L}_Lwc_cpAL", base, cp_AL,
                      "E_LAT_Lwc_cpAL", CHR, L, "research_letter", letter=L)
+                # plain — `{s} {L}` без wildcard (даёт apple store, olx, shop by)
+                base_plain = f"{s} {L}"
+                emit("E_LAT", f"{L}_plain", base_plain, len(base_plain),
+                     "E_LAT_plain", CHR, L, "research_letter", letter=L)
+                # hyp_wcL — `{s}-{L} *` (re store и подобные)
+                base_hyp = f"{s}-{L} *"
+                emit("E_LAT", f"{L}_hyp_wcL", base_hyp, len(s) + 1 + 1 + len(L) + 1,
+                     "E_LAT_hyp_wcL", CHR, L, "research_letter", letter=L)
 
     def _append_research_block(self, seed: str, results: List[InfixQuery]):
         """
