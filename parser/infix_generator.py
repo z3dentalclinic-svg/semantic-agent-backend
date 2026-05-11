@@ -1105,8 +1105,13 @@ class InfixGenerator:
             for D in DIGITS_SD:
                 for L in SDL_LETTERS:
                     base = f"{s} {D}{L}"
+                    # cp=конец строки (after L) — основной
                     emit("SDL", f"{D}_{L}_plain", base, len(base),
                          "SDL_plain_end", CHR, D, "research_digit", letter=L)
+                    # cp=после цифры (before L) — даёт другой набор суджестов
+                    cp_after_D = len(s) + 1 + len(str(D))
+                    emit("SDL", f"{D}_{L}_plain_cpD", base, cp_after_D,
+                         "SDL_plain_afterD", CHR, D, "research_digit", letter=L)
 
             # ── SDL_REV: 1 буква × 10 цифр chrome ─────────────────────
             for D in DIGITS_SD:
