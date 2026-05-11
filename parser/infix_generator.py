@@ -1040,10 +1040,10 @@ class InfixGenerator:
         CHR = ("chrome",)
         FF  = ("firefox",)
 
-        # Буквы доказавшие эксклюзивы по 8 сидам
+        # Буквы доказавшие эксклюзивы по 8 сидам + проверка на айфон 16
         SDL_LETTERS     = list("сц")        # 2 буквы
         SDL_REV_LETTERS = list("е")         # 1 буква
-        ELAT_LETTERS    = list("ampso")     # 5 букв
+        ELAT_LETTERS    = list("ampsobre")  # 8 букв (добавлены b, r — olx/shop by/re store)
 
         for gap_n, (i_left, i_right) in enumerate(
             zip(anchor_indices[:-1], anchor_indices[1:])
@@ -1100,6 +1100,11 @@ class InfixGenerator:
                 base = f"{s} *{D}"
                 emit("SD", f"{D}_wcL_nosp2", base, len(base),
                      "SD_wcL_nosp2_end", FF, D, "research_digit")
+
+                # 7. plain_nosp chrome — `{s}{D}` (без пробела, даёт N-значные числа)
+                base = f"{s}{D}"
+                emit("SD", f"{D}_plain_nosp", base, len(base),
+                     "SD_plain_nosp_end", CHR, D, "research_digit")
 
             # ── SDL: 2 буквы × 10 цифр chrome ─────────────────────────
             for D in DIGITS_SD:
