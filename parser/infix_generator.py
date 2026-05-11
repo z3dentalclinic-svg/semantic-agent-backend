@@ -1112,6 +1112,10 @@ class InfixGenerator:
                     cp_after_D = len(s) + 1 + len(str(D))
                     emit("SDL", f"{D}_{L}_plain_cpD", base, cp_after_D,
                          "SDL_plain_afterD", CHR, D, "research_digit", letter=L)
+                    # wcR вариант: `{s} {D}{L}*` — даёт эксклюзивы которых plain не видит
+                    base_wc = f"{s} {D}{L}*"
+                    emit("SDL", f"{D}_{L}_wcR", base_wc, len(base_wc),
+                         "SDL_wcR_end", CHR, D, "research_digit", letter=L)
 
             # ── SDL_REV: 1 буква × 10 цифр chrome ─────────────────────
             for D in DIGITS_SD:
