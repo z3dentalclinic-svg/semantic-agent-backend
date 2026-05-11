@@ -31,7 +31,7 @@ UA_FIREFOX = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101
 UA_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
 
 DELAY_LOCAL  = 0.3
-DELAY_SERVER = 0.15   # Снижен с 0.3 до 0.15 — 5 IP × Semaphore(5) = 25 concurrent
+DELAY_SERVER = 0.3
 BATCH_SIZE   = 5      # Семафор на каждый IP (как в суффиксе)
 
 # 5 IP: по одному из каждого батча (index 0 каждого батча × 5 батчей = 5 разных IP)
