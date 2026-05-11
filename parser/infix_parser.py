@@ -34,21 +34,31 @@ DELAY_LOCAL  = 0.3
 DELAY_SERVER = 0.15   # Снижен с 0.3 до 0.15 — 5 IP × Semaphore(5) = 25 concurrent
 BATCH_SIZE   = 5      # Семафор на каждый IP (5 IP × 5 = 25 concurrent суммарно)
 
-# 5 IP: 3 Chrome + 2 Firefox — как в суффикс-парсере
-# 3×Semaphore(5)=15 concurrent Chrome, 2×Semaphore(5)=10 concurrent FF = 25 total
+# 5 IP: по одному из каждого батча (index 0 каждого батча × 5 батчей = 5 разных IP)
+# ProxyPool.get("infix_chrome") всегда возвращает index 0 ТЕКУЩЕГО батча — один и тот же IP.
+# Правильно: взять get_all_proxies() и взять index 0 из каждого батча.
+def _get_5_infix_proxies(PP) -> list:
+    all_p = PP.get_all_proxies()
+    ips = [all_p[i * 10] for i in range(min(5, len(all_p) // 10))]
+    if not ips:
+        return [None] * 5
+    while len(ips) < 5:
+        ips.append(ips[-1])
+    return ips
+
 try:
     from utils.proxy_pool import ProxyPool
-    _proxies_infix = [ProxyPool.get("infix_chrome") for _ in range(5)]
+    _proxies_infix = _get_5_infix_proxies(ProxyPool)
 except ImportError:
     try:
         from proxy_pool import ProxyPool
-        _proxies_infix = [ProxyPool.get("infix_chrome") for _ in range(5)]
+        _proxies_infix = _get_5_infix_proxies(ProxyPool)
     except ImportError:
         _fb = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
         _proxies_infix = [_fb] * 5
 
-_proxy_chrome  = _proxies_infix[0]   # для обратной совместимости
-_proxy_firefox = _proxies_infix[3]
+_proxy_chrome  = _proxies_infix[0]
+_proxy_firefox = _proxies_infix[1]
 _proxy_safari  = os.getenv("INFIX_PROXY_SAFARI") or os.getenv("GOOGLE_PROXY_URL") or None
 
 _google_proxy = _proxy_chrome  # для обратной совместимости
