@@ -254,7 +254,9 @@ class InfixParser:
 
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
-            await asyncio.sleep(DELAY)
+            # Addon-запросы на отдельных IP — можно короче задержку
+            delay = 0.15 if getattr(iq, 'is_new_research', False) else DELAY
+            await asyncio.sleep(delay)
             t0 = time.time()
             # Addon-запросы получают __agent суффикс в struct чтобы отличаться от боевых
             struct_label = f"{iq.struct}__{agent}" if getattr(iq, 'is_new_research', False) else iq.struct
@@ -310,11 +312,18 @@ class InfixParser:
                 await progress_callback(done_count[0], len(matrix), entry)
 
         async def run_letter(letter_queries, client):
-            for iq in letter_queries:
+            # Параллельно внутри буквы (было последовательно — главный хвост)
+            await asyncio.gather(*[fetch_one(iq, client) for iq in letter_queries])
+
+        non_e_chr_sem = asyncio.Semaphore(BATCH_SIZE)
+        non_e_ff_sem  = asyncio.Semaphore(BATCH_SIZE)
+
+        async def run_non_e_chr(iq, client):
+            async with non_e_chr_sem:
                 await fetch_one(iq, client)
 
-        async def run_non_e(iq, client):
-            async with non_e_sem:
+        async def run_non_e_ff(iq, client):
+            async with non_e_ff_sem:
                 await fetch_one(iq, client)
 
         # ═══════════════════════════════════════════════════════════════════
@@ -464,13 +473,13 @@ class InfixParser:
                     await fetch_one(iq, client)
 
             async def run_chr(iq, idx):
-                """Addon-запросы chrome — round-robin по 3 IP."""
-                slot = idx % 3
+                """Addon chrome — на chr_c2/chr_c3 (не мешают боевым на chr_c1)."""
+                slot = (idx % 2) + 1  # slots 1,2 → chr_c2, chr_c3
                 async with chr_sems[slot]:
                     await fetch_one(iq, chr_clients[slot])
 
             async def run_ff(iq, idx):
-                """Addon-запросы firefox — round-robin по 2 IP."""
+                """Addon firefox — на ff_c1/ff_c2."""
                 slot = idx % 2
                 async with ff_sems[slot]:
                     await fetch_one(iq, ff_clients[slot])
@@ -482,9 +491,9 @@ class InfixParser:
                     # Боевые — оригинальный путь (даёт 4с как раньше)
                     *[run_letter(qs, chr_c1)    for qs in e_by_letter_chr.values()],
                     *[run_letter(qs, ff_c1)     for qs in e_by_letter_ff.values()],
-                    *[run_non_e(iq, chr_c1)     for iq in non_e_chr],
-                    *[run_non_e(iq, ff_c1)      for iq in non_e_ff],
-                    # Addon — round-robin по 5 IP
+                    *[run_non_e_chr(iq, chr_c1) for iq in non_e_chr],
+                    *[run_non_e_ff(iq, ff_c1)   for iq in non_e_ff],
+                    # Addon — отдельные IP не мешают боевым
                     *[run_chr(iq, i)            for i, iq in enumerate(addon_chr)],
                     *[run_ff(iq, i)             for i, iq in enumerate(addon_ff)],
                     run_research_all(),
