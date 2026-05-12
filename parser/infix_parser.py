@@ -40,14 +40,17 @@ try:
     from utils.proxy_pool import ProxyPool
     _proxy_chrome  = ProxyPool.get("infix_chrome")
     _proxy_firefox = ProxyPool.get("infix_firefox")
+    _proxy_safari  = ProxyPool.get("infix_safari")
 except ImportError:
     try:
         from proxy_pool import ProxyPool
         _proxy_chrome  = ProxyPool.get("infix_chrome")
         _proxy_firefox = ProxyPool.get("infix_firefox")
+        _proxy_safari  = ProxyPool.get("infix_safari")
     except ImportError:
         _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
         _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
+        _proxy_safari  = None
 
 _google_proxy = _proxy_chrome  # для обратной совместимости
 DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
@@ -306,8 +309,12 @@ class InfixParser:
             async with non_e_sem:
                 await fetch_one(iq, client)
 
-        async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
-                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
+        # safari IP используется как второй chrome-клиент для разбивки E-цепочек
+        _safari_proxy = _proxy_safari if _proxy_safari else _proxy_chrome
+
+        async with httpx.AsyncClient(proxy=_proxy_chrome)  as chrome_client, \
+                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
+                   httpx.AsyncClient(proxy=_safari_proxy)  as safari_client:
             e_by_letter_chr  = defaultdict(list)
             e_by_letter_ff   = defaultdict(list)
             addon_by_key_chr = defaultdict(list)
@@ -331,8 +338,15 @@ class InfixParser:
             addon_chr = [iq for qs in addon_by_key_chr.values() for iq in qs]
             addon_ff  = [iq for qs in addon_by_key_ff.values()  for iq in qs]
 
+            # Разбиваем E-chr цепочки пополам: чётные → chrome, нечётные → safari
+            # Это сокращает bottleneck с ~17 шагов до ~9 (2× ускорение E-блока)
+            e_chr_letters = list(e_by_letter_chr.items())
+            e_chr_even = [qs for _, qs in e_chr_letters[0::2]]
+            e_chr_odd  = [qs for _, qs in e_chr_letters[1::2]]
+
             await asyncio.gather(
-                *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
+                *[run_letter(qs, chrome_client) for qs in e_chr_even],
+                *[run_letter(qs, safari_client) for qs in e_chr_odd],
                 *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
                 *[run_addon(iq, chrome_client)  for iq in addon_chr],
                 *[run_addon(iq, ff_client)      for iq in addon_ff],
