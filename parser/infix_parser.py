@@ -231,7 +231,8 @@ class InfixParser:
         lock = asyncio.Lock()
         done_count = [0]
 
-        non_e_sem = asyncio.Semaphore(BATCH_SIZE)
+        non_e_sem  = asyncio.Semaphore(BATCH_SIZE)
+        addon_sem  = asyncio.Semaphore(BATCH_SIZE * 3)  # addon: выше concurrency чем non_e
 
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
@@ -323,11 +324,18 @@ class InfixParser:
                 else:
                     (non_e_ff if is_ff else non_e_chr).append(iq)
 
+            async def run_addon(iq, client):
+                async with addon_sem:
+                    await fetch_one(iq, client)
+
+            addon_chr = [iq for qs in addon_by_key_chr.values() for iq in qs]
+            addon_ff  = [iq for qs in addon_by_key_ff.values()  for iq in qs]
+
             await asyncio.gather(
                 *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
                 *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
-                *[run_letter(qs, chrome_client) for qs in addon_by_key_chr.values()],
-                *[run_letter(qs, ff_client)     for qs in addon_by_key_ff.values()],
+                *[run_addon(iq, chrome_client)  for iq in addon_chr],
+                *[run_addon(iq, ff_client)      for iq in addon_ff],
                 *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
                 *[run_non_e(iq, ff_client)      for iq in non_e_ff],
             )
