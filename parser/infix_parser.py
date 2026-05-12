@@ -302,7 +302,7 @@ class InfixParser:
                 is_ff = "firefox" in iq.agents
                 if iq.group == "E" and iq.letter:
                     (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
-                elif iq.is_new_research:
+                elif getattr(iq, 'is_new_research', False):
                     key = (iq.group, iq.insert_val)
                     (addon_by_key_ff if is_ff else addon_by_key_chr)[key].append(iq)
                 else:
