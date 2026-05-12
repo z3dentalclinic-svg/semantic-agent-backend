@@ -556,39 +556,44 @@ class PrefixGenerator:
         """
         DIGITS_ADDON = [str(i) for i in range(10)]
         ADDON_STRUCTS = [
-            ("plain_trail", False, None),
-            ("wcL_nosp2",   False, None),
-            ("wcR_S2star",  False, None),
-            ("wcM_nosp1",   False, None),
-            ("col",         False, None),
-            ("plain",       True,  "е"),
-            ("wcR",         True,  "ч"),
-            ("plain",       True,  "р"),
+            # PD структуры
+            # plain_trail cp=1: основной вариант — 130 GAP, топ cp=1
+            ("plain_trail", False, None, 1),
+            # plain_trail cp=-1: nocp вариант — закрывает 'доставки цветов киев', 'цветы доставка полтава'
+            # research показал cp=no (=-1) для этих ключей
+            ("plain_trail", False, None, -1),
+            # hyp: {D} - {S} — 101 GAP, топ cp=1. Закрывает '95-й квартал', 'ивано-франковск'
+            ("hyp",         False, None, 1),
+            ("wcL_nosp2",   False, None, -1),
+            ("wcR_S2star",  False, None, 1),
+            ("wcM_nosp1",   False, None, 1),
+            ("col",         False, None, 1),
+            # PDL структуры
+            ("plain",       True,  "е",  3),
+            ("wcR",         True,  "ч",  3),
+            ("plain",       True,  "р",  3),
         ]
         qs: List[PrefixQuery] = []
-        for struct_class, is_pdl, pdl_letter in ADDON_STRUCTS:
+        for struct_class, is_pdl, pdl_letter, cp in ADDON_STRUCTS:
             for D in DIGITS_ADDON:
                 if not is_pdl:
                     if struct_class == "plain_trail":
                         base = f"{D} {seed} "
-                        cp = 1      # cp=1 (после цифры) — research: топ cp=1 (65/130 попаданий)
+                    elif struct_class == "hyp":
+                        base = f"{D} - {seed}"
                     elif struct_class == "wcL_nosp2":
                         base = f"* {D}{seed}"
-                        cp = -1     # cp=-1 (nocp) — research: топ cp=-1 (4/13 попаданий)
                     elif struct_class == "wcR_S2star":
                         base = f"{D}{seed}*"
-                        cp = 1      # cp=1 — research: топ cp=1 (61/94 попаданий)
                     elif struct_class == "wcM_nosp1":
                         base = f"{D}* {seed}"
-                        cp = 1      # cp=1 — research: топ cp=1 (62/92 попаданий)
                     elif struct_class == "col":
                         base = f"{D}: {seed}"
-                        cp = 1      # cp=1 — research: топ cp=1 (67/132 попаданий)
                     else:
                         continue
                     qs.append(PrefixQuery(
                         query=base, group="ADDON",
-                        struct=f"PD_{struct_class}_{D}",
+                        struct=f"PD_{struct_class}_{D}_cp{cp}",
                         cp=cp, cp_note=f"cp{cp}_research_verified",
                         operator=D, op_type="digit",
                         agents=("chrome",),
@@ -599,17 +604,13 @@ class PrefixGenerator:
                     L = pdl_letter
                     if struct_class == "plain":
                         base = f"{D} {L} {seed}"
-                        cp = 3      # cp=3 (после буквы: D+" "+L = 3 символа)
-                                    # research: е_plain топ cp=0,1,4; р_plain топ cp=3
-                                    # cp=3 = после буквы, перед пробелом перед сидом
                     elif struct_class == "wcR":
                         base = f"{D} {L} {seed} *"
-                        cp = 3      # cp=3 — research: ч_wcR топ cp=3 (1/1 попадание)
                     else:
                         continue
                     qs.append(PrefixQuery(
                         query=base, group="ADDON",
-                        struct=f"PDL_{L}_{struct_class}_{D}",
+                        struct=f"PDL_{L}_{struct_class}_{D}_cp{cp}",
                         cp=cp, cp_note=f"cp{cp}_research_verified",
                         operator=f"{D}_{L}", op_type="digit_letter",
                         agents=("chrome",),
