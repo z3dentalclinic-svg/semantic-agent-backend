@@ -18,6 +18,7 @@ import logging
 import argparse
 from typing import Set, List, Dict, Optional
 from dataclasses import dataclass, field, asdict
+from collections import Counter, defaultdict
 
 try:
     from parser.infix_generator import InfixGenerator, InfixQuery, ALL_GROUPS
@@ -108,6 +109,7 @@ class InfixTraceEntry:
     status: str = "pending"
     error: Optional[str] = None
     letter: Optional[str] = None
+    http_status: int = 0
 
 
 @dataclass
@@ -123,6 +125,9 @@ class InfixParseResult:
     with_results: int = 0
     empty_queries: int = 0
     error_queries: int = 0
+    blocked_queries: int = 0   # 429/500/503 от Google
+    timeout_queries: int = 0   # сеть/таймаут
+    status_counts: Dict = field(default_factory=dict)  # {"ok": N, "blocked_500": N, ...}
     total_keywords: int = 0
     exclusive_count: int = 0
     total_time_ms: float = 0.0
@@ -164,9 +169,10 @@ class InfixParser:
         headers = {"User-Agent": ua}
         try:
             response = await client.get(url, params=params, headers=headers, timeout=10.0)
-            if response.status_code == 429:
-                return []
-            if response.status_code == 200:
+            http_status = response.status_code
+            if http_status == 429:
+                return [], 429
+            if http_status == 200:
                 text = response.text.strip()
                 try:
                     data = response.json()
@@ -183,7 +189,7 @@ class InfixParser:
                                     s = item.get("suggestion") or item.get("value") or item.get("text", "")
                                     if s:
                                         result.append(self._clean_suggestion(str(s)))
-                            return result
+                            return result, 200
                 except Exception:
                     pass
                 if text.startswith(")]}'"):
@@ -199,12 +205,13 @@ class InfixParser:
                                         result.append(self._clean_suggestion(item))
                                     elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
                                         result.append(self._clean_suggestion(item[0]))
-                                return result
+                                return result, 200
                     except Exception:
                         pass
+            return [], http_status
         except Exception:
             pass
-        return []
+        return [], 0
 
     async def parse(self, seed, country="ua", language="ru",
                     groups=None, progress_callback=None,
@@ -231,7 +238,7 @@ class InfixParser:
             await asyncio.sleep(DELAY)
             t0 = time.time()
             try:
-                raw_results = await self.fetch_suggestions(
+                raw_results, http_status = await self.fetch_suggestions(
                     query=iq.query, country=country, language=language,
                     client=client, google_client=agent, cursor_position=iq.cp,
                     uule=_uule,
@@ -241,7 +248,15 @@ class InfixParser:
                 # Фильтр мусора
                 results = [kw for kw in raw_results if not _is_garbage_keyword(kw)]
 
-                status = "ok" if results else "empty"
+                if http_status == 200:
+                    status = "ok" if results else "empty"
+                elif http_status in (429, 500, 503):
+                    status = f"blocked_{http_status}"
+                elif http_status == 0:
+                    status = "timeout"
+                else:
+                    status = f"http_{http_status}"
+
                 entry = InfixTraceEntry(
                     gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
                     group=iq.group, struct=iq.struct,
@@ -250,6 +265,7 @@ class InfixParser:
                     query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
                     agent=agent, results=results, results_count=len(results),
                     time_ms=round(elapsed, 1), status=status, letter=iq.letter,
+                    http_status=http_status,
                 )
                 async with lock:
                     for kw in results:
@@ -291,10 +307,9 @@ class InfixParser:
 
         async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
                    httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
-            from collections import defaultdict
             e_by_letter_chr  = defaultdict(list)
             e_by_letter_ff   = defaultdict(list)
-            addon_by_key_chr = defaultdict(list)  # addon: (group, insert_val) → без семафора
+            addon_by_key_chr = defaultdict(list)
             addon_by_key_ff  = defaultdict(list)
             non_e_chr = []
             non_e_ff  = []
@@ -380,6 +395,9 @@ class InfixParser:
             with_results=sum(1 for e in trace_entries if e.status == "ok"),
             empty_queries=sum(1 for e in trace_entries if e.status == "empty"),
             error_queries=sum(1 for e in trace_entries if e.status == "error"),
+            blocked_queries=sum(1 for e in trace_entries if e.status.startswith("blocked_")),
+            timeout_queries=sum(1 for e in trace_entries if e.status == "timeout"),
+            status_counts=dict(Counter(e.status for e in trace_entries)),
             total_keywords=len(kw_map), exclusive_count=len(exclusive_kw),
             total_time_ms=round(total_time, 1),
             trace=[asdict(e) for e in trace_entries],
