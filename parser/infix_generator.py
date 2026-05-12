@@ -50,6 +50,7 @@ Preprocessing:
 """
 
 import re
+import string as _string
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Set
 
@@ -227,6 +228,35 @@ PREP_MERGE = {"в", "во", "на", "для", "с", "со", "от", "под", "�
 
 
 # ══════════════════════════════════════════════
+# RESEARCH CONSTANTS
+# ══════════════════════════════════════════════
+# Карта research-структур — зеркало suffix-research (E_LAT + SD + SDL + SDL_REV).
+# Перенос на инфикс: вместо `{S} {pattern}` строим `{left_block} {pattern} {right_block}`,
+# где left_block / right_block определяются по anchor-логике (см. _research_anchors).
+#
+# Pre-processing для research отличается от боевой матрицы:
+#   - T_MARKERS / Q_MARKERS / geo НЕ пропускают gap, а становятся non-anchor токенами
+#     (остаются в строке в исходных позициях, но gap'ы между ними не строятся)
+#   - Atomic merge / PREP_MERGE применяются как обычно
+#
+# Объём на gap: ~8800 структур (E_LAT 338 + SD ~2450 + SDL 3000 + SDL_REV 3000)
+# × 3 агента (chrome+firefox+safari, кроме E_LAT — chrome only) ≈ 26k реальных запросов
+
+# 30 русских букв (ъ ы ь исключены — не дают unique вклада)
+LETTERS_RU_FULL = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
+
+# 26 латинских букв
+LETTERS_LAT = list(_string.ascii_lowercase)
+
+# 10 цифр
+DIGITS_SD = [str(i) for i in range(10)]
+
+# 3 агента для research (Safari почти полностью покрывает Firefox по отчёту,
+# но по требованию заказчика включаем все три)
+ALL_AGENTS_RESEARCH = ("chrome", "firefox", "safari")
+
+
+# ══════════════════════════════════════════════
 # DATACLASS
 # ══════════════════════════════════════════════
 
@@ -246,6 +276,8 @@ class InfixQuery:
     agents: tuple
     priority: int = 1
     letter: Optional[str] = None
+    is_new_research: bool = False  # research-блок: парсер маршрутизирует через research_pool
+
 
 
 # ══════════════════════════════════════════════
@@ -333,6 +365,22 @@ class InfixGenerator:
             out.extend(self._generate_gap(gap_idx, w1, w2, active, geo_tokens,
                                           skip_cp=skip_cp, right_suffix=right_suffix,
                                           left_prefix=left_prefix))
+
+        # Research-блок (E_LAT + SD + SDL + SDL_REV) — карта суффикс-research,
+        # перенесённая на инфикс. Маркеры (T/Q/geo) не пропускают gap, а становятся
+        # non-anchor токенами (остаются в строке, gap'ы между ними не строятся).
+        # Агенты: chrome+firefox+safari (E_LAT — chrome only).
+        # Закомментировать одной правкой после завершения research-прогона.
+        # ОТКЛЮЧЕНО ПОСЛЕ GAP-АНАЛИЗА 8 СИДОВ (300 GAP'ов). Полный research давал
+        # ~26k запросов на сид; минимальная добавка для покрытия 64 пропущенных
+        # боевой GAP'ов укомплектована в _append_battle_addon (10 cp×agent комбинаций).
+        # Чтобы вернуть research-режим — раскомментировать строку ниже:
+        # self._append_research_block(seed, out)
+
+        # Минимальная research-добавка к боевой матрице.
+        # Покрывает 64/64 GAP'ов через chrome+firefox (set cover по 8 сидам).
+        # 11 GAP'ов требуют safari — отложено до подключения safari в прод.
+        self._append_battle_addon(seed, out)
 
         return out
 
@@ -632,6 +680,528 @@ class InfixGenerator:
                     out.append(q("E", f"E_{L}_Lstar_cpAS", t_Lstar, cp_Lstar, "после *", L, "letter", "L", FF, letter=L))
 
         return out
+
+    # ══════════════════════════════════════════════════════════════════
+    # RESEARCH BLOCK — перенос карты suffix-research (E_LAT/SD/SDL/SDL_REV)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _research_anchors(self, seed: str) -> Tuple[List[str], List[int]]:
+        """
+        Research-mode preprocessing.
+
+        Отличия от _preprocess (боевой матрицы):
+          - geo НЕ стрипается с краёв — остаётся в строке как non-anchor токен
+          - T_MARKERS / Q_MARKERS НЕ пропускают gap — становятся non-anchor токенами
+          - atomic merge / PREP_MERGE применяются как обычно
+
+        Anchor — токен который НЕ является T/Q/geo маркером (или склеенным предлогом
+        с geo-словом). Gap'ы строятся только между парами соседних anchor'ов.
+        Pattern вставляется сразу после левого anchor'а; всё что между левым anchor'ом
+        и правым anchor'ом (T/Q/geo маркеры) сохраняет свои позиции в right_block.
+
+        Returns:
+            tokens         — список токенов (после atomic + PREP merge)
+            anchor_indices — индексы anchor-токенов в tokens
+        """
+        s = seed.strip().lower()
+        s = re.sub(r'^[^\w\s]+', '', s)
+        s = re.sub(r'[^\w\s]+$', '', s)
+        s = s.strip()
+
+        words = s.split()
+        if len(words) < 2:
+            return [], []
+
+        # Atomic + PREP merge (как в боевой матрице)
+        tokens_with_flags = self._merge_tokens(words)
+        tokens = [t for t, _ in tokens_with_flags]
+
+        # Identify anchors: НЕ T_MARKER, НЕ Q_MARKER, НЕ geo
+        # Для merged токенов проверяем все составляющие слова
+        anchor_indices: List[int] = []
+        for i, tok in enumerate(tokens):
+            sub_words = tok.lower().split()
+            first = sub_words[0]
+            # T/Q-маркер по первому слову токена
+            if first in T_MARKERS or first in Q_MARKERS:
+                continue
+            # geo — любое слово в токене
+            if any(_is_geo_word(w) for w in sub_words):
+                continue
+            anchor_indices.append(i)
+
+        return tokens, anchor_indices
+
+    def _meaningful_cps(self, base: str) -> List[Tuple[int, str]]:
+        """
+        Возвращает meaningful cp-позиции для строки base:
+        границы токенов (после/перед каждым пробелом/спецсимволом),
+        0, len, и -1 (без cp). Зеркало _meaningful_cps из suffix_generator.
+
+        Используется для SD-структур research-блока.
+        """
+        cps: List[Tuple[int, str]] = [(-1, "без cp")]
+        cps.append((0, "cp=0 начало"))
+
+        for i, ch in enumerate(base):
+            if ch in " *-:":
+                if i + 1 <= len(base):
+                    cps.append((i + 1, f"cp={i+1} после '{ch}'"))
+                cps.append((i, f"cp={i} перед '{ch}'"))
+
+        cps.append((len(base), f"cp={len(base)} конец"))
+
+        # Дедуп по позиции
+        seen = {}
+        for cp, note in cps:
+            if cp not in seen:
+                seen[cp] = note
+        return [(cp, note) for cp, note in seen.items()]
+
+    def _build_research_letter_structures(
+        self, left_block: str, right_block: str, letter: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+        struct_type: str, agents: tuple,
+    ):
+        """
+        13 letter-structures (зеркало _build_letter_structures из суффикса).
+        Используется и для русского E (если понадобится в research), и для E_LAT.
+
+        Pattern вставляется как блок: `{left_block} {pattern} {right_block}`.
+        cp вычисляется относительно `{left_block} {pattern}` — позиции в pattern.
+        """
+        s = left_block
+        L = letter
+        rs = right_block
+
+        def _full(base: str) -> str:
+            """Дополнить base правым блоком (если есть)."""
+            return f"{base} {rs}".strip() if rs else base
+
+        def add(base: str, cp: int, struct_name: str):
+            full = _full(base)
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group=struct_type, struct=f"{L}_{struct_name}",
+                insert_val=L, insert_type="research_letter",
+                orientation="N", cp=cp, cp_note=f"{struct_type}_{struct_name}",
+                agents=agents, letter=L,
+                is_new_research=True,
+            ))
+
+        # 1. plain
+        q = f"{s} {L}"
+        add(q, len(q), "plain")
+        # 1b. plain_nocp
+        add(q, -1, "plain_nocp")
+        # 2. trail
+        q = f"{s} {L} "
+        add(q, len(q), "trail")
+        # 5. sandwich
+        q = f"{s} * {L} *"
+        add(q, len(q), "sandwich")
+        # wcB_cpMid
+        q = f"{s} * {L}"
+        add(q, len(s) + 3, "wcB_cpMid")
+        # Lwc cp варианты
+        q = f"{s} {L} *"
+        add(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL")
+        add(q, len(s) + 1, "Lwc_cpBL")
+        # col_B_trail
+        q = f"{s} : {L} "
+        add(q, len(q), "col_B_trail")
+        # L_col
+        q = f"{s} {L} :"
+        add(q, len(q), "L_col")
+        # hyp_B_trail
+        q = f"{s} - {L} "
+        add(q, len(q), "hyp_B_trail")
+        # hyp_Lwc
+        q = f"{s} - {L} *"
+        add(q, len(q), "hyp_Lwc")
+        # hyp_wcL
+        q = f"{s} - * {L}"
+        add(q, len(q), "hyp_wcL")
+        # L_hyp
+        q = f"{s} {L} -"
+        add(q, len(q), "L_hyp")
+
+    def _build_research_SD(
+        self, left_block: str, right_block: str, D: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+    ):
+        """
+        SD структуры — 31 sd_base × meaningful_cps. Зеркало suffix-research SD.
+        Включая 3 «мусорные» по отчёту суффикса (dstar_nosp/paren_open/dot) —
+        в инфиксе их поведение может отличаться, проверяем честно.
+        """
+        s = left_block
+        rs = right_block
+
+        sd_bases = [
+            ("plain",        f"{s} {D}"),
+            ("plain_nosp",   f"{s}{D}"),
+            ("plain_trail",  f"{s} {D} "),
+            ("wcL",          f"{s} * {D}"),
+            ("wcL_nosp1",    f"{s}* {D}"),
+            ("wcL_nosp2",    f"{s} *{D}"),
+            ("wcR",          f"{s} {D} *"),
+            ("wcR_nosp",     f"{s} {D}*"),
+            ("wcR_S2star",   f"{s} {D}*"),
+            ("wcR_trail",    f"{s} {D} * "),
+            ("wcM",          f"* {s} {D}"),
+            ("wcM_nosp1",    f"*{s} {D}"),
+            ("wcM_nosp2",    f"* {s}{D}"),
+            ("wcM_nosp3",    f"*{s}{D}"),
+            ("wcLR",         f"* {s} {D} *"),
+            ("wcLM",         f"* {s} * {D}"),
+            ("wcMR",         f"{s} * {D} *"),
+            ("wcLMR",        f"* {s} * {D} *"),
+            ("dwcL",         f"** {s} {D}"),
+            ("dwcM",         f"{s} ** {D}"),
+            ("dwcR",         f"{s} {D} **"),
+            ("hyp",          f"{s} - {D}"),
+            ("hyp_wc",       f"{s} - {D} *"),
+            ("hyp_nosp",     f"{s}-{D}"),
+            ("hyp_nosp_wc",  f"{s}-{D}*"),
+            ("col",          f"{s}: {D}"),
+            ("col_nosp",     f"{s}:{D}"),
+            ("col_wc",       f"{s}: {D} *"),
+            ("dstar_nosp",   f"{s} {D}**"),
+            ("paren_open",   f"{s} ({D}"),
+            ("dot",          f"{s} {D}."),
+        ]
+
+        for class_name, base in sd_bases:
+            for cp_pos, _cp_note in self._meaningful_cps(base):
+                tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
+                full = f"{base} {rs}".strip() if rs else base
+                results.append(InfixQuery(
+                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group="SD", struct=f"{D}_{class_name}_{tag}",
+                    insert_val=D, insert_type="research_digit",
+                    orientation="N", cp=cp_pos, cp_note=f"SD_{class_name}_{tag}",
+                    agents=ALL_AGENTS_RESEARCH,
+                    is_new_research=True,
+                ))
+
+    def _build_research_SDL(
+        self, left_block: str, right_block: str, L: str, D: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+    ):
+        """
+        SDL структуры — суффикс {буква}{цифра}, 5 cp × 2 базы (plain + wcR).
+        Зеркало suffix-research SDL.
+        """
+        s = left_block
+        rs = right_block
+
+        # База 1: plain
+        base = f"{s} {L} {D}"
+        after_seed = len(s)
+        after_letter = len(s) + 1 + 1
+        after_letter_space = after_letter + 1
+        end = len(base)
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_seed, f"cp{after_seed}"),
+            (after_letter, f"cp{after_letter}"),
+            (after_letter_space, f"cp{after_letter_space}"),
+            (end, f"cp{end}"),
+        ]:
+            full = f"{base} {rs}".strip() if rs else base
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL", struct=f"{D}_{L}_plain_{tag}",
+                insert_val=f"{L}_{D}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_plain_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+        # База 2: wcR
+        base_wc = f"{s} {L} {D} *"
+        end_wc = len(base_wc)
+        before_wc = len(base) + 1
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_letter, f"cp{after_letter}"),
+            (after_letter_space, f"cp{after_letter_space}"),
+            (before_wc, f"cp{before_wc}"),
+            (end_wc, f"cp{end_wc}"),
+        ]:
+            full = f"{base_wc} {rs}".strip() if rs else base_wc
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL", struct=f"{D}_{L}_wcR_{tag}",
+                insert_val=f"{L}_{D}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_wcR_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+    def _build_research_SDL_REV(
+        self, left_block: str, right_block: str, D: str, L: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+    ):
+        """
+        SDL_REV структуры — суффикс {цифра}{буква}, паразитный суффикс (идея Gemini).
+        5 cp × 2 базы. Зеркало suffix-research SDL_REV — единственная реально
+        работающая research-структура в суффиксе по отчёту (закрыла ~99% эксклюзивов).
+        """
+        s = left_block
+        rs = right_block
+
+        # База 1: plain
+        base = f"{s} {D} {L}"
+        after_seed = len(s)
+        after_digit = len(s) + 1 + 1
+        after_digit_space = after_digit + 1
+        end = len(base)
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_seed, f"cp{after_seed}"),
+            (after_digit, f"cp{after_digit}"),
+            (after_digit_space, f"cp{after_digit_space}"),
+            (end, f"cp{end}"),
+        ]:
+            full = f"{base} {rs}".strip() if rs else base
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL_REV", struct=f"{D}_{L}_rev_plain_{tag}",
+                insert_val=f"{D}_{L}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_REV_plain_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+        # База 2: wcR
+        base_wc = f"{s} {D} {L} *"
+        end_wc = len(base_wc)
+        before_wc = len(base) + 1
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_digit, f"cp{after_digit}"),
+            (after_digit_space, f"cp{after_digit_space}"),
+            (before_wc, f"cp{before_wc}"),
+            (end_wc, f"cp{end_wc}"),
+        ]:
+            full = f"{base_wc} {rs}".strip() if rs else base_wc
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL_REV", struct=f"{D}_{L}_rev_wcR_{tag}",
+                insert_val=f"{D}_{L}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_REV_wcR_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+    def _append_battle_addon(self, seed: str, results: List[InfixQuery]):
+        """
+        Минимальная research-добавка к боевой матрице (FINAL v3).
+
+        Источник: GAP-анализ 8 сидов (300 GAP'ов). Cost-weighted greedy set cover
+        на (struct × agent × letter) с дедупликацией дублей между структурами.
+
+        Результат: 14 уникальных unit'ов, 95 запросов на anchor-пару,
+        покрывает 77/77 GAP'ов (chrome+firefox, без safari).
+
+        SD-структуры (6 типов, все chrome кроме wcL_nosp2):
+          - paren_open  chrome  `{s} ({D}`     +53 GAP'ов (главный универсал)
+          - wcR_nosp    chrome  `{s} {D}*`     +1 эксклюзив
+          - dwcL        chrome  `** {s} {D}`   +1 эксклюзив
+          - hyp_wc      chrome  `{s}-{D} *`    +1 эксклюзив
+          - wcL_nosp1   chrome  `{s}* {D}`     +1 эксклюзив
+          - wcL_nosp2   firefox `{s} *{D}`     +1 эксклюзив
+
+        SDL (2 буквы из 30 — только с, ц дали эксклюзивы):
+          - с, ц        chrome  `{s} {D}{L}`   +3 GAP'а суммарно
+
+        SDL_REV (1 буква — только е дала эксклюзивы):
+          - е           chrome  `{D}{L} {s}`   +2 GAP'а
+
+        E_LAT (5 букв из 26 — только a,m,o,p,s дали эксклюзивы):
+          - a,m,o,p,s   chrome  `{s} {L} *`    +14 GAP'ов
+
+        Итого: 6×10 + 2×10 + 1×10 + 5×1 = 95 запросов на anchor-пару.
+        Это абсолютный минимум при котором нет потерь — каждый unit
+        имеет хотя бы 1 эксклюзивный GAP на 8 сидах анализа.
+
+        Цифры: полный перебор 0-9 (каждая имеет эксклюзив на каком-то сиде).
+        """
+        tokens, anchor_indices = self._research_anchors(seed)
+        if len(anchor_indices) < 2:
+            return
+
+        CHR = ("chrome",)
+        FF  = ("firefox",)
+
+        # Буквы доказавшие эксклюзивы по 8 сидам + проверка на айфон 16
+        SDL_LETTERS     = list("сц")        # 2 буквы
+        SDL_REV_LETTERS = list("е")         # 1 буква
+        ELAT_LETTERS    = list("ampsobre")  # 8 букв (добавлены b, r — olx/shop by/re store)
+
+        for gap_n, (i_left, i_right) in enumerate(
+            zip(anchor_indices[:-1], anchor_indices[1:])
+        ):
+            left_block  = " ".join(tokens[:i_left + 1])
+            right_block = " ".join(tokens[i_left + 1:])
+            w1_val = tokens[i_left]
+            w2_val = tokens[i_right]
+            s  = left_block
+            rs = right_block
+
+            def _full(base: str) -> str:
+                return f"{base} {rs}".strip() if rs else base
+
+            def emit(group, struct, base, cp, cp_note, agents,
+                     insert_val, insert_type, letter=None, skip_rs=False):
+                results.append(InfixQuery(
+                    query=base if skip_rs else _full(base),
+                    gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group=group, struct=struct,
+                    insert_val=insert_val, insert_type=insert_type,
+                    orientation="N", cp=cp, cp_note=cp_note,
+                    agents=agents, letter=letter,
+                    is_new_research=True,
+                ))
+
+            # ── SD: 6 структур × 10 цифр ──────────────────────────────
+            for D in DIGITS_SD:
+                # 1. paren_open chrome — главный универсал (+53 GAP'ов)
+                base = f"{s} ({D}"
+                emit("SD", f"{D}_paren_open", base, len(base),
+                     "SD_paren_open_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 2. wcR_nosp chrome (+1 эксклюзив)
+                base = f"{s} {D}*"
+                emit("SD", f"{D}_wcR_nosp", base, len(base),
+                     "SD_wcR_nosp_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 3. dwcL chrome (+1 эксклюзив)
+                base = f"** {s} {D}"
+                emit("SD", f"{D}_dwcL", base, len(base),
+                     "SD_dwcL_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 4. hyp_wc chrome (+1 эксклюзив)
+                base = f"{s}-{D} *"
+                emit("SD", f"{D}_hyp_wc", base, len(base),
+                     "SD_hyp_wc_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 5. wcL_nosp1 chrome (+1 эксклюзив)
+                base = f"{s}* {D}"
+                emit("SD", f"{D}_wcL_nosp1", base, len(base),
+                     "SD_wcL_nosp1_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 6. wcL_nosp2 firefox (+1 эксклюзив)
+                base = f"{s} *{D}"
+                emit("SD", f"{D}_wcL_nosp2", base, len(base),
+                     "SD_wcL_nosp2_end", FF, D, "research_digit", skip_rs=True)
+
+                # 7. plain_nosp chrome — `{s}{D}` (без пробела, даёт N-значные числа)
+                base = f"{s}{D}"
+                emit("SD", f"{D}_plain_nosp", base, len(base),
+                     "SD_plain_nosp_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 8. dwcM firefox — `{s} ** {D}` (даёт 512, длинные числовые хвосты)
+                base = f"{s} ** {D}"
+                emit("SD", f"{D}_dwcM", base, len(base),
+                     "SD_dwcM_end", FF, D, "research_digit", skip_rs=True)
+
+            # ── SDL: 2 буквы × 10 цифр chrome ─────────────────────────
+            for D in DIGITS_SD:
+                for L in SDL_LETTERS:
+                    base = f"{s} {D}{L}"
+                    emit("SDL", f"{D}_{L}_plain", base, len(base),
+                         "SDL_plain_end", CHR, D, "research_digit", letter=L, skip_rs=True)
+                    cp_after_D = len(s) + 1 + len(str(D))
+                    emit("SDL", f"{D}_{L}_plain_cpD", base, cp_after_D,
+                         "SDL_plain_afterD", CHR, D, "research_digit", letter=L, skip_rs=True)
+                    base_wc = f"{s} {D}{L}*"
+                    emit("SDL", f"{D}_{L}_wcR", base_wc, len(base_wc),
+                         "SDL_wcR_end", CHR, D, "research_digit", letter=L, skip_rs=True)
+
+            # ── SDL_REV: 1 буква × 10 цифр chrome ─────────────────────
+            for D in DIGITS_SD:
+                for L in SDL_REV_LETTERS:
+                    base = f"{D}{L} {s}"
+                    emit("SDL_REV", f"{D}_{L}_rev", base, len(base),
+                         "SDL_REV_end", CHR, D, "research_digit", letter=L, skip_rs=True)
+
+            # ── E_LAT: 8 букв chrome, 3 структуры ─────────────────────
+            for L in ELAT_LETTERS:
+                base = f"{s} {L} *"
+                cp_AL = len(s) + 1 + len(L) + 1
+                emit("E_LAT", f"{L}_Lwc_cpAL", base, cp_AL,
+                     "E_LAT_Lwc_cpAL", CHR, L, "research_letter", letter=L, skip_rs=True)
+                base_plain = f"{s} {L}"
+                emit("E_LAT", f"{L}_plain", base_plain, len(base_plain),
+                     "E_LAT_plain", CHR, L, "research_letter", letter=L, skip_rs=True)
+                base_hyp = f"{s}-{L} *"
+                emit("E_LAT", f"{L}_hyp_wcL", base_hyp, len(s) + 1 + 1 + len(L) + 1,
+                     "E_LAT_hyp_wcL", CHR, L, "research_letter", letter=L, skip_rs=True)
+
+    def _append_research_block(self, seed: str, results: List[InfixQuery]):
+        """
+        Главная точка входа research-блока. Прогоняет E_LAT + SD + SDL + SDL_REV
+        для каждой пары соседних anchor-токенов.
+
+        Anchor-логика:
+          - tokens строятся через _research_anchors (без geo-strip, T/Q/geo не skip'ают)
+          - для каждой пары anchor[i]/anchor[i+1]:
+              left_block  = " ".join(tokens[:anchor[i]+1])  — всё включая левый anchor
+              right_block = " ".join(tokens[anchor[i]+1:])  — всё после левого anchor
+              pattern вставляется между ними: `{left} {pattern} {right}`
+
+        Если anchor'ов меньше двух — research пустой (нечего исследовать).
+        """
+        tokens, anchor_indices = self._research_anchors(seed)
+        if len(anchor_indices) < 2:
+            return
+
+        for gap_n, (i_left, i_right) in enumerate(
+            zip(anchor_indices[:-1], anchor_indices[1:])
+        ):
+            left_block = " ".join(tokens[:i_left + 1])
+            right_block = " ".join(tokens[i_left + 1:])
+
+            w1_val = tokens[i_left]
+            w2_val = tokens[i_right]
+
+            # E_LAT — Latin Letter Sweep, Chrome only
+            for L in LETTERS_LAT:
+                self._build_research_letter_structures(
+                    left_block, right_block, L,
+                    results, gap_n, w1_val, w2_val,
+                    struct_type="E_LAT", agents=("chrome",),
+                )
+
+            # SD — Цифровой перебор, 3 агента
+            for D in DIGITS_SD:
+                self._build_research_SD(
+                    left_block, right_block, D,
+                    results, gap_n, w1_val, w2_val,
+                )
+
+            # SDL — Суффикс {буква}{цифра}, 3 агента
+            for D in DIGITS_SD:
+                for L in LETTERS_RU_FULL:
+                    self._build_research_SDL(
+                        left_block, right_block, L, D,
+                        results, gap_n, w1_val, w2_val,
+                    )
+
+            # SDL_REV — Суффикс {цифра}{буква}, 3 агента
+            for D in DIGITS_SD:
+                for L in LETTERS_RU_FULL:
+                    self._build_research_SDL_REV(
+                        left_block, right_block, D, L,
+                        results, gap_n, w1_val, w2_val,
+                    )
 
     def summary(self, queries: List[InfixQuery]) -> dict:
         by_group = {}
