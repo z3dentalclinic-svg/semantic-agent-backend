@@ -557,20 +557,23 @@ class PrefixGenerator:
         DIGITS_ADDON = [str(i) for i in range(10)]
         ADDON_STRUCTS = [
             # PD структуры
-            ("plain_trail", False, None,  1),   # cp=1 — основной (65/130 GAP)
-            ("plain_trail", False, None, -1),   # cp=-1 (nocp)
-            ("plain_trail", False, None,  0),   # cp=0 — нужен для 'доставки цветов киев', 'цветы доставка полтава'
-            ("hyp",         False, None,  1),   # {D} - {S}, cp=1 — основной
-            ("hyp",         False, None,  0),   # cp=0 — нужен для '95-й квартал', 'ивано-франковск'
+            ("plain_trail", False, None,  1),
+            ("plain_trail", False, None, -1),
+            ("plain_trail", False, None,  0),
+            ("hyp",         False, None,  1),
+            ("hyp",         False, None,  0),
+            ("hyp",         False, None, -1),   # nocp — для '95-й квартал', 'ивано-франковск'
             ("wcL_nosp2",   False, None, -1),
             ("wcR_S2star",  False, None,  1),
             ("wcM_nosp1",   False, None,  1),
             ("col",         False, None,  1),
+            ("col",         False, None,  0),   # cp=0 — для 'доставки цветов киев'
+            ("col",         False, None,  3),   # cp=3 — для 'цветы доставка полтава'
             # PDL структуры
             ("plain",       True,  "е",  3),
             ("wcR",         True,  "ч",  3),
             ("plain",       True,  "р",  3),
-            ("plain",       True,  "и",  0),    # PDL и_plain cp=0 — нужен для 'ивано-франковск'
+            ("plain",       True,  "и",  0),
         ]
         qs: List[PrefixQuery] = []
         for struct_class, is_pdl, pdl_letter, cp in ADDON_STRUCTS:
