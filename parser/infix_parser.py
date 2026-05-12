@@ -292,20 +292,27 @@ class InfixParser:
         async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
                    httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
             from collections import defaultdict
-            e_by_letter_chr = defaultdict(list)
-            e_by_letter_ff  = defaultdict(list)
+            e_by_letter_chr  = defaultdict(list)
+            e_by_letter_ff   = defaultdict(list)
+            addon_by_key_chr = defaultdict(list)  # addon: (group, insert_val) → без семафора
+            addon_by_key_ff  = defaultdict(list)
             non_e_chr = []
             non_e_ff  = []
             for iq in matrix:
                 is_ff = "firefox" in iq.agents
                 if iq.group == "E" and iq.letter:
                     (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
+                elif iq.is_new_research:
+                    key = (iq.group, iq.insert_val)
+                    (addon_by_key_ff if is_ff else addon_by_key_chr)[key].append(iq)
                 else:
                     (non_e_ff if is_ff else non_e_chr).append(iq)
 
             await asyncio.gather(
                 *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
                 *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
+                *[run_letter(qs, chrome_client) for qs in addon_by_key_chr.values()],
+                *[run_letter(qs, ff_client)     for qs in addon_by_key_ff.values()],
                 *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
                 *[run_non_e(iq, ff_client)      for iq in non_e_ff],
             )
