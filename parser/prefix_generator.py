@@ -557,21 +557,20 @@ class PrefixGenerator:
         DIGITS_ADDON = [str(i) for i in range(10)]
         ADDON_STRUCTS = [
             # PD структуры
-            # plain_trail cp=1: основной вариант — 130 GAP, топ cp=1
-            ("plain_trail", False, None, 1),
-            # plain_trail cp=-1: nocp вариант — закрывает 'доставки цветов киев', 'цветы доставка полтава'
-            # research показал cp=no (=-1) для этих ключей
-            ("plain_trail", False, None, -1),
-            # hyp: {D} - {S} — 101 GAP, топ cp=1. Закрывает '95-й квартал', 'ивано-франковск'
-            ("hyp",         False, None, 1),
+            ("plain_trail", False, None,  1),   # cp=1 — основной (65/130 GAP)
+            ("plain_trail", False, None, -1),   # cp=-1 (nocp)
+            ("plain_trail", False, None,  0),   # cp=0 — нужен для 'доставки цветов киев', 'цветы доставка полтава'
+            ("hyp",         False, None,  1),   # {D} - {S}, cp=1 — основной
+            ("hyp",         False, None,  0),   # cp=0 — нужен для '95-й квартал', 'ивано-франковск'
             ("wcL_nosp2",   False, None, -1),
-            ("wcR_S2star",  False, None, 1),
-            ("wcM_nosp1",   False, None, 1),
-            ("col",         False, None, 1),
+            ("wcR_S2star",  False, None,  1),
+            ("wcM_nosp1",   False, None,  1),
+            ("col",         False, None,  1),
             # PDL структуры
             ("plain",       True,  "е",  3),
             ("wcR",         True,  "ч",  3),
             ("plain",       True,  "р",  3),
+            ("plain",       True,  "и",  0),    # PDL и_plain cp=0 — нужен для 'ивано-франковск'
         ]
         qs: List[PrefixQuery] = []
         for struct_class, is_pdl, pdl_letter, cp in ADDON_STRUCTS:
