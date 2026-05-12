@@ -572,7 +572,7 @@ class PrefixGenerator:
                     if struct_class == "plain_trail":
                         base = f"{D} {seed} "
                     elif struct_class == "wcL_nosp2":
-                        base = f"*{D}{seed}"
+                        base = f"* {D}{seed}"
                     elif struct_class == "wcR_S2star":
                         base = f"{D}{seed}*"
                     elif struct_class == "wcM_nosp1":
@@ -594,9 +594,9 @@ class PrefixGenerator:
                 else:
                     L = pdl_letter
                     if struct_class == "plain":
-                        base = f"{D}{L} {seed}"
+                        base = f"{D} {L} {seed}"
                     elif struct_class == "wcR":
-                        base = f"{D}{L} {seed} *"
+                        base = f"{D} {L} {seed} *"
                     else:
                         continue
                     cp = len(base)
