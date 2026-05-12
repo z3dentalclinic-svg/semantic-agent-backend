@@ -1,95 +1,268 @@
 """
-Infix Parser v2.0
+Infix Generator v2.7 — GT-валидированная оптимизация П0.
+
+Changes vs v2.6:
+  - GT-анализ 3 датасетов (айфон, акб, имплантация): unique_contrib + real-loss проверка
+  - WC: удалена wc_nocp_chr (unique=0 на всех датасетах)
+  - B: удалён предлог "в" (unique=0); "с" оставлен (1 реальная потеря)
+  - C: "сколько" оставлен (11 реальных потерь; L+R парные → unique_contrib ложно=0)
+  - D: удалена D_L_и_cpAL (unique=0)
+  - E plain_nocp_chr: оставлены только и,в,д (остальные 26 unique=0)
+  - E Lstar_cpAS: оставлены только б,е,к,о,п,т,у,ш,ю (остальные 20 unique=0)
+  - Geo-in-gap fix: гэпы где w1 или w2 содержит гео-слово → skip
+    (_preprocess снимает гео только с краёв; гео внутри сида давало мусорные запросы)
+  - Итог: 104 → 55 запросов на gap (-47%), реальных GT потерь = 0
+
+Changes vs v2.4:
+  - E Chrome: возвращена plain_cpAL (одна вместо десяти)
+    Анализ: все cpAL структуры дают одни ключи (~300 каждая),
+    но без cpAL теряются 512 инфикс-расширений (гео, бренды).
+    3 структуры × 26 букв = 78 E-запросов на gap (было 312)
+
+Changes vs v2.3:
+  - E Chrome: убраны 9 лишних cpAL структур (plain_cpAL оставлена)
+    -234 запросов на gap
+
+Changes vs v2.2:
+  - skip_cp: PREP+NOUN токены больше не блокируют cp-группы
+    (аккумулятор на скутер → все 6 групп, было только WC+A)
+
+Changes vs v2.1:
+  - WC: wc_nocp_ff убран (0 эксклюзивных)
+  - A: A_*_nocp_ff убраны (0 эксклюзивных)
 
 Changes vs v1.0:
-  - _is_garbage_keyword() фильтр: спецсимволы, одиночные буквы не предлоги/союзы
-  - Delay 0.5s локально, 0.3s на сервере
-  - Batch 5 (антибан)
+  - E: optimized structures (cpAL chrome only)
+  - WC: 5 → 1 (nocp_chr only)
+  - A: 6 → 2 (nocp_chr only)
+  - B: 16 per prep → 1 (B_L_{prep}_cpAL only)
+  - C: 10 per word → 3 total
+  - D: 10 per word → 3 total
+
+Preprocessing:
+  - Strip leading/trailing special chars from seed
+  - Strip GEO tokens from seed edges (киев/лондон → убираем перед инфиксом)
+  - Merge PREP+NOUN tokens
+  - Merge atomic tokens (айфон 16, RTX 3060)
+  - Skip gap if w1 is Q-marker
+  - Skip full groups if w2 is T-marker → WC only
+  - Skip cp-variants if w2 is multi-word token (склеенный предлог)
 """
 
-import asyncio
-import httpx
-import time
-import random
-import json
 import re
-import os
-import logging
-import argparse
-from typing import Set, List, Dict, Optional
-from dataclasses import dataclass, field, asdict
-from collections import Counter, defaultdict
+import string as _string
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Set
 
-try:
-    from parser.infix_generator import InfixGenerator, InfixQuery, ALL_GROUPS
-except ImportError:
-    from infix_generator import InfixGenerator, InfixQuery, ALL_GROUPS
+# Пробуем импортировать geo_db из основного парсера
+# Если недоступно — используем pymorphy3 Geox тег
+_geo_db: Optional[Set[str]] = None
+_morph = None
 
-logger = logging.getLogger(__name__)
+def _get_geo_set() -> Set[str]:
+    """Загружает гео-базу один раз и кэширует."""
+    global _geo_db
+    if _geo_db is not None:
+        return _geo_db
 
-UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-UA_FIREFOX = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-
-DELAY_LOCAL  = 0.3
-DELAY_SERVER = 0.3
-BATCH_SIZE   = 5
-
-# Два отдельных IP: Chrome и Firefox идут на разные прокси
-# Если INFIX_PROXY_CHROME/FF не заданы — fallback на GOOGLE_PROXY_URL
-try:
-    from utils.proxy_pool import ProxyPool
-    _proxy_chrome  = ProxyPool.get("infix_chrome")
-    _proxy_firefox = ProxyPool.get("infix_firefox")
-except ImportError:
+    # Попытка 1: load_geonames_db из databases (основной проект)
     try:
-        from proxy_pool import ProxyPool
-        _proxy_chrome  = ProxyPool.get("infix_chrome")
-        _proxy_firefox = ProxyPool.get("infix_firefox")
-    except ImportError:
-        _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
-        _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
+        from databases import load_geonames_db
+        db = load_geonames_db()  # Dict[str, Set[str]] — город → {коды стран}
+        _geo_db = set(db.keys())
+        return _geo_db
+    except Exception:
+        pass
 
-_google_proxy = _proxy_chrome  # для обратной совместимости
-DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
-
-try:
-    from utils.geo_uule import get_uule
-except ImportError:
+    # Попытка 2: через sys.modules (если уже загружено в памяти)
     try:
-        from geo_uule import get_uule
-    except ImportError:
-        get_uule = lambda cc, city=None: None
+        import sys
+        for mod in sys.modules.values():
+            if hasattr(mod, 'GEO_DB'):
+                db = mod.GEO_DB
+                if isinstance(db, dict):
+                    _geo_db = set(db.keys())
+                elif isinstance(db, set):
+                    _geo_db = set(w.lower() for w in db)
+                if _geo_db:
+                    return _geo_db
+    except Exception:
+        pass
 
-# Предлоги и союзы — одиночные буквы из этого списка НЕ мусор
-PREP_UNION = {"в","во","на","с","со","к","ко","о","у","и","а","б","я"}
+    # Fallback: ручной набор для тестирования
+    # Включает все вариации городов из тестовых датасетов
+    _geo_db = {
+        # Киев
+        "киев", "київ", "kyiv", "kiev",
+        # Днепр и вариации
+        "днепр", "дніпро", "дніпр", "днепро", "dnipro", "dnepr",
+        "днепропетровск", "дніпропетровськ",
+        # Львов и вариации
+        "львов", "львів", "lviv", "lvov",
+        # Лондон и вариации
+        "лондон", "london",
+        # Харьков
+        "харьков", "харків", "kharkiv", "kharkov",
+        # Одесса
+        "одесса", "одеса", "odessa", "odesa",
+        # Запорожье
+        "запорожье", "запоріжжя", "zaporizhzhia",
+        # Другие UA города
+        "донецк", "донецьк", "луганск", "луганськ",
+        "николаев", "миколаїв", "херсон", "полтава",
+        "чернигов", "чернігів", "черновцы", "чернівці",
+        "ужгород", "ивано-франковск", "івано-франківськ",
+        "тернополь", "тернопіль", "хмельницкий", "хмельницький",
+        "житомир", "сумы", "суми", "луцк", "луцьк", "ровно", "рівне",
+        "кропивницкий", "кропивницький", "винница", "вінниця",
+        "кривой рог", "кривий ріг", "мариуполь", "маріуполь",
+        "ирпень", "ірпінь", "буча", "бровары", "бровари",
+        "борисполь", "бориспіль", "белая церковь", "біла церква",
+        # RU города
+        "москва", "moscow", "санкт-петербург", "петербург", "спб",
+        "новосибирск", "екатеринбург", "казань", "нижний новгород",
+        "самара", "омск", "ростов", "ростов-на-дону", "уфа", "красноярск",
+        "пермь", "воронеж", "волгоград", "краснодар", "саратов",
+        "тюмень", "тольятти", "ижевск", "барнаул", "ульяновск",
+        "иркутск", "хабаровск", "ярославль", "владивосток", "махачкала",
+        "томск", "оренбург", "кемерово", "новокузнецк", "рязань",
+        "астрахань", "набережные челны", "пенза", "липецк", "тула",
+        "киров", "чебоксары", "калининград", "брянск", "курск",
+        "иваново", "магнитогорск", "улан-удэ", "сочи", "тверь",
+        "ставрополь", "белгород", "нижний тагил", "архангельск",
+        "владимир", "смоленск", "сургут", "чита", "орел",
+        "волжский", "мурманск", "череповец", "вологда", "саранск",
+        # BY города
+        "минск", "гродно", "брест", "гомель", "витебск", "могилев",
+        "минске", "гродне",
+        # KZ города
+        "алматы", "нур-султан", "астана", "шымкент", "актобе",
+        "тараз", "павлодар", "усть-каменогорск", "семей",
+        "атырау", "костанай", "петропавловск", "бишкек", "ташкент",
+        # Другие СНГ
+        "баку", "ереван", "тбилиси", "кишинев", "кишинів",
+        "рига", "таллин", "вильнюс", "варшава", "warsaw",
+        # Мировые
+        "берлин", "berlin", "париж", "paris", "рим", "rome",
+        "мадрид", "madrid", "барселона", "barcelona",
+        "амстердам", "amsterdam", "вена", "vienna", "прага", "prague",
+        "будапешт", "budapest", "варшава", "стамбул", "istanbul",
+        "анкара", "ankara", "тель-авив", "дубай", "dubai",
+        "нью-йорк", "new york", "лос-анджелес", "чикаго",
+        "пекин", "beijing", "шанхай", "shanghai", "токио", "tokyo",
+        "сеул", "seoul", "бангкок", "bangkok", "сингапур", "singapore",
+    }
+    return _geo_db
 
-
-# ══════════════════════════════════════════════
-# ФИЛЬТР МУСОРА
-# ══════════════════════════════════════════════
-
-def _is_garbage_keyword(kw: str) -> bool:
-    """
-    Возвращает True если ключ — мусор:
-    1. Содержит спецсимволы запроса (* : & | \)
-    2. Содержит одиночную букву которая не предлог/союз
-    """
-    # Спецсимволы — Google вернул запрос обратно
-    if re.search(r'[*:|&\\]', kw):
+def _is_geo_word(word: str) -> bool:
+    """Определяет является ли слово гео-токеном."""
+    global _morph
+    w = word.lower().strip()
+    if not w or len(w) < 3:
+        return False
+    # Проверяем geo_db
+    geo_set = _get_geo_set()
+    if w in geo_set:
         return True
-    # Одиночная буква не предлог/союз — вставка не раскрылась
-    for w in kw.lower().split():
-        if len(w) == 1 and w not in PREP_UNION:
-            return True
+    # Fallback: pymorphy3 Geox тег
+    try:
+        if _morph is None:
+            import pymorphy3
+            _morph = pymorphy3.MorphAnalyzer(lang='ru')
+        parsed = _morph.parse(w)
+        if parsed and parsed[0].score >= 0.3:
+            tag = str(parsed[0].tag)
+            if 'Geox' in tag:
+                return True
+    except Exception:
+        pass
     return False
 
 
 # ══════════════════════════════════════════════
-# DATACLASSES
+# CONSTANTS
+# ══════════════════════════════════════════════
+
+LETTERS_RU = list("абвгдежзийклмнопрстуфхцчшщэюя")  # 26 букв
+
+SYMBOL_UA = ":"
+SYMBOL_RU = "&"
+
+PREPS_RU = ["в", "на", "для", "с", "от", "под", "из", "без"]
+# "в" восстановлен (v2.8): реальная потеря "айфон в америке цена 16 про макс"
+
+# Только самые ценные по анализу дублей
+QUESTIONS_KEEP = ["как", "сколько"]
+
+# Финализаторы
+FINALIZERS_KEEP = ["и", "или", "vs"]
+# "и" восстановлена (v2.8): реальная потеря "17 айфон и 16 про сравнение"
+
+# Буквы E-группы: не все 29 букв дают unique вклад в nocp/Lstar
+# plain_cpAL — для всех 29 букв (все дают unique > 0)
+# plain_nocp_chr — только и,в,д (остальные 26 unique=0 по GT-анализу)
+# Lstar_cpAS — только б,е,к,о,п,т,у,ш,ю (остальные 20 unique=0)
+# Baseline сравнение (104 vs 58): потери одинаковые, +46 запросов дают 0 GT выгоды
+E_NOCP_LETTERS: frozenset = frozenset("ивд")        # plain_nocp_chr — только 3 буквы (GT-валидировано)
+E_LSTAR_LETTERS: frozenset = frozenset("кушебюпот") # Lstar_cpAS — только 9 букв (GT-валидировано)
+
+ALL_GROUPS = ["WC", "A", "B", "C", "D", "E"]
+# WC восстановлена (v2.8): wc_nocp_chr давала реальные потери на айфоне
+# "iphone 16 plus", "iphone 16 pro 256gb" — infix-эксклюзивы
+
+# Q-маркеры — gap где w1 = Q-маркер пропускается (Google игнорирует правый якорь)
+Q_MARKERS = {"как", "какой", "какая", "какое", "какие", "где", "сколько",
+             "почему", "зачем", "когда", "куда", "откуда", "чей"}
+
+# T-маркеры — gap где w2 = T-маркер запускаем только WC.
+# цена/стоимость здесь намеренно: все 104 запроса gap'а с w2=цена
+# возвращают один тип мусора "[X] цена [город]". WC даёт 15 качественных.
+T_MARKERS = {"купить", "купи", "отзывы", "обзор",
+             "характеристики", "аналоги", "сравнение", "форум",
+             "цена", "стоимость"}
+
+# Предлоги для склейки PREP+NOUN
+PREP_MERGE = {"в", "во", "на", "для", "с", "со", "от", "под", "из", "без",
+              "по", "за", "при", "до", "над", "через", "про", "об", "о",
+              "к", "ко", "у", "между"}
+
+
+# ══════════════════════════════════════════════
+# RESEARCH CONSTANTS
+# ══════════════════════════════════════════════
+# Карта research-структур — зеркало suffix-research (E_LAT + SD + SDL + SDL_REV).
+# Перенос на инфикс: вместо `{S} {pattern}` строим `{left_block} {pattern} {right_block}`,
+# где left_block / right_block определяются по anchor-логике (см. _research_anchors).
+#
+# Pre-processing для research отличается от боевой матрицы:
+#   - T_MARKERS / Q_MARKERS / geo НЕ пропускают gap, а становятся non-anchor токенами
+#     (остаются в строке в исходных позициях, но gap'ы между ними не строятся)
+#   - Atomic merge / PREP_MERGE применяются как обычно
+#
+# Объём на gap: ~8800 структур (E_LAT 338 + SD ~2450 + SDL 3000 + SDL_REV 3000)
+# × 3 агента (chrome+firefox+safari, кроме E_LAT — chrome only) ≈ 26k реальных запросов
+
+# 30 русских букв (ъ ы ь исключены — не дают unique вклада)
+LETTERS_RU_FULL = list("абвгдеёжзийклмнопрстуфхцчшщэюя")
+
+# 26 латинских букв
+LETTERS_LAT = list(_string.ascii_lowercase)
+
+# 10 цифр
+DIGITS_SD = [str(i) for i in range(10)]
+
+# 3 агента для research (Safari почти полностью покрывает Firefox по отчёту,
+# но по требованию заказчика включаем все три)
+ALL_AGENTS_RESEARCH = ("chrome", "firefox", "safari")
+
+
+# ══════════════════════════════════════════════
+# DATACLASS
 # ══════════════════════════════════════════════
 
 @dataclass
-class InfixTraceEntry:
+class InfixQuery:
+    query: str
     gap_index: int
     w1: str
     w2: str
@@ -98,389 +271,957 @@ class InfixTraceEntry:
     insert_val: str
     insert_type: str
     orientation: str
-    query_sent: str
     cp: int
     cp_note: str
-    agent: str
-    results_count: int = 0
-    results: List[str] = field(default_factory=list)
-    unique: List[str] = field(default_factory=list)
-    time_ms: float = 0.0
-    status: str = "pending"
-    error: Optional[str] = None
+    agents: tuple
+    priority: int = 1
     letter: Optional[str] = None
-    http_status: int = 0
+    is_new_research: bool = False  # research-блок: парсер маршрутизирует через research_pool
 
-
-@dataclass
-class InfixParseResult:
-    seed: str
-    country: str
-    language: str
-    groups_used: List[str]
-    all_keywords: Dict[str, List[str]] = field(default_factory=dict)
-    alt_seed_keywords: Set[str] = field(default_factory=set)
-    exclusive_keywords: Dict[str, str] = field(default_factory=dict)
-    total_queries: int = 0
-    with_results: int = 0
-    empty_queries: int = 0
-    error_queries: int = 0
-    blocked_queries: int = 0   # 429/500/503 от Google
-    timeout_queries: int = 0   # сеть/таймаут
-    status_counts: Dict = field(default_factory=dict)  # {"ok": N, "blocked_500": N, ...}
-    total_keywords: int = 0
-    exclusive_count: int = 0
-    total_time_ms: float = 0.0
-    trace: List[Dict] = field(default_factory=list)
-    summary_by_gap: Dict = field(default_factory=dict)
-    summary_by_group: Dict = field(default_factory=dict)
-    timestamp: str = ""
 
 
 # ══════════════════════════════════════════════
-# PARSER
+# GENERATOR
 # ══════════════════════════════════════════════
 
-class InfixParser:
+class InfixGenerator:
+    """
+    Generates optimized infix query variants for a seed.
 
-    def __init__(self, lang: str = "ru"):
-        self.generator = InfixGenerator()
-        self.lang = lang
+    Usage:
+        gen = InfixGenerator()
+        queries = gen.generate("ремонт пылесосов")
+        # → ~46 запросов (было 1367)
+    """
 
-    def _clean_suggestion(self, text: str) -> str:
-        return re.sub(r'<[^>]+>', '', text).strip()
+    def generate(self, seed: str, groups: Optional[List[str]] = None) -> List[InfixQuery]:
+        # 1. Предобработка сида
+        S, geo_tokens = self._preprocess(seed)
+        words = S.split()
+        grp = set(groups) if groups else set(ALL_GROUPS)
+        out: List[InfixQuery] = []
 
-    async def fetch_suggestions(self, query, country, language, client,
-                                 google_client="firefox", cursor_position=None,
-                                 uule=None):
-        url = "https://www.google.com/complete/search"
-        params = {"q": query, "client": google_client,
-                  "gl": country, "ie": "utf-8", "oe": "utf-8", "hl": language}
-        if uule:
-            params["uule"] = uule
-        if cursor_position == -1:
-            pass
-        elif cursor_position is not None:
-            params["cp"] = cursor_position
-        else:
-            params["cp"] = len(query)
+        # 2. Склейка токенов: предлоги + атомарные пары
+        # _merge_tokens возвращает List[(token, is_atomic)]
+        #   is_atomic=True  → latin/цифровая цепочка (samsung galaxy s21) → skip_cp
+        #   is_atomic=False → PREP+NOUN (на скутер) → cp работает нормально
+        tokens_with_flags = self._merge_tokens(words)
+        tokens = [t for t, _ in tokens_with_flags]
+        atomic_set = {t for t, is_atomic in tokens_with_flags if is_atomic}
 
-        ua = UA_FIREFOX if google_client == "firefox" else UA_CHROME
-        headers = {"User-Agent": ua}
-        try:
-            response = await client.get(url, params=params, headers=headers, timeout=10.0)
-            http_status = response.status_code
-            if http_status == 429:
-                return [], 429
-            if http_status == 200:
-                text = response.text.strip()
-                try:
-                    data = response.json()
-                    if isinstance(data, list) and len(data) > 1:
-                        raw = data[1]
-                        if isinstance(raw, list):
-                            result = []
-                            for item in raw:
-                                if isinstance(item, str):
-                                    result.append(self._clean_suggestion(item))
-                                elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                    result.append(self._clean_suggestion(item[0]))
-                                elif isinstance(item, dict):
-                                    s = item.get("suggestion") or item.get("value") or item.get("text", "")
-                                    if s:
-                                        result.append(self._clean_suggestion(str(s)))
-                            return result, 200
-                except Exception:
-                    pass
-                if text.startswith(")]}'"):
-                    text = text[4:].strip()
-                    try:
-                        data = json.loads(text)
-                        if isinstance(data, list) and len(data) > 1:
-                            raw = data[1]
-                            if isinstance(raw, list):
-                                result = []
-                                for item in raw:
-                                    if isinstance(item, str):
-                                        result.append(self._clean_suggestion(item))
-                                    elif isinstance(item, list) and len(item) > 0 and isinstance(item[0], str):
-                                        result.append(self._clean_suggestion(item[0]))
-                                return result, 200
-                    except Exception:
-                        pass
-            return [], http_status
-        except Exception:
-            pass
-        return [], 0
+        # 3. Gap'ы
+        gaps = self._get_gaps(tokens)
 
-    async def parse(self, seed, country="ua", language="ru",
-                    groups=None, progress_callback=None,
-                    city=None) -> InfixParseResult:
-        from datetime import datetime
-        total_start = time.time()
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        for gap_idx, w1, w2, full_coverage in gaps:
+            # Q-маркер на w1 → пропускаем gap полностью
+            if w1.lower() in Q_MARKERS:
+                continue
+            # Гео-маркер в w1 или w2 → пропускаем gap
+            # _preprocess снимает гео только с краёв — если гео внутри сида,
+            # оно остаётся токеном и становится якорем гэпа.
+            # "харьков X недорого" или "кондиционер X киев" — некорректные запросы.
+            # Проверяем каждое слово токена: PREP+NOUN ("в харькове") → "харькове" тоже проверяем.
+            if (any(_is_geo_word(w) for w in w1.lower().split()) or
+                    any(_is_geo_word(w) for w in w2.lower().split())):
+                continue
+            # T-маркер на w2 → только WC
+            if w2.lower().split()[0] in T_MARKERS:
+                active = grp & {"WC"}
+            else:
+                active = grp if full_coverage else (grp & {"WC"})
 
-        # uule: city=None → столица страны, city="Lviv" → конкретный город
-        _uule = get_uule(country, city)
+            # skip_cp только для атомарных токенов (latin/цифры), не для PREP+NOUN
+            skip_cp = (w1 in atomic_set) or (w2 in atomic_set)
 
-        matrix: List[InfixQuery] = self.generator.generate(seed=seed, groups=groups or ALL_GROUPS)
+            # right_suffix — токены после w2 в исходном сиде.
+            # Нужен чтобы сохранить семантический контекст в запросе.
+            # Пример "аренда авто без залога", gap[0]:
+            #   с suffix:   "аренда А авто без залога" → релевантные инфикс-ключи
+            #   без suffix: "аренда А авто"            → generic "аренда авто [город]" мусор
+            #
+            # НО: если суффикс начинается с T_MARKER (цена/стоимость/купить...),
+            # right_suffix убирается для gap[0] — Google фокусируется на T_MARKER
+            # и возвращает только гео-вариации вместо инфикс-расширений.
+            # Пример "установка кондиционера цена", gap[0]:
+            #   с suffix:   "установка А кондиционера цена" → цена киев / цена минск ...
+            #   без suffix: "установка А кондиционера"      → инверторного / настенного ...
+            w1_idx = tokens.index(w1)
+            w2_idx = tokens.index(w2)
 
-        kw_map: Dict[str, List[str]] = {}
-        alt_seed_set: Set[str] = set()
-        trace_entries: List[InfixTraceEntry] = []
-        lock = asyncio.Lock()
-        done_count = [0]
+            # left_prefix — все токены левее w1 (контекст для gap[N>0])
+            # Пример: "ремонт пылесосов самсунг", gap[1]:
+            #   left_prefix="ремонт" → "ремонт пылесосов [X] самсунг"
+            #   без left_prefix:     → "пылесосов [X] самсунг" — теряем контекст
+            left_prefix = " ".join(tokens[:w1_idx]) if w1_idx > 0 else ""
 
-        non_e_sem = asyncio.Semaphore(BATCH_SIZE)
+            # right_suffix — все токены правее w2
+            raw_suffix = " ".join(tokens[w2_idx + 1:]) if w2_idx + 1 < len(tokens) else ""
+            suffix_first_word = raw_suffix.split()[0] if raw_suffix else ""
+            if gap_idx == 0 and suffix_first_word in T_MARKERS:
+                right_suffix = ""
+            else:
+                right_suffix = raw_suffix
 
-        async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
-            agent = iq.agents[0]
-            await asyncio.sleep(DELAY)
-            t0 = time.time()
-            try:
-                raw_results, http_status = await self.fetch_suggestions(
-                    query=iq.query, country=country, language=language,
-                    client=client, google_client=agent, cursor_position=iq.cp,
-                    uule=_uule,
-                )
-                elapsed = (time.time() - t0) * 1000
+            out.extend(self._generate_gap(gap_idx, w1, w2, active, geo_tokens,
+                                          skip_cp=skip_cp, right_suffix=right_suffix,
+                                          left_prefix=left_prefix))
 
-                # Фильтр мусора
-                results = [kw for kw in raw_results if not _is_garbage_keyword(kw)]
+        # Research-блок (E_LAT + SD + SDL + SDL_REV) — карта суффикс-research,
+        # перенесённая на инфикс. Маркеры (T/Q/geo) не пропускают gap, а становятся
+        # non-anchor токенами (остаются в строке, gap'ы между ними не строятся).
+        # Агенты: chrome+firefox+safari (E_LAT — chrome only).
+        # Закомментировать одной правкой после завершения research-прогона.
+        # ОТКЛЮЧЕНО ПОСЛЕ GAP-АНАЛИЗА 8 СИДОВ (300 GAP'ов). Полный research давал
+        # ~26k запросов на сид; минимальная добавка для покрытия 64 пропущенных
+        # боевой GAP'ов укомплектована в _append_battle_addon (10 cp×agent комбинаций).
+        # Чтобы вернуть research-режим — раскомментировать строку ниже:
+        # self._append_research_block(seed, out)
 
-                if http_status == 200:
-                    status = "ok" if results else "empty"
-                elif http_status in (429, 500, 503):
-                    status = f"blocked_{http_status}"
-                elif http_status == 0:
-                    status = "timeout"
+        # Минимальная research-добавка к боевой матрице.
+        # Покрывает 64/64 GAP'ов через chrome+firefox (set cover по 8 сидам).
+        # 11 GAP'ов требуют safari — отложено до подключения safari в прод.
+        self._append_battle_addon(seed, out)
+
+        return out
+
+    # ──────────────────────────────────────────
+    # ПРЕДОБРАБОТКА
+    # ──────────────────────────────────────────
+
+    def _preprocess(self, seed: str) -> Tuple[str, str]:
+        """
+        Стрипаем спецсимволы и гео-токены с краёв сида.
+
+        Возвращает:
+            core       — сид без гео-краёв (для построения якорей)
+            geo_tokens — гео-токены с краёв (строка, может быть пустой)
+
+        Логика geo_tokens:
+            - nocp структуры: geo добавляется в КОНЕЦ  → "w1 [X] w2 geo"
+              Google видит оба якоря + гео как правый контекст
+            - cp структуры:   geo добавляется в НАЧАЛО → "geo w1 [X] w2"
+              geo оказывается в стабильном левом контексте,
+              cp сдвигается на len(geo)+1
+        """
+        s = seed.strip().lower()
+        # Убираем ведущие/хвостовые спецсимволы
+        s = re.sub(r'^[^\w\s]+', '', s)
+        s = re.sub(r'[^\w\s]+$', '', s)
+        s = s.strip()
+
+        # Собираем гео-токены с краёв (только если в ядре остаётся ≥2 слов)
+        words = s.split()
+        geo_collected = []
+
+        while len(words) > 2 and _is_geo_word(words[-1]):
+            geo_collected.insert(0, words.pop())   # правый край → в начало списка
+        while len(words) > 2 and _is_geo_word(words[0]):
+            words = words[1:]                       # левый край → просто убираем
+
+        return ' '.join(words), ' '.join(geo_collected)
+
+    # ──────────────────────────────────────────
+    # СКЛЕЙКА ТОКЕНОВ
+    # ──────────────────────────────────────────
+
+    def _merge_tokens(self, words: List[str]) -> List[Tuple[str, bool]]:
+        """
+        Возвращает List[(token, is_atomic)] где:
+          is_atomic=True  → latin/цифровая цепочка (samsung galaxy s21) → skip_cp
+          is_atomic=False → одиночное слово или PREP+NOUN → cp работает нормально
+
+        Два этапа:
+        1. ИТЕРАТИВНАЯ склейка атомарных цепочек: латиница/цифра подряд → один токен
+        2. Склейка PREP+NOUN → один токен (is_atomic=False)
+        """
+        if len(words) < 2:
+            return [(w, False) for w in words]
+
+        MODEL_WORDS = {"pro", "max", "plus", "ultra", "fe", "mini",
+                       "lite", "note", "air", "se", "s", "e", "x"}
+
+        def _can_merge(w: str, nw: str) -> bool:
+            curr_has_lat = bool(re.search(r'[a-zA-Z0-9]', w))
+            next_is_atom = bool(re.search(r'^[a-zA-Z0-9]', nw)) or nw.lower() in MODEL_WORDS
+            return curr_has_lat and next_is_atom
+
+        # Проход 1: атомарные цепочки (is_atomic=True)
+        result: List[Tuple[str, bool]] = [(w, False) for w in words]
+        while True:
+            merged: List[Tuple[str, bool]] = []
+            i = 0
+            changed = False
+            while i < len(result):
+                tok, was_atomic = result[i]
+                if i + 1 < len(result) and _can_merge(tok, result[i+1][0]):
+                    merged.append((tok + " " + result[i+1][0], True))
+                    i += 2
+                    changed = True
                 else:
-                    status = f"http_{http_status}"
+                    merged.append((tok, was_atomic))
+                    i += 1
+            result = merged
+            if not changed:
+                break
 
-                entry = InfixTraceEntry(
-                    gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=iq.struct,
-                    insert_val=iq.insert_val, insert_type=iq.insert_type,
-                    orientation=iq.orientation,
-                    query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
-                    agent=agent, results=results, results_count=len(results),
-                    time_ms=round(elapsed, 1), status=status, letter=iq.letter,
-                    http_status=http_status,
-                )
-                async with lock:
-                    for kw in results:
-                        k = kw.lower().strip()
-                        if not k:
-                            continue
-                        if k not in kw_map:
-                            kw_map[k] = []
-                        kw_map[k].append(f"{agent}:{iq.struct}")
-                        if seed.lower() not in k:
-                            alt_seed_set.add(k)
+        # Проход 2: PREP+NOUN (is_atomic=False — cp работает через предлог)
+        result2: List[Tuple[str, bool]] = []
+        i = 0
+        while i < len(result):
+            tok, is_atomic = result[i]
+            if tok in PREP_MERGE and i + 1 < len(result) and result2:
+                result2.append((tok + " " + result[i+1][0], False))
+                i += 2
+            else:
+                result2.append((tok, is_atomic))
+                i += 1
 
-            except Exception as e:
-                elapsed = (time.time() - t0) * 1000
-                entry = InfixTraceEntry(
-                    gap_index=iq.gap_index, w1=iq.w1, w2=iq.w2,
-                    group=iq.group, struct=iq.struct,
-                    insert_val=iq.insert_val, insert_type=iq.insert_type,
-                    orientation=iq.orientation,
-                    query_sent=iq.query, cp=iq.cp, cp_note=iq.cp_note,
-                    agent=agent, time_ms=round(elapsed, 1),
-                    status="error", error=str(e), letter=iq.letter,
-                )
+        return result2
 
-            async with lock:
-                trace_entries.append(entry)
-                done_count[0] += 1
+    # ──────────────────────────────────────────
+    # GAP СТРАТЕГИЯ
+    # ──────────────────────────────────────────
 
-            if progress_callback:
-                await progress_callback(done_count[0], len(matrix), entry)
+    def _get_gaps(self, tokens: List[str]) -> List[Tuple[int, str, str, bool]]:
+        """
+        2 токена → gap[0] (full)
+        3 токена → gap[0], gap[1] (full)
+        4 токена → gap[0] full, gap[1] WC-only, gap[2] full
+        5+ токенов → gap[0] full, gap[last] full
+        """
+        n = len(tokens)
+        if n < 2:
+            return []
+        if n == 2:
+            return [(0, tokens[0], tokens[1], True)]
+        if n == 3:
+            return [(0, tokens[0], tokens[1], True),
+                    (1, tokens[1], tokens[2], True)]
+        if n == 4:
+            return [(0, tokens[0], tokens[1], True),
+                    (1, tokens[1], tokens[2], False),
+                    (2, tokens[2], tokens[3], True)]
+        return [(0, tokens[0], tokens[1], True),
+                (n - 2, tokens[n - 2], tokens[n - 1], True)]
 
-        async def run_letter(letter_queries, client):
-            for iq in letter_queries:
-                await fetch_one(iq, client)
+    # ──────────────────────────────────────────
+    # ГЕНЕРАЦИЯ ОДНОГО GAP'А
+    # ──────────────────────────────────────────
 
-        async def run_non_e(iq, client):
-            async with non_e_sem:
-                await fetch_one(iq, client)
+    def _generate_gap(self, gap_idx, w1, w2, groups, geo_tokens="", skip_cp=False, right_suffix="", left_prefix="") -> List[InfixQuery]:
+        out = []
+        CHR = ("chrome",)
+        FF  = ("firefox",)
 
-        async with httpx.AsyncClient(proxy=_proxy_chrome) as chrome_client, \
-                   httpx.AsyncClient(proxy=_proxy_firefox) as ff_client:
-            e_by_letter_chr  = defaultdict(list)
-            e_by_letter_ff   = defaultdict(list)
-            addon_by_key_chr = defaultdict(list)
-            addon_by_key_ff  = defaultdict(list)
-            non_e_chr = []
-            non_e_ff  = []
-            for iq in matrix:
-                is_ff = "firefox" in iq.agents
-                if iq.group == "E" and iq.letter:
-                    (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
-                elif getattr(iq, 'is_new_research', False):
-                    key = (iq.group, iq.insert_val)
-                    (addon_by_key_ff if is_ff else addon_by_key_chr)[key].append(iq)
-                else:
-                    (non_e_ff if is_ff else non_e_chr).append(iq)
+        # FF-exclusive наборы (GT-валидировано, unified_firefox_structs.json)
+        E_FF_PLAIN_CPAL = frozenset("вдмнопсбзикртэгжлфхцшю")  # 22 буквы
+        E_FF_NOCP       = frozenset("ивбау")                    # 5 букв (и,в дубли + а,б,у новые)
+        E_FF_LSTAR      = frozenset("вк")                       # 2 буквы
 
-            await asyncio.gather(
-                *[run_letter(qs, chrome_client) for qs in e_by_letter_chr.values()],
-                *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
-                *[run_letter(qs, chrome_client) for qs in addon_by_key_chr.values()],
-                *[run_letter(qs, ff_client)     for qs in addon_by_key_ff.values()],
-                *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
-                *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+        # ── Гео-контекст ─────────────────────────────────────────
+        # nocp: geo в конце  → "left_prefix w1 [X] w2 right_suffix geo"
+        # cp:   geo в начале → "left_prefix geo w1 [X] w2 right_suffix"
+        geo = geo_tokens.strip()
+        lp = left_prefix.strip()  # левый контекст (токены до w1)
+
+        # Сдвиги cp-позиции
+        lp_shift  = len(lp) + 1 if lp else 0   # сдвиг на left_prefix
+        geo_shift = len(geo) + 1 if geo else 0  # сдвиг на гео (только для cp)
+
+        def _w2_nocp():
+            """w2 + right_suffix + гео в конце для nocp-структур."""
+            parts = [w2]
+            if right_suffix:
+                parts.append(right_suffix)
+            if geo:
+                parts.append(geo)
+            return " ".join(parts)
+
+        def _w2_cp():
+            """w2 + right_suffix для cp-структур (гео уже в начале через _w1_cp)."""
+            return f"{w2} {right_suffix}".strip() if right_suffix else w2
+
+        def _w1_nocp():
+            """left_prefix + w1 для nocp-структур."""
+            return f"{lp} {w1}".strip() if lp else w1
+
+        def _w1_cp():
+            """left_prefix + geo + w1 для cp-структур."""
+            parts = []
+            if lp:
+                parts.append(lp)
+            if geo:
+                parts.append(geo)
+            parts.append(w1)
+            return " ".join(parts)
+
+        def q(group, struct, query, cp, cp_note, insert_val, insert_type,
+              orientation, agents=CHR, letter=None):
+            return InfixQuery(
+                query=query, gap_index=gap_idx, w1=w1, w2=w2,
+                group=group, struct=struct,
+                insert_val=insert_val, insert_type=insert_type,
+                orientation=orientation, cp=cp, cp_note=cp_note,
+                agents=agents, letter=letter,
             )
 
-        total_time = (time.time() - total_start) * 1000
+        n1 = len(w1)
 
-        # Ротируем батч IP после каждого прогона
-        try:
-            from utils.proxy_pool import ProxyPool
-            ProxyPool.rotate()
-        except ImportError:
-            try:
-                from proxy_pool import ProxyPool
-                ProxyPool.rotate()
-            except ImportError:
-                pass
+        # ── WC: nocp_chr ─────────────────────────────────────────
+        # Восстановлена (v2.8): реальные потери "iphone 16 plus", "iphone 16 pro 256gb"
+        if "WC" in groups:
+            base = f"{_w1_nocp()} * {_w2_nocp()}"
+            out.append(q("WC", "wc_nocp_chr", base, -1, "без cp, chrome", "*", "wildcard", "N", CHR))
 
-        for entry in trace_entries:
-            entry.unique = [
-                kw for kw in entry.results
-                if len(kw_map.get(kw.lower().strip(), [])) == 1
-            ]
+        # ── A: только nocp_chr ───────────────────────────────────
+        if "A" in groups:
+            for sym, cluster in [(SYMBOL_UA, "ua"), (SYMBOL_RU, "ru")]:
+                base = f"{_w1_nocp()} {sym} {_w2_nocp()}"
+                out.append(q("A", f"A_{cluster}_nocp_chr", base, -1, "без cp, chrome", sym, "symbol", "N", CHR))
 
-        gaps = sorted(set(e.gap_index for e in trace_entries))
-        summary_by_gap = {}
-        for gi in gaps:
-            ge = [e for e in trace_entries if e.gap_index == gi]
-            kws: set = set()
-            for e in ge:
-                kws.update(k.lower().strip() for k in e.results)
-            summary_by_gap[str(gi)] = {
-                "gap_index": gi, "w1": ge[0].w1, "w2": ge[0].w2,
-                "total_queries": len(ge),
-                "with_results": sum(1 for e in ge if e.status == "ok"),
-                "empty": sum(1 for e in ge if e.status == "empty"),
-                "unique_keywords": len(kws),
-                "exclusive": sum(len(e.unique) for e in ge),
-            }
+        # ── B: только B_L_{prep}_cpAL ────────────────────────────
+        if "B" in groups and not skip_cp:
+            for prep in PREPS_RU:
+                bl = f"{_w1_cp()} {prep} * {_w2_cp()}"
+                cp_al = lp_shift + geo_shift + n1 + 1 + len(prep) + 1
+                out.append(q("B", f"B_L_{prep}_cpAL", bl, cp_al, "после предлога", prep, "prep", "L", CHR))
 
-        summary_by_group = {}
-        for g in ALL_GROUPS:
-            ge = [e for e in trace_entries if e.group == g]
-            if not ge:
+        # ── C: как_cpAL + сколько_nocp_chr ────────────────────────
+        if "C" in groups and not skip_cp:
+            cl = f"{_w1_cp()} как * {_w2_cp()}"
+            cp_al = lp_shift + geo_shift + n1 + 1 + len("как") + 1
+            out.append(q("C", "C_L_как_cpAL", cl, cp_al, "после как", "как", "question", "L", CHR))
+
+            cl2 = f"{_w1_nocp()} сколько * {_w2_nocp()}"
+            out.append(q("C", "C_L_сколько_nocp_chr", cl2, -1, "без cp, chrome", "сколько", "question", "L", CHR))
+            cr2 = f"{_w1_nocp()} * сколько {_w2_nocp()}"
+            out.append(q("C", "C_R_сколько_nocp_chr", cr2, -1, "без cp, chrome", "сколько", "question", "R", CHR))
+
+        # ── D: финализаторы с unique > 0 ─────────────────────────
+        if "D" in groups and not skip_cp:
+            for fin in FINALIZERS_KEEP:
+                dl = f"{_w1_cp()} {fin} * {_w2_cp()}"
+                cp_al = lp_shift + geo_shift + n1 + 1 + len(fin) + 1
+                out.append(q("D", f"D_L_{fin}_cpAL", dl, cp_al, f"после {fin}", fin, "finalizer", "L", CHR))
+
+        # ── E: plain_cpAL (все буквы) + nocp/Lstar (только с unique > 0) ──
+        if "E" in groups and not skip_cp:
+            for L in LETTERS_RU:
+                w2n = _w2_nocp()
+                w1n = _w1_nocp()
+                w1c = _w1_cp()
+
+                t_plain_n = f"{w1n} {L} {w2n}"
+                t_plain   = f"{w1c} {L} {_w2_cp()}"
+                t_Lstar   = f"{w1c} {L}* {_w2_cp()}"
+
+                n1c = len(w1c)
+                cp_plain = n1c + 2
+                cp_Lstar = n1c + 3
+
+                # plain_cpAL — для всех букв
+                out.append(q("E", f"E_{L}_plain_cpAL", t_plain, cp_plain, "после L", L, "letter", "L", CHR, letter=L))
+
+                # plain_nocp_chr — только и, в, д
+                if L in E_NOCP_LETTERS:
+                    out.append(q("E", f"E_{L}_plain_nocp_chr", t_plain_n, -1, "без cp", L, "letter", "N", CHR, letter=L))
+
+                # Lstar_cpAS — только б,е,к,о,п,т,у,ш,ю
+                if L in E_LSTAR_LETTERS:
+                    out.append(q("E", f"E_{L}_Lstar_cpAS", t_Lstar, cp_Lstar, "после *", L, "letter", "L", CHR, letter=L))
+
+        # ── FF-EXCLUSIVE структуры ────────────────────────────────────
+        # GT-валидировано: unified_firefox_structs.json, 40 структур на gap
+
+        # B: все 8 предлогов с Firefox
+        if "B" in groups and not skip_cp:
+            for prep in PREPS_RU:
+                bl = f"{_w1_cp()} {prep} * {_w2_cp()}"
+                cp_al = lp_shift + geo_shift + n1 + 1 + len(prep) + 1
+                out.append(q("B", f"B_L_{prep}_cpAL", bl, cp_al, "после предлога", prep, "prep", "L", FF))
+
+        # C: как_cpAL + сколько_nocp_chr с Firefox
+        if "C" in groups and not skip_cp:
+            cl = f"{_w1_cp()} как * {_w2_cp()}"
+            cp_al = lp_shift + geo_shift + n1 + 1 + len("как") + 1
+            out.append(q("C", "C_L_как_cpAL", cl, cp_al, "после как", "как", "question", "L", FF))
+            cl2 = f"{_w1_nocp()} сколько * {_w2_nocp()}"
+            out.append(q("C", "C_L_сколько_nocp_chr", cl2, -1, "без cp", "сколько", "question", "L", FF))
+
+        # D: или_cpAL с Firefox
+        if "D" in groups and not skip_cp:
+            dl = f"{_w1_cp()} или * {_w2_cp()}"
+            cp_al = lp_shift + geo_shift + n1 + 1 + len("или") + 1
+            out.append(q("D", "D_L_или_cpAL", dl, cp_al, "после или", "или", "finalizer", "L", FF))
+
+        # E: FF-exclusive буквы
+        if "E" in groups and not skip_cp:
+            for L in LETTERS_RU:
+                w2n = _w2_nocp()
+                w1n = _w1_nocp()
+                w1c = _w1_cp()
+                n1c = len(w1c)
+
+                # plain_cpAL — 22 буквы
+                if L in E_FF_PLAIN_CPAL:
+                    t_plain = f"{w1c} {L} {_w2_cp()}"
+                    cp_plain = n1c + 2
+                    out.append(q("E", f"E_{L}_plain_cpAL", t_plain, cp_plain, "после L", L, "letter", "L", FF, letter=L))
+
+                # plain_nocp_chr — 5 букв (и,в дубли + а,б,у новые)
+                if L in E_FF_NOCP:
+                    t_plain_n = f"{w1n} {L} {w2n}"
+                    out.append(q("E", f"E_{L}_plain_nocp_chr", t_plain_n, -1, "без cp", L, "letter", "N", FF, letter=L))
+
+                # Lstar_cpAS — 2 буквы (в новая + к дубль)
+                if L in E_FF_LSTAR:
+                    t_Lstar = f"{w1c} {L}* {_w2_cp()}"
+                    cp_Lstar = n1c + 3
+                    out.append(q("E", f"E_{L}_Lstar_cpAS", t_Lstar, cp_Lstar, "после *", L, "letter", "L", FF, letter=L))
+
+        return out
+
+    # ══════════════════════════════════════════════════════════════════
+    # RESEARCH BLOCK — перенос карты suffix-research (E_LAT/SD/SDL/SDL_REV)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _research_anchors(self, seed: str) -> Tuple[List[str], List[int]]:
+        """
+        Research-mode preprocessing.
+
+        Отличия от _preprocess (боевой матрицы):
+          - geo НЕ стрипается с краёв — остаётся в строке как non-anchor токен
+          - T_MARKERS / Q_MARKERS НЕ пропускают gap — становятся non-anchor токенами
+          - atomic merge / PREP_MERGE применяются как обычно
+
+        Anchor — токен который НЕ является T/Q/geo маркером (или склеенным предлогом
+        с geo-словом). Gap'ы строятся только между парами соседних anchor'ов.
+        Pattern вставляется сразу после левого anchor'а; всё что между левым anchor'ом
+        и правым anchor'ом (T/Q/geo маркеры) сохраняет свои позиции в right_block.
+
+        Returns:
+            tokens         — список токенов (после atomic + PREP merge)
+            anchor_indices — индексы anchor-токенов в tokens
+        """
+        s = seed.strip().lower()
+        s = re.sub(r'^[^\w\s]+', '', s)
+        s = re.sub(r'[^\w\s]+$', '', s)
+        s = s.strip()
+
+        words = s.split()
+        if len(words) < 2:
+            return [], []
+
+        # Atomic + PREP merge (как в боевой матрице)
+        tokens_with_flags = self._merge_tokens(words)
+        tokens = [t for t, _ in tokens_with_flags]
+
+        # Identify anchors: НЕ T_MARKER, НЕ Q_MARKER, НЕ geo
+        # Для merged токенов проверяем все составляющие слова
+        anchor_indices: List[int] = []
+        for i, tok in enumerate(tokens):
+            sub_words = tok.lower().split()
+            first = sub_words[0]
+            # T/Q-маркер по первому слову токена
+            if first in T_MARKERS or first in Q_MARKERS:
                 continue
-            kws_g: set = set()
-            for e in ge:
-                kws_g.update(k.lower().strip() for k in e.results)
-            summary_by_group[g] = {
-                "total_queries": len(ge),
-                "with_results": sum(1 for e in ge if e.status == "ok"),
-                "empty": sum(1 for e in ge if e.status == "empty"),
-                "unique_keywords": len(kws_g),
-                "exclusive": sum(len(e.unique) for e in ge),
-                "avg_time_ms": round(sum(e.time_ms for e in ge) / max(len(ge), 1), 1),
+            # geo — любое слово в токене
+            if any(_is_geo_word(w) for w in sub_words):
+                continue
+            anchor_indices.append(i)
+
+        return tokens, anchor_indices
+
+    def _meaningful_cps(self, base: str) -> List[Tuple[int, str]]:
+        """
+        Возвращает meaningful cp-позиции для строки base:
+        границы токенов (после/перед каждым пробелом/спецсимволом),
+        0, len, и -1 (без cp). Зеркало _meaningful_cps из suffix_generator.
+
+        Используется для SD-структур research-блока.
+        """
+        cps: List[Tuple[int, str]] = [(-1, "без cp")]
+        cps.append((0, "cp=0 начало"))
+
+        for i, ch in enumerate(base):
+            if ch in " *-:":
+                if i + 1 <= len(base):
+                    cps.append((i + 1, f"cp={i+1} после '{ch}'"))
+                cps.append((i, f"cp={i} перед '{ch}'"))
+
+        cps.append((len(base), f"cp={len(base)} конец"))
+
+        # Дедуп по позиции
+        seen = {}
+        for cp, note in cps:
+            if cp not in seen:
+                seen[cp] = note
+        return [(cp, note) for cp, note in seen.items()]
+
+    def _build_research_letter_structures(
+        self, left_block: str, right_block: str, letter: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+        struct_type: str, agents: tuple,
+    ):
+        """
+        13 letter-structures (зеркало _build_letter_structures из суффикса).
+        Используется и для русского E (если понадобится в research), и для E_LAT.
+
+        Pattern вставляется как блок: `{left_block} {pattern} {right_block}`.
+        cp вычисляется относительно `{left_block} {pattern}` — позиции в pattern.
+        """
+        s = left_block
+        L = letter
+        rs = right_block
+
+        def _full(base: str) -> str:
+            """Дополнить base правым блоком (если есть)."""
+            return f"{base} {rs}".strip() if rs else base
+
+        def add(base: str, cp: int, struct_name: str):
+            full = _full(base)
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group=struct_type, struct=f"{L}_{struct_name}",
+                insert_val=L, insert_type="research_letter",
+                orientation="N", cp=cp, cp_note=f"{struct_type}_{struct_name}",
+                agents=agents, letter=L,
+                is_new_research=True,
+            ))
+
+        # 1. plain
+        q = f"{s} {L}"
+        add(q, len(q), "plain")
+        # 1b. plain_nocp
+        add(q, -1, "plain_nocp")
+        # 2. trail
+        q = f"{s} {L} "
+        add(q, len(q), "trail")
+        # 5. sandwich
+        q = f"{s} * {L} *"
+        add(q, len(q), "sandwich")
+        # wcB_cpMid
+        q = f"{s} * {L}"
+        add(q, len(s) + 3, "wcB_cpMid")
+        # Lwc cp варианты
+        q = f"{s} {L} *"
+        add(q, len(s) + 1 + len(L) + 1, "Lwc_cpAL")
+        add(q, len(s) + 1, "Lwc_cpBL")
+        # col_B_trail
+        q = f"{s} : {L} "
+        add(q, len(q), "col_B_trail")
+        # L_col
+        q = f"{s} {L} :"
+        add(q, len(q), "L_col")
+        # hyp_B_trail
+        q = f"{s} - {L} "
+        add(q, len(q), "hyp_B_trail")
+        # hyp_Lwc
+        q = f"{s} - {L} *"
+        add(q, len(q), "hyp_Lwc")
+        # hyp_wcL
+        q = f"{s} - * {L}"
+        add(q, len(q), "hyp_wcL")
+        # L_hyp
+        q = f"{s} {L} -"
+        add(q, len(q), "L_hyp")
+
+    def _build_research_SD(
+        self, left_block: str, right_block: str, D: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+    ):
+        """
+        SD структуры — 31 sd_base × meaningful_cps. Зеркало suffix-research SD.
+        Включая 3 «мусорные» по отчёту суффикса (dstar_nosp/paren_open/dot) —
+        в инфиксе их поведение может отличаться, проверяем честно.
+        """
+        s = left_block
+        rs = right_block
+
+        sd_bases = [
+            ("plain",        f"{s} {D}"),
+            ("plain_nosp",   f"{s}{D}"),
+            ("plain_trail",  f"{s} {D} "),
+            ("wcL",          f"{s} * {D}"),
+            ("wcL_nosp1",    f"{s}* {D}"),
+            ("wcL_nosp2",    f"{s} *{D}"),
+            ("wcR",          f"{s} {D} *"),
+            ("wcR_nosp",     f"{s} {D}*"),
+            ("wcR_S2star",   f"{s} {D}*"),
+            ("wcR_trail",    f"{s} {D} * "),
+            ("wcM",          f"* {s} {D}"),
+            ("wcM_nosp1",    f"*{s} {D}"),
+            ("wcM_nosp2",    f"* {s}{D}"),
+            ("wcM_nosp3",    f"*{s}{D}"),
+            ("wcLR",         f"* {s} {D} *"),
+            ("wcLM",         f"* {s} * {D}"),
+            ("wcMR",         f"{s} * {D} *"),
+            ("wcLMR",        f"* {s} * {D} *"),
+            ("dwcL",         f"** {s} {D}"),
+            ("dwcM",         f"{s} ** {D}"),
+            ("dwcR",         f"{s} {D} **"),
+            ("hyp",          f"{s} - {D}"),
+            ("hyp_wc",       f"{s} - {D} *"),
+            ("hyp_nosp",     f"{s}-{D}"),
+            ("hyp_nosp_wc",  f"{s}-{D}*"),
+            ("col",          f"{s}: {D}"),
+            ("col_nosp",     f"{s}:{D}"),
+            ("col_wc",       f"{s}: {D} *"),
+            ("dstar_nosp",   f"{s} {D}**"),
+            ("paren_open",   f"{s} ({D}"),
+            ("dot",          f"{s} {D}."),
+        ]
+
+        for class_name, base in sd_bases:
+            for cp_pos, _cp_note in self._meaningful_cps(base):
+                tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
+                full = f"{base} {rs}".strip() if rs else base
+                results.append(InfixQuery(
+                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group="SD", struct=f"{D}_{class_name}_{tag}",
+                    insert_val=D, insert_type="research_digit",
+                    orientation="N", cp=cp_pos, cp_note=f"SD_{class_name}_{tag}",
+                    agents=ALL_AGENTS_RESEARCH,
+                    is_new_research=True,
+                ))
+
+    def _build_research_SDL(
+        self, left_block: str, right_block: str, L: str, D: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+    ):
+        """
+        SDL структуры — суффикс {буква}{цифра}, 5 cp × 2 базы (plain + wcR).
+        Зеркало suffix-research SDL.
+        """
+        s = left_block
+        rs = right_block
+
+        # База 1: plain
+        base = f"{s} {L} {D}"
+        after_seed = len(s)
+        after_letter = len(s) + 1 + 1
+        after_letter_space = after_letter + 1
+        end = len(base)
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_seed, f"cp{after_seed}"),
+            (after_letter, f"cp{after_letter}"),
+            (after_letter_space, f"cp{after_letter_space}"),
+            (end, f"cp{end}"),
+        ]:
+            full = f"{base} {rs}".strip() if rs else base
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL", struct=f"{D}_{L}_plain_{tag}",
+                insert_val=f"{L}_{D}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_plain_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+        # База 2: wcR
+        base_wc = f"{s} {L} {D} *"
+        end_wc = len(base_wc)
+        before_wc = len(base) + 1
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_letter, f"cp{after_letter}"),
+            (after_letter_space, f"cp{after_letter_space}"),
+            (before_wc, f"cp{before_wc}"),
+            (end_wc, f"cp{end_wc}"),
+        ]:
+            full = f"{base_wc} {rs}".strip() if rs else base_wc
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL", struct=f"{D}_{L}_wcR_{tag}",
+                insert_val=f"{L}_{D}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_wcR_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+    def _build_research_SDL_REV(
+        self, left_block: str, right_block: str, D: str, L: str,
+        results: List[InfixQuery], gap_n: int, w1_val: str, w2_val: str,
+    ):
+        """
+        SDL_REV структуры — суффикс {цифра}{буква}, паразитный суффикс (идея Gemini).
+        5 cp × 2 базы. Зеркало suffix-research SDL_REV — единственная реально
+        работающая research-структура в суффиксе по отчёту (закрыла ~99% эксклюзивов).
+        """
+        s = left_block
+        rs = right_block
+
+        # База 1: plain
+        base = f"{s} {D} {L}"
+        after_seed = len(s)
+        after_digit = len(s) + 1 + 1
+        after_digit_space = after_digit + 1
+        end = len(base)
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_seed, f"cp{after_seed}"),
+            (after_digit, f"cp{after_digit}"),
+            (after_digit_space, f"cp{after_digit_space}"),
+            (end, f"cp{end}"),
+        ]:
+            full = f"{base} {rs}".strip() if rs else base
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL_REV", struct=f"{D}_{L}_rev_plain_{tag}",
+                insert_val=f"{D}_{L}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_REV_plain_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+        # База 2: wcR
+        base_wc = f"{s} {D} {L} *"
+        end_wc = len(base_wc)
+        before_wc = len(base) + 1
+
+        for cp, tag in [
+            (-1, "nocp"),
+            (after_digit, f"cp{after_digit}"),
+            (after_digit_space, f"cp{after_digit_space}"),
+            (before_wc, f"cp{before_wc}"),
+            (end_wc, f"cp{end_wc}"),
+        ]:
+            full = f"{base_wc} {rs}".strip() if rs else base_wc
+            results.append(InfixQuery(
+                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                group="SDL_REV", struct=f"{D}_{L}_rev_wcR_{tag}",
+                insert_val=f"{D}_{L}", insert_type="research_digit_letter",
+                orientation="N", cp=cp, cp_note=f"SDL_REV_wcR_{tag}",
+                agents=ALL_AGENTS_RESEARCH, letter=L,
+                is_new_research=True,
+            ))
+
+    def _append_battle_addon(self, seed: str, results: List[InfixQuery]):
+        """
+        Минимальная research-добавка к боевой матрице (FINAL v3).
+
+        Источник: GAP-анализ 8 сидов (300 GAP'ов). Cost-weighted greedy set cover
+        на (struct × agent × letter) с дедупликацией дублей между структурами.
+
+        Результат: 14 уникальных unit'ов, 95 запросов на anchor-пару,
+        покрывает 77/77 GAP'ов (chrome+firefox, без safari).
+
+        SD-структуры (6 типов, все chrome кроме wcL_nosp2):
+          - paren_open  chrome  `{s} ({D}`     +53 GAP'ов (главный универсал)
+          - wcR_nosp    chrome  `{s} {D}*`     +1 эксклюзив
+          - dwcL        chrome  `** {s} {D}`   +1 эксклюзив
+          - hyp_wc      chrome  `{s}-{D} *`    +1 эксклюзив
+          - wcL_nosp1   chrome  `{s}* {D}`     +1 эксклюзив
+          - wcL_nosp2   firefox `{s} *{D}`     +1 эксклюзив
+
+        SDL (2 буквы из 30 — только с, ц дали эксклюзивы):
+          - с, ц        chrome  `{s} {D}{L}`   +3 GAP'а суммарно
+
+        SDL_REV (1 буква — только е дала эксклюзивы):
+          - е           chrome  `{D}{L} {s}`   +2 GAP'а
+
+        E_LAT (5 букв из 26 — только a,m,o,p,s дали эксклюзивы):
+          - a,m,o,p,s   chrome  `{s} {L} *`    +14 GAP'ов
+
+        Итого: 6×10 + 2×10 + 1×10 + 5×1 = 95 запросов на anchor-пару.
+        Это абсолютный минимум при котором нет потерь — каждый unit
+        имеет хотя бы 1 эксклюзивный GAP на 8 сидах анализа.
+
+        Цифры: полный перебор 0-9 (каждая имеет эксклюзив на каком-то сиде).
+        """
+        tokens, anchor_indices = self._research_anchors(seed)
+        if len(anchor_indices) < 2:
+            return
+
+        CHR = ("chrome",)
+        FF  = ("firefox",)
+
+        # Буквы доказавшие эксклюзивы по 8 сидам + проверка на айфон 16
+        SDL_LETTERS     = list("сц")        # 2 буквы
+        SDL_REV_LETTERS = list("е")         # 1 буква
+        ELAT_LETTERS    = list("ampsobre")  # 8 букв (добавлены b, r — olx/shop by/re store)
+
+        for gap_n, (i_left, i_right) in enumerate(
+            zip(anchor_indices[:-1], anchor_indices[1:])
+        ):
+            left_block  = " ".join(tokens[:i_left + 1])
+            right_block = " ".join(tokens[i_left + 1:])
+            w1_val = tokens[i_left]
+            w2_val = tokens[i_right]
+            s  = left_block
+            rs = right_block
+
+            def _full(base: str) -> str:
+                return f"{base} {rs}".strip() if rs else base
+
+            def emit(group, struct, base, cp, cp_note, agents,
+                     insert_val, insert_type, letter=None, skip_rs=False):
+                results.append(InfixQuery(
+                    query=base if skip_rs else _full(base),
+                    gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group=group, struct=struct,
+                    insert_val=insert_val, insert_type=insert_type,
+                    orientation="N", cp=cp, cp_note=cp_note,
+                    agents=agents, letter=letter,
+                    is_new_research=True,
+                ))
+
+            # ── SD: 6 структур × 10 цифр ──────────────────────────────
+            for D in DIGITS_SD:
+                # 1. paren_open chrome — главный универсал (+53 GAP'ов)
+                base = f"{s} ({D}"
+                emit("SD", f"{D}_paren_open", base, len(base),
+                     "SD_paren_open_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 2. wcR_nosp chrome (+1 эксклюзив)
+                base = f"{s} {D}*"
+                emit("SD", f"{D}_wcR_nosp", base, len(base),
+                     "SD_wcR_nosp_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 3. dwcL chrome (+1 эксклюзив)
+                base = f"** {s} {D}"
+                emit("SD", f"{D}_dwcL", base, len(base),
+                     "SD_dwcL_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 4. hyp_wc chrome (+1 эксклюзив)
+                base = f"{s}-{D} *"
+                emit("SD", f"{D}_hyp_wc", base, len(base),
+                     "SD_hyp_wc_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 5. wcL_nosp1 chrome (+1 эксклюзив)
+                base = f"{s}* {D}"
+                emit("SD", f"{D}_wcL_nosp1", base, len(base),
+                     "SD_wcL_nosp1_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 6. wcL_nosp2 firefox (+1 эксклюзив)
+                base = f"{s} *{D}"
+                emit("SD", f"{D}_wcL_nosp2", base, len(base),
+                     "SD_wcL_nosp2_end", FF, D, "research_digit", skip_rs=True)
+
+                # 7. plain_nosp chrome — `{s}{D}` (без пробела, даёт N-значные числа)
+                base = f"{s}{D}"
+                emit("SD", f"{D}_plain_nosp", base, len(base),
+                     "SD_plain_nosp_end", CHR, D, "research_digit", skip_rs=True)
+
+                # 8. dwcM firefox — `{s} ** {D}` (даёт 512, длинные числовые хвосты)
+                base = f"{s} ** {D}"
+                emit("SD", f"{D}_dwcM", base, len(base),
+                     "SD_dwcM_end", FF, D, "research_digit", skip_rs=True)
+
+            # ── SDL: 2 буквы × 10 цифр chrome ─────────────────────────
+            for D in DIGITS_SD:
+                for L in SDL_LETTERS:
+                    base = f"{s} {D}{L}"
+                    emit("SDL", f"{D}_{L}_plain", base, len(base),
+                         "SDL_plain_end", CHR, D, "research_digit", letter=L, skip_rs=True)
+                    cp_after_D = len(s) + 1 + len(str(D))
+                    emit("SDL", f"{D}_{L}_plain_cpD", base, cp_after_D,
+                         "SDL_plain_afterD", CHR, D, "research_digit", letter=L, skip_rs=True)
+                    base_wc = f"{s} {D}{L}*"
+                    emit("SDL", f"{D}_{L}_wcR", base_wc, len(base_wc),
+                         "SDL_wcR_end", CHR, D, "research_digit", letter=L, skip_rs=True)
+
+            # ── SDL_REV: 1 буква × 10 цифр chrome ─────────────────────
+            for D in DIGITS_SD:
+                for L in SDL_REV_LETTERS:
+                    base = f"{D}{L} {s}"
+                    emit("SDL_REV", f"{D}_{L}_rev", base, len(base),
+                         "SDL_REV_end", CHR, D, "research_digit", letter=L, skip_rs=True)
+
+            # ── E_LAT: 8 букв chrome, 3 структуры ─────────────────────
+            for L in ELAT_LETTERS:
+                base = f"{s} {L} *"
+                cp_AL = len(s) + 1 + len(L) + 1
+                emit("E_LAT", f"{L}_Lwc_cpAL", base, cp_AL,
+                     "E_LAT_Lwc_cpAL", CHR, L, "research_letter", letter=L, skip_rs=True)
+                base_plain = f"{s} {L}"
+                emit("E_LAT", f"{L}_plain", base_plain, len(base_plain),
+                     "E_LAT_plain", CHR, L, "research_letter", letter=L, skip_rs=True)
+                base_hyp = f"{s}-{L} *"
+                emit("E_LAT", f"{L}_hyp_wcL", base_hyp, len(s) + 1 + 1 + len(L) + 1,
+                     "E_LAT_hyp_wcL", CHR, L, "research_letter", letter=L, skip_rs=True)
+
+    def _append_research_block(self, seed: str, results: List[InfixQuery]):
+        """
+        Главная точка входа research-блока. Прогоняет E_LAT + SD + SDL + SDL_REV
+        для каждой пары соседних anchor-токенов.
+
+        Anchor-логика:
+          - tokens строятся через _research_anchors (без geo-strip, T/Q/geo не skip'ают)
+          - для каждой пары anchor[i]/anchor[i+1]:
+              left_block  = " ".join(tokens[:anchor[i]+1])  — всё включая левый anchor
+              right_block = " ".join(tokens[anchor[i]+1:])  — всё после левого anchor
+              pattern вставляется между ними: `{left} {pattern} {right}`
+
+        Если anchor'ов меньше двух — research пустой (нечего исследовать).
+        """
+        tokens, anchor_indices = self._research_anchors(seed)
+        if len(anchor_indices) < 2:
+            return
+
+        for gap_n, (i_left, i_right) in enumerate(
+            zip(anchor_indices[:-1], anchor_indices[1:])
+        ):
+            left_block = " ".join(tokens[:i_left + 1])
+            right_block = " ".join(tokens[i_left + 1:])
+
+            w1_val = tokens[i_left]
+            w2_val = tokens[i_right]
+
+            # E_LAT — Latin Letter Sweep, Chrome only
+            for L in LETTERS_LAT:
+                self._build_research_letter_structures(
+                    left_block, right_block, L,
+                    results, gap_n, w1_val, w2_val,
+                    struct_type="E_LAT", agents=("chrome",),
+                )
+
+            # SD — Цифровой перебор, 3 агента
+            for D in DIGITS_SD:
+                self._build_research_SD(
+                    left_block, right_block, D,
+                    results, gap_n, w1_val, w2_val,
+                )
+
+            # SDL — Суффикс {буква}{цифра}, 3 агента
+            for D in DIGITS_SD:
+                for L in LETTERS_RU_FULL:
+                    self._build_research_SDL(
+                        left_block, right_block, L, D,
+                        results, gap_n, w1_val, w2_val,
+                    )
+
+            # SDL_REV — Суффикс {цифра}{буква}, 3 агента
+            for D in DIGITS_SD:
+                for L in LETTERS_RU_FULL:
+                    self._build_research_SDL_REV(
+                        left_block, right_block, D, L,
+                        results, gap_n, w1_val, w2_val,
+                    )
+
+    def summary(self, queries: List[InfixQuery]) -> dict:
+        by_group = {}
+        for g in ALL_GROUPS:
+            gq = [q for q in queries if q.group == g]
+            by_group[g] = {
+                "total": len(gq),
+                "chrome": sum(1 for q in gq if "chrome" in q.agents),
+                "firefox": sum(1 for q in gq if "firefox" in q.agents),
             }
-
-        exclusive_kw = {kw: structs[0] for kw, structs in kw_map.items() if len(structs) == 1}
-
-        return InfixParseResult(
-            seed=seed, country=country, language=language,
-            groups_used=list(set(e.group for e in trace_entries)),
-            all_keywords=kw_map, alt_seed_keywords=alt_seed_set,
-            exclusive_keywords=exclusive_kw,
-            total_queries=len(matrix),
-            with_results=sum(1 for e in trace_entries if e.status == "ok"),
-            empty_queries=sum(1 for e in trace_entries if e.status == "empty"),
-            error_queries=sum(1 for e in trace_entries if e.status == "error"),
-            blocked_queries=sum(1 for e in trace_entries if e.status.startswith("blocked_")),
-            timeout_queries=sum(1 for e in trace_entries if e.status == "timeout"),
-            status_counts=dict(Counter(e.status for e in trace_entries)),
-            total_keywords=len(kw_map), exclusive_count=len(exclusive_kw),
-            total_time_ms=round(total_time, 1),
-            trace=[asdict(e) for e in trace_entries],
-            summary_by_gap=summary_by_gap, summary_by_group=summary_by_group,
-            timestamp=timestamp,
-        )
-
-
-# ══════════════════════════════════════════════
-# LOCAL TEST MODE
-# ══════════════════════════════════════════════
-
-async def _local_run(seed, groups, country, language, output_file=None):
-    print(f"\n{'='*60}")
-    print(f"  Infix Parser v2.0 — LOCAL TEST")
-    print(f"  Seed:    {seed}")
-    print(f"  Groups:  {groups or 'ALL'}")
-    print(f"  Delay:   {DELAY}s | Batch: {BATCH_SIZE}")
-    print(f"{'='*60}\n")
-
-    parser = InfixParser()
-    matrix = parser.generator.generate(seed=seed, groups=groups or ALL_GROUPS)
-    stats = parser.generator.summary(matrix)
-    print(f"  Матрица: {stats['total_queries']} запросов (было ~1367, -{round((1-stats['total_queries']/1367)*100)}%)")
-    for gi, gd in stats['by_gap'].items():
-        print(f"  gap[{gi}]: '{gd['w1']}' ↔ '{gd['w2']}' — {gd['total']} запросов")
-    est = stats['total_queries'] * DELAY / BATCH_SIZE
-    print(f"  Оценка: ~{est:.0f}s (~{est/60:.1f} мин)\n")
-
-    def make_progress():
-        async def cb(done, total, entry):
-            icon = "✅" if entry.status == "ok" else ("○" if entry.status == "empty" else "❌")
-            cnt = f"{entry.results_count} кл" if entry.status == "ok" else entry.status
-            print(f"  [{done:>4}/{total}] {icon} gap[{entry.gap_index}] {entry.group:<4} {entry.struct:<35} {entry.agent:<8} {cnt}")
-        return cb
-
-    result = await parser.parse(seed=seed, country=country, language=language,
-                                 groups=groups, progress_callback=make_progress())
-
-    print(f"\n{'='*60}")
-    print(f"  РЕЗУЛЬТАТЫ")
-    print(f"{'='*60}")
-    print(f"  Запросов:       {result.total_queries}")
-    print(f"  С результатом:  {result.with_results}")
-    print(f"  Уникальных кл.: {result.total_keywords}")
-    print(f"  Эксклюзивных:   {result.exclusive_count}")
-    print(f"  Время:          {result.total_time_ms:.0f}ms")
-    print(f"\n  По gap'ам:")
-    for gi, s in result.summary_by_gap.items():
-        pct = round(s['with_results']/max(s['total_queries'],1)*100)
-        print(f"    gap[{gi}] '{s['w1']}' ↔ '{s['w2']}': {s['with_results']}/{s['total_queries']} ({pct}%) | {s['unique_keywords']} кл | {s['exclusive']} эксклюз.")
-    print(f"\n  По группам:")
-    for g, s in result.summary_by_group.items():
-        pct = round(s['with_results']/max(s['total_queries'],1)*100)
-        print(f"    {g:<6} {s['with_results']:>4}/{s['total_queries']:<5} ({pct:>3}%) | {s['unique_keywords']:>5} кл | {s['exclusive']:>4} эксклюз.")
-
-    from datetime import datetime
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fn = output_file or f"infix_{seed.replace(' ','_')}_{ts}.json"
-    export = {
-        "meta": {"seed": result.seed, "country": result.country, "language": result.language,
-                 "groups": result.groups_used, "timestamp": result.timestamp,
-                 "total_time_ms": result.total_time_ms, "delay": DELAY, "batch_size": BATCH_SIZE},
-        "summary": {"total_queries": result.total_queries, "with_results": result.with_results,
-                    "empty": result.empty_queries, "errors": result.error_queries,
-                    "total_keywords": result.total_keywords, "exclusive_count": result.exclusive_count},
-        "summary_by_gap": result.summary_by_gap, "summary_by_group": result.summary_by_group,
-        "kw_map": result.all_keywords, "exclusive_keywords": result.exclusive_keywords,
-        "trace": result.trace,
-    }
-    with open(fn, "w", encoding="utf-8") as f:
-        json.dump(export, f, ensure_ascii=False, indent=2)
-    print(f"\n  💾 Сохранено: {fn}")
-    print(f"{'='*60}\n")
-
-
-if __name__ == "__main__":
-    cli = argparse.ArgumentParser(description="Infix Parser v2.0")
-    cli.add_argument("--seed",    default="ремонт пылесосов")
-    cli.add_argument("--groups",  default="all")
-    cli.add_argument("--country", default="ua")
-    cli.add_argument("--lang",    default="ru")
-    cli.add_argument("--out",     default=None)
-    args = cli.parse_args()
-    grp = None if args.groups == "all" else args.groups.split(",")
-    asyncio.run(_local_run(args.seed, grp, args.country, args.lang, args.out))
+        gaps = sorted(set(q.gap_index for q in queries))
+        by_gap = {}
+        for gi in gaps:
+            gq = [q for q in queries if q.gap_index == gi]
+            by_gap[gi] = {"total": len(gq), "w1": gq[0].w1, "w2": gq[0].w2}
+        return {
+            "total_queries": len(queries),
+            "chrome_queries": sum(1 for q in queries if "chrome" in q.agents),
+            "firefox_queries": sum(1 for q in queries if "firefox" in q.agents),
+            "gaps": len(gaps),
+            "by_group": by_group,
+            "by_gap": by_gap,
+        }
