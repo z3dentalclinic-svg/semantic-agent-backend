@@ -51,7 +51,7 @@ LETTERS_RU = list("абвгдеёжзийклмнопрстуфхцчшщэюя"
 QUESTIONS_RU = ["как", "какой", "где", "сколько", "почему"]
 
 # Группы для удобства итерации
-ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC"]
+ALL_GROUPS = ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "PA", "PC", "ADDON"]
 
 
 # ══════════════════════════════════════════════
@@ -76,6 +76,7 @@ class PrefixQuery:
     is_alpha: bool = False       # Входит в алфавитный перебор
     is_question: bool = False    # Вопросительный оператор
     letter: Optional[str] = None # Буква для PA группы
+    is_new_research: bool = False # ADDON-структура: маршрутизация через addon_sem
 
 
 # ══════════════════════════════════════════════
@@ -541,7 +542,74 @@ class PrefixGenerator:
         }
 
         filtered = [pq for pq in out if pq.struct not in PREFIX_SKIP]
+
+        # ── ADDON: цифровые research-структуры (PD/PDL) ──────────────────────
+        if "ADDON" in grp:
+            filtered.extend(self._make_addon_queries(S))
+
         return filtered
+
+    def _make_addon_queries(self, seed: str) -> List[PrefixQuery]:
+        """
+        ADDON: 8 structural types × 10 digits = 80 запросов на сид.
+        Покрывает 77/77 достижимых GAP-ключей по 5 датасетам.
+        """
+        DIGITS_ADDON = [str(i) for i in range(10)]
+        ADDON_STRUCTS = [
+            ("plain_trail", False, None),
+            ("wcL_nosp2",   False, None),
+            ("wcR_S2star",  False, None),
+            ("wcM_nosp1",   False, None),
+            ("col",         False, None),
+            ("plain",       True,  "е"),
+            ("wcR",         True,  "ч"),
+            ("plain",       True,  "р"),
+        ]
+        qs: List[PrefixQuery] = []
+        for struct_class, is_pdl, pdl_letter in ADDON_STRUCTS:
+            for D in DIGITS_ADDON:
+                if not is_pdl:
+                    if struct_class == "plain_trail":
+                        base = f"{D} {seed} "
+                    elif struct_class == "wcL_nosp2":
+                        base = f"*{D}{seed}"
+                    elif struct_class == "wcR_S2star":
+                        base = f"{D}{seed}*"
+                    elif struct_class == "wcM_nosp1":
+                        base = f"{D}* {seed}"
+                    elif struct_class == "col":
+                        base = f"{D}: {seed}"
+                    else:
+                        continue
+                    cp = len(base)
+                    qs.append(PrefixQuery(
+                        query=base, group="ADDON",
+                        struct=f"PD_{struct_class}_{D}",
+                        cp=cp, cp_note="addon_end",
+                        operator=D, op_type="digit",
+                        agents=("chrome",),
+                        is_alpha=False, is_question=False,
+                        letter=D, is_new_research=True,
+                    ))
+                else:
+                    L = pdl_letter
+                    if struct_class == "plain":
+                        base = f"{D}{L} {seed}"
+                    elif struct_class == "wcR":
+                        base = f"{D}{L} {seed} *"
+                    else:
+                        continue
+                    cp = len(base)
+                    qs.append(PrefixQuery(
+                        query=base, group="ADDON",
+                        struct=f"PDL_{L}_{struct_class}_{D}",
+                        cp=cp, cp_note="addon_end",
+                        operator=f"{D}{L}", op_type="digit_letter",
+                        agents=("chrome",),
+                        is_alpha=False, is_question=False,
+                        letter=L, is_new_research=True,
+                    ))
+        return qs
 
     def summary(self, queries: List[PrefixQuery]) -> dict:
         """Stats for tracer — mirrors suffix_generator.summary()"""
