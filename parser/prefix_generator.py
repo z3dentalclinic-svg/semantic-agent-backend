@@ -571,21 +571,25 @@ class PrefixGenerator:
                 if not is_pdl:
                     if struct_class == "plain_trail":
                         base = f"{D} {seed} "
+                        cp = 1      # cp=1 (после цифры) — research: топ cp=1 (65/130 попаданий)
                     elif struct_class == "wcL_nosp2":
                         base = f"* {D}{seed}"
+                        cp = -1     # cp=-1 (nocp) — research: топ cp=-1 (4/13 попаданий)
                     elif struct_class == "wcR_S2star":
                         base = f"{D}{seed}*"
+                        cp = 1      # cp=1 — research: топ cp=1 (61/94 попаданий)
                     elif struct_class == "wcM_nosp1":
                         base = f"{D}* {seed}"
+                        cp = 1      # cp=1 — research: топ cp=1 (62/92 попаданий)
                     elif struct_class == "col":
                         base = f"{D}: {seed}"
+                        cp = 1      # cp=1 — research: топ cp=1 (67/132 попаданий)
                     else:
                         continue
-                    cp = len(base)
                     qs.append(PrefixQuery(
                         query=base, group="ADDON",
                         struct=f"PD_{struct_class}_{D}",
-                        cp=cp, cp_note="addon_end",
+                        cp=cp, cp_note=f"cp{cp}_research_verified",
                         operator=D, op_type="digit",
                         agents=("chrome",),
                         is_alpha=False, is_question=False,
@@ -595,16 +599,19 @@ class PrefixGenerator:
                     L = pdl_letter
                     if struct_class == "plain":
                         base = f"{D} {L} {seed}"
+                        cp = 3      # cp=3 (после буквы: D+" "+L = 3 символа)
+                                    # research: е_plain топ cp=0,1,4; р_plain топ cp=3
+                                    # cp=3 = после буквы, перед пробелом перед сидом
                     elif struct_class == "wcR":
                         base = f"{D} {L} {seed} *"
+                        cp = 3      # cp=3 — research: ч_wcR топ cp=3 (1/1 попадание)
                     else:
                         continue
-                    cp = len(base)
                     qs.append(PrefixQuery(
                         query=base, group="ADDON",
                         struct=f"PDL_{L}_{struct_class}_{D}",
-                        cp=cp, cp_note="addon_end",
-                        operator=f"{D}{L}", op_type="digit_letter",
+                        cp=cp, cp_note=f"cp{cp}_research_verified",
+                        operator=f"{D}_{L}", op_type="digit_letter",
                         agents=("chrome",),
                         is_alpha=False, is_question=False,
                         letter=L, is_new_research=True,
