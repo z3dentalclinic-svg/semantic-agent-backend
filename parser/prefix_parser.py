@@ -469,10 +469,13 @@ class PrefixParser:
         pa_ff_by_letter:  Dict[str, List[PrefixQuery]] = {}
         nonpa_chr: List[PrefixQuery] = []
         nonpa_ff:  List[PrefixQuery] = []
+        addon_chr: List[PrefixQuery] = []
 
         for pq in matrix:
             is_ff = "firefox" in pq.agents and "chrome" not in pq.agents
-            if pq.group == "PA" and pq.letter:
+            if getattr(pq, 'is_new_research', False):
+                addon_chr.append(pq)
+            elif pq.group == "PA" and pq.letter:
                 if is_ff:
                     pa_ff_by_letter.setdefault(pq.letter, []).append(pq)
                 else:
@@ -484,6 +487,11 @@ class PrefixParser:
                     nonpa_chr.append(pq)
 
         nonpa_sem = asyncio.Semaphore(BATCH_SIZE)
+        addon_sem = asyncio.Semaphore(BATCH_SIZE * 3)
+
+        async def run_addon(pq: PrefixQuery, client: httpx.AsyncClient):
+            async with addon_sem:
+                await fetch_one(pq, "chrome", client)
 
         async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
                    httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
@@ -496,6 +504,8 @@ class PrefixParser:
                 # PA FF — аналогично
                 *[run_letter(qs, "firefox", ff_client)
                   for qs in pa_ff_by_letter.values()],
+                # ADDON — через addon_sem на chrome IP
+                *[run_addon(pq, chr_client) for pq in addon_chr],
                 # Non-PA Chrome (G+PC) — через semaphore на отдельном IP
                 *[run_nonpa(pq, "chrome", npa_client, nonpa_sem)
                   for pq in nonpa_chr],
