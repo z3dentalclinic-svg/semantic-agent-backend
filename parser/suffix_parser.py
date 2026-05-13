@@ -448,8 +448,11 @@ class SuffixParser:
 
         blocked_queries = [q for q in all_queries if q.priority == 0]
 
-        # Step 3: Separate E from other types
+        # Step 3: Separate E / addon / other types
         e_queries_by_letter: Dict[str, List] = {}
+        addon_sd_queries: List = []                  # SD addon — 4 типа × 10 цифр
+        addon_sdl_chr_by_letter: Dict[str, List] = {}  # SDL addon chrome — 26 букв × 10 цифр
+        addon_sdl_ff_queries: List = []              # SDL addon firefox — буква 'в' × 10 цифр
         other_queries = []
         for q in queries_to_send:
             if q.suffix_type == "E":
@@ -457,6 +460,16 @@ class SuffixParser:
                 if letter not in e_queries_by_letter:
                     e_queries_by_letter[letter] = []
                 e_queries_by_letter[letter].append(q)
+            elif getattr(q, 'is_new_research', False) and q.suffix_type == "SD":
+                addon_sd_queries.append(q)
+            elif getattr(q, 'is_new_research', False) and q.suffix_type == "SDL":
+                if getattr(q, 'agents', None) == ("firefox",):
+                    addon_sdl_ff_queries.append(q)
+                else:
+                    letter = q.suffix_val.split('_')[1] if '_' in q.suffix_val else q.suffix_val
+                    if letter not in addon_sdl_chr_by_letter:
+                        addon_sdl_chr_by_letter[letter] = []
+                    addon_sdl_chr_by_letter[letter].append(q)
             else:
                 other_queries.append(q)
 
@@ -748,6 +761,53 @@ class SuffixParser:
                      for i, (L, qs) in enumerate(letters)]
             await asyncio.gather(*tasks)
 
+        # ── Addon SD/SDL: letter-parallel, аналог run_e_chr_parallel ─────────
+        async def run_addon_letter(letter: str, queries: list, client: httpx.AsyncClient):
+            """Один SDL addon трек — 10 цифр последовательно с 0.3s delay.
+            Startup jitter стаггирует старт букв (как E-треки).
+            """
+            await asyncio.sleep(random.uniform(0, 1.0))  # startup jitter
+            for sq in queries:
+                await asyncio.sleep(0.3)
+                await fetch_one_tracked(sq, client, force_client="chrome")
+
+        async def run_addon_sd_letter(struct_name: str, queries: list, client: httpx.AsyncClient):
+            """Один SD addon трек — 10 цифр последовательно с 0.3s delay."""
+            await asyncio.sleep(random.uniform(0, 0.5))  # startup jitter
+            for sq in queries:
+                await asyncio.sleep(0.3)
+                await fetch_one_tracked(sq, client, force_client="chrome")
+
+        async def run_addon_chr_parallel(clients: list):
+            """Addon Chrome: SDL буквы + SD типы параллельно, round-robin по IP.
+            SDL: 26 букв / 3 IP = ~9 букв/IP — как E-треки.
+            SD: 4 типа / 3 IP = ~1-2 типа/IP.
+            """
+            tasks = []
+            # SDL буквы — каждая буква отдельный трек
+            sdl_letters = list(addon_sdl_chr_by_letter.items())
+            for i, (L, qs) in enumerate(sdl_letters):
+                tasks.append(run_addon_letter(L, qs, clients[i % len(clients)]))
+            # SD типы — группируем по variant (4 типа)
+            sd_by_struct: Dict[str, list] = {}
+            for sq in addon_sd_queries:
+                v = sq.variant or 'other'
+                if v not in sd_by_struct:
+                    sd_by_struct[v] = []
+                sd_by_struct[v].append(sq)
+            for i, (struct_name, qs) in enumerate(sd_by_struct.items()):
+                tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)]))
+            await asyncio.gather(*tasks)
+
+        async def run_addon_ff(clients: list):
+            """Addon Firefox: буква 'в' × 10 цифр — один трек."""
+            if not addon_sdl_ff_queries:
+                return
+            await asyncio.sleep(random.uniform(0, 0.5))
+            for sq in addon_sdl_ff_queries:
+                await asyncio.sleep(0.3)
+                await fetch_one_tracked(sq, clients[0], force_client="firefox")
+
         # ── E_simple Chrome ───────────────────────────────────────────────
         async def run_e_simple_chrome(clients: list, sems: list):
             """Chrome E_simple: буквы + цифры 0-9 параллельно через shared sems.
@@ -785,6 +845,9 @@ class SuffixParser:
             """Chrome A/B/C/D — round-robin по 3 IP, Semaphore(5) каждый."""
             if sq.suffix_label in CHROME_BCD_SKIP:
                 return
+            # Пропускаем если запрос явно не для Chrome (addon-маршрутизация)
+            if hasattr(sq, 'agents') and sq.agents and 'chrome' not in sq.agents:
+                return
             slot = idx % 3
             async with chr_sems[slot]:
                 await asyncio.sleep(0.15)
@@ -794,29 +857,34 @@ class SuffixParser:
             """Firefox A/B/C/D — round-robin по 2 IP, Semaphore(5) каждый."""
             if sq.suffix_label in FF_BCD_SKIP_VARIANTS:
                 return
+            # Пропускаем если запрос явно не для Firefox (addon-маршрутизация)
+            if hasattr(sq, 'agents') and sq.agents and 'firefox' not in sq.agents:
+                return
             slot = idx % 2
             async with ff_sems[slot]:
                 await asyncio.sleep(0.15)
                 await fetch_one_tracked(sq, clients[slot], force_client="firefox")
 
         async def run_chrome(clients: list, sems: list):
-            """Chrome agent: ABCD + E_simple + E structured — все параллельно.
+            """Chrome agent: ABCD + E_simple + E structured + Addon — все параллельно.
             ABCD: Semaphore(5)/клиент (безопасно).
             E_simple: jitter, без semaphore.
             E structured: startup jitter + sequential 0.3с внутри трека, без semaphore.
-            Chrome E стартует вместе с ABCD — нет зависимости от E_simple (нет novelty threshold).
+            Addon SD/SDL: letter-parallel аналог E — 26 букв × 10 цифр параллельно.
             """
             tasks = [fetch_chr_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
             tasks.append(run_e_simple_chrome(clients, sems))
             tasks.append(run_e_chr_parallel(clients))
+            tasks.append(run_addon_chr_parallel(clients))
             await asyncio.gather(*tasks)
 
         async def run_firefox(clients: list, sems: list):
-            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist).
-            Один Semaphore(5) на клиент shared между всеми операциями.
+            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist) + Addon FF.
+            Addon FF: буква 'в' × 10 цифр — параллельно с ABCD.
             """
             phase1 = [fetch_ff_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
             phase1.append(run_e_simple(clients, sems))
+            phase1.append(run_addon_ff(clients))
             await asyncio.gather(*phase1)
             try:
                 await run_e_chrome_with_novelty(clients[0])
@@ -1028,214 +1096,3 @@ class SuffixParser:
             summary_by_type=summary_by_type,
             summary_by_suffix=summary_by_suffix,
         )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ЗАКОММЕНТИРОВАННЫЙ RESEARCH-БЛОК (parser)
-# ═══════════════════════════════════════════════════════════════════════════════
-# Ниже сохранены добавки из сессии 2026-05-06 для запуска research через
-# pool из всех IP с тремя агентами (chrome+firefox+safari).
-#
-# Чтобы восстановить:
-#  1. Раскомментировать UA_BY_CLIENT (заменить логику UA в fetch_suggestions)
-#  2. В parse() добавить разделение research_queries из queries_to_send
-#  3. Добавить research-pool секцию в parse() (создание httpx-клиентов на каждый IP)
-#  4. Добавить run_research_all() в asyncio.gather в основном async with блоке
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# --- 1. UA_BY_CLIENT (для подмены UA по google_client) ---
-# UA_BY_CLIENT = {
-#     "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-#     "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-#     "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-# }
-
-# --- 2. fetch_suggestions: заменить выбор UA на ---
-# ua = UA_BY_CLIENT.get(google_client)
-# if ua is None:
-#     if 'chrome' in google_client:
-#         ua = random.choice(USER_AGENTS_CHROME)
-#     else:
-#         ua = random.choice(USER_AGENTS_FF)
-# headers = {'User-Agent': ua}
-
-# --- 3. RESEARCH POOL логика в parse() ---
-#         # ═══════════════════════════════════════════════════════════════════
-#         # RESEARCH POOL — для SD/SDL запросов (is_new_research=True)
-#         # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
-#         # распределяем research-запросы round-robin между клиентами.
-#         # Каждый research-запрос идёт на 3 агентах (chrome+firefox+safari)
-#         # — три запроса через ОДИН и тот же IP (последовательно).
-#         # ═══════════════════════════════════════════════════════════════════
-#         research_clients: List[httpx.AsyncClient] = []
-#         if ProxyPool and research_queries:
-#             try:
-#                 _research_proxies = ProxyPool.get_all_proxies()
-#             except Exception:
-#                 _research_proxies = []
-#             if _research_proxies:
-#                 for proxy_url in _research_proxies:
-#                     research_clients.append(httpx.AsyncClient(proxy=proxy_url))
-#                 logger.info(
-#                     f"[Suffix Research] Pool: {len(research_clients)} httpx-клиентов "
-#                     f"для {len(research_queries)} запросов × 3 агента "
-#                     f"= {len(research_queries) * 3} реальных запросов "
-#                     f"(~{(len(research_queries) * 3) // max(len(research_clients), 1)} запросов на IP)"
-#                 )
-#
-#         # Семафор для research — ограничивает параллелизм по всему пулу
-#         research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
-#
-#         async def run_research_one(sq: "SuffixQuery", agent: str, idx: int):
-#             """
-#             Один research-запрос на одном из IP пула (round-robin по индексу).
-#             agent — chrome/firefox/safari.
-#             """
-#             if not research_clients:
-#                 return
-#             client = research_clients[idx % len(research_clients)]
-#             async with research_sem:
-#                 t0 = time.time()
-#                 cp = sq.cp_override if sq.cp_override is not None else len(sq.query)
-#                 try:
-#                     results = await self.fetch_suggestions(
-#                         query=sq.query, country=country, language=language,
-#                         client=client, google_client=agent,
-#                         cursor_position=cp, uule=_uule,
-#                     )
-#                     elapsed_ms = (time.time() - t0) * 1000
-#                     # Вешаем агента на label чтобы потом разделить в trace
-#                     sq_tagged = SuffixQuery(
-#                         query=sq.query, suffix_val=sq.suffix_val,
-#                         suffix_label=f"{sq.suffix_label}__{agent}",
-#                         suffix_type=sq.suffix_type, priority=sq.priority,
-#                         markers=list(sq.markers) + [agent],
-#                         cp_override=sq.cp_override, variant=sq.variant,
-#                         is_new_research=True, agents=(agent,),
-#                     )
-#                     _record_results(sq_tagged, results, elapsed_ms)
-#                 except Exception as e:
-#                     elapsed_ms = (time.time() - t0) * 1000
-#                     trace_entries.append(SuffixTraceEntry(
-#                         suffix_val=sq.suffix_val,
-#                         suffix_label=f"{sq.suffix_label}__{agent}",
-#                         suffix_type=sq.suffix_type, priority=sq.priority,
-#                         query_sent=sq.query,
-#                         time_ms=round(elapsed_ms, 1),
-#                         status="error", error=str(e),
-#                     ))
-#
-#         async def run_research_all():
-#             """Запускает все research-запросы × 3 агента параллельно через research_pool."""
-#             if not research_clients:
-#                 return
-#             tasks = []
-#             for i, sq in enumerate(research_queries):
-#                 # Каждый запрос идёт на 3 агентах через тот же IP (по индексу запроса).
-#                 # Параллельно по агентам в пределах одного запроса.
-#                 for agent in sq.agents:  # ("chrome", "firefox", "safari")
-#                     tasks.append(run_research_one(sq, agent, i))
-#             await asyncio.gather(*tasks)
-
-# --- 4. run_e_lat_chrome для Latin Sweep ---
-#         # ═══════════════════════════════════════════════════════════════════
-#         # RESEARCH POOL — для SD/SDL запросов (is_new_research=True)
-#         # Берём ВСЕ IP пула, создаём по httpx-клиенту на каждый IP,
-#         # распределяем research-запросы round-robin между клиентами.
-#         # Каждый research-запрос идёт на 3 агентах (chrome+firefox+safari)
-#         # — три запроса через ОДИН и тот же IP (последовательно).
-#         # ═══════════════════════════════════════════════════════════════════
-#         research_clients: List[httpx.AsyncClient] = []
-#         if ProxyPool and research_queries:
-#             try:
-#                 _research_proxies = ProxyPool.get_all_proxies()
-#             except Exception:
-#                 _research_proxies = []
-#             if _research_proxies:
-#                 for proxy_url in _research_proxies:
-#                     research_clients.append(httpx.AsyncClient(proxy=proxy_url))
-#                 logger.info(
-#                     f"[Suffix Research] Pool: {len(research_clients)} httpx-клиентов "
-#                     f"для {len(research_queries)} запросов × 3 агента "
-#                     f"= {len(research_queries) * 3} реальных запросов "
-#                     f"(~{(len(research_queries) * 3) // max(len(research_clients), 1)} запросов на IP)"
-#                 )
-#
-#         # Семафор для research — ограничивает параллелизм по всему пулу
-#         research_sem = asyncio.Semaphore(max(5, len(research_clients) // 2)) if research_clients else None
-#
-#         async def run_research_one(sq: "SuffixQuery", agent: str, idx: int):
-#             """
-#             Один research-запрос на одном из IP пула (round-robin по индексу).
-#             agent — chrome/firefox/safari.
-#             """
-#             if not research_clients:
-#                 return
-#             client = research_clients[idx % len(research_clients)]
-#             async with research_sem:
-#                 t0 = time.time()
-#                 cp = sq.cp_override if sq.cp_override is not None else len(sq.query)
-#                 try:
-#                     results = await self.fetch_suggestions(
-#                         query=sq.query, country=country, language=language,
-#                         client=client, google_client=agent,
-#                         cursor_position=cp, uule=_uule,
-#                     )
-#                     elapsed_ms = (time.time() - t0) * 1000
-#                     # Вешаем агента на label чтобы потом разделить в trace
-#                     sq_tagged = SuffixQuery(
-#                         query=sq.query, suffix_val=sq.suffix_val,
-#                         suffix_label=f"{sq.suffix_label}__{agent}",
-#                         suffix_type=sq.suffix_type, priority=sq.priority,
-#                         markers=list(sq.markers) + [agent],
-#                         cp_override=sq.cp_override, variant=sq.variant,
-#                         is_new_research=True, agents=(agent,),
-#                     )
-#                     _record_results(sq_tagged, results, elapsed_ms)
-#                 except Exception as e:
-#                     elapsed_ms = (time.time() - t0) * 1000
-#                     trace_entries.append(SuffixTraceEntry(
-#                         suffix_val=sq.suffix_val,
-#                         suffix_label=f"{sq.suffix_label}__{agent}",
-#                         suffix_type=sq.suffix_type, priority=sq.priority,
-#                         query_sent=sq.query,
-#                         time_ms=round(elapsed_ms, 1),
-#                         status="error", error=str(e),
-#                     ))
-#
-#         async def run_research_all():
-#             """Запускает все research-запросы × 3 агента параллельно через research_pool."""
-#             if not research_clients:
-#                 return
-#             tasks = []
-#             for i, sq in enumerate(research_queries):
-#                 # Каждый запрос идёт на 3 агентах через тот же IP (по индексу запроса).
-#                 # Параллельно по агентам в пределах одного запроса.
-#                 for agent in sq.agents:  # ("chrome", "firefox", "safari")
-#                     tasks.append(run_research_one(sq, agent, i))
-#             await asyncio.gather(*tasks)
-#
-#         # ═══════════════════════════════════════════════════════════════════
-#         # E_LAT — Latin Letter Sweep (Chrome only). Идёт через обычный suffix-пул.
-#         # Зеркало run_e_chrome но для e_lat_queries_by_letter.
-#         # ═══════════════════════════════════════════════════════════════════
-#         async def run_e_lat_chrome(client: httpx.AsyncClient):
-#             """Latin Letter Sweep — 26 букв × 13 структур. Chrome only."""
-#             if not e_lat_queries_by_letter:
-#                 return
-#             tasks = []
-#             for letter, letter_qs in e_lat_queries_by_letter.items():
-#                 async def run_letter(qs):
-#                     for sq in qs:
-#                         await fetch_one_tracked(sq, client, force_client="chrome")
-#                 tasks.append(run_letter(letter_qs))
-#             await asyncio.gather(*tasks)
-
-# --- 5. В parse() Step 3 нужно разделить очереди ---
-# research_queries = [q for q in queries_to_send if q.is_new_research]
-# e_lat_queries_by_letter = {} (по аналогии с e_queries_by_letter)
-# other_queries исключают research и E_LAT
-
-# --- 6. В asyncio.gather добавить ---
-# run_research_all(),
-# run_e_lat_chrome(chr_c1),
-
