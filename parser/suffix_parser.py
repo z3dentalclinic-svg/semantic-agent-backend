@@ -872,25 +872,16 @@ class SuffixParser:
                 await fetch_one_tracked(sq, clients[slot], force_client="firefox")
 
         async def run_chrome(clients: list, sems: list):
-            """Chrome agent: ABCD + E_simple + E structured + Addon — все параллельно.
-            ABCD: Semaphore(5)/клиент (безопасно).
-            E_simple: jitter, без semaphore.
-            E structured: startup jitter + sequential 0.3с внутри трека, без semaphore.
-            Addon SD/SDL: letter-parallel аналог E — 26 букв × 10 цифр параллельно.
-            """
+            """Chrome agent: ABCD + E_simple + E structured — все параллельно."""
             tasks = [fetch_chr_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
             tasks.append(run_e_simple_chrome(clients, sems))
             tasks.append(run_e_chr_parallel(clients))
-            tasks.append(run_addon_chr_parallel(clients))
             await asyncio.gather(*tasks)
 
         async def run_firefox(clients: list, sems: list):
-            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist) + Addon FF.
-            Addon FF: буква 'в' × 10 цифр — параллельно с ABCD.
-            """
+            """Firefox agent: A/B/C/D + E_simple + E structured (allowlist)."""
             phase1 = [fetch_ff_abcd(sq, i, clients) for i, sq in enumerate(other_queries)]
             phase1.append(run_e_simple(clients, sems))
-            phase1.append(run_addon_ff(clients))
             await asyncio.gather(*phase1)
             try:
                 await run_e_chrome_with_novelty(clients[0])
@@ -982,12 +973,34 @@ class SuffixParser:
         proxy_chr1, proxy_chr2, proxy_chr3 = proxies[0], proxies[1], proxies[2]
         proxy_ff1,  proxy_ff2              = proxies[3], proxies[4]
 
+        # Addon-клиенты: берём свободные suffix IP (index 6-9) по всем батчам.
+        # 5 батчей × 4 IP = 20 IP под addon chrome и firefox.
+        # Не конкурируют с infix (0-2) и prefix (3-5).
+        # ~10 секунд на addon при 65 треках × 3s / 20 IP.
+        _N_ADDON_CLIENTS = 20
+        if ProxyPool:
+            _addon_chr_proxies = [ProxyPool.get("suffix_addon_chrome") for _ in range(_N_ADDON_CLIENTS)]
+            _addon_ff_proxies  = [ProxyPool.get("suffix_addon_firefox") for _ in range(_N_ADDON_CLIENTS)]
+        else:
+            _fb = os.getenv("GOOGLE_PROXY_URL") or None
+            _addon_chr_proxies = [_fb] * _N_ADDON_CLIENTS
+            _addon_ff_proxies  = [_fb] * _N_ADDON_CLIENTS
+
         async with httpx.AsyncClient(proxy=proxy_chr1) as chr_c1,                    httpx.AsyncClient(proxy=proxy_chr2) as chr_c2,                    httpx.AsyncClient(proxy=proxy_chr3) as chr_c3,                    httpx.AsyncClient(proxy=proxy_ff1)  as ff_c1,                     httpx.AsyncClient(proxy=proxy_ff2)  as ff_c2:
-            await asyncio.gather(
-                run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
-                # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
-                # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
-            )
+            # Addon-клиенты открываем здесь чтобы они жили всё время прогона
+            addon_chr_clients = [httpx.AsyncClient(proxy=p) for p in _addon_chr_proxies]
+            addon_ff_clients  = [httpx.AsyncClient(proxy=p) for p in _addon_ff_proxies]
+            try:
+                await asyncio.gather(
+                    run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
+                    run_addon_chr_parallel(addon_chr_clients),
+                    run_addon_ff(addon_ff_clients),
+                    # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
+                    # run_bing(bi_client),    # ОТКЛЮЧЕНО для лайт-серча
+                )
+            finally:
+                for c in addon_chr_clients + addon_ff_clients:
+                    await c.aclose()
 
         # Ротация батча после прогона
         if ProxyPool:
