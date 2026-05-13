@@ -414,15 +414,15 @@ class SuffixGenerator:
 
         # L6+: only symbols (A_ua + A_ru), v1 only
         if analysis.l_level == "L6+":
-            queries = []
+            results = []
             for stype in ["A_ua", "A_ru"]:
                 for s in self.suffixes.get(stype, []):
                     q = f"{seed_lower} {s['val']}".strip()
-                    queries.append(SuffixQuery(
+                    results.append(SuffixQuery(
                         query=q, suffix_val=s["val"], suffix_label=s["label"],
                         suffix_type=stype, priority=1, markers=[analysis.l_level]
                     ))
-            return analysis, queries
+            # Addon SD/SDL добавляется ниже — общий блок для всех уровней
 
         # Collect active markers for matrix lookup
         active_markers = []
@@ -464,7 +464,8 @@ class SuffixGenerator:
         # Генератор отдаёт все варианты — парсер сам выбирает нужные per-agent.
         BCD_SKIP_VARIANTS = set()
 
-        results = []
+        if analysis.l_level != "L6+":
+            results = []
 
         def expand_type_a(seed_lower, suffix_val, suffix_label, priority, markers, stype="A"):
             """
@@ -514,80 +515,77 @@ class SuffixGenerator:
         if not a_types:
             a_types = ["A_ua"]  # fallback
 
-        for stype in a_types:
-            priority = self._calc_priority("A", active_markers)
-            for s in self.suffixes.get(stype, []):
-                suffix_val = s["val"]
-                suffix_label = s["label"]
-                results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype))
+        if analysis.l_level != "L6+":
+            for stype in a_types:
+                priority = self._calc_priority("A", active_markers)
+                for s in self.suffixes.get(stype, []):
+                    suffix_val = s["val"]
+                    suffix_label = s["label"]
+                    results.extend(expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype))
 
-        # Process Types B, C, D
-        for stype in ["B", "C", "D"]:
-            suffix_list = self.suffixes.get(stype, [])
+        # Process Types B, C, D + числа + буквы — только для не-L6+ сидов
+        if analysis.l_level != "L6+":
+            for stype in ["B", "C", "D"]:
+                suffix_list = self.suffixes.get(stype, [])
 
-            # Calculate priority using min() rule
-            priority = self._calc_priority(stype, active_markers)
+                # Calculate priority using min() rule
+                priority = self._calc_priority(stype, active_markers)
 
-            for s in suffix_list:
-                suffix_val = s["val"]
-                suffix_label = s["label"]
+                for s in suffix_list:
+                    suffix_val = s["val"]
+                    suffix_label = s["label"]
 
-                # ── Self-Match Check ──
-                blocked = self._check_self_match(suffix_val, seed_words, seed_lemmas, analysis)
-                if blocked:
-                    results.append(SuffixQuery(
-                        query=f"{seed_lower} {suffix_val}".strip(),
-                        suffix_val=suffix_val,
-                        suffix_label=suffix_label,
-                        suffix_type=stype,
-                        priority=0,  # 0 = blocked
-                        markers=[m for m in active_markers],
-                        blocked_by=blocked,
-                    ))
-                    continue
+                    # ── Self-Match Check ──
+                    blocked = self._check_self_match(suffix_val, seed_words, seed_lemmas, analysis)
+                    if blocked:
+                        results.append(SuffixQuery(
+                            query=f"{seed_lower} {suffix_val}".strip(),
+                            suffix_val=suffix_val,
+                            suffix_label=suffix_label,
+                            suffix_type=stype,
+                            priority=0,  # 0 = blocked
+                            markers=[m for m in active_markers],
+                            blocked_by=blocked,
+                        ))
+                        continue
 
-                # All types: expand into cp variants, filter П0 skip variants
-                # suffix_label у variant = "{label}_{vname}" e.g. "prep_bez_v3"
-                expanded = expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype)
-                expanded = [q for q in expanded if q.suffix_label not in BCD_SKIP_VARIANTS]
-                results.extend(expanded)
+                    # All types: expand into cp variants, filter П0 skip variants
+                    # suffix_label у variant = "{label}_{vname}" e.g. "prep_bez_v3"
+                    expanded = expand_type_a(seed_lower, suffix_val, suffix_label, priority, active_markers, stype=stype)
+                    expanded = [q for q in expanded if q.suffix_label not in BCD_SKIP_VARIANTS]
+                    results.extend(expanded)
 
-                # Type B trailing space variant — "сид в " (без wildcard)
-                # Даёт кластер гео-расширений (районы, локации) которые "в *" не вытаскивает.
-                # Пример: "курсы английского киев в " → "в центре", "в оболони", "на троещине"
-                # Только для предлогов "в" и "на" — остальные предлоги не дают гео-кластер.
-                # Блокируем если последнее слово сида — T-маркер (цена, стоимость...):
-                # "ремонт телефонов цена в " — Google игнорирует, бессмысленный запрос.
-                last_word_is_t = analysis.words[-1] in T_ROOTS_RU if analysis.words else False
-                if stype == "B" and suffix_val in ("в *", "на *") and not last_word_is_t:
-                    prep = suffix_val.replace(" *", "")  # "в" или "на"
-                    trail_q = f"{seed_lower} {prep} "
-                    trail_cp = len(trail_q)
-                    results.append(SuffixQuery(
-                        query=trail_q,
-                        suffix_val=prep,
-                        suffix_label=f"prep_{prep}_trail",
-                        suffix_type="B",
-                        priority=priority,
-                        markers=list(active_markers),
-                        cp_override=trail_cp,
-                        variant="trail",
-                    ))
+                    # Type B trailing space variant — "сид в " (без wildcard)
+                    last_word_is_t = analysis.words[-1] in T_ROOTS_RU if analysis.words else False
+                    if stype == "B" and suffix_val in ("в *", "на *") and not last_word_is_t:
+                        prep = suffix_val.replace(" *", "")
+                        trail_q = f"{seed_lower} {prep} "
+                        trail_cp = len(trail_q)
+                        results.append(SuffixQuery(
+                            query=trail_q,
+                            suffix_val=prep,
+                            suffix_label=f"prep_{prep}_trail",
+                            suffix_type="B",
+                            priority=priority,
+                            markers=list(active_markers),
+                            cp_override=trail_cp,
+                            variant="trail",
+                        ))
 
-        # Numeric suffixes (always priority 1, part of type A)
-        if include_numbers:
-            for s in self.suffixes.get("A_num", []):
-                results.extend(expand_type_a(seed_lower, s["val"], s["label"], 1, active_markers))
+            # Numeric suffixes (always priority 1, part of type A)
+            if include_numbers:
+                for s in self.suffixes.get("A_num", []):
+                    results.extend(expand_type_a(seed_lower, s["val"], s["label"], 1, active_markers))
 
-        # Letter sweep (type E) — 21 structures × 10 letters
-        if include_letters:
-            for letter in LETTER_SWEEP_RU:
-                results.extend(self._build_letter_structures(seed_lower, letter))
+            # Letter sweep (type E) — 21 structures × 10 letters
+            if include_letters:
+                for letter in LETTER_SWEEP_RU:
+                    results.extend(self._build_letter_structures(seed_lower, letter))
 
-        # Double-space suffix always gets +1 (but max 2)
-        for r in results:
-            if r.suffix_label == "double_space" and r.priority == 1:
-                r.priority = 2
+            # Double-space suffix always gets +1 (but max 2)
+            for r in results:
+                if r.suffix_label == "double_space" and r.priority == 1:
+                    r.priority = 2
 
         # ════════════════════════════════════════════════════════════════════
         # ADDON-БЛОК: SD + SDL
