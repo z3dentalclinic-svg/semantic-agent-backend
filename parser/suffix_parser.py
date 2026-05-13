@@ -770,37 +770,32 @@ class SuffixParser:
             await asyncio.gather(*tasks)
 
         # ── Addon SD/SDL: letter-parallel, аналог run_e_chr_parallel ─────────
-        async def run_addon_letter(letter: str, queries: list, client: httpx.AsyncClient):
-            """Один SDL addon трек — 10 цифр последовательно с 0.3s delay.
-            Startup jitter стаггирует старт букв (как E-треки).
-            """
-            await asyncio.sleep(random.uniform(0, 1.0))  # startup jitter
+        async def run_addon_letter(letter: str, queries: list, client: httpx.AsyncClient, agent: str = "chrome"):
+            """Один SDL addon трек — 10 цифр последовательно с 0.3s delay."""
+            await asyncio.sleep(random.uniform(0, 1.0))
             for sq in queries:
                 await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client="chrome")
+                await fetch_one_tracked(sq, client, force_client=agent)
 
-        async def run_addon_sd_letter(struct_name: str, queries: list, client: httpx.AsyncClient):
+        async def run_addon_sd_letter(struct_name: str, queries: list, client: httpx.AsyncClient, agent: str = "chrome"):
             """Один SD addon трек — 10 цифр последовательно с 0.3s delay."""
-            await asyncio.sleep(random.uniform(0, 0.5))  # startup jitter
+            await asyncio.sleep(random.uniform(0, 0.5))
             for sq in queries:
                 await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client="chrome")
+                await fetch_one_tracked(sq, client, force_client=agent)
 
         async def run_addon_chr_parallel(clients: list):
-            """Addon Chrome: SDL буквы (plain+wcR) + SD типы параллельно.
-            30 букв × 2 варианта × 10 цифр + 5 SD типов × 10 цифр.
-            Каждая буква = отдельный трек как E-структуры.
-            """
+            """Addon Chrome: SDL буквы (plain+wcR) + SD типы параллельно."""
             tasks = []
             for i, (L, qs) in enumerate(addon_sdl_chr_by_letter.items()):
-                tasks.append(run_addon_letter(L, qs, clients[i % len(clients)]))
+                tasks.append(run_addon_letter(L, qs, clients[i % len(clients)], agent="chrome"))
             sd_by_struct: Dict[str, list] = {}
             for sq in addon_sd_chr_queries:
                 v = sq.variant or 'other'
                 if v not in sd_by_struct: sd_by_struct[v] = []
                 sd_by_struct[v].append(sq)
             for i, (struct_name, qs) in enumerate(sd_by_struct.items()):
-                tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)]))
+                tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)], agent="chrome"))
             await asyncio.gather(*tasks)
 
         async def run_addon_ff(clients: list):
@@ -809,14 +804,14 @@ class SuffixParser:
                 return
             tasks = []
             for i, (L, qs) in enumerate(addon_sdl_ff_by_letter.items()):
-                tasks.append(run_addon_letter(L, qs, clients[i % len(clients)]))
+                tasks.append(run_addon_letter(L, qs, clients[i % len(clients)], agent="firefox"))
             sd_by_struct: Dict[str, list] = {}
             for sq in addon_sd_ff_queries:
                 v = sq.variant or 'other'
                 if v not in sd_by_struct: sd_by_struct[v] = []
                 sd_by_struct[v].append(sq)
             for i, (struct_name, qs) in enumerate(sd_by_struct.items()):
-                tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)]))
+                tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)], agent="firefox"))
             await asyncio.gather(*tasks)
 
         # ── E_simple Chrome ───────────────────────────────────────────────
