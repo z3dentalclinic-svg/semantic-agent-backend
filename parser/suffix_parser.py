@@ -450,9 +450,10 @@ class SuffixParser:
 
         # Step 3: Separate E / addon / other types
         e_queries_by_letter: Dict[str, List] = {}
-        addon_sd_queries: List = []                  # SD addon — 4 типа × 10 цифр
-        addon_sdl_chr_by_letter: Dict[str, List] = {}  # SDL addon chrome — 26 букв × 10 цифр
-        addon_sdl_ff_queries: List = []              # SDL addon firefox — буква 'в' × 10 цифр
+        addon_sd_chr_queries: List = []              # SD addon chrome
+        addon_sd_ff_queries: List = []               # SD addon firefox
+        addon_sdl_chr_by_letter: Dict[str, List] = {}  # SDL addon chrome — по буквам
+        addon_sdl_ff_by_letter: Dict[str, List] = {}   # SDL addon firefox — по буквам
         other_queries = []
         for q in queries_to_send:
             if q.suffix_type == "E":
@@ -461,12 +462,19 @@ class SuffixParser:
                     e_queries_by_letter[letter] = []
                 e_queries_by_letter[letter].append(q)
             elif getattr(q, 'is_new_research', False) and q.suffix_type == "SD":
-                addon_sd_queries.append(q)
-            elif getattr(q, 'is_new_research', False) and q.suffix_type == "SDL":
-                if getattr(q, 'agents', None) == ("firefox",):
-                    addon_sdl_ff_queries.append(q)
+                ag = getattr(q, 'agents', ('chrome',))
+                if 'firefox' in ag:
+                    addon_sd_ff_queries.append(q)
                 else:
-                    letter = q.suffix_val.split('_')[1] if '_' in q.suffix_val else q.suffix_val
+                    addon_sd_chr_queries.append(q)
+            elif getattr(q, 'is_new_research', False) and q.suffix_type == "SDL":
+                letter = q.suffix_val.split('_')[1] if '_' in q.suffix_val else q.suffix_val
+                ag = getattr(q, 'agents', ('chrome',))
+                if 'firefox' in ag:
+                    if letter not in addon_sdl_ff_by_letter:
+                        addon_sdl_ff_by_letter[letter] = []
+                    addon_sdl_ff_by_letter[letter].append(q)
+                else:
                     if letter not in addon_sdl_chr_by_letter:
                         addon_sdl_chr_by_letter[letter] = []
                     addon_sdl_chr_by_letter[letter].append(q)
@@ -779,34 +787,37 @@ class SuffixParser:
                 await fetch_one_tracked(sq, client, force_client="chrome")
 
         async def run_addon_chr_parallel(clients: list):
-            """Addon Chrome: SDL буквы + SD типы параллельно, round-robin по IP.
-            SDL: 26 букв / 3 IP = ~9 букв/IP — как E-треки.
-            SD: 4 типа / 3 IP = ~1-2 типа/IP.
+            """Addon Chrome: SDL буквы (plain+wcR) + SD типы параллельно.
+            30 букв × 2 варианта × 10 цифр + 5 SD типов × 10 цифр.
+            Каждая буква = отдельный трек как E-структуры.
             """
             tasks = []
-            # SDL буквы — каждая буква отдельный трек
-            sdl_letters = list(addon_sdl_chr_by_letter.items())
-            for i, (L, qs) in enumerate(sdl_letters):
+            for i, (L, qs) in enumerate(addon_sdl_chr_by_letter.items()):
                 tasks.append(run_addon_letter(L, qs, clients[i % len(clients)]))
-            # SD типы — группируем по variant (4 типа)
             sd_by_struct: Dict[str, list] = {}
-            for sq in addon_sd_queries:
+            for sq in addon_sd_chr_queries:
                 v = sq.variant or 'other'
-                if v not in sd_by_struct:
-                    sd_by_struct[v] = []
+                if v not in sd_by_struct: sd_by_struct[v] = []
                 sd_by_struct[v].append(sq)
             for i, (struct_name, qs) in enumerate(sd_by_struct.items()):
                 tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)]))
             await asyncio.gather(*tasks)
 
         async def run_addon_ff(clients: list):
-            """Addon Firefox: буква 'в' × 10 цифр — один трек."""
-            if not addon_sdl_ff_queries:
+            """Addon Firefox: SDL буквы (plain+wcR) + SD типы параллельно."""
+            if not addon_sdl_ff_by_letter and not addon_sd_ff_queries:
                 return
-            await asyncio.sleep(random.uniform(0, 0.5))
-            for sq in addon_sdl_ff_queries:
-                await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, clients[0], force_client="firefox")
+            tasks = []
+            for i, (L, qs) in enumerate(addon_sdl_ff_by_letter.items()):
+                tasks.append(run_addon_letter(L, qs, clients[i % len(clients)]))
+            sd_by_struct: Dict[str, list] = {}
+            for sq in addon_sd_ff_queries:
+                v = sq.variant or 'other'
+                if v not in sd_by_struct: sd_by_struct[v] = []
+                sd_by_struct[v].append(sq)
+            for i, (struct_name, qs) in enumerate(sd_by_struct.items()):
+                tasks.append(run_addon_sd_letter(struct_name, qs, clients[i % len(clients)]))
+            await asyncio.gather(*tasks)
 
         # ── E_simple Chrome ───────────────────────────────────────────────
         async def run_e_simple_chrome(clients: list, sems: list):
