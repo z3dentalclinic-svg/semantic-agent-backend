@@ -591,58 +591,89 @@ class SuffixGenerator:
 
         # ════════════════════════════════════════════════════════════════════
         # ADDON-БЛОК: SD + SDL
-        #
-        # Минимальный набор выведен из greedy-анализа по 5 сидам
-        # (CHECKLIST_structure_optimization.md). Покрывает 46 GAP-ключей
-        # недостижимых старыми структурами.
-        #
-        # Стоимость: 1310 запросов на сид
-        #   SD:  5 типов × 10 цифр × chrome+firefox = 100
-        #   SDL plain:  30 букв × 10 цифр × chrome+firefox = 600
-        #   SDL wcR:    30 букв × 10 цифр × chrome+firefox = 600
-        #   SDL: буква 'в' × 10 цифр × firefox (дубль — уже в chrome, убрать можно, но пусть)
+        # cp-позиции взяты из research-прогона (lite_search_1778266838815.json)
+        # строго по паттернам которые давали GAP-ключи.
         # ════════════════════════════════════════════════════════════════════
 
         DIGITS_ADDON = [str(i) for i in range(10)]
         _SDL_LETTERS_FULL = list("абвгдеёжзийклмнопрстуфхцчшщэюя")  # 30 букв
 
-        # SD: 5 структур × 10 цифр × chrome+firefox = 100 запросов
-        _SD_ADDONS = [
-            ("plain",      lambda s, d: f"{s} {d}"),
-            ("dwcL",       lambda s, d: f"** {s} {d}"),
-            ("dstar_nosp", lambda s, d: f"{s} {d}**"),
-            ("wcR_trail",  lambda s, d: f"{s} {d} * "),
-            ("plain_nosp", lambda s, d: f"{s}{d}"),
+        # Опорные cp-позиции (одинаковы для всех цифр, цифра — 1 символ)
+        _W1_END  = 8                      # после первого слова сида
+        _W1_SP   = 9                      # после первого слова + пробел
+        _S_END   = len(seed_lower)        # после полного сида
+        _S_SP    = len(seed_lower) + 1    # после сида + пробел
+        _D_END   = len(seed_lower) + 2    # после сида + пробел + цифра
+        _D_SP    = len(seed_lower) + 3    # после сида + пробел + цифра + пробел
+
+        # ── SD: 5 структур × 10 цифр × 6-7 cp × chrome+firefox ─────────────
+        # Research cp по структурам (проверено по lite_search_1778266838815.json):
+        # plain:       [-1, 0, W1_END, W1_SP, S_END, S_SP, end]
+        # dwcL:        [-1, 0, W1_END+3, W1_SP+3, S_END+3, S_SP+3, end]  (+3 за "** ")
+        # dstar_nosp:  [-1, 0, W1_END, W1_SP, S_END, S_SP, end]
+        # wcR_trail:   [-1, 0, W1_END, W1_SP, S_END, S_SP, end]
+        # plain_nosp:  [-1, 0, W1_END, W1_SP, S_END, end]  (нет S_SP — нет пробела перед цифрой)
+
+        def _sd_cps(q, offset=0, has_seed_sp=True):
+            cps = [-1, 0, _W1_END+offset, _W1_SP+offset,
+                   _S_END+offset, _S_SP+offset if has_seed_sp else None, len(q)]
+            return [c for c in cps if c is not None]
+
+        _SD_SPECS = [
+            ("plain",      lambda s, d: f"{s} {d}",    lambda q: _sd_cps(q)),
+            ("dwcL",       lambda s, d: f"** {s} {d}", lambda q: _sd_cps(q, offset=3)),
+            ("dstar_nosp", lambda s, d: f"{s} {d}**",  lambda q: _sd_cps(q)),
+            ("wcR_trail",  lambda s, d: f"{s} {d} * ", lambda q: _sd_cps(q)),
+            ("plain_nosp", lambda s, d: f"{s}{d}",     lambda q: _sd_cps(q, has_seed_sp=False)),
         ]
-        for struct_name, qfn in _SD_ADDONS:
+
+        for struct_name, qfn, cps_fn in _SD_SPECS:
             for D in DIGITS_ADDON:
                 q = qfn(seed_lower, D)
-                for agent in ("chrome", "firefox"):
-                    results.append(SuffixQuery(
-                        query=q, suffix_val=D,
-                        suffix_label=f"{D}_{struct_name}_addon_{agent}",
-                        suffix_type="SD", priority=1,
-                        markers=["addon"], cp_override=len(q),
-                        variant=struct_name, is_new_research=True,
-                        agents=(agent,),
-                    ))
-
-        # SDL plain: 30 букв × 10 цифр × chrome+firefox = 600 запросов
-        # SDL wcR:   30 букв × 10 цифр × chrome+firefox = 600 запросов
-        for L in _SDL_LETTERS_FULL:
-            for D in DIGITS_ADDON:
-                for variant, qfn in [
-                    ("sdl_plain", lambda s, d, l: f"{s} {d} {l}"),
-                    ("sdl_wcR",   lambda s, d, l: f"{s} {d} {l} *"),
-                ]:
-                    q = qfn(seed_lower, D, L)
+                for cp in cps_fn(q):
                     for agent in ("chrome", "firefox"):
                         results.append(SuffixQuery(
-                            query=q, suffix_val=f"{D}_{L}",
-                            suffix_label=f"{D}_{L}_{variant}_addon_{agent}",
+                            query=q, suffix_val=D,
+                            suffix_label=f"{D}_{struct_name}_cp{cp}_addon_{agent}",
+                            suffix_type="SD", priority=1,
+                            markers=["addon"], cp_override=cp,
+                            variant=struct_name, is_new_research=True,
+                            agents=(agent,),
+                        ))
+
+        # ── SDL: 30 букв × 10 цифр × cp × chrome+firefox ───────────────────
+        # Research cp (проверено):
+        # SDL:plain:  [-1, S_END, D_END, D_SP, end]    (5 cp)
+        # SDL:wcR:    [-1, D_END, D_SP, before_star, end]  (5 cp)
+
+        for L in _SDL_LETTERS_FULL:
+            for D in DIGITS_ADDON:
+                # plain: {seed} {D} {L}
+                q_plain = f"{seed_lower} {D} {L}"
+                _end_plain = len(q_plain)
+                for cp in [-1, _S_END, _D_END, _D_SP, _end_plain]:
+                    for agent in ("chrome", "firefox"):
+                        results.append(SuffixQuery(
+                            query=q_plain, suffix_val=f"{D}_{L}",
+                            suffix_label=f"{D}_{L}_sdl_plain_cp{cp}_addon_{agent}",
                             suffix_type="SDL", priority=1,
-                            markers=["addon"], cp_override=len(q),
-                            variant=variant, is_new_research=True,
+                            markers=["addon"], cp_override=cp,
+                            variant="sdl_plain", is_new_research=True,
+                            agents=(agent,),
+                        ))
+
+                # wcR: {seed} {D} {L} *
+                q_wcR = f"{seed_lower} {D} {L} *"
+                _before_star = _end_plain + 1   # позиция перед *
+                _end_wcR = len(q_wcR)
+                for cp in [-1, _D_END, _D_SP, _before_star, _end_wcR]:
+                    for agent in ("chrome", "firefox"):
+                        results.append(SuffixQuery(
+                            query=q_wcR, suffix_val=f"{D}_{L}",
+                            suffix_label=f"{D}_{L}_sdl_wcR_cp{cp}_addon_{agent}",
+                            suffix_type="SDL", priority=1,
+                            markers=["addon"], cp_override=cp,
+                            variant="sdl_wcR", is_new_research=True,
                             agents=(agent,),
                         ))
 
