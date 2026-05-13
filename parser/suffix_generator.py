@@ -596,19 +596,17 @@ class SuffixGenerator:
         # (CHECKLIST_structure_optimization.md). Покрывает 46 GAP-ключей
         # недостижимых старыми структурами.
         #
-        # Стоимость: 310 запросов на сид
-        #   SD: 4 типа × 10 цифр × chrome = 40
-        #   SDL: 26 букв × 10 цифр × chrome = 260
-        #   SDL: буква 'в' × 10 цифр × firefox = 10 (3 эксклюзивных GAP)
+        # Стоимость: 1310 запросов на сид
+        #   SD:  5 типов × 10 цифр × chrome+firefox = 100
+        #   SDL plain:  30 букв × 10 цифр × chrome+firefox = 600
+        #   SDL wcR:    30 букв × 10 цифр × chrome+firefox = 600
+        #   SDL: буква 'в' × 10 цифр × firefox (дубль — уже в chrome, убрать можно, но пусть)
         # ════════════════════════════════════════════════════════════════════
 
         DIGITS_ADDON = [str(i) for i in range(10)]
+        _SDL_LETTERS_FULL = list("абвгдеёжзийклмнопрстуфхцчшщэюя")  # 30 букв
 
-        # SD: 4 структуры × 10 цифр × chrome
-        # dwcL:       ** сид D  — 30 GAP (самый мощный)
-        # dstar_nosp: сид D**   — 26 GAP
-        # wcR_trail:  сид D *   — 23 GAP
-        # plain_nosp: сидD      —  9 GAP
+        # SD: 5 структур × 10 цифр × chrome+firefox = 100 запросов
         _SD_ADDONS = [
             ("plain",      lambda s, d: f"{s} {d}"),
             ("dwcL",       lambda s, d: f"** {s} {d}"),
@@ -619,42 +617,34 @@ class SuffixGenerator:
         for struct_name, qfn in _SD_ADDONS:
             for D in DIGITS_ADDON:
                 q = qfn(seed_lower, D)
-                results.append(SuffixQuery(
-                    query=q, suffix_val=D,
-                    suffix_label=f"{D}_{struct_name}_addon",
-                    suffix_type="SD", priority=1,
-                    markers=["addon"], cp_override=len(q),
-                    variant=struct_name, is_new_research=True,
-                    agents=("chrome",),
-                ))
+                for agent in ("chrome", "firefox"):
+                    results.append(SuffixQuery(
+                        query=q, suffix_val=D,
+                        suffix_label=f"{D}_{struct_name}_addon_{agent}",
+                        suffix_type="SD", priority=1,
+                        markers=["addon"], cp_override=len(q),
+                        variant=struct_name, is_new_research=True,
+                        agents=(agent,),
+                    ))
 
-        # SDL: полный алфавит 30 букв × 10 цифр × chrome
-        # (без ы, ъ, ь — они не встречаются в начале слова)
-        _SDL_LETTERS_FULL = list("абвгдеёжзийклмнопрстуфхцчшщэюя")  # 30 букв
-
+        # SDL plain: 30 букв × 10 цифр × chrome+firefox = 600 запросов
+        # SDL wcR:   30 букв × 10 цифр × chrome+firefox = 600 запросов
         for L in _SDL_LETTERS_FULL:
             for D in DIGITS_ADDON:
-                q = f"{seed_lower} {D} {L}"
-                results.append(SuffixQuery(
-                    query=q, suffix_val=f"{D}_{L}",
-                    suffix_label=f"{D}_{L}_sdl_addon",
-                    suffix_type="SDL", priority=1,
-                    markers=["addon"], cp_override=len(q),
-                    variant="sdl", is_new_research=True,
-                    agents=("chrome",),
-                ))
-
-        # SDL: буква 'в' × 10 цифр × firefox (3 эксклюзивных GAP)
-        for D in DIGITS_ADDON:
-            q = f"{seed_lower} {D} в"
-            results.append(SuffixQuery(
-                query=q, suffix_val=f"{D}_в",
-                suffix_label=f"{D}_в_sdl_addon_ff",
-                suffix_type="SDL", priority=1,
-                markers=["addon"], cp_override=len(q),
-                variant="sdl", is_new_research=True,
-                agents=("firefox",),
-            ))
+                for variant, qfn in [
+                    ("sdl_plain", lambda s, d, l: f"{s} {d} {l}"),
+                    ("sdl_wcR",   lambda s, d, l: f"{s} {d} {l} *"),
+                ]:
+                    q = qfn(seed_lower, D, L)
+                    for agent in ("chrome", "firefox"):
+                        results.append(SuffixQuery(
+                            query=q, suffix_val=f"{D}_{L}",
+                            suffix_label=f"{D}_{L}_{variant}_addon_{agent}",
+                            suffix_type="SDL", priority=1,
+                            markers=["addon"], cp_override=len(q),
+                            variant=variant, is_new_research=True,
+                            agents=(agent,),
+                        ))
 
         return analysis, results
 
