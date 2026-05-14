@@ -416,6 +416,11 @@ class SuffixParser:
         """
         total_start = time.time()
 
+        # ═══ DEBUG INSTRUMENTATION: per-request timing log ═══
+        _req_log: list = []           # каждый запрос: t_start/t_end/client/struct/...
+        _client_ids: dict = {}        # id(client_obj) -> "addon_chr_3" / "boevoy_chr_1"
+        # ═════════════════════════════════════════════════════
+
         # Determine region from country
         if country in ("ua", "by", "kz"):
             region = "ua"
@@ -569,6 +574,26 @@ class SuffixParser:
             results = await self.fetch_suggestions(sq.query, country, language, client, gc, cp, uule=_uule)
             elapsed = (time.time() - t0) * 1000
             _record_results(sq, results, elapsed)
+
+            # ─── DEBUG: log per-request timing ───
+            try:
+                _req_log.append({
+                    "t_start": round(t0 - total_start, 4),
+                    "t_end":   round(t0 - total_start + elapsed/1000.0, 4),
+                    "elapsed_ms": round(elapsed, 1),
+                    "client_id": _client_ids.get(id(client), f"unk_{id(client) & 0xFFFF:04x}"),
+                    "agent": gc,
+                    "suffix_type": sq.suffix_type,
+                    "suffix_label": sq.suffix_label,
+                    "variant": sq.variant or "",
+                    "query": sq.query,
+                    "cp": cp,
+                    "is_addon": bool(getattr(sq, "is_new_research", False)),
+                    "n_results": len(results) if results else 0,
+                })
+            except Exception:
+                pass
+            # ─────────────────────────────────────
 
         # async def fetch_one_firefox(sq, client: httpx.AsyncClient):
         #     """Firefox pass for E — same query, firefox agent, cp not sent."""
@@ -990,6 +1015,19 @@ class SuffixParser:
             # Addon-клиенты открываем здесь чтобы они жили всё время прогона
             addon_chr_clients = [httpx.AsyncClient(proxy=p) for p in _addon_chr_proxies]
             addon_ff_clients  = [httpx.AsyncClient(proxy=p) for p in _addon_ff_proxies]
+
+            # ─── DEBUG: tag clients for per-IP log analysis ───
+            _client_ids[id(chr_c1)] = "boevoy_chr_1"
+            _client_ids[id(chr_c2)] = "boevoy_chr_2"
+            _client_ids[id(chr_c3)] = "boevoy_chr_3"
+            _client_ids[id(ff_c1)]  = "boevoy_ff_1"
+            _client_ids[id(ff_c2)]  = "boevoy_ff_2"
+            for i, c in enumerate(addon_chr_clients):
+                _client_ids[id(c)] = f"addon_chr_{i:02d}"
+            for i, c in enumerate(addon_ff_clients):
+                _client_ids[id(c)] = f"addon_ff_{i:02d}"
+            # ──────────────────────────────────────────────────
+
             try:
                 await asyncio.gather(
                     run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
@@ -1100,6 +1138,30 @@ class SuffixParser:
             1 for t in trace_entries
             if not t.status.startswith("blocked")
         )
+
+        # ═══ DEBUG: dump per-request timing log to JSONL ═══
+        try:
+            import json as _json
+            _safe_seed = "".join(c if c.isalnum() else "_" for c in seed)[:60]
+            _ts = int(total_start * 1000)
+            _log_path = f"/tmp/suffix_req_log_{_ts}_{_safe_seed}.jsonl"
+            with open(_log_path, "w", encoding="utf-8") as _fp:
+                # header line — meta
+                _fp.write(_json.dumps({
+                    "_meta": True,
+                    "seed": seed,
+                    "country": country,
+                    "total_start_ts": total_start,
+                    "total_time_s": round(time.time() - total_start, 3),
+                    "n_requests": len(_req_log),
+                    "client_ids": list(_client_ids.values()),
+                }, ensure_ascii=False) + "\n")
+                for _e in _req_log:
+                    _fp.write(_json.dumps(_e, ensure_ascii=False) + "\n")
+            print(f"[ReqLog] wrote {len(_req_log)} entries → {_log_path}")
+        except Exception as _err:
+            print(f"[ReqLog] FAILED to write log: {_err}")
+        # ═══════════════════════════════════════════════════
 
         return SuffixParseResult(
             seed=seed,
