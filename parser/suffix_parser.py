@@ -561,8 +561,12 @@ class SuffixParser:
         # Step 5a: Other queries (A/B/C/D) — concurrent with semaphore
         semaphore = asyncio.Semaphore(parallel_limit)
 
+        # ═══ per-IP semaphore (создаются после клиентов, см. ниже) ═══
+        _client_sems: dict = {}        # id(client_obj) -> asyncio.Semaphore(6)
+        _PER_IP_CONCURRENCY = 6
+
         async def fetch_one_tracked(sq, client: httpx.AsyncClient, force_client: str = None):
-            """Fetch single query and record results."""
+            """Fetch single query and record results. Per-IP semaphore protects IP from rate-limit."""
             if sq.cp_override is not None:
                 cp = sq.cp_override
             elif cursor_position == -1:
@@ -571,30 +575,36 @@ class SuffixParser:
                 cp = None
 
             gc = force_client or google_client
-            t0 = time.time()
-            results = await self.fetch_suggestions(sq.query, country, language, client, gc, cp, uule=_uule)
-            elapsed = (time.time() - t0) * 1000
-            _record_results(sq, results, elapsed)
+            sem = _client_sems.get(id(client))
 
-            # ─── DEBUG: log per-request timing ───
-            try:
-                _req_log.append({
-                    "t_start": round(t0 - total_start, 4),
-                    "t_end":   round(t0 - total_start + elapsed/1000.0, 4),
-                    "elapsed_ms": round(elapsed, 1),
-                    "client_id": _client_ids.get(id(client), f"unk_{id(client) & 0xFFFF:04x}"),
-                    "agent": gc,
-                    "suffix_type": sq.suffix_type,
-                    "suffix_label": sq.suffix_label,
-                    "variant": sq.variant or "",
-                    "query": sq.query,
-                    "cp": cp,
-                    "is_addon": bool(getattr(sq, "is_new_research", False)),
-                    "n_results": len(results) if results else 0,
-                })
-            except Exception:
-                pass
-            # ─────────────────────────────────────
+            async def _do_fetch():
+                t0 = time.time()
+                results = await self.fetch_suggestions(sq.query, country, language, client, gc, cp, uule=_uule)
+                elapsed = (time.time() - t0) * 1000
+                _record_results(sq, results, elapsed)
+                try:
+                    _req_log.append({
+                        "t_start": round(t0 - total_start, 4),
+                        "t_end":   round(t0 - total_start + elapsed/1000.0, 4),
+                        "elapsed_ms": round(elapsed, 1),
+                        "client_id": _client_ids.get(id(client), f"unk_{id(client) & 0xFFFF:04x}"),
+                        "agent": gc,
+                        "suffix_type": sq.suffix_type,
+                        "suffix_label": sq.suffix_label,
+                        "variant": sq.variant or "",
+                        "query": sq.query,
+                        "cp": cp,
+                        "is_addon": bool(getattr(sq, "is_new_research", False)),
+                        "n_results": len(results) if results else 0,
+                    })
+                except Exception:
+                    pass
+
+            if sem is not None:
+                async with sem:
+                    await _do_fetch()
+            else:
+                await _do_fetch()
 
         # async def fetch_one_firefox(sq, client: httpx.AsyncClient):
         #     """Firefox pass for E — same query, firefox agent, cp not sent."""
@@ -769,22 +779,22 @@ class SuffixParser:
         #         await asyncio.sleep(0.3)
         #         await fetch_one_firefox(sq, client)
 
-        # ── Chrome E structured: prefix-style letter-parallel (без semaphore) ─────
+        # ── Chrome E structured: letter-parallel + intra-track parallel via per-IP sem ─────
         async def run_e_chr_letter(letter: str, queries: list, client: httpx.AsyncClient):
-            """Один Chrome E буквенный трек — как prefix PA.
-            Startup jitter 0-1с стаггирует старт букв.
-            Запросы sequential внутри трека с 0.3с delay как натуральный ограничитель.
-            Нет semaphore — 9 треков/IP = ~9 concurrent max, как prefix (30 треков/IP).
-            """
-            await asyncio.sleep(random.uniform(0, 1.0))  # startup jitter
+            """Chrome E буквенный трек. Запросы внутри буквы летят параллельно через per-IP semaphore(6)."""
+            await asyncio.sleep(random.uniform(0, 0.3))  # mild jitter
+            # Filter queries before gathering
+            valid_qs = []
             for sq in queries:
                 if sq.variant in CHROME_E_SKIP:
                     continue
                 letter_skip = CHROME_E_LETTER_SKIP.get(sq.suffix_val, set())
                 if sq.variant in letter_skip:
                     continue
-                await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client="chrome")
+                valid_qs.append(sq)
+            await asyncio.gather(*(
+                fetch_one_tracked(sq, client, force_client="chrome") for sq in valid_qs
+            ))
 
         async def run_e_chr_parallel(clients: list):
             """Chrome E: все буквы параллельно, round-robin по 3 Chrome IP.
@@ -795,20 +805,20 @@ class SuffixParser:
                      for i, (L, qs) in enumerate(letters)]
             await asyncio.gather(*tasks)
 
-        # ── Addon SD/SDL: letter-parallel, аналог run_e_chr_parallel ─────────
+        # ── Addon SD/SDL: letter-parallel + intra-track parallel ─────────────
         async def run_addon_letter(letter: str, queries: list, client: httpx.AsyncClient, agent: str = "chrome"):
-            """Один SDL addon трек — 10 цифр последовательно с 0.3s delay."""
-            await asyncio.sleep(random.uniform(0, 1.0))
-            for sq in queries:
-                await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client=agent)
+            """SDL addon трек: запросы внутри буквы летят параллельно через per-IP semaphore(6)."""
+            await asyncio.sleep(random.uniform(0, 0.3))  # mild jitter для разнесения старта
+            await asyncio.gather(*(
+                fetch_one_tracked(sq, client, force_client=agent) for sq in queries
+            ))
 
         async def run_addon_sd_letter(struct_name: str, queries: list, client: httpx.AsyncClient, agent: str = "chrome"):
-            """Один SD addon трек — 10 цифр последовательно с 0.3s delay."""
-            await asyncio.sleep(random.uniform(0, 0.5))
-            for sq in queries:
-                await asyncio.sleep(0.3)
-                await fetch_one_tracked(sq, client, force_client=agent)
+            """SD addon трек: запросы параллельно через per-IP semaphore."""
+            await asyncio.sleep(random.uniform(0, 0.3))
+            await asyncio.gather(*(
+                fetch_one_tracked(sq, client, force_client=agent) for sq in queries
+            ))
 
         async def run_addon_chr_parallel(clients: list):
             """Addon Chrome: SDL буквы (plain+wcR) + SD типы параллельно."""
@@ -866,21 +876,19 @@ class SuffixParser:
             await asyncio.gather(*[fetch_chr_char(c, i) for i, c in enumerate(chars)])
 
         # ── Agent runners ─────────────────────────────────────────────────
-        # 3 Chrome IP × Semaphore(5) = 15 concurrent Chrome ABCD
-        # 2 FF IP    × Semaphore(5) = 10 concurrent FF ABCD
-        # 68 Chrome ABCD / 15 = 4.5 раунда × 0.65с = ~2.9с
-        # 30 FF ABCD    / 10 = 3.0 раунда × 0.65с = ~1.9с
-        chr_sems = [asyncio.Semaphore(5) for _ in range(3)]
-        ff_sems  = [asyncio.Semaphore(5) for _ in range(2)]
+        # 4 Chrome IP × Semaphore(6) = 24 concurrent Chrome ABCD
+        # 2 FF IP    × Semaphore(6) = 12 concurrent FF ABCD
+        chr_sems = [asyncio.Semaphore(_PER_IP_CONCURRENCY) for _ in range(4)]
+        ff_sems  = [asyncio.Semaphore(_PER_IP_CONCURRENCY) for _ in range(2)]
 
         async def fetch_chr_abcd(sq: "SuffixQuery", idx: int, clients: list):
-            """Chrome A/B/C/D — round-robin по 3 IP, Semaphore(5) каждый."""
+            """Chrome A/B/C/D — round-robin по 4 IP, Semaphore(6) каждый."""
             if sq.suffix_label in CHROME_BCD_SKIP:
                 return
             # Пропускаем если запрос явно не для Chrome (addon-маршрутизация)
             if hasattr(sq, 'agents') and sq.agents and 'chrome' not in sq.agents:
                 return
-            slot = idx % 3
+            slot = idx % 4
             async with chr_sems[slot]:
                 await asyncio.sleep(0.15)
                 await fetch_one_tracked(sq, clients[slot], force_client="chrome")
@@ -987,32 +995,29 @@ class SuffixParser:
 
             await asyncio.gather(*bi_tasks)
 
-        # Прокси из ProxyPool — 3 Chrome IP + 2 FF IP из round-robin пула (indices 5-9)
-        # 3×Semaphore(5)=15 concurrent Chrome, 2×Semaphore(5)=10 concurrent FF
+        # Прокси из ProxyPool — 4 Chrome IP + 2 FF IP для boevoy (6 IP всего)
         # Fallback: GOOGLE_PROXY_URL из env (один IP для всех)
         if ProxyPool:
-            proxies = [ProxyPool.get("suffix") for _ in range(5)]
+            proxies = [ProxyPool.get("suffix") for _ in range(6)]
         else:
             _fb = os.getenv("GOOGLE_PROXY_URL") or None
-            proxies = [_fb] * 5
+            proxies = [_fb] * 6
 
-        proxy_chr1, proxy_chr2, proxy_chr3 = proxies[0], proxies[1], proxies[2]
-        proxy_ff1,  proxy_ff2              = proxies[3], proxies[4]
+        proxy_chr1, proxy_chr2, proxy_chr3, proxy_chr4 = proxies[0], proxies[1], proxies[2], proxies[3]
+        proxy_ff1,  proxy_ff2                          = proxies[4], proxies[5]
 
-        # Addon-клиенты: берём свободные suffix IP (index 6-9) по всем батчам.
-        # 5 батчей × 4 IP = 20 IP под addon chrome и firefox.
-        # Не конкурируют с infix (0-2) и prefix (3-5).
-        # ~10 секунд на addon при 65 треках × 3s / 20 IP.
-        _N_ADDON_CLIENTS = 20
+        # Addon-клиенты: уменьшены до 4 Chrome + 2 FF, параллелизм внутри через per-IP semaphore(6).
+        _N_ADDON_CHR_CLIENTS = 4
+        _N_ADDON_FF_CLIENTS  = 2
         if ProxyPool:
-            _addon_chr_proxies = [ProxyPool.get("suffix_addon_chrome") for _ in range(_N_ADDON_CLIENTS)]
-            _addon_ff_proxies  = [ProxyPool.get("suffix_addon_firefox") for _ in range(_N_ADDON_CLIENTS)]
+            _addon_chr_proxies = [ProxyPool.get("suffix_addon_chrome") for _ in range(_N_ADDON_CHR_CLIENTS)]
+            _addon_ff_proxies  = [ProxyPool.get("suffix_addon_firefox") for _ in range(_N_ADDON_FF_CLIENTS)]
         else:
             _fb = os.getenv("GOOGLE_PROXY_URL") or None
-            _addon_chr_proxies = [_fb] * _N_ADDON_CLIENTS
-            _addon_ff_proxies  = [_fb] * _N_ADDON_CLIENTS
+            _addon_chr_proxies = [_fb] * _N_ADDON_CHR_CLIENTS
+            _addon_ff_proxies  = [_fb] * _N_ADDON_FF_CLIENTS
 
-        async with httpx.AsyncClient(proxy=proxy_chr1) as chr_c1,                    httpx.AsyncClient(proxy=proxy_chr2) as chr_c2,                    httpx.AsyncClient(proxy=proxy_chr3) as chr_c3,                    httpx.AsyncClient(proxy=proxy_ff1)  as ff_c1,                     httpx.AsyncClient(proxy=proxy_ff2)  as ff_c2:
+        async with httpx.AsyncClient(proxy=proxy_chr1) as chr_c1,                    httpx.AsyncClient(proxy=proxy_chr2) as chr_c2,                    httpx.AsyncClient(proxy=proxy_chr3) as chr_c3,                    httpx.AsyncClient(proxy=proxy_chr4) as chr_c4,                    httpx.AsyncClient(proxy=proxy_ff1)  as ff_c1,                     httpx.AsyncClient(proxy=proxy_ff2)  as ff_c2:
             # Addon-клиенты открываем здесь чтобы они жили всё время прогона
             addon_chr_clients = [httpx.AsyncClient(proxy=p) for p in _addon_chr_proxies]
             addon_ff_clients  = [httpx.AsyncClient(proxy=p) for p in _addon_ff_proxies]
@@ -1021,6 +1026,7 @@ class SuffixParser:
             _client_ids[id(chr_c1)] = "boevoy_chr_1"
             _client_ids[id(chr_c2)] = "boevoy_chr_2"
             _client_ids[id(chr_c3)] = "boevoy_chr_3"
+            _client_ids[id(chr_c4)] = "boevoy_chr_4"
             _client_ids[id(ff_c1)]  = "boevoy_ff_1"
             _client_ids[id(ff_c2)]  = "boevoy_ff_2"
             for i, c in enumerate(addon_chr_clients):
@@ -1029,9 +1035,18 @@ class SuffixParser:
                 _client_ids[id(c)] = f"addon_ff_{i:02d}"
             # ──────────────────────────────────────────────────
 
+            # ─── PER-IP SEMAPHORE: max 6 concurrent requests per IP ───
+            for _c in [chr_c1, chr_c2, chr_c3, chr_c4, ff_c1, ff_c2]:
+                _client_sems[id(_c)] = asyncio.Semaphore(_PER_IP_CONCURRENCY)
+            for _c in addon_chr_clients:
+                _client_sems[id(_c)] = asyncio.Semaphore(_PER_IP_CONCURRENCY)
+            for _c in addon_ff_clients:
+                _client_sems[id(_c)] = asyncio.Semaphore(_PER_IP_CONCURRENCY)
+            # ──────────────────────────────────────────────────────────
+
             try:
                 await asyncio.gather(
-                    run_google([chr_c1, chr_c2, chr_c3], [ff_c1, ff_c2]),
+                    run_google([chr_c1, chr_c2, chr_c3, chr_c4], [ff_c1, ff_c2]),
                     run_addon_chr_parallel(addon_chr_clients),
                     run_addon_ff(addon_ff_clients),
                     # run_yandex(ya_client),  # ОТКЛЮЧЕНО для лайт-серча
