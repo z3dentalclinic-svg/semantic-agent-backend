@@ -111,5 +111,6 @@ def register_suffix_endpoint(app: FastAPI):
                 "trace": result.trace,
                 "summary_by_type": result.summary_by_type,
                 "summary_by_suffix": result.summary_by_suffix,
+                "request_log": result.request_log,   # per-request timing для анализа нагрузки
             },
         }
