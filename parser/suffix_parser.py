@@ -135,6 +135,7 @@ class SuffixParseResult:
     trace: List[Dict] = field(default_factory=list)
     summary_by_type: Dict = field(default_factory=dict)
     summary_by_suffix: Dict = field(default_factory=dict)
+    request_log: List[Dict] = field(default_factory=list)   # per-request timing для load analysis
 
 
 class SuffixParser:
@@ -1139,30 +1140,6 @@ class SuffixParser:
             if not t.status.startswith("blocked")
         )
 
-        # ═══ DEBUG: dump per-request timing log to JSONL ═══
-        try:
-            import json as _json
-            _safe_seed = "".join(c if c.isalnum() else "_" for c in seed)[:60]
-            _ts = int(total_start * 1000)
-            _log_path = f"/tmp/suffix_req_log_{_ts}_{_safe_seed}.jsonl"
-            with open(_log_path, "w", encoding="utf-8") as _fp:
-                # header line — meta
-                _fp.write(_json.dumps({
-                    "_meta": True,
-                    "seed": seed,
-                    "country": country,
-                    "total_start_ts": total_start,
-                    "total_time_s": round(time.time() - total_start, 3),
-                    "n_requests": len(_req_log),
-                    "client_ids": list(_client_ids.values()),
-                }, ensure_ascii=False) + "\n")
-                for _e in _req_log:
-                    _fp.write(_json.dumps(_e, ensure_ascii=False) + "\n")
-            print(f"[ReqLog] wrote {len(_req_log)} entries → {_log_path}")
-        except Exception as _err:
-            print(f"[ReqLog] FAILED to write log: {_err}")
-        # ═══════════════════════════════════════════════════
-
         return SuffixParseResult(
             seed=seed,
             analysis=analysis_summary,
@@ -1176,4 +1153,5 @@ class SuffixParser:
             trace=[asdict(t) for t in trace_entries],
             summary_by_type=summary_by_type,
             summary_by_suffix=summary_by_suffix,
+            request_log=_req_log,   # per-request timing
         )
