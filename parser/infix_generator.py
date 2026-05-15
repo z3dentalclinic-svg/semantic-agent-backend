@@ -370,17 +370,16 @@ class InfixGenerator:
         # перенесённая на инфикс. Маркеры (T/Q/geo) не пропускают gap, а становятся
         # non-anchor токенами (остаются в строке, gap'ы между ними не строятся).
         # Агенты: chrome+firefox+safari (E_LAT — chrome only).
-        # Закомментировать одной правкой после завершения research-прогона.
-        # ОТКЛЮЧЕНО ПОСЛЕ GAP-АНАЛИЗА 8 СИДОВ (300 GAP'ов). Полный research давал
-        # ~26k запросов на сид; минимальная добавка для покрытия 64 пропущенных
-        # боевой GAP'ов укомплектована в _append_battle_addon (10 cp×agent комбинаций).
-        # Чтобы вернуть research-режим — раскомментировать строку ниже:
-        # self._append_research_block(seed, out)
+        #
+        # RESEARCH MODE АКТИВЕН — новый GAP-анализ по обновлённому ground-файлу.
+        # Ожидаемый объём: ~19-57k запросов на сид в зависимости от количества gap'ов.
+        # Перед прогоном на Render обязательно вызвать POST /debug/unload-models
+        # чтобы освободить память (~600 МБ от MiniLM + Natasha).
+        self._append_research_block(seed, out)
 
-        # Минимальная research-добавка к боевой матрице.
-        # Покрывает 64/64 GAP'ов через chrome+firefox (set cover по 8 сидам).
-        # 11 GAP'ов требуют safari — отложено до подключения safari в прод.
-        self._append_battle_addon(seed, out)
+        # Минимальная research-добавка к боевой матрице — ОТКЛЮЧЕНА на время research.
+        # После анализа новых GAP'ов будет пересобрана с учётом обновлённого ground.
+        # self._append_battle_addon(seed, out)
 
         return out
 
@@ -876,14 +875,16 @@ class InfixGenerator:
             for cp_pos, _cp_note in self._meaningful_cps(base):
                 tag = "nocp" if cp_pos == -1 else f"cp{cp_pos}"
                 full = f"{base} {rs}".strip() if rs else base
-                results.append(InfixQuery(
-                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
-                    group="SD", struct=f"{D}_{class_name}_{tag}",
-                    insert_val=D, insert_type="research_digit",
-                    orientation="N", cp=cp_pos, cp_note=f"SD_{class_name}_{tag}",
-                    agents=ALL_AGENTS_RESEARCH,
-                    is_new_research=True,
-                ))
+                # Один запрос на агента — парсер берёт agents[0] и роутит соответственно.
+                for ag in ALL_AGENTS_RESEARCH:
+                    results.append(InfixQuery(
+                        query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                        group="SD", struct=f"{D}_{class_name}_{tag}_{ag[:3]}",
+                        insert_val=D, insert_type="research_digit",
+                        orientation="N", cp=cp_pos, cp_note=f"SD_{class_name}_{tag}",
+                        agents=(ag,),
+                        is_new_research=True,
+                    ))
 
     def _build_research_SDL(
         self, left_block: str, right_block: str, L: str, D: str,
@@ -911,14 +912,15 @@ class InfixGenerator:
             (end, f"cp{end}"),
         ]:
             full = f"{base} {rs}".strip() if rs else base
-            results.append(InfixQuery(
-                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
-                group="SDL", struct=f"{D}_{L}_plain_{tag}",
-                insert_val=f"{L}_{D}", insert_type="research_digit_letter",
-                orientation="N", cp=cp, cp_note=f"SDL_plain_{tag}",
-                agents=ALL_AGENTS_RESEARCH, letter=L,
-                is_new_research=True,
-            ))
+            for ag in ALL_AGENTS_RESEARCH:
+                results.append(InfixQuery(
+                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group="SDL", struct=f"{D}_{L}_plain_{tag}_{ag[:3]}",
+                    insert_val=f"{L}_{D}", insert_type="research_digit_letter",
+                    orientation="N", cp=cp, cp_note=f"SDL_plain_{tag}",
+                    agents=(ag,), letter=L,
+                    is_new_research=True,
+                ))
 
         # База 2: wcR
         base_wc = f"{s} {L} {D} *"
@@ -933,14 +935,15 @@ class InfixGenerator:
             (end_wc, f"cp{end_wc}"),
         ]:
             full = f"{base_wc} {rs}".strip() if rs else base_wc
-            results.append(InfixQuery(
-                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
-                group="SDL", struct=f"{D}_{L}_wcR_{tag}",
-                insert_val=f"{L}_{D}", insert_type="research_digit_letter",
-                orientation="N", cp=cp, cp_note=f"SDL_wcR_{tag}",
-                agents=ALL_AGENTS_RESEARCH, letter=L,
-                is_new_research=True,
-            ))
+            for ag in ALL_AGENTS_RESEARCH:
+                results.append(InfixQuery(
+                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group="SDL", struct=f"{D}_{L}_wcR_{tag}_{ag[:3]}",
+                    insert_val=f"{L}_{D}", insert_type="research_digit_letter",
+                    orientation="N", cp=cp, cp_note=f"SDL_wcR_{tag}",
+                    agents=(ag,), letter=L,
+                    is_new_research=True,
+                ))
 
     def _build_research_SDL_REV(
         self, left_block: str, right_block: str, D: str, L: str,
@@ -969,14 +972,15 @@ class InfixGenerator:
             (end, f"cp{end}"),
         ]:
             full = f"{base} {rs}".strip() if rs else base
-            results.append(InfixQuery(
-                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
-                group="SDL_REV", struct=f"{D}_{L}_rev_plain_{tag}",
-                insert_val=f"{D}_{L}", insert_type="research_digit_letter",
-                orientation="N", cp=cp, cp_note=f"SDL_REV_plain_{tag}",
-                agents=ALL_AGENTS_RESEARCH, letter=L,
-                is_new_research=True,
-            ))
+            for ag in ALL_AGENTS_RESEARCH:
+                results.append(InfixQuery(
+                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group="SDL_REV", struct=f"{D}_{L}_rev_plain_{tag}_{ag[:3]}",
+                    insert_val=f"{D}_{L}", insert_type="research_digit_letter",
+                    orientation="N", cp=cp, cp_note=f"SDL_REV_plain_{tag}",
+                    agents=(ag,), letter=L,
+                    is_new_research=True,
+                ))
 
         # База 2: wcR
         base_wc = f"{s} {D} {L} *"
@@ -991,14 +995,15 @@ class InfixGenerator:
             (end_wc, f"cp{end_wc}"),
         ]:
             full = f"{base_wc} {rs}".strip() if rs else base_wc
-            results.append(InfixQuery(
-                query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
-                group="SDL_REV", struct=f"{D}_{L}_rev_wcR_{tag}",
-                insert_val=f"{D}_{L}", insert_type="research_digit_letter",
-                orientation="N", cp=cp, cp_note=f"SDL_REV_wcR_{tag}",
-                agents=ALL_AGENTS_RESEARCH, letter=L,
-                is_new_research=True,
-            ))
+            for ag in ALL_AGENTS_RESEARCH:
+                results.append(InfixQuery(
+                    query=full, gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group="SDL_REV", struct=f"{D}_{L}_rev_wcR_{tag}_{ag[:3]}",
+                    insert_val=f"{D}_{L}", insert_type="research_digit_letter",
+                    orientation="N", cp=cp, cp_note=f"SDL_REV_wcR_{tag}",
+                    agents=(ag,), letter=L,
+                    is_new_research=True,
+                ))
 
     def _append_battle_addon(self, seed: str, results: List[InfixQuery]):
         """
