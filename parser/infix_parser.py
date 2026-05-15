@@ -254,7 +254,11 @@ class InfixParser:
         done_count = [0]
 
         non_e_sem  = asyncio.Semaphore(BATCH_SIZE)
-        addon_sem  = asyncio.Semaphore(BATCH_SIZE * 3)  # addon: выше concurrency чем non_e
+        # addon_sem поднят с 15 до 90 для research-прогонов:
+        # 30 research IP × 3 concurrent = 90 одновременных запросов.
+        # Это ~3 req/IP — безопасный уровень (в suffix мы держим sem=6 без 429).
+        # Прогноз: 24k запросов / 90 × 0.5с ≈ 2 минуты (было 11 минут с sem=15).
+        addon_sem  = asyncio.Semaphore(90)
 
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
