@@ -41,16 +41,20 @@ try:
     _proxy_chrome  = ProxyPool.get("infix_chrome")
     _proxy_firefox = ProxyPool.get("infix_firefox")
     _proxy_safari  = ProxyPool.get("infix_safari")
+    _PROXY_POOL_AVAILABLE = True
 except ImportError:
     try:
         from proxy_pool import ProxyPool
         _proxy_chrome  = ProxyPool.get("infix_chrome")
         _proxy_firefox = ProxyPool.get("infix_firefox")
         _proxy_safari  = ProxyPool.get("infix_safari")
+        _PROXY_POOL_AVAILABLE = True
     except ImportError:
         _proxy_chrome  = os.getenv("INFIX_PROXY_CHROME") or os.getenv("GOOGLE_PROXY_URL") or None
         _proxy_firefox = os.getenv("INFIX_PROXY_FF")     or os.getenv("GOOGLE_PROXY_URL") or None
         _proxy_safari  = None
+        _PROXY_POOL_AVAILABLE = False
+        ProxyPool = None
 
 _google_proxy = _proxy_chrome  # для обратной совместимости
 DELAY = DELAY_SERVER if (_proxy_chrome or _proxy_firefox) else DELAY_LOCAL
@@ -312,47 +316,96 @@ class InfixParser:
         # safari IP используется как второй chrome-клиент для разбивки E-цепочек
         _safari_proxy = _proxy_safari if _proxy_safari else _proxy_chrome
 
+        # ═══ RESEARCH POOL: распределяем research-запросы по всем свободным IP ═══
+        # Берём весь пул минус IP, занятые боевыми ролями infix/prefix/suffix.
+        # При 5 батчах × 10 IP = 50 IP минус ~10 боевых = ~40 IP под research.
+        _research_pool: list = []
+        if _PROXY_POOL_AVAILABLE and ProxyPool is not None:
+            try:
+                _research_pool = ProxyPool.get_research_pool(exclude_roles={
+                    "infix_chrome", "infix_firefox", "infix_safari",
+                    "prefix_chrome", "prefix_firefox", "prefix_nonpa",
+                    "suffix",
+                })
+                print(f"[InfixResearch] research pool size: {len(_research_pool)} IPs")
+            except Exception as e:
+                print(f"[InfixResearch] failed to get research pool: {e}")
+                _research_pool = []
+        # ════════════════════════════════════════════════════════════════════════
+
         async with httpx.AsyncClient(proxy=_proxy_chrome)  as chrome_client, \
                    httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
                    httpx.AsyncClient(proxy=_safari_proxy)  as safari_client:
-            e_by_letter_chr  = defaultdict(list)
-            e_by_letter_ff   = defaultdict(list)
-            addon_by_key_chr = defaultdict(list)
-            addon_by_key_ff  = defaultdict(list)
-            non_e_chr = []
-            non_e_ff  = []
-            for iq in matrix:
-                is_ff = "firefox" in iq.agents
-                if iq.group == "E" and iq.letter:
-                    (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
-                elif getattr(iq, 'is_new_research', False):
-                    key = (iq.group, iq.insert_val)
-                    (addon_by_key_ff if is_ff else addon_by_key_chr)[key].append(iq)
+
+            # Открываем research-клиенты — по одному httpx.AsyncClient на каждый research IP
+            _research_clients = [httpx.AsyncClient(proxy=p) for p in _research_pool]
+
+            try:
+                e_by_letter_chr  = defaultdict(list)
+                e_by_letter_ff   = defaultdict(list)
+                addon_by_key_chr = defaultdict(list)
+                addon_by_key_ff  = defaultdict(list)
+                non_e_chr = []
+                non_e_ff  = []
+                for iq in matrix:
+                    is_ff = "firefox" in iq.agents
+                    if iq.group == "E" and iq.letter:
+                        (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
+                    elif getattr(iq, 'is_new_research', False):
+                        key = (iq.group, iq.insert_val)
+                        (addon_by_key_ff if is_ff else addon_by_key_chr)[key].append(iq)
+                    else:
+                        (non_e_ff if is_ff else non_e_chr).append(iq)
+
+                async def run_addon(iq, client):
+                    async with addon_sem:
+                        await fetch_one(iq, client)
+
+                addon_chr = [iq for qs in addon_by_key_chr.values() for iq in qs]
+                addon_ff  = [iq for qs in addon_by_key_ff.values()  for iq in qs]
+
+                # ─── РАСПРЕДЕЛЕНИЕ research-запросов ───
+                # Если research_pool пустой — fallback: всё через chrome/ff (старое поведение).
+                # Если есть — round-robin по research-клиентам.
+                if _research_clients:
+                    research_sem = asyncio.Semaphore(len(_research_clients) * 6)
+                    n_clients = len(_research_clients)
+
+                    async def run_research(iq, slot):
+                        async with research_sem:
+                            await fetch_one(iq, _research_clients[slot])
+
+                    all_research = addon_chr + addon_ff
+                    print(f"[InfixResearch] dispatching {len(all_research)} queries over {n_clients} IPs (sem={n_clients*6})")
+                    research_tasks = [
+                        run_research(iq, i % n_clients) for i, iq in enumerate(all_research)
+                    ]
                 else:
-                    (non_e_ff if is_ff else non_e_chr).append(iq)
+                    research_tasks = (
+                        [run_addon(iq, chrome_client) for iq in addon_chr] +
+                        [run_addon(iq, ff_client)     for iq in addon_ff]
+                    )
 
-            async def run_addon(iq, client):
-                async with addon_sem:
-                    await fetch_one(iq, client)
+                # Разбиваем E-chr цепочки пополам: чётные → chrome, нечётные → safari
+                e_chr_letters = list(e_by_letter_chr.items())
+                e_chr_even = [qs for _, qs in e_chr_letters[0::2]]
+                e_chr_odd  = [qs for _, qs in e_chr_letters[1::2]]
 
-            addon_chr = [iq for qs in addon_by_key_chr.values() for iq in qs]
-            addon_ff  = [iq for qs in addon_by_key_ff.values()  for iq in qs]
-
-            # Разбиваем E-chr цепочки пополам: чётные → chrome, нечётные → safari
-            # Это сокращает bottleneck с ~17 шагов до ~9 (2× ускорение E-блока)
-            e_chr_letters = list(e_by_letter_chr.items())
-            e_chr_even = [qs for _, qs in e_chr_letters[0::2]]
-            e_chr_odd  = [qs for _, qs in e_chr_letters[1::2]]
-
-            await asyncio.gather(
-                *[run_letter(qs, chrome_client) for qs in e_chr_even],
-                *[run_letter(qs, safari_client) for qs in e_chr_odd],
-                *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
-                *[run_addon(iq, chrome_client)  for iq in addon_chr],
-                *[run_addon(iq, ff_client)      for iq in addon_ff],
-                *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
-                *[run_non_e(iq, ff_client)      for iq in non_e_ff],
-            )
+                await asyncio.gather(
+                    *[run_letter(qs, chrome_client) for qs in e_chr_even],
+                    *[run_letter(qs, safari_client) for qs in e_chr_odd],
+                    *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
+                    *research_tasks,
+                    *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
+                    *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+                )
+            finally:
+                # Закрываем research httpx-клиенты
+                for c in _research_clients:
+                    try:
+                        await c.aclose()
+                    except Exception:
+                        pass
 
         total_time = (time.time() - total_start) * 1000
 
