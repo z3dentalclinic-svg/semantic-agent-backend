@@ -54,8 +54,13 @@ import nltk
 from nltk.stem import SnowballStemmer
 
 try:
-    from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
-    NATASHA_AVAILABLE = True
+    # === NATASHA ОТКЛЮЧЕНА для экономии RAM при research-прогонах ===
+    # NewsEmbedding + NewsNERTagger едят ~250 МБ. На время research отключено.
+    # Чтобы вернуть — раскомментировать строку ниже и закомментировать NATASHA_AVAILABLE = False:
+    # from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
+    # NATASHA_AVAILABLE = True
+    NATASHA_AVAILABLE = False
+    print("⚠️ Natasha ОТКЛЮЧЕНА вручную в main.py (research mode)")
 except ImportError:
     NATASHA_AVAILABLE = False
     print("⚠️ Natasha не установлена. EntityLogicManager будет работать только с жёстким кешем.")
@@ -971,6 +976,24 @@ class GoogleAutocompleteParser:
 
 parser = GoogleAutocompleteParser()
 
+# === ПРИНУДИТЕЛЬНАЯ ВЫГРУЗКА MiniLM ПРИ СТАРТЕ — для research-прогонов ===
+# MiniLM (fastembed) автоматически подгружался l2_filter'ом. На время research
+# фильтры не нужны — выгружаем модель из памяти. При первом вызове L2-фильтра
+# модель загрузится снова (~5с задержка).
+try:
+    import gc
+    from filters import shared_model as _sm
+    if getattr(_sm, "_model", None) is not None:
+        _sm._model = None
+        gc.collect()
+        gc.collect()
+        print("✅ MiniLM выгружен при старте (research mode)")
+    else:
+        print("ℹ️ MiniLM не был загружен при старте")
+except Exception as _e:
+    print(f"⚠️ Не удалось выгрузить MiniLM: {_e}")
+# ════════════════════════════════════════════════════════════════════════════
+
 def apply_smart_fix(result: dict, seed: str, language: str):
     """
     Финальная нормализация результатов
@@ -1614,56 +1637,47 @@ def memory_audit():
     }
 
 
-# === Memory Unload Endpoint — для research-прогонов ===
-# Освобождает ML-модели (MiniLM + Natasha) когда нужна RAM для широких прогонов
-# (infix research, prefix research, итд). Фильтры L2 после этого не будут работать
-# до следующего вызова apply_l2_filter (там сработает lazy reload).
+# === Memory Unload Endpoint — ручное освобождение моделей ===
 @app.post("/debug/unload-models")
 def unload_models():
     """
-    Выгружает ML-модели для освобождения памяти перед research-прогонами.
-    Освобождает: MiniLM (~400 МБ), Natasha NER + NewsEmbedding (~250 МБ).
-
-    После вызова L2-фильтр перестанет работать пока модель не подгрузится снова
-    (это случится автоматически при первом вызове apply_l2_filter, но опять
-    сожрёт память). Для прогонов где фильтры не нужны — используй этот endpoint.
+    Ручная выгрузка ML-моделей.
+    MiniLM и Natasha обычно уже выгружены при старте (см. patch в main.py).
+    Этот endpoint позволяет ещё раз почистить если что-то подгрузилось.
     """
-    import gc, sys, psutil, os
+    import gc, psutil, os
     process = psutil.Process(os.getpid())
     mem_before = process.memory_info().rss / 1024 / 1024
     freed = []
 
-    # 1. Unload MiniLM (fastembed)
     try:
         from filters import shared_model
-        if shared_model._model is not None:
+        if getattr(shared_model, "_model", None) is not None:
             shared_model._model = None
             freed.append("MiniLM (fastembed)")
     except Exception as e:
         freed.append(f"MiniLM_skip: {e}")
 
-    # 2. Unload Natasha embeddings/NER из глобального парсера
     try:
         global parser
-        if hasattr(parser, "emb"):
+        if hasattr(parser, "emb") and parser.emb is not None:
             parser.emb = None
             freed.append("Natasha NewsEmbedding")
-        if hasattr(parser, "ner_tagger"):
+        if hasattr(parser, "ner_tagger") and parser.ner_tagger is not None:
             parser.ner_tagger = None
             freed.append("Natasha NER")
-        if hasattr(parser, "morph_vocab"):
+        if hasattr(parser, "morph_vocab") and parser.morph_vocab is not None:
             parser.morph_vocab = None
             freed.append("Natasha MorphVocab")
-        if hasattr(parser, "segmenter"):
+        if hasattr(parser, "segmenter") and parser.segmenter is not None:
             parser.segmenter = None
             freed.append("Natasha Segmenter")
         parser.natasha_ready = False
     except Exception as e:
         freed.append(f"Natasha_skip: {e}")
 
-    # 3. Force GC
-    collected = gc.collect()
-    gc.collect()  # second pass для cyclic refs
+    gc.collect()
+    gc.collect()
 
     mem_after = process.memory_info().rss / 1024 / 1024
     return {
@@ -1671,6 +1685,5 @@ def unload_models():
         "ram_before_mb": round(mem_before, 1),
         "ram_after_mb": round(mem_after, 1),
         "freed_mb": round(mem_before - mem_after, 1),
-        "gc_collected_objects": collected,
         "freed_components": freed,
     }
