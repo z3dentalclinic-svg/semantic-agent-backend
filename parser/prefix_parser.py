@@ -525,17 +525,49 @@ class PrefixParser:
                 else:
                     nonpa_chr.append(pq)
 
-        nonpa_sem = asyncio.Semaphore(BATCH_SIZE)
-        addon_sem = asyncio.Semaphore(BATCH_SIZE * 3)
+        # ═══ PREFIX RESEARCH POOL — 5 IP (3 chrome + 2 firefox) ═══
+        # Бета-архитектура (2 батча × 25 IP = 50):
+        #   suffix 10 + infix 10 + prefix 5 = 25 на батч
+        #   2 юзера одновременно → 10 IP на префикс из 50 пула
+        #
+        # Разделение по агентам:
+        #   - chrome bucket: 3 IP (для PA chrome + nonpa_chrome + addon_chrome)
+        #   - firefox bucket: 2 IP (для PA firefox + nonpa_firefox)
+        # Concurrency = 6 на каждый IP. Roundrobin внутри bucket.
+        _N_PREFIX_RESEARCH = 5
+        _N_PREFIX_CHROME = 3   # сколько IP под chrome
+        _N_PREFIX_FF = 2       # сколько IP под firefox
+        _CONC_PER_IP = 6
 
-        async def run_addon(pq: PrefixQuery, client: httpx.AsyncClient):
-            async with addon_sem:
-                await fetch_with_stage(pq, "chrome", client, "addon_chrome")
+        _research_proxies: list = []
+        _pool_source = "none"
+        try:
+            from utils.proxy_pool import ProxyPool as _PP
+            _research_proxies = [_PP.get("prefix_research") for _ in range(_N_PREFIX_RESEARCH)]
+            _research_proxies = [p for p in _research_proxies if p]
+            _pool_source = "utils.proxy_pool"
+        except Exception as _e1:
+            _trace("RESEARCH_POOL_TRY1_FAIL", error=repr(_e1)[:120])
+            try:
+                from proxy_pool import ProxyPool as _PP
+                _research_proxies = [_PP.get("prefix_research") for _ in range(_N_PREFIX_RESEARCH)]
+                _research_proxies = [p for p in _research_proxies if p]
+                _pool_source = "proxy_pool"
+            except Exception as _e2:
+                _trace("RESEARCH_POOL_TRY2_FAIL", error=repr(_e2)[:120])
+                _research_proxies = []
+                _pool_source = "fallback_empty"
 
-        _trace("PROXY_INIT",
-               chrome=str(proxy_chr)[:25] if proxy_chr else "None",
-               firefox=str(proxy_ff)[:25] if proxy_ff else "None",
-               nonpa=str(proxy_npa)[:25] if proxy_npa else "None")
+        _trace("RESEARCH_POOL_READY",
+               n_proxies=len(_research_proxies),
+               target=_N_PREFIX_RESEARCH,
+               chrome_slots=_N_PREFIX_CHROME,
+               firefox_slots=_N_PREFIX_FF,
+               conc_per_ip=_CONC_PER_IP,
+               source=_pool_source,
+               sample=str(_research_proxies[0])[:35] if _research_proxies else "EMPTY")
+        # ════════════════════════════════════════════════════════════════════════
+
         _trace("BUCKETS_BUILT",
                pa_chr_letters=len(pa_chr_by_letter),
                pa_ff_letters=len(pa_ff_by_letter),
@@ -546,47 +578,116 @@ class PrefixParser:
                addon_chr=len(addon_chr),
                total_matrix=len(matrix))
 
-        async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
-                   httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
-                   httpx.AsyncClient(proxy=proxy_npa) as npa_client:
+        try:
+            # Открываем httpx-клиенты на каждый IP в пуле.
+            # Первые _N_PREFIX_CHROME IP — для chrome запросов, остальные — для firefox.
+            _research_clients = []
+            if _research_proxies:
+                try:
+                    _research_clients = [httpx.AsyncClient(proxy=p) for p in _research_proxies]
+                    _trace("RESEARCH_CLIENTS_OPENED", n=len(_research_clients))
+                except Exception as _e:
+                    _trace("RESEARCH_CLIENTS_FAIL", error=repr(_e)[:200])
+                    _research_clients = []
 
-            _trace("CLIENTS_OPENED")
-            _trace("GATHER_START",
-                   total_tasks=total_tasks,
-                   nonpa_sem=BATCH_SIZE,
-                   addon_sem=BATCH_SIZE * 3)
+            # Fallback если пул не получили — открываем 1 клиент без прокси
+            if not _research_clients:
+                _research_clients = [httpx.AsyncClient()]
+                _trace("FALLBACK_NO_PROXY", n_clients=1)
 
-            await asyncio.gather(
-                # PA Chrome — все буквы параллельно, внутри буквы последовательно
-                *[run_letter(qs, "chrome", chr_client, "pa_chrome")
-                  for qs in pa_chr_by_letter.values()],
-                # PA FF — аналогично
-                *[run_letter(qs, "firefox", ff_client, "pa_firefox")
-                  for qs in pa_ff_by_letter.values()],
-                # ADDON — через addon_sem на chrome IP
-                *[run_addon(pq, chr_client) for pq in addon_chr],
-                # Non-PA Chrome (G+PC) — через semaphore на отдельном IP
-                *[run_nonpa(pq, "chrome", npa_client, nonpa_sem, "nonpa_chrome")
-                  for pq in nonpa_chr],
-                # Non-PA FF
-                *[run_nonpa(pq, "firefox", ff_client, nonpa_sem, "nonpa_firefox")
-                  for pq in nonpa_ff],
-            )
-            _trace("GATHER_DONE", elapsed_s=round(time.time() - total_start, 2))
+            try:
+                # Разбиваем клиенты на 2 группы: первые N_CHROME — для chrome, остальные — для firefox
+                n_have = len(_research_clients)
+                _chrome_clients = _research_clients[:min(_N_PREFIX_CHROME, n_have)]
+                _ff_clients = _research_clients[min(_N_PREFIX_CHROME, n_have):]
+                if not _ff_clients:
+                    # Если IP слишком мало — firefox использует те же что chrome
+                    _ff_clients = _chrome_clients
+                _trace("CLIENTS_SPLIT",
+                       chrome_n=len(_chrome_clients),
+                       firefox_n=len(_ff_clients))
 
-            # ═══ Детальные таймы по stage ═══
-            for stage, st in sorted(stage_stats.items()):
-                if st['requests'] == 0:
-                    continue
-                wall_s = (st['finished_at'] - st['started_at']) if st['started_at'] else 0
-                avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
-                req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
-                _trace("STAGE_STATS",
-                       stage_name=stage,
-                       requests=st['requests'],
-                       wall_s=round(wall_s, 2),
-                       req_per_s=round(req_per_s, 1),
-                       avg_ms=round(avg_ms, 0))
+                # ═══ ЕДИНЫЙ СЕМАФОР для всех запросов ═══
+                # Все запросы идут через research_clients с глобальным семафором
+                global_sem = asyncio.Semaphore(n_have * _CONC_PER_IP)
+
+                async def run_one(pq, agent, stage, client_pool, idx):
+                    """Запускает 1 запрос через client из соответствующего pool round-robin."""
+                    async with global_sem:
+                        client = client_pool[idx % len(client_pool)]
+                        await fetch_with_stage(pq, agent, client, stage)
+
+                # Собираем все задачи: PA chrome + PA firefox + nonpa chrome + nonpa firefox + addon
+                tasks = []
+                idx_chr = 0
+                idx_ff = 0
+
+                # PA chrome — все буквы параллельно, внутри буквы sequential
+                async def run_pa_chrome_letter(qs, start_idx):
+                    for pq in qs:
+                        async with global_sem:
+                            client = _chrome_clients[start_idx % len(_chrome_clients)]
+                            await fetch_with_stage(pq, "chrome", client, "pa_chrome")
+
+                async def run_pa_firefox_letter(qs, start_idx):
+                    for pq in qs:
+                        async with global_sem:
+                            client = _ff_clients[start_idx % len(_ff_clients)]
+                            await fetch_with_stage(pq, "firefox", client, "pa_firefox")
+
+                for i, letter in enumerate(pa_chr_by_letter):
+                    tasks.append(run_pa_chrome_letter(pa_chr_by_letter[letter], i))
+                for i, letter in enumerate(pa_ff_by_letter):
+                    tasks.append(run_pa_firefox_letter(pa_ff_by_letter[letter], i))
+
+                # Non-PA chrome — через global_sem на chrome bucket
+                for i, pq in enumerate(nonpa_chr):
+                    tasks.append(run_one(pq, "chrome", "nonpa_chrome", _chrome_clients, i))
+                # Non-PA firefox — на firefox bucket
+                for i, pq in enumerate(nonpa_ff):
+                    tasks.append(run_one(pq, "firefox", "nonpa_firefox", _ff_clients, i))
+                # Addon — chrome only через chrome bucket
+                for i, pq in enumerate(addon_chr):
+                    tasks.append(run_one(pq, "chrome", "addon_chrome", _chrome_clients, i))
+
+                _trace("GATHER_START",
+                       total_tasks=len(tasks),
+                       global_sem=n_have * _CONC_PER_IP,
+                       chrome_clients=len(_chrome_clients),
+                       firefox_clients=len(_ff_clients))
+
+                await asyncio.gather(*tasks)
+                _trace("GATHER_DONE", elapsed_s=round(time.time() - total_start, 2))
+
+                # ═══ Детальные таймы по stage ═══
+                for stage, st in sorted(stage_stats.items()):
+                    if st['requests'] == 0:
+                        continue
+                    wall_s = (st['finished_at'] - st['started_at']) if st['started_at'] else 0
+                    avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
+                    req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
+                    _trace("STAGE_STATS",
+                           stage_name=stage,
+                           requests=st['requests'],
+                           wall_s=round(wall_s, 2),
+                           req_per_s=round(req_per_s, 1),
+                           avg_ms=round(avg_ms, 0))
+            except Exception as _e:
+                import traceback as _tb
+                _trace("GATHER_FAIL", error=repr(_e)[:200], tb=_tb.format_exc()[-500:])
+                raise
+            finally:
+                # Закрываем все research-клиенты
+                for c in _research_clients:
+                    try:
+                        await c.aclose()
+                    except Exception:
+                        pass
+                _trace("RESEARCH_CLIENTS_CLOSED")
+        except Exception as _e:
+            import traceback as _tb
+            _trace("TOP_FAIL", error=repr(_e)[:200], tb=_tb.format_exc()[-500:])
+            raise
 
         # Ротация батча после прогона
         try:
