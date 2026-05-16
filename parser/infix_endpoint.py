@@ -89,6 +89,9 @@ def register_infix_endpoint(app: FastAPI):
                 "groups_used": result.groups_used,
                 "summary_by_gap": result.summary_by_gap,
                 "summary_by_group": result.summary_by_group,
+                "stage_stats": result.stage_stats,
                 "trace": result.trace,
             },
+            "infixStageStats": result.stage_stats,  # дублирую на верхний уровень для удобства анализа в JSON-экспорте
+            "infixTraceLog": result.trace_log,      # подробный пошаговый лог парсера (START/MATRIX_OK/STAGE_STATS/etc)
         }
