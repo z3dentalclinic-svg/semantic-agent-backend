@@ -356,22 +356,19 @@ class InfixParser:
         # Legacy run_letter/run_non_e удалены в v3.0 — заменены на run_one внутри
         # секции диспатча после получения research pool.
 
-        # ═══ INFIX RESEARCH POOL — 12 IP × conc=6 = 72 параллельных ═══
+        # ═══ INFIX RESEARCH POOL — 10 IP × conc=6 = 60 параллельных ═══
         # Сафари не используем. Базовые infix_chrome/infix_firefox освобождены —
         # все запросы идут через research pool.
         #
-        # Эксперимент 10×4 показал что bottleneck — НЕ concurrency, а IP count.
-        # 12×6=72 conc даёт ~4.8с на 1-pair сид (vs 8.6с при 10×4).
-        #
-        # Бета-архитектура (2 батча):
-        #   suffix 10 + infix 12 + prefix 3 = 25 на батч × 2 = 50 IP
-        #   2 юзера одновременно → 2 × 12 = 24 IP на инфикс
+        # Бета-архитектура (2 батча × 25 IP = 50):
+        #   suffix 10 + infix 10 + prefix 5 = 25 на батч
+        #   2 юзера одновременно → 2 × 10 = 20 IP на инфикс из 50 пула
         #
         # Прогноз (avg latency ~700ms при conc=6):
-        #   1 pair (~284 reqs):  ~4с
-        #   2 pair (~568 reqs):  ~8с
-        #   3 pair (~660 reqs):  ~9с
-        _N_INFIX_RESEARCH = 12
+        #   1 pair (~284 reqs):  ~5с
+        #   2 pair (~568 reqs):  ~9с
+        #   3 pair (~660 reqs):  ~11с
+        _N_INFIX_RESEARCH = 10
         _CONC_PER_IP = 6
 
         try:
