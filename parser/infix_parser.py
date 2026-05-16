@@ -356,22 +356,23 @@ class InfixParser:
         # Legacy run_letter/run_non_e удалены в v3.0 — заменены на run_one внутри
         # секции диспатча после получения research pool.
 
-        # ═══ INFIX RESEARCH POOL — фиксированный размер 12 IP ═══
+        # ═══ INFIX RESEARCH POOL — 10 IP × conc=4 = 40 параллельных ═══
         # Сафари не используем. Базовые infix_chrome/infix_firefox освобождены —
         # все запросы идут через research pool.
         #
-        # Фиксированные 12 IP позволяют 2-batch архитектуру для бета-теста:
-        #   2 юзера одновременно → 2 × 12 = 24 IP на инфикс из 50 пула
-        #   Никаких конфликтов за ProxyPool — каждый юзер работает на своём батче.
+        # Бета-архитектура (2 батча по 25 IP):
+        #   suffix 10 + infix 10 + prefix 5 = 25 на батч × 2 = 50 IP
+        #   2 юзера одновременно → 2 × 10 = 20 IP на инфикс из 50 пула
         #
-        # Concurrency = 6 на каждый IP → общий semaphore = 12 × 6 = 72.
+        # Concurrency = 4 на каждый IP → общий semaphore = 10 × 4 = 40.
+        # При conc=4 avg latency Google ~600ms (vs 1709ms при conc=6).
         #
-        # Прогноз скорости (avg latency 1000ms при conc=6):
-        #   1 pair (~284 reqs):  ~4с
-        #   2 pair (~568 reqs):  ~8с
-        #   3 pair (~660 reqs):  ~9с
-        _N_INFIX_RESEARCH = 12
-        _CONC_PER_IP = 6  # параллелизм на 1 IP
+        # Прогноз (avg latency 600ms при conc=4):
+        #   1 pair (~284 reqs):  ~4.3с
+        #   2 pair (~568 reqs):  ~8.5с
+        #   3 pair (~660 reqs):  ~9.9с
+        _N_INFIX_RESEARCH = 10
+        _CONC_PER_IP = 4
 
         try:
             n_pairs = len(set(iq.gap_index for iq in matrix)) or 1
