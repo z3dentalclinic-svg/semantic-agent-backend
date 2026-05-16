@@ -262,12 +262,9 @@ class InfixParser:
         lock = asyncio.Lock()
         done_count = [0]
 
-        non_e_sem  = asyncio.Semaphore(BATCH_SIZE)
-        # addon_sem поднят с 15 до 90 для research-прогонов:
-        # 30 research IP × 3 concurrent = 90 одновременных запросов.
-        # Это ~3 req/IP — безопасный уровень (в suffix мы держим sem=6 без 429).
-        # Прогноз: 24k запросов / 90 × 0.5с ≈ 2 минуты (было 11 минут с sem=15).
-        addon_sem  = asyncio.Semaphore(90)
+        # Старые семафоры (non_e_sem, addon_sem) удалены при рефакторинге v3.0 —
+        # теперь единый global_sem = N_IP × CONC_PER_IP создаётся ниже после получения
+        # размера research pool.
 
         async def fetch_one(iq: InfixQuery, client: httpx.AsyncClient):
             agent = iq.agents[0]
@@ -356,28 +353,31 @@ class InfixParser:
                 stage_stats[stage]['time_ms'] += elapsed_ms
                 stage_stats[stage]['finished_at'] = time.time()
 
-        async def run_letter(letter_queries, client, stage):
-            for iq in letter_queries:
-                await fetch_with_stage(iq, client, stage)
+        # Legacy run_letter/run_non_e удалены в v3.0 — заменены на run_one внутри
+        # секции диспатча после получения research pool.
 
-        async def run_non_e(iq, client, stage):
-            async with non_e_sem:
-                await fetch_with_stage(iq, client, stage)
+        # ═══ INFIX RESEARCH POOL — фиксированный размер 12 IP ═══
+        # Сафари не используем. Базовые infix_chrome/infix_firefox освобождены —
+        # все запросы идут через research pool.
+        #
+        # Фиксированные 12 IP позволяют 2-batch архитектуру для бета-теста:
+        #   2 юзера одновременно → 2 × 12 = 24 IP на инфикс из 50 пула
+        #   Никаких конфликтов за ProxyPool — каждый юзер работает на своём батче.
+        #
+        # Concurrency = 6 на каждый IP → общий semaphore = 12 × 6 = 72.
+        #
+        # Прогноз скорости (avg latency 1000ms при conc=6):
+        #   1 pair (~284 reqs):  ~4с
+        #   2 pair (~568 reqs):  ~8с
+        #   3 pair (~660 reqs):  ~9с
+        _N_INFIX_RESEARCH = 12
+        _CONC_PER_IP = 6  # параллелизм на 1 IP
 
-        # safari IP используется как второй chrome-клиент для разбивки E-цепочек
-        _safari_proxy = _proxy_safari if _proxy_safari else _proxy_chrome
-        _trace("PROXY_INIT",
-               chrome=str(_proxy_chrome)[:25] if _proxy_chrome else "None",
-               firefox=str(_proxy_firefox)[:25] if _proxy_firefox else "None",
-               safari=str(_safari_proxy)[:25] if _safari_proxy else "None")
+        try:
+            n_pairs = len(set(iq.gap_index for iq in matrix)) or 1
+        except Exception:
+            n_pairs = 1
 
-        # ═══ INFIX RESEARCH POOL — 30 IP под is_new_research запросы ═══
-        # Берём ProxyPool.get("infix_research") в режиме round-robin: возвращает IP
-        # по очереди со всех 5 батчей (50 IP всего), на этой роли в пуле зарегистрировано
-        # значение RESEARCH_ROLES = {"infix_research", ...}.
-        # Если пул недоступен — _research_proxies остаётся пустым, и research-запросы
-        # пойдут через chrome_client/ff_client как раньше.
-        _N_INFIX_RESEARCH = 30
         _research_proxies: list = []
         _pool_source = "none"
         try:
@@ -399,17 +399,17 @@ class InfixParser:
         _trace("RESEARCH_POOL_READY",
                n_proxies=len(_research_proxies),
                target=_N_INFIX_RESEARCH,
+               n_pairs=n_pairs,
+               conc_per_ip=_CONC_PER_IP,
                source=_pool_source,
                sample=str(_research_proxies[0])[:35] if _research_proxies else "EMPTY")
         # ════════════════════════════════════════════════════════════════════════
 
         try:
-            async with httpx.AsyncClient(proxy=_proxy_chrome)  as chrome_client, \
-                       httpx.AsyncClient(proxy=_proxy_firefox) as ff_client, \
-                       httpx.AsyncClient(proxy=_safari_proxy)  as safari_client:
-                _trace("MAIN_CLIENTS_OPENED")
-
-                # Открываем по одному httpx-клиенту на каждый research IP
+            # Открываем по 1 httpx-клиенту на каждый IP в пуле.
+            # Базовые infix_chrome/firefox/safari клиенты НЕ создаются — выкинуты.
+            _research_clients = []
+            if _research_proxies:
                 try:
                     _research_clients = [httpx.AsyncClient(proxy=p) for p in _research_proxies]
                     _trace("RESEARCH_CLIENTS_OPENED", n=len(_research_clients))
@@ -417,103 +417,79 @@ class InfixParser:
                     _trace("RESEARCH_CLIENTS_FAIL", error=repr(_e)[:200])
                     _research_clients = []
 
-                try:
-                    e_by_letter_chr  = defaultdict(list)
-                    e_by_letter_ff   = defaultdict(list)
-                    addon_by_key_chr = defaultdict(list)
-                    addon_by_key_ff  = defaultdict(list)
-                    non_e_chr = []
-                    non_e_ff  = []
-                    for iq in matrix:
-                        is_ff = "firefox" in iq.agents
-                        if iq.group == "E" and iq.letter:
-                            (e_by_letter_ff if is_ff else e_by_letter_chr)[iq.letter].append(iq)
-                        elif getattr(iq, 'is_new_research', False):
-                            key = (iq.group, iq.insert_val)
-                            (addon_by_key_ff if is_ff else addon_by_key_chr)[key].append(iq)
-                        else:
-                            (non_e_ff if is_ff else non_e_chr).append(iq)
+            # Если пул не получили — fallback: открываем 1 клиент без прокси.
+            # Это аварийный режим, такого происходить не должно.
+            if not _research_clients:
+                _research_clients = [httpx.AsyncClient()]
+                _trace("FALLBACK_NO_PROXY", n_clients=1)
 
-                    addon_chr_n = sum(len(qs) for qs in addon_by_key_chr.values())
-                    addon_ff_n  = sum(len(qs) for qs in addon_by_key_ff.values())
-                    e_chr_n = sum(len(qs) for qs in e_by_letter_chr.values())
-                    e_ff_n  = sum(len(qs) for qs in e_by_letter_ff.values())
-                    _trace("BUCKETS_BUILT",
-                           addon_chr=addon_chr_n, addon_ff=addon_ff_n,
-                           e_chr=e_chr_n, e_ff=e_ff_n,
-                           non_e_chr=len(non_e_chr), non_e_ff=len(non_e_ff))
+            try:
+                # ═══ ЕДИНЫЙ СЕМАФОР для всех запросов ═══
+                # Все запросы инфикса (E + non_e + addon) идут через research_clients
+                # с единым семафором = n_ip * conc_per_ip.
+                global_sem = asyncio.Semaphore(len(_research_clients) * _CONC_PER_IP)
+                n_clients = len(_research_clients)
 
-                    async def run_addon(iq, client, stage):
-                        async with addon_sem:
-                            await fetch_with_stage(iq, client, stage)
+                async def run_one(iq, client_idx, stage):
+                    async with global_sem:
+                        await fetch_with_stage(iq, _research_clients[client_idx], stage)
 
-                    addon_chr = [iq for qs in addon_by_key_chr.values() for iq in qs]
-                    addon_ff  = [iq for qs in addon_by_key_ff.values()  for iq in qs]
-
-                    # ─── Распределяем research-запросы ───
-                    if _research_clients:
-                        n_clients = len(_research_clients)
-                        all_addon = addon_chr + addon_ff
-                        _trace("ADDON_DISPATCH_RESEARCH",
-                               total=len(all_addon), n_clients=n_clients,
-                               req_per_client=len(all_addon) // max(1, n_clients))
-                        addon_tasks = [
-                            run_addon(iq, _research_clients[i % n_clients], "addon_research")
-                            for i, iq in enumerate(all_addon)
-                        ]
+                # Разбиваем матрицу на 3 bucket'а только для трекинга stage:
+                # e_pool, non_e_pool, addon_pool — все идут через общий пул round-robin.
+                e_tasks = []
+                non_e_tasks = []
+                addon_tasks = []
+                idx = 0
+                for iq in matrix:
+                    if iq.group == "E" and iq.letter:
+                        stage = "e_pool"
+                        e_tasks.append(run_one(iq, idx % n_clients, stage))
+                    elif getattr(iq, 'is_new_research', False):
+                        stage = "addon_pool"
+                        addon_tasks.append(run_one(iq, idx % n_clients, stage))
                     else:
-                        _trace("ADDON_DISPATCH_FALLBACK", addon_chr=len(addon_chr), addon_ff=len(addon_ff))
-                        addon_tasks = (
-                            [run_addon(iq, chrome_client, "addon_chrome") for iq in addon_chr] +
-                            [run_addon(iq, ff_client, "addon_firefox")    for iq in addon_ff]
-                        )
+                        stage = "non_e_pool"
+                        non_e_tasks.append(run_one(iq, idx % n_clients, stage))
+                    idx += 1
 
-                    # Разбиваем E-chr цепочки пополам: чётные → chrome, нечётные → safari
-                    e_chr_letters = list(e_by_letter_chr.items())
-                    e_chr_even = [qs for _, qs in e_chr_letters[0::2]]
-                    e_chr_odd  = [qs for _, qs in e_chr_letters[1::2]]
+                _trace("BUCKETS_BUILT",
+                       e=len(e_tasks),
+                       non_e=len(non_e_tasks),
+                       addon=len(addon_tasks),
+                       total=len(matrix),
+                       global_sem=n_clients * _CONC_PER_IP)
+                _trace("GATHER_START", total_tasks=len(matrix), n_ip=n_clients)
 
-                    _trace("GATHER_START", total_tasks=len(addon_tasks) + len(e_chr_even) + len(e_chr_odd) + len(e_by_letter_ff) + len(non_e_chr) + len(non_e_ff))
+                await asyncio.gather(*e_tasks, *non_e_tasks, *addon_tasks)
 
-                    await asyncio.gather(
-                        *[run_letter(qs, chrome_client, "e_chrome")  for qs in e_chr_even],
-                        *[run_letter(qs, safari_client, "e_safari")  for qs in e_chr_odd],
-                        *[run_letter(qs, ff_client, "e_firefox")     for qs in e_by_letter_ff.values()],
-                        *addon_tasks,
-                        *[run_non_e(iq, chrome_client, "non_e_chrome")  for iq in non_e_chr],
-                        *[run_non_e(iq, ff_client, "non_e_firefox")     for iq in non_e_ff],
-                    )
-                    elapsed_total = time.time() - total_start
-                    _trace("GATHER_DONE", elapsed_s=round(elapsed_total, 2))
+                elapsed_total = time.time() - total_start
+                _trace("GATHER_DONE", elapsed_s=round(elapsed_total, 2))
 
-                    # ═══ Детальные таймы по stage ═══
-                    # Для каждой stage вычисляем wall_time (started_at..finished_at)
-                    # и avg latency (sum_of_request_times / requests).
-                    for stage, st in sorted(stage_stats.items()):
-                        if st['requests'] == 0:
-                            continue
-                        wall_s = (st['finished_at'] - st['started_at']) if st['started_at'] else 0
-                        avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
-                        req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
-                        _trace("STAGE_STATS",
-                               stage_name=stage,
-                               requests=st['requests'],
-                               wall_s=round(wall_s, 2),
-                               req_per_s=round(req_per_s, 1),
-                               avg_ms=round(avg_ms, 0))
-                    _trace("GATHER_DONE", elapsed_s=round(time.time() - total_start, 2))
-                except Exception as _e:
-                    import traceback as _tb
-                    _trace("GATHER_FAIL", error=repr(_e)[:200], tb=_tb.format_exc()[-500:])
-                    raise
-                finally:
-                    # Закрываем research-клиенты
-                    for c in _research_clients:
-                        try:
-                            await c.aclose()
-                        except Exception:
-                            pass
-                    _trace("RESEARCH_CLIENTS_CLOSED")
+                # ═══ Детальные таймы по stage ═══
+                for stage, st in sorted(stage_stats.items()):
+                    if st['requests'] == 0:
+                        continue
+                    wall_s = (st['finished_at'] - st['started_at']) if st['started_at'] else 0
+                    avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
+                    req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
+                    _trace("STAGE_STATS",
+                           stage_name=stage,
+                           requests=st['requests'],
+                           wall_s=round(wall_s, 2),
+                           req_per_s=round(req_per_s, 1),
+                           avg_ms=round(avg_ms, 0))
+            except Exception as _e:
+                import traceback as _tb
+                _trace("GATHER_FAIL", error=repr(_e)[:200], tb=_tb.format_exc()[-500:])
+                raise
+            finally:
+                # Закрываем все research-клиенты
+                for c in _research_clients:
+                    try:
+                        await c.aclose()
+                    except Exception:
+                        pass
+                _trace("RESEARCH_CLIENTS_CLOSED")
         except Exception as _e:
             import traceback as _tb
             _trace("TOP_FAIL", error=repr(_e)[:200], tb=_tb.format_exc()[-500:])
