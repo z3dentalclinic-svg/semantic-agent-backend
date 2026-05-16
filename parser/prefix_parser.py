@@ -41,6 +41,7 @@ import logging
 import argparse
 from typing import Set, List, Dict, Optional
 from dataclasses import dataclass, field, asdict
+from collections import defaultdict
 
 
 def _brute_seed_variants(seed: str) -> List[str]:
@@ -180,6 +181,10 @@ class PrefixParseResult:
     # Trace
     trace: List[Dict] = field(default_factory=list)
     summary_by_group: Dict = field(default_factory=dict)
+    # Tайминги по stages (pa_chrome/pa_firefox/nonpa_chrome/nonpa_firefox/addon_chrome) — для оптимизации
+    stage_stats: Dict = field(default_factory=dict)
+    # Пошаговый trace парсера (START/MATRIX_OK/PROXY_INIT/STAGE_STATS/etc) — для анализа в JSON
+    trace_log: List[Dict] = field(default_factory=list)
     # Meta
     timestamp: str = ""
 
@@ -370,6 +375,27 @@ class PrefixParser:
         total_start = time.time()
         timestamp = datetime.utcnow().isoformat() + "Z"
 
+        # ═══ TRACE_LOG: все события парсинга копятся в список, отдаются в JSON ═══
+        trace_log: List[Dict] = []
+        _t_zero = total_start
+        def _trace(stage: str, **kwargs):
+            trace_log.append({
+                "stage": stage,
+                "t_ms": round((time.time() - _t_zero) * 1000, 1),
+                **{k: (str(v) if isinstance(v, (tuple, set)) else v) for k, v in kwargs.items()},
+            })
+
+        # ═══ STAGE TIMING TRACKERS ═══
+        # pa_chrome, pa_firefox, nonpa_chrome, nonpa_firefox, addon_chrome
+        stage_stats = defaultdict(lambda: {
+            'requests': 0, 'time_ms': 0.0,
+            'started_at': None, 'finished_at': None,
+        })
+        stage_lock = asyncio.Lock()
+
+        _trace("START", seed=seed, operator=operator, country=country, language=language, city=city, groups=groups)
+        # ════════════════════════════════════════════════════════
+
         # Обновляем прокси из ProxyPool на момент вызова
         try:
             from utils.proxy_pool import ProxyPool as _PP
@@ -452,17 +478,30 @@ class PrefixParser:
             if progress_callback:
                 await progress_callback(done, total_tasks, entry)
 
+        async def fetch_with_stage(pq, agent, client, stage):
+            """Wrapper: трекает время fetch_one в рамках конкретной stage."""
+            async with stage_lock:
+                if stage_stats[stage]['started_at'] is None:
+                    stage_stats[stage]['started_at'] = time.time()
+            t0 = time.time()
+            await fetch_one(pq, agent, client)
+            elapsed_ms = (time.time() - t0) * 1000
+            async with stage_lock:
+                stage_stats[stage]['requests'] += 1
+                stage_stats[stage]['time_ms'] += elapsed_ms
+                stage_stats[stage]['finished_at'] = time.time()
+
         async def run_letter(queries: List[PrefixQuery], agent: str,
-                             client: httpx.AsyncClient):
+                             client: httpx.AsyncClient, stage: str):
             """Один буквенный трек — запросы последовательно."""
             for pq in queries:
-                await fetch_one(pq, agent, client)
+                await fetch_with_stage(pq, agent, client, stage)
 
         async def run_nonpa(pq: PrefixQuery, agent: str, client: httpx.AsyncClient,
-                            sem: asyncio.Semaphore):
+                            sem: asyncio.Semaphore, stage: str):
             """G+PC запросы через semaphore."""
             async with sem:
-                await fetch_one(pq, agent, client)
+                await fetch_with_stage(pq, agent, client, stage)
 
         # Разбиваем матрицу
         pa_chr_by_letter: Dict[str, List[PrefixQuery]] = {}
@@ -491,28 +530,63 @@ class PrefixParser:
 
         async def run_addon(pq: PrefixQuery, client: httpx.AsyncClient):
             async with addon_sem:
-                await fetch_one(pq, "chrome", client)
+                await fetch_with_stage(pq, "chrome", client, "addon_chrome")
+
+        _trace("PROXY_INIT",
+               chrome=str(proxy_chr)[:25] if proxy_chr else "None",
+               firefox=str(proxy_ff)[:25] if proxy_ff else "None",
+               nonpa=str(proxy_npa)[:25] if proxy_npa else "None")
+        _trace("BUCKETS_BUILT",
+               pa_chr_letters=len(pa_chr_by_letter),
+               pa_ff_letters=len(pa_ff_by_letter),
+               pa_chr_total=sum(len(qs) for qs in pa_chr_by_letter.values()),
+               pa_ff_total=sum(len(qs) for qs in pa_ff_by_letter.values()),
+               nonpa_chr=len(nonpa_chr),
+               nonpa_ff=len(nonpa_ff),
+               addon_chr=len(addon_chr),
+               total_matrix=len(matrix))
 
         async with httpx.AsyncClient(proxy=proxy_chr) as chr_client, \
                    httpx.AsyncClient(proxy=proxy_ff)  as ff_client,  \
                    httpx.AsyncClient(proxy=proxy_npa) as npa_client:
 
+            _trace("CLIENTS_OPENED")
+            _trace("GATHER_START",
+                   total_tasks=total_tasks,
+                   nonpa_sem=BATCH_SIZE,
+                   addon_sem=BATCH_SIZE * 3)
+
             await asyncio.gather(
                 # PA Chrome — все буквы параллельно, внутри буквы последовательно
-                *[run_letter(qs, "chrome", chr_client)
+                *[run_letter(qs, "chrome", chr_client, "pa_chrome")
                   for qs in pa_chr_by_letter.values()],
                 # PA FF — аналогично
-                *[run_letter(qs, "firefox", ff_client)
+                *[run_letter(qs, "firefox", ff_client, "pa_firefox")
                   for qs in pa_ff_by_letter.values()],
                 # ADDON — через addon_sem на chrome IP
                 *[run_addon(pq, chr_client) for pq in addon_chr],
                 # Non-PA Chrome (G+PC) — через semaphore на отдельном IP
-                *[run_nonpa(pq, "chrome", npa_client, nonpa_sem)
+                *[run_nonpa(pq, "chrome", npa_client, nonpa_sem, "nonpa_chrome")
                   for pq in nonpa_chr],
                 # Non-PA FF
-                *[run_nonpa(pq, "firefox", ff_client, nonpa_sem)
+                *[run_nonpa(pq, "firefox", ff_client, nonpa_sem, "nonpa_firefox")
                   for pq in nonpa_ff],
             )
+            _trace("GATHER_DONE", elapsed_s=round(time.time() - total_start, 2))
+
+            # ═══ Детальные таймы по stage ═══
+            for stage, st in sorted(stage_stats.items()):
+                if st['requests'] == 0:
+                    continue
+                wall_s = (st['finished_at'] - st['started_at']) if st['started_at'] else 0
+                avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
+                req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
+                _trace("STAGE_STATS",
+                       stage_name=stage,
+                       requests=st['requests'],
+                       wall_s=round(wall_s, 2),
+                       req_per_s=round(req_per_s, 1),
+                       avg_ms=round(avg_ms, 0))
 
         # Ротация батча после прогона
         try:
@@ -580,6 +654,17 @@ class PrefixParser:
             total_time_ms=round(total_time, 1),
             trace=[asdict(e) for e in trace_entries],
             summary_by_group=summary_by_group,
+            stage_stats={
+                stage: {
+                    'requests': st['requests'],
+                    'wall_s': round((st['finished_at'] - st['started_at']) if st['started_at'] else 0, 3),
+                    'sum_time_ms': round(st['time_ms'], 1),
+                    'avg_ms': round(st['time_ms'] / max(1, st['requests']), 1),
+                    'req_per_s': round(st['requests'] / max(0.001, (st['finished_at'] - st['started_at']) if st['started_at'] else 0.001), 1),
+                }
+                for stage, st in stage_stats.items() if st['requests'] > 0
+            },
+            trace_log=trace_log,
             timestamp=timestamp,
         )
 
