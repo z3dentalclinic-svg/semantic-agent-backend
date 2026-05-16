@@ -1,37 +1,32 @@
 """
-Proxy Pool Manager v1.2
+Proxy Pool Manager v2.0 — жёсткая 2-batch архитектура для бета-теста.
 
-Управляет пулом IP-адресов для всех парсеров.
-Конфигурация через env переменную PROXY_POOL (список через запятую).
+Конфигурация: 50 IP всего → 2 батча по 25 IP.
+Карусель батчей: при ротации текущий батч уходит в конец, следующий становится активным.
 
-Роли внутри батча (10 IP):
-  index 0 → infix_chrome
-  index 1 → infix_firefox
-  index 2 → infix_safari    ← новая роль (v1.2)
-  index 3 → prefix_chrome
-  index 4 → prefix_firefox
-  index 5 → prefix_nonpa
-  index 6-9 → suffix/morph (общий пул, 4 IP)
+Роли внутри одного батча (25 IP):
+  индексы 0-3   (4 IP) → suffix_boevoy_chrome  ← round-robin
+  индексы 4-5   (2 IP) → suffix_boevoy_firefox ← round-robin
+  индексы 6-7   (2 IP) → suffix_addon_chrome   ← round-robin
+  индексы 8-9   (2 IP) → suffix_addon_firefox  ← round-robin
+  индексы 10-19 (10 IP) → infix_research       ← round-robin (10 IP под единый research pool)
+  индексы 20-22 (3 IP) → prefix_research (chrome bucket)  ← первые 3 IP из 5 prefix-research
+  индексы 23-24 (2 IP) → prefix_research (firefox bucket) ← последние 2 IP из 5 prefix-research
 
-Карусель батчей сделана для НЕПРЕРЫВНОГО парсинга (несколько пользователей).
-В режиме research работает один пользователь, и инфикс может забрать ВСЕ IP
-из всех батчей минус те что заняты собственной боевой матрицей.
+Итого на батч:
+  suffix: 10 (4 boevoy chr + 2 boevoy ff + 2 addon chr + 2 addon ff)
+  infix:  10
+  prefix: 5 (3 chr + 2 ff)
+  ────────
+  25
 
-Research-роли (round-robin по ВСЕМУ пулу):
-  prefix_research → старая PD/PDL prefix-research сессия
-  infix_research  → новая E_LAT/SD/SDL/SDL_REV infix-research (v1.2)
+При 2 одновременных пользователях → 2 × 25 = 50 IP без конфликтов.
 
-Метод get_research_pool(exclude_roles) — возвращает все IP минус занятые
-указанными ролями активного батча. Используется чтобы research-прогон
-не пересекался по IP со своей боевой матрицей (~47 IP вместо 50 при пуле в 5 батчей).
-
-Использование в парсере:
-  from proxy_pool import ProxyPool
-  proxy   = ProxyPool.get("infix_chrome")             # → IP из активного батча
-  proxy   = ProxyPool.get("infix_safari")             # → IP из активного батча (v1.2)
-  ips     = ProxyPool.get_research_pool(              # → все IP минус боевые инфикс-слоты
-              exclude_roles={"infix_chrome", "infix_firefox", "infix_safari"})
-  ips_all = ProxyPool.get_all_proxies()               # → весь пул без исключений
+API:
+  ProxyPool.get("suffix_boevoy_chrome")  → round-robin IP из своих 4 слотов
+  ProxyPool.get("infix_research")        → round-robin IP из своих 10 слотов
+  ProxyPool.get("prefix_research")       → round-robin IP из своих 5 слотов
+  ProxyPool.rotate()                     → переключение на следующий батч
 """
 
 import os
@@ -41,36 +36,43 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Размер батча и роли
-BATCH_SIZE = 10
-ROLE_MAP = {
-    "infix_chrome":   0,   # всегда первый IP в батче
-    "infix_firefox":  1,   # всегда второй IP в батче
-    "infix_safari":   2,   # всегда третий IP в батче (v1.2)
-    "prefix_chrome":  3,   # PA Chrome — letter-parallel треки
-    "prefix_firefox": 4,   # PA FF + G FF
-    "prefix_nonpa":   5,   # G+PC Chrome (небольшой semaphore)
-    # suffix/morph берут IP с индекса 6 по 9 по round-robin
-}
-GENERAL_ROLES = {"suffix", "morph"}
-GENERAL_START = 6   # IP с этого индекса идут на общие парсеры (4 IP: 6,7,8,9)
+# Размер батча
+BATCH_SIZE = 25
 
-# Research роли — для разовых широких прогонов в режиме одного пользователя.
-# Берут IP из ВСЕГО пула (все батчи), round-robin.
-# Не привязаны к активному батчу — research-прогон нагружает 30-50 IP параллельно,
-# и карусель батчей здесь не нужна.
-RESEARCH_ROLES = {"prefix_research", "infix_research", "suffix_addon_chrome", "suffix_addon_firefox"}
+# Карта ролей: role → (start_index, count)
+# Каждая роль занимает контигуозный диапазон слотов внутри батча.
+ROLE_SLOTS = {
+    "suffix_boevoy_chrome":  (0, 4),    # слоты 0-3
+    "suffix_boevoy_firefox": (4, 2),    # слоты 4-5
+    "suffix_addon_chrome":   (6, 2),    # слоты 6-7
+    "suffix_addon_firefox":  (8, 2),    # слоты 8-9
+    "infix_research":        (10, 10),  # слоты 10-19
+    "prefix_research":       (20, 5),   # слоты 20-24 (первые 3 chrome, последние 2 firefox)
+}
+
+# Алиасы для обратной совместимости со старым кодом.
+# Старые роли "suffix"/"prefix_chrome" и т.д. мапятся на новые.
+LEGACY_ALIASES = {
+    "suffix":          "suffix_boevoy_chrome",   # старый suffix general → boevoy chrome
+    "infix_chrome":    "infix_research",          # старый infix_chrome   → research pool
+    "infix_firefox":   "infix_research",
+    "infix_safari":    "infix_research",
+    "prefix_chrome":   "prefix_research",
+    "prefix_firefox":  "prefix_research",
+    "prefix_nonpa":    "prefix_research",
+}
 
 
 class ProxyPool:
     _lock = threading.Lock()
-    _proxies: list = []          # все IP из env
-    _batches: list = []          # батчи по BATCH_SIZE
-    _current_batch: int = 0      # индекс активного батча
-    _last_rotation: float = 0    # время последней ротации
-    _general_counter: int = 0    # round-robin счётчик для suffix/prefix
-    _research_counter: int = 0   # round-robin счётчик для research (по всему пулу)
+    _proxies: list = []                 # все IP из env (плоский список)
+    _batches: list = []                  # батчи по BATCH_SIZE
+    _current_batch: int = 0              # индекс активного батча
+    _last_rotation: float = 0            # время последней ротации
+    _role_counters: dict = {}            # role → round-robin counter внутри роли
     _initialized: bool = False
+
+    MIN_ROTATION_INTERVAL: float = 7.0  # минимум между ротациями
 
     @classmethod
     def _init(cls):
@@ -78,73 +80,74 @@ class ProxyPool:
             return
         raw = os.getenv("PROXY_POOL", "")
         if not raw:
-            logger.warning("[ProxyPool] PROXY_POOL не задан — прокси отключены")
+            logger.warning("[ProxyPool v2] PROXY_POOL не задан — прокси отключены")
             cls._proxies = []
             cls._batches = []
             cls._initialized = True
             return
 
         cls._proxies = [p.strip() for p in raw.split(",") if p.strip()]
-        # Нарезаем на батчи по BATCH_SIZE
         cls._batches = [
             cls._proxies[i:i + BATCH_SIZE]
             for i in range(0, len(cls._proxies), BATCH_SIZE)
         ]
+        # Инициализируем счётчики
+        for role in ROLE_SLOTS:
+            cls._role_counters[role] = 0
+
         logger.info(
-            f"[ProxyPool] Загружено {len(cls._proxies)} IP "
+            f"[ProxyPool v2] Загружено {len(cls._proxies)} IP "
             f"→ {len(cls._batches)} батчей по {BATCH_SIZE}"
         )
+        if len(cls._proxies) < BATCH_SIZE:
+            logger.warning(
+                f"[ProxyPool v2] Внимание: всего {len(cls._proxies)} IP < BATCH_SIZE={BATCH_SIZE}. "
+                f"Некоторые роли получат меньше IP чем ожидается."
+            )
         cls._initialized = True
 
     @classmethod
     def get(cls, role: str) -> str | None:
         """
         Возвращает proxy URL для указанной роли из текущего активного батча.
-        Если пул не настроен — возвращает None (без прокси).
+        Внутри роли — round-robin по её слотам.
+
+        Принимает как новые роли (suffix_boevoy_chrome и т.п.), так и старые
+        алиасы для совместимости (suffix, infix_chrome и т.п.).
         """
         with cls._lock:
             cls._init()
-
             if not cls._batches:
                 return None
 
-            batch = cls._batches[cls._current_batch]
+            # Резолвим алиас
+            resolved_role = LEGACY_ALIASES.get(role, role)
 
-            # Фиксированные роли
-            if role in ROLE_MAP:
-                idx = ROLE_MAP[role]
-                if idx < len(batch):
-                    return batch[idx]
+            if resolved_role not in ROLE_SLOTS:
+                logger.warning(f"[ProxyPool v2] Неизвестная роль: {role!r}")
                 return None
 
-            # Общие роли (suffix/prefix/morph) — round-robin по IP 2..9
-            if role in GENERAL_ROLES:
-                general_ips = batch[GENERAL_START:]
-                if not general_ips:
-                    return None
-                ip = general_ips[cls._general_counter % len(general_ips)]
-                cls._general_counter += 1
-                return ip
+            start, count = ROLE_SLOTS[resolved_role]
+            batch = cls._batches[cls._current_batch]
 
-            # Research роль — round-robin по ВСЕМУ пулу (все IP, все батчи).
-            # Используется для разовых прогонов PD/PDL prefix research.
-            # Игнорирует карусель батчей — нагрузка распределяется по всему пулу.
-            if role in RESEARCH_ROLES:
-                if not cls._proxies:
-                    return None
-                ip = cls._proxies[cls._research_counter % len(cls._proxies)]
-                cls._research_counter += 1
-                return ip
+            # Извлекаем слоты роли из батча
+            role_slots = batch[start:start + count]
+            if not role_slots:
+                logger.warning(
+                    f"[ProxyPool v2] Роль {resolved_role!r} требует слоты {start}-{start+count-1}, "
+                    f"но в активном батче только {len(batch)} IP"
+                )
+                return None
 
-            logger.warning(f"[ProxyPool] Неизвестная роль: {role}")
-            return None
+            # Round-robin внутри роли
+            counter = cls._role_counters.setdefault(resolved_role, 0)
+            ip = role_slots[counter % len(role_slots)]
+            cls._role_counters[resolved_role] = counter + 1
+            return ip
 
     @classmethod
     def get_all_proxies(cls) -> list:
-        """
-        Возвращает копию всего списка IP (без привязки к батчам).
-        Используется research-парсером для создания пула httpx-клиентов.
-        """
+        """Возвращает копию всего списка IP (без привязки к батчам)."""
         with cls._lock:
             cls._init()
             return list(cls._proxies)
@@ -153,26 +156,10 @@ class ProxyPool:
     def get_research_pool(cls, exclude_roles: set | None = None) -> list:
         """
         Возвращает все IP пула МИНУС те что закреплены за указанными ролями
-        в АКТИВНОМ батче. Используется research-прогонами при параллельном
-        запуске всех парсеров (combined_parser.html запускает suffix+prefix+infix
-        одновременно через Promise.all).
+        в АКТИВНОМ батче. Для обратной совместимости.
 
-        exclude_roles может содержать:
-          - Фиксированные роли из ROLE_MAP (infix_chrome, prefix_nonpa и т.д.)
-            → исключается соответствующий IP активного батча
-          - Общие роли (suffix, morph) → исключается весь general_pool
-            активного батча (4 IP с индекса GENERAL_START)
-
-        Пример (5 батчей × 10 IP = 50 IP, combined_parser параллельный режим):
-          get_research_pool(exclude_roles={
-              "infix_chrome", "infix_firefox", "infix_safari",       # 3 IP — свои боевые
-              "prefix_chrome", "prefix_firefox", "prefix_nonpa",     # 3 IP — префикс
-              "suffix",                                                # 4 IP — суффикс/morph (general)
-          })
-          → 50 - 3 - 3 - 4 = 40 IP под research
-
-        Если exclude_roles не задан — поведение идентично get_all_proxies().
-        После rotate() исключения автоматически сдвигаются на новый активный батч.
+        В новой архитектуре V2 предпочтительно использовать ProxyPool.get("infix_research")
+        и ProxyPool.get("prefix_research") вместо этого метода.
         """
         with cls._lock:
             cls._init()
@@ -183,30 +170,20 @@ class ProxyPool:
             if exclude_roles and cls._batches:
                 current = cls._batches[cls._current_batch]
                 for role in exclude_roles:
-                    idx = ROLE_MAP.get(role)
-                    if idx is not None and idx < len(current):
-                        excluded_ips.add(current[idx])
-                    elif role in GENERAL_ROLES:
-                        # Исключаем весь general pool активного батча
-                        for ip in current[GENERAL_START:]:
+                    resolved = LEGACY_ALIASES.get(role, role)
+                    if resolved in ROLE_SLOTS:
+                        start, count = ROLE_SLOTS[resolved]
+                        for ip in current[start:start + count]:
                             excluded_ips.add(ip)
 
             return [ip for ip in cls._proxies if ip not in excluded_ips]
-
-    # Минимальный интервал между ротациями — защита от тройного вызова
-    # при параллельном запуске suffix+prefix+infix.
-    MIN_ROTATION_INTERVAL: float = 7.0
 
     @classmethod
     def rotate(cls):
         """
         Ротирует батч — текущий уходит в конец очереди.
-        Вызывается после завершения каждого полного прогона сида.
-
-        Защита: при параллельном запуске suffix+prefix+infix все три
-        вызывают rotate() почти одновременно. MIN_ROTATION_INTERVAL
-        гарантирует что реальная ротация происходит только один раз
-        на весь комбинированный прогон (~4-6с).
+        Защита MIN_ROTATION_INTERVAL предотвращает тройной вызов
+        при параллельном запуске suffix+prefix+infix.
         """
         with cls._lock:
             cls._init()
@@ -216,7 +193,7 @@ class ProxyPool:
             now = time.time()
             if now - cls._last_rotation < cls.MIN_ROTATION_INTERVAL:
                 logger.debug(
-                    f"[ProxyPool] rotate() пропущен — "
+                    f"[ProxyPool v2] rotate() пропущен — "
                     f"прошло {now - cls._last_rotation:.1f}с < {cls.MIN_ROTATION_INTERVAL}с"
                 )
                 return
@@ -224,10 +201,11 @@ class ProxyPool:
             prev = cls._current_batch
             cls._current_batch = (cls._current_batch + 1) % len(cls._batches)
             cls._last_rotation = now
-            cls._general_counter = 0
-            cls._research_counter = 0
+            # Сбрасываем счётчики ролей для нового батча
+            for role in cls._role_counters:
+                cls._role_counters[role] = 0
             logger.info(
-                f"[ProxyPool] Ротация: батч {prev} → {cls._current_batch} "
+                f"[ProxyPool v2] Ротация: батч {prev} → {cls._current_batch} "
                 f"(всего {len(cls._batches)} батчей)"
             )
 
@@ -240,24 +218,23 @@ class ProxyPool:
                 return {"status": "disabled", "reason": "PROXY_POOL не задан"}
 
             batch = cls._batches[cls._current_batch]
+            role_view = {}
+            for role, (start, count) in ROLE_SLOTS.items():
+                role_view[role] = {
+                    "slots": f"{start}-{start+count-1}",
+                    "ips": batch[start:start + count] if start < len(batch) else [],
+                    "n_ips": len(batch[start:start + count]) if start < len(batch) else 0,
+                    "counter": cls._role_counters.get(role, 0),
+                }
+
             return {
                 "status": "active",
+                "version": "2.0",
                 "total_proxies": len(cls._proxies),
                 "total_batches": len(cls._batches),
                 "batch_size": BATCH_SIZE,
                 "current_batch": cls._current_batch,
                 "current_batch_size": len(batch),
-                "roles": {
-                    "infix_chrome":   batch[0] if len(batch) > 0 else None,
-                    "infix_firefox":  batch[1] if len(batch) > 1 else None,
-                    "infix_safari":   batch[2] if len(batch) > 2 else None,
-                    "prefix_chrome":  batch[3] if len(batch) > 3 else None,
-                    "prefix_firefox": batch[4] if len(batch) > 4 else None,
-                    "prefix_nonpa":   batch[5] if len(batch) > 5 else None,
-                    "general_pool":   f"{len(batch[GENERAL_START:])} IP (индексы {GENERAL_START}-{len(batch)-1})",
-                },
+                "roles": role_view,
                 "last_rotation": cls._last_rotation,
-                "cooldown_per_batch_sec": round(
-                    (len(cls._batches) - 1) * 3, 1
-                ),  # примерно при 3с на прогон
             }
