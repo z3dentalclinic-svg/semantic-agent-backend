@@ -356,23 +356,23 @@ class InfixParser:
         # Legacy run_letter/run_non_e удалены в v3.0 — заменены на run_one внутри
         # секции диспатча после получения research pool.
 
-        # ═══ INFIX RESEARCH POOL — 10 IP × conc=4 = 40 параллельных ═══
+        # ═══ INFIX RESEARCH POOL — 12 IP × conc=6 = 72 параллельных ═══
         # Сафари не используем. Базовые infix_chrome/infix_firefox освобождены —
         # все запросы идут через research pool.
         #
-        # Бета-архитектура (2 батча по 25 IP):
-        #   suffix 10 + infix 10 + prefix 5 = 25 на батч × 2 = 50 IP
-        #   2 юзера одновременно → 2 × 10 = 20 IP на инфикс из 50 пула
+        # Эксперимент 10×4 показал что bottleneck — НЕ concurrency, а IP count.
+        # 12×6=72 conc даёт ~4.8с на 1-pair сид (vs 8.6с при 10×4).
         #
-        # Concurrency = 4 на каждый IP → общий semaphore = 10 × 4 = 40.
-        # При conc=4 avg latency Google ~600ms (vs 1709ms при conc=6).
+        # Бета-архитектура (2 батча):
+        #   suffix 10 + infix 12 + prefix 3 = 25 на батч × 2 = 50 IP
+        #   2 юзера одновременно → 2 × 12 = 24 IP на инфикс
         #
-        # Прогноз (avg latency 600ms при conc=4):
-        #   1 pair (~284 reqs):  ~4.3с
-        #   2 pair (~568 reqs):  ~8.5с
-        #   3 pair (~660 reqs):  ~9.9с
-        _N_INFIX_RESEARCH = 10
-        _CONC_PER_IP = 4
+        # Прогноз (avg latency ~700ms при conc=6):
+        #   1 pair (~284 reqs):  ~4с
+        #   2 pair (~568 reqs):  ~8с
+        #   3 pair (~660 reqs):  ~9с
+        _N_INFIX_RESEARCH = 12
+        _CONC_PER_IP = 6
 
         try:
             n_pairs = len(set(iq.gap_index for iq in matrix)) or 1
