@@ -995,10 +995,13 @@ class SuffixParser:
 
             await asyncio.gather(*bi_tasks)
 
-        # Прокси из ProxyPool — 4 Chrome IP + 2 FF IP для boevoy (6 IP всего)
-        # Fallback: GOOGLE_PROXY_URL из env (один IP для всех)
+        # Прокси из ProxyPool — 4 Chrome IP + 2 FF IP для boevoy (6 IP всего).
+        # В v2 proxy_pool это разделено на 2 отдельные роли.
+        # Fallback: GOOGLE_PROXY_URL из env (один IP для всех).
         if ProxyPool:
-            proxies = [ProxyPool.get("suffix") for _ in range(6)]
+            chr_proxies = [ProxyPool.get("suffix_boevoy_chrome") for _ in range(4)]
+            ff_proxies  = [ProxyPool.get("suffix_boevoy_firefox") for _ in range(2)]
+            proxies = chr_proxies + ff_proxies
         else:
             _fb = os.getenv("GOOGLE_PROXY_URL") or None
             proxies = [_fb] * 6
@@ -1006,8 +1009,10 @@ class SuffixParser:
         proxy_chr1, proxy_chr2, proxy_chr3, proxy_chr4 = proxies[0], proxies[1], proxies[2], proxies[3]
         proxy_ff1,  proxy_ff2                          = proxies[4], proxies[5]
 
-        # Addon-клиенты: уменьшены до 4 Chrome + 2 FF, параллелизм внутри через per-IP semaphore(6).
-        _N_ADDON_CHR_CLIENTS = 4
+        # Addon-клиенты: 2 Chrome + 2 FF в бета-архитектуре (v2 proxy_pool).
+        # Раньше было 4 Chrome — урезано до 2 для влезания в 25-IP батч:
+        # suffix 10 (4 boevoy chr + 2 boevoy ff + 2 addon chr + 2 addon ff) + infix 10 + prefix 5 = 25
+        _N_ADDON_CHR_CLIENTS = 2
         _N_ADDON_FF_CLIENTS  = 2
         if ProxyPool:
             _addon_chr_proxies = [ProxyPool.get("suffix_addon_chrome") for _ in range(_N_ADDON_CHR_CLIENTS)]
