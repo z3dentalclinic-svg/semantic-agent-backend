@@ -366,19 +366,19 @@ class InfixGenerator:
                                           skip_cp=skip_cp, right_suffix=right_suffix,
                                           left_prefix=left_prefix))
 
-        # Research-блок (E_LAT + SD + SDL + SDL_REV) — карта суффикс-research,
-        # перенесённая на инфикс. Маркеры (T/Q/geo) не пропускают gap, а становятся
-        # non-anchor токенами (остаются в строке, gap'ы между ними не строятся).
-        # Агенты: chrome+firefox+safari (E_LAT — chrome only).
-        #
-        # RESEARCH MODE АКТИВЕН — новый GAP-анализ по обновлённому ground-файлу.
-        # Ожидаемый объём: ~19-57k запросов на сид в зависимости от количества gap'ов.
-        # Перед прогоном на Render обязательно вызвать POST /debug/unload-models
-        # чтобы освободить память (~600 МБ от MiniLM + Natasha).
-        self._append_research_block(seed, out)
+        # Research-блок (E_LAT + SD + SDL + SDL_REV) — полная карта 24-57k запросов/сид.
+        # Использовался для GAP-анализа на 8 сидах. ОТКЛЮЧЁН — заменён battle_addon_v2.
+        # Чтобы вернуть research-режим (для пересборки матрицы) — раскомментировать ниже:
+        # self._append_research_block(seed, out)
 
-        # Минимальная research-добавка к боевой матрице — ОТКЛЮЧЕНА на время research.
-        # После анализа новых GAP'ов будет пересобрана с учётом обновлённого ground.
+        # BATTLE ADDON v2 — оптимизированная матрица 189 запросов/gap, ~78% покрытия.
+        # Собрана на основе research-прогона 8 сидов 16 May 2026.
+        # Состав: SDL plain (10 букв) + E_LAT (28 cyr) + OTHER (B_L/C_L/D_L/hyp_wcL) + SD top-4.
+        # Chrome only. Все запросы помечены is_new_research=True для маршрутизации
+        # через research_pool (~30 IP, sem=90).
+        self._append_battle_addon_v2(seed, out)
+
+        # OLD battle addon (FINAL v3) — отключён, оставлен для отката если v2 не работает.
         # self._append_battle_addon(seed, out)
 
         return out
@@ -1149,6 +1149,170 @@ class InfixGenerator:
                 base_hyp = f"{s}-{L} *"
                 emit("E_LAT", f"{L}_hyp_wcL", base_hyp, len(s) + 1 + 1 + len(L) + 1,
                      "E_LAT_hyp_wcL", CHR, L, "research_letter", letter=L, skip_rs=True)
+
+    # ════════════════════════════════════════════════════════════════════════════
+    #  BATTLE ADDON v2 — собран на основе research-прогона 8 сидов (16 May 2026)
+    # ════════════════════════════════════════════════════════════════════════════
+    #
+    #  Источник: greedy set cover на 8 сидах (4071 chrome-only kw universe).
+    #  Объём: 186 запросов на anchor-пару (gap), покрытие ~75% chrome universe.
+    #
+    #  Состав на 1 gap:
+    #    1) SDL plain chrome  : 10 букв × 10 цифр × 1 cp     = 100 запр
+    #    2) E_LAT кириллица   : 28 букв × 1 cp               =  28 запр
+    #    3) OTHER B_L предлоги: 6 слов × 1 cp                =   6 запр  (без 'с','в' — дубли E_LAT)
+    #    4) OTHER C_L/D_L conn: 2 слова × 1 cp               =   2 запр  (без 'и' — дубль E_LAT)
+    #    5) OTHER hyp_wcL lat : 10 латинских букв × 1 cp     =  10 запр
+    #    6) SD chrome top-4   : 4 структ × 10 цифр × 1 cp    =  40 запр
+    #                                                        ──────────
+    #                                                          186 запр
+    #
+    #  Покрытие per-seed (chrome universe):
+    #    доставка цветов        : 67.3%
+    #    имплантация зубов      : 80.7%
+    #    hp laserjet (полный)   : 77.7%
+    #    купить айфон 16        : 51.4%  (слабее из-за латинских моделей)
+    #    установка кондиционера : 85.3%
+    #    доставка суши          : 76.5%
+    #    удаление зуба мудрости : 93.3%
+    #    аренда перфоратора     : 93.1%
+    #    среднее                : ~78%
+    #
+    # ════════════════════════════════════════════════════════════════════════════
+
+    # --- константы выбранных параметров (по greedy cover) ---
+    _BATTLE_V2_SDL_LETTERS  = list("чнплфдберо")              # 10 букв SDL plain
+    _BATTLE_V2_ELAT_LETTERS = list("абвгдежзиклмнопрстуфхцчшщэюя")  # 28 букв E_LAT cyr
+    _BATTLE_V2_HYP_LAT      = list("wpfcsgvdmh")              # 10 латинских букв hyp_wcL
+    _BATTLE_V2_BL_PREPS     = ["без", "от", "для", "на", "из", "под"]   # 6 (без 'с', 'в' — дубли с E_LAT)
+    _BATTLE_V2_CL_DL_WORDS  = [("C_L", "как"), ("D_L", "или")]            # 2 (без 'и' — дубль с E_LAT)
+    _BATTLE_V2_SD_STRUCTS   = ["wcLM", "wcM_nosp2", "dwcM", "wcR_S2star"]
+
+    def _append_battle_addon_v2(self, seed: str, results: List[InfixQuery]):
+        """
+        BATTLE ADDON v2 — оптимизированная матрица 189 запросов/gap.
+        Заменяет _append_battle_addon (v3). См. шапку секции выше.
+
+        Все запросы помечены is_new_research=True, чтобы парсер маршрутизировал
+        их через research_pool (~30 IP, sem=90), а не через 2 основных IP.
+
+        Chrome only — safari и firefox отключены сознательно:
+          - safari: нет на проде (только в research-блоке)
+          - firefox: даёт <3% уникальных kw на этих 8 сидах
+
+        Все cp выбраны по семантике (одна позиция курсора на структуру):
+          - SDL plain: cp = after_letter (после {D}{L}) — топ по greedy
+          - E_LAT cpAL: cp = после буквы и пробела
+          - B_L/C_L/D_L cpAL: cp = после слова и пробела
+          - hyp_wcL: cp = после `{seed}-{L} `
+          - SD: cp_note различается по структуре, см. ниже
+        """
+        tokens, anchor_indices = self._research_anchors(seed)
+        if len(anchor_indices) < 2:
+            return
+
+        CHR = ("chrome",)
+
+        for gap_n, (i_left, i_right) in enumerate(
+            zip(anchor_indices[:-1], anchor_indices[1:])
+        ):
+            left_block  = " ".join(tokens[:i_left + 1])
+            right_block = " ".join(tokens[i_left + 1:])
+            w1_val = tokens[i_left]
+            w2_val = tokens[i_right]
+            s  = left_block
+            rs = right_block
+
+            def _full(base: str) -> str:
+                return f"{base} {rs}".strip() if rs else base
+
+            def emit(group, struct, base, cp, cp_note,
+                     insert_val, insert_type, letter=None, skip_rs=False):
+                results.append(InfixQuery(
+                    query=base if skip_rs else _full(base),
+                    gap_index=gap_n, w1=w1_val, w2=w2_val,
+                    group=group, struct=struct,
+                    insert_val=insert_val, insert_type=insert_type,
+                    orientation="N", cp=cp, cp_note=cp_note,
+                    agents=CHR, letter=letter,
+                    is_new_research=True,
+                ))
+
+            # ── 1. SDL plain chrome: 10 букв × 10 цифр × 1 cp = 100 запр ─────
+            # Структура: `{s} {D}{L} {rest}` , cp = после {D}{L}
+            for D in DIGITS_SD:
+                for L in self._BATTLE_V2_SDL_LETTERS:
+                    base = f"{s} {D}{L}"
+                    # cp = len(s) + 1 (пробел) + len(D) + len(L) — сразу после буквы
+                    cp = len(s) + 1 + len(D) + len(L)
+                    emit("SDL", f"{D}_{L}_plain", base, cp,
+                         "SDL_plain_after_letter", D, "research_digit",
+                         letter=L, skip_rs=False)
+
+            # ── 2. E_LAT кириллица: 28 букв × 1 cp = 28 запр ─────────────────
+            # Структура: `{s} {L} {rest}` , cp = после {L} и пробела (cpAL)
+            for L in self._BATTLE_V2_ELAT_LETTERS:
+                base = f"{s} {L}"
+                cp = len(s) + 1 + len(L) + 1  # cpAL = после буквы и пробела
+                emit("OTHER", f"E_{L}_plain_cpAL", base, cp,
+                     "E_LAT_cpAL", L, "research_letter",
+                     letter=L, skip_rs=False)
+
+            # ── 3. OTHER B_L (предлоги): 8 слов × 1 cp = 8 запр ──────────────
+            # Структура: `{s} {word} {rest}` , cp = после слова и пробела
+            for word in self._BATTLE_V2_BL_PREPS:
+                base = f"{s} {word}"
+                cp = len(s) + 1 + len(word) + 1
+                emit("OTHER", f"B_L_{word}_cpAL", base, cp,
+                     "B_L_cpAL", word, "connector_token",
+                     letter=word, skip_rs=False)
+
+            # ── 4. OTHER C_L/D_L (connector words): 3 слова × 1 cp = 3 запр ──
+            for group_label, word in self._BATTLE_V2_CL_DL_WORDS:
+                base = f"{s} {word}"
+                cp = len(s) + 1 + len(word) + 1
+                emit("OTHER", f"{group_label}_{word}_cpAL", base, cp,
+                     f"{group_label}_cpAL", word, "connector_token",
+                     letter=word, skip_rs=False)
+
+            # ── 5. OTHER hyp_wcL латиница: 10 букв × 1 cp = 10 запр ──────────
+            # Структура: `{s}-{L} *` (skip_rs — wildcard уже в base, rs не нужен)
+            # cp = после `{s}-{L} ` (позиция перед wildcard)
+            for L in self._BATTLE_V2_HYP_LAT:
+                base = f"{s}-{L} *"
+                cp = len(s) + 1 + len(L) + 1  # после hyphen+letter+space
+                emit("OTHER", f"{L}_hyp_wcL", base, cp,
+                     "hyp_wcL_after_letter", L, "research_letter",
+                     letter=L, skip_rs=True)
+
+            # ── 6. SD chrome top-4: 4 структуры × 10 цифр × 1 cp = 40 запр ───
+            # Каждая SD-структура имеет свой шаблон. Воспроизводим точно как в research.
+            for D in DIGITS_SD:
+                # wcLM: `* {s} *{D}*`  — wildcard слева, в середине, справа от D
+                # cp = после `* {s} *{D}` (перед последним *)
+                base = f"* {s} *{D}*"
+                cp = 2 + len(s) + 2 + len(D)  # "* " + s + " *" + D
+                emit("SD", f"{D}_wcLM", base, cp,
+                     "SD_wcLM", D, "research_digit", skip_rs=True)
+
+                # wcM_nosp2: `{s} *{D}` (без пробела между * и D)
+                base = f"{s} *{D}"
+                cp = len(s) + 1 + 1 + len(D)  # s + " " + "*" + D
+                emit("SD", f"{D}_wcM_nosp2", base, cp,
+                     "SD_wcM_nosp2", D, "research_digit", skip_rs=True)
+
+                # dwcM: `{s} ** {D}` (двойной wildcard в середине)
+                base = f"{s} ** {D}"
+                cp = len(s) + 1 + 2 + 1 + len(D)  # s + " " + "**" + " " + D
+                emit("SD", f"{D}_dwcM", base, cp,
+                     "SD_dwcM", D, "research_digit", skip_rs=True)
+
+                # wcR_S2star: `{s} {D} *2*` (D плюс stars справа)
+                base = f"{s} {D} *2*"
+                cp = len(s) + 1 + len(D) + 1 + 3  # s + " " + D + " " + "*2*"
+                emit("SD", f"{D}_wcR_S2star", base, cp,
+                     "SD_wcR_S2star", D, "research_digit", skip_rs=True)
+
 
     def _append_research_block(self, seed: str, results: List[InfixQuery]):
         """
