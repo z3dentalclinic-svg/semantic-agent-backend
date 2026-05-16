@@ -496,7 +496,7 @@ class InfixParser:
                         avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
                         req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
                         _trace("STAGE_STATS",
-                               stage=stage,
+                               stage_name=stage,
                                requests=st['requests'],
                                wall_s=round(wall_s, 2),
                                req_per_s=round(req_per_s, 1),
