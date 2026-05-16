@@ -96,5 +96,8 @@ def register_prefix_endpoint(app: FastAPI):
                 "groups_used": result.groups_used,
                 "trace": result.trace,
                 "summary_by_group": result.summary_by_group,
+                "stage_stats": result.stage_stats,
             },
+            "prefixStageStats": result.stage_stats,  # дублирую на верхний уровень для удобства анализа в JSON-экспорте
+            "prefixTraceLog": result.trace_log,      # подробный пошаговый лог
         }
