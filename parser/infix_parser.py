@@ -138,6 +138,8 @@ class InfixParseResult:
     summary_by_gap: Dict = field(default_factory=dict)
     summary_by_group: Dict = field(default_factory=dict)
     timestamp: str = ""
+    stage_stats: Dict = field(default_factory=dict)  # тайминги по stages (e_chrome/e_firefox/addon_research/non_e_chrome/etc)
+    trace_log: List[Dict] = field(default_factory=list)  # подробный пошаговый лог (START/MATRIX_OK/STAGE_STATS/etc) для анализа
 
 
 # ══════════════════════════════════════════════
@@ -223,11 +225,18 @@ class InfixParser:
         total_start = time.time()
         timestamp = datetime.utcnow().isoformat() + "Z"
 
-        # ═══ INFIX_TRACE: подробное логирование каждого шага ═══
+        # ═══ INFIX_TRACE: подробное логирование каждого шага в trace_log ═══
+        # Все события парсинга копятся в список, потом отдаются в JSON ответе.
+        # Никаких print в stdout (Render логи не нужны).
+        trace_log: List[Dict] = []
+        _t_zero = total_start
         def _trace(stage: str, **kwargs):
-            """Печать в stdout — Render логи подхватит."""
-            extras = " ".join(f"{k}={v}" for k, v in kwargs.items())
-            print(f"[INFIX_TRACE][{stage}] seed={seed!r} {extras}", flush=True)
+            """Запись события в trace_log. t_ms = от старта parse() в миллисекундах."""
+            trace_log.append({
+                "stage": stage,
+                "t_ms": round((time.time() - _t_zero) * 1000, 1),
+                **{k: (str(v) if isinstance(v, (tuple, set)) else v) for k, v in kwargs.items()},
+            })
         # ════════════════════════════════════════════════════════
 
         _trace("START", country=country, language=language, city=city, groups=groups)
@@ -324,13 +333,36 @@ class InfixParser:
             if progress_callback:
                 await progress_callback(done_count[0], len(matrix), entry)
 
-        async def run_letter(letter_queries, client):
-            for iq in letter_queries:
-                await fetch_one(iq, client)
+        # ═══ STAGE TIMING TRACKERS ═══
+        # Каждая stage отдельно учитывает свое время и запросы
+        # stages: e_chrome, e_safari, e_firefox, non_e_chrome, non_e_firefox, addon_research, addon_chrome, addon_firefox
+        stage_stats = defaultdict(lambda: {
+            'requests': 0, 'time_ms': 0.0,
+            'started_at': None, 'finished_at': None,
+            'ok': 0, 'empty': 0, 'error': 0, 'blocked': 0, 'timeout': 0,
+        })
+        stage_lock = asyncio.Lock()
 
-        async def run_non_e(iq, client):
+        async def fetch_with_stage(iq, client, stage):
+            """Wrapper: засекает время в рамках конкретной stage."""
+            async with stage_lock:
+                if stage_stats[stage]['started_at'] is None:
+                    stage_stats[stage]['started_at'] = time.time()
+            t0 = time.time()
+            await fetch_one(iq, client)
+            elapsed_ms = (time.time() - t0) * 1000
+            async with stage_lock:
+                stage_stats[stage]['requests'] += 1
+                stage_stats[stage]['time_ms'] += elapsed_ms
+                stage_stats[stage]['finished_at'] = time.time()
+
+        async def run_letter(letter_queries, client, stage):
+            for iq in letter_queries:
+                await fetch_with_stage(iq, client, stage)
+
+        async def run_non_e(iq, client, stage):
             async with non_e_sem:
-                await fetch_one(iq, client)
+                await fetch_with_stage(iq, client, stage)
 
         # safari IP используется как второй chrome-клиент для разбивки E-цепочек
         _safari_proxy = _proxy_safari if _proxy_safari else _proxy_chrome
@@ -411,9 +443,9 @@ class InfixParser:
                            e_chr=e_chr_n, e_ff=e_ff_n,
                            non_e_chr=len(non_e_chr), non_e_ff=len(non_e_ff))
 
-                    async def run_addon(iq, client):
+                    async def run_addon(iq, client, stage):
                         async with addon_sem:
-                            await fetch_one(iq, client)
+                            await fetch_with_stage(iq, client, stage)
 
                     addon_chr = [iq for qs in addon_by_key_chr.values() for iq in qs]
                     addon_ff  = [iq for qs in addon_by_key_ff.values()  for iq in qs]
@@ -426,14 +458,14 @@ class InfixParser:
                                total=len(all_addon), n_clients=n_clients,
                                req_per_client=len(all_addon) // max(1, n_clients))
                         addon_tasks = [
-                            run_addon(iq, _research_clients[i % n_clients])
+                            run_addon(iq, _research_clients[i % n_clients], "addon_research")
                             for i, iq in enumerate(all_addon)
                         ]
                     else:
                         _trace("ADDON_DISPATCH_FALLBACK", addon_chr=len(addon_chr), addon_ff=len(addon_ff))
                         addon_tasks = (
-                            [run_addon(iq, chrome_client) for iq in addon_chr] +
-                            [run_addon(iq, ff_client)     for iq in addon_ff]
+                            [run_addon(iq, chrome_client, "addon_chrome") for iq in addon_chr] +
+                            [run_addon(iq, ff_client, "addon_firefox")    for iq in addon_ff]
                         )
 
                     # Разбиваем E-chr цепочки пополам: чётные → chrome, нечётные → safari
@@ -444,13 +476,31 @@ class InfixParser:
                     _trace("GATHER_START", total_tasks=len(addon_tasks) + len(e_chr_even) + len(e_chr_odd) + len(e_by_letter_ff) + len(non_e_chr) + len(non_e_ff))
 
                     await asyncio.gather(
-                        *[run_letter(qs, chrome_client) for qs in e_chr_even],
-                        *[run_letter(qs, safari_client) for qs in e_chr_odd],
-                        *[run_letter(qs, ff_client)     for qs in e_by_letter_ff.values()],
+                        *[run_letter(qs, chrome_client, "e_chrome")  for qs in e_chr_even],
+                        *[run_letter(qs, safari_client, "e_safari")  for qs in e_chr_odd],
+                        *[run_letter(qs, ff_client, "e_firefox")     for qs in e_by_letter_ff.values()],
                         *addon_tasks,
-                        *[run_non_e(iq, chrome_client)  for iq in non_e_chr],
-                        *[run_non_e(iq, ff_client)      for iq in non_e_ff],
+                        *[run_non_e(iq, chrome_client, "non_e_chrome")  for iq in non_e_chr],
+                        *[run_non_e(iq, ff_client, "non_e_firefox")     for iq in non_e_ff],
                     )
+                    elapsed_total = time.time() - total_start
+                    _trace("GATHER_DONE", elapsed_s=round(elapsed_total, 2))
+
+                    # ═══ Детальные таймы по stage ═══
+                    # Для каждой stage вычисляем wall_time (started_at..finished_at)
+                    # и avg latency (sum_of_request_times / requests).
+                    for stage, st in sorted(stage_stats.items()):
+                        if st['requests'] == 0:
+                            continue
+                        wall_s = (st['finished_at'] - st['started_at']) if st['started_at'] else 0
+                        avg_ms = st['time_ms'] / st['requests'] if st['requests'] else 0
+                        req_per_s = st['requests'] / wall_s if wall_s > 0 else 0
+                        _trace("STAGE_STATS",
+                               stage=stage,
+                               requests=st['requests'],
+                               wall_s=round(wall_s, 2),
+                               req_per_s=round(req_per_s, 1),
+                               avg_ms=round(avg_ms, 0))
                     _trace("GATHER_DONE", elapsed_s=round(time.time() - total_start, 2))
                 except Exception as _e:
                     import traceback as _tb
@@ -540,6 +590,17 @@ class InfixParser:
             trace=[asdict(e) for e in trace_entries],
             summary_by_gap=summary_by_gap, summary_by_group=summary_by_group,
             timestamp=timestamp,
+            stage_stats={
+                stage: {
+                    'requests': st['requests'],
+                    'wall_s': round((st['finished_at'] - st['started_at']) if st['started_at'] else 0, 3),
+                    'sum_time_ms': round(st['time_ms'], 1),
+                    'avg_ms': round(st['time_ms'] / max(1, st['requests']), 1),
+                    'req_per_s': round(st['requests'] / max(0.001, (st['finished_at'] - st['started_at']) if st['started_at'] else 0.001), 1),
+                }
+                for stage, st in stage_stats.items() if st['requests'] > 0
+            },
+            trace_log=trace_log,
         )
 
 
