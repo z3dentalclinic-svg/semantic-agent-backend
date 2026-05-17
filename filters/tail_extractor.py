@@ -595,10 +595,13 @@ def _extract_fuzzy_ordered(
                     qw_is_lat = any('a' <= c <= 'z' for c in qw)
 
                     if (sw_is_cyr and qw_is_lat) or (sw_is_lat and qw_is_cyr):
-                        seed_positions.append(i)
-                        search_from = i + 1
-                        found = True
-                        break
+                        # Не любая cyr+lat пара — должна быть фонетическая близость.
+                        # Без этой проверки 'скутер' ↔ '5v' матчилось ложно.
+                        if _is_cross_script(sw, qw):
+                            seed_positions.append(i)
+                            search_from = i + 1
+                            found = True
+                            break
 
             if not found:
                 return None  # слово seed'а отсутствует → seed не найден
