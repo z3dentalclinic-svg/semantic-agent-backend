@@ -1,5 +1,5 @@
 """
-FGS Parser API - Full Fixed Version
+FGS1 Parser API - Full Fixed Version
 """
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
