@@ -1195,6 +1195,8 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     
     # L1.5 DOMAIN ANCHOR FILTER (между L0 и L2)
     # Отсекает явный off-topic мусор из GREY через domain anchor (object_seed + qualifier).
+    _l1_5_stage_data = None
+    _l1_5_blocked_map = None
     if run_l15 and result.get("keywords_grey"):
         parser.tracer.before_filter("l1_5_filter", result.get("keywords_grey", []))
         _grey_before = len(result.get("keywords_grey", []))
@@ -1218,6 +1220,28 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         )
         
         logger.info(f"[L1.5] grey: {_grey_before} → {_grey_after}, trashed: {len(l1_5_trashed)}")
+        
+        # Сохраняем данные для инжекта ПОСЛЕ tracer.finish_request()
+        # (нельзя писать сейчас — finish_request перезапишет _trace в конце)
+        _l1_5_stage_data = {
+            "name": "l1_5_filter",
+            "input": _grey_before,
+            "output": _grey_after,
+            "valid": _grey_after,
+            "blocked": _grey_before - _grey_after,
+            "grey": _grey_after,
+            "time": _timings["l1_5_filter"],
+        }
+        _l1_5_blocked_map = {
+            tr["keyword"]: {
+                "blocked_by": "l1_5_filter",
+                "reason": tr.get("reason", "no_domain_anchor"),
+            }
+            for tr in l1_5_trace
+        }
+    else:
+        _l1_5_stage_data = None
+        _l1_5_blocked_map = None
     
     # L2 СЕМАНТИЧЕСКИЙ КЛАССИФИКАТОР
     if run_l2 and result.get("keywords_grey"):
@@ -1315,6 +1339,24 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         result["groups"] = {"order": [], "by_group": {}, "summary": {}}
     
     result["_trace"] = parser.tracer.finish_request()
+    
+    # Инжектим L1.5 stage в pipeline-трассу (после L0, перед L2)
+    if _l1_5_stage_data and isinstance(result.get("_trace"), dict):
+        stages = result["_trace"].setdefault("stages", [])
+        # Найдём индекс l0_filter и вставим L1.5 сразу после него
+        insert_idx = None
+        for i, st in enumerate(stages):
+            if st.get("name") == "l0_filter":
+                insert_idx = i + 1
+                break
+        if insert_idx is not None:
+            stages.insert(insert_idx, _l1_5_stage_data)
+        else:
+            stages.append(_l1_5_stage_data)
+        
+        # Добавим заблокированные ключи в таблицу
+        if _l1_5_blocked_map:
+            result["_trace"].setdefault("blocked_keywords", {}).update(_l1_5_blocked_map)
 
     result["_filter_timings"] = _timings  # ← реальные замеры времени
     result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l15": run_l15, "l2": run_l2, "l3": run_l3, "rel": not parser.skip_relevance_filter}
