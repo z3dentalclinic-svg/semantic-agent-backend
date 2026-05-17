@@ -33,11 +33,11 @@ def pre_filter(query: str, seed: str) -> tuple:
     _kw_lat = len(re.findall(r'[a-zA-Z]', query))
     _kw_cyr = len(re.findall(r'[а-яёіїєґА-ЯЁІЇЄҐ]', query))
     _kw_alpha = _kw_lat + _kw_cyr
-    if _kw_alpha > 0 and _kw_lat / _kw_alpha > 0.7:
+    if _kw_alpha > 0 and _kw_lat / _kw_alpha > 0.8:
         _s_cyr = len(re.findall(r'[а-яёіїєґА-ЯЁІЇЄҐ]', seed))
         _s_lat = len(re.findall(r'[a-zA-Z]', seed))
         _s_alpha = _s_cyr + _s_lat
-        if _s_alpha > 0 and _s_cyr / _s_alpha > 0.7:
+        if _s_alpha > 0 and _s_cyr / _s_alpha > 0.8:
             return True, "языковой мисматч: keyword латиница при кириллическом seed"
 
     # 1. Seed встречается 2+ раз: "ремонт пылесосов ремонт пылесосов"
