@@ -698,7 +698,14 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _is_cross_script(w1: str, w2: str, threshold: float = 0.5) -> bool:
+def _bigrams(s: str) -> set:
+    """Множество символьных биграмм слова."""
+    return {s[i:i+2] for i in range(len(s)-1)} if len(s) >= 2 else set()
+
+
+def _is_cross_script(w1: str, w2: str,
+                     sim_threshold: float = 0.5,
+                     bigram_threshold: float = 0.2) -> bool:
     """
     Проверка что слова — это cross-script вариации друг друга
     (т.е. одно кириллицей, другое латиницей, но фонетически близкие).
@@ -709,32 +716,45 @@ def _is_cross_script(w1: str, w2: str, threshold: float = 0.5) -> bool:
     реально присутствует только часть seed.
     
     СТАЛО: транслитерируем кириллицу → латиницу, нормализуем фонетически
-    обе стороны (ph→f, y→i и т.д.), сравниваем Левенштейном с порогом.
+    обе стороны (ph→f, y→i, w→v и т.д.). Возвращаем True если выполнены
+    ОБА условия:
+      1. Левенштейн-similarity >= 0.5 (общая фонетическая похожесть)
+      2. Bigram Jaccard >= 0.2 (есть общие биграммы — структурное сходство)
+    
+    Двойной критерий нужен потому что одиночный similarity 0.5 на коротких
+    словах может давать ложные срабатывания типа 'скутер' (skuter) vs
+    's-power' (spover) — sim=0.5, но реально слова разные.
     """
     w1_cyr = any('\u0400' <= c <= '\u04ff' for c in w1)
     w1_lat = any('a' <= c <= 'z' for c in w1)
     w2_cyr = any('\u0400' <= c <= '\u04ff' for c in w2)
     w2_lat = any('a' <= c <= 'z' for c in w2)
     
-    # Должен быть один cyr, другой lat
     if not ((w1_cyr and w2_lat) or (w1_lat and w2_cyr)):
         return False
     
     cyr_word = w1 if w1_cyr else w2
     lat_word = w2 if w1_cyr else w1
     
-    # Транслитерируем кириллицу + нормализуем фонетически обе стороны
     cyr_translit_norm = _normalize_lat_phonetic(_transliterate_ru(cyr_word))
     lat_norm = _normalize_lat_phonetic(lat_word)
     
     if not cyr_translit_norm or not lat_norm:
         return False
     
-    # Левенштейн с нормализацией по max длины
+    # Сигнал 1: Левенштейн-similarity
     dist = _levenshtein(cyr_translit_norm, lat_norm)
     max_len = max(len(cyr_translit_norm), len(lat_norm))
     similarity = 1 - dist / max_len
-    return similarity >= threshold
+    
+    # Сигнал 2: Bigram Jaccard
+    bg1, bg2 = _bigrams(cyr_translit_norm), _bigrams(lat_norm)
+    if bg1 | bg2:
+        bigram_jaccard = len(bg1 & bg2) / len(bg1 | bg2)
+    else:
+        bigram_jaccard = 0.0
+    
+    return similarity >= sim_threshold and bigram_jaccard >= bigram_threshold
 
 
 def _unordered_match(
