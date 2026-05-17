@@ -26,6 +26,20 @@ def pre_filter(query: str, seed: str) -> tuple:
     q = normalize(query)
     s = normalize(seed)
     
+    # 0. Языковой мисматч: keyword преимущественно латиница, seed — кириллица.
+    # Ловит парсерный мусор типа "delivery 1-2 working days", "power delivery 3/2"
+    # при русском/украинском сиде. Смешанные запросы ("доставка цветов interflora")
+    # проходят: у них lat-доля обычно <50%.
+    _kw_lat = len(re.findall(r'[a-zA-Z]', query))
+    _kw_cyr = len(re.findall(r'[а-яёіїєґА-ЯЁІЇЄҐ]', query))
+    _kw_alpha = _kw_lat + _kw_cyr
+    if _kw_alpha > 0 and _kw_lat / _kw_alpha > 0.7:
+        _s_cyr = len(re.findall(r'[а-яёіїєґА-ЯЁІЇЄҐ]', seed))
+        _s_lat = len(re.findall(r'[a-zA-Z]', seed))
+        _s_alpha = _s_cyr + _s_lat
+        if _s_alpha > 0 and _s_cyr / _s_alpha > 0.7:
+            return True, "языковой мисматч: keyword латиница при кириллическом seed"
+
     # 1. Seed встречается 2+ раз: "ремонт пылесосов ремонт пылесосов"
     if q.count(s) >= 2:
         return True, "дубль seed целиком"
