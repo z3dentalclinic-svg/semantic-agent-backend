@@ -54,13 +54,8 @@ import nltk
 from nltk.stem import SnowballStemmer
 
 try:
-    # === NATASHA ОТКЛЮЧЕНА для экономии RAM при research-прогонах ===
-    # NewsEmbedding + NewsNERTagger едят ~250 МБ. На время research отключено.
-    # Чтобы вернуть — раскомментировать строку ниже и закомментировать NATASHA_AVAILABLE = False:
-    # from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
-    # NATASHA_AVAILABLE = True
-    NATASHA_AVAILABLE = False
-    print("⚠️ Natasha ОТКЛЮЧЕНА вручную в main.py (research mode)")
+    from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsNERTagger, Doc
+    NATASHA_AVAILABLE = True
 except ImportError:
     NATASHA_AVAILABLE = False
     print("⚠️ Natasha не установлена. EntityLogicManager будет работать только с жёстким кешем.")
@@ -976,23 +971,6 @@ class GoogleAutocompleteParser:
 
 parser = GoogleAutocompleteParser()
 
-# === ПРИНУДИТЕЛЬНАЯ ВЫГРУЗКА MiniLM ПРИ СТАРТЕ — для research-прогонов ===
-# MiniLM (fastembed) автоматически подгружался l2_filter'ом. На время research
-# фильтры не нужны — выгружаем модель из памяти. При первом вызове L2-фильтра
-# модель загрузится снова (~5с задержка).
-try:
-    import gc
-    from filters import shared_model as _sm
-    if getattr(_sm, "_model", None) is not None:
-        _sm._model = None
-        gc.collect()
-        gc.collect()
-        print("✅ MiniLM выгружен при старте (research mode)")
-    else:
-        print("ℹ️ MiniLM не был загружен при старте")
-except Exception as _e:
-    print(f"⚠️ Не удалось выгрузить MiniLM: {_e}")
-# ════════════════════════════════════════════════════════════════════════════
 
 def apply_smart_fix(result: dict, seed: str, language: str):
     """
