@@ -27,7 +27,6 @@ from filters import (
     apply_l2_filter,   # ← L2 Tri-Signal классификатор (PMI + Centroid + L0 signals)
     apply_l3_filter,   # ← L3 DeepSeek LLM классификатор (финальная GREY)
     L3Config,          # ← конфигурация L3
-    compute_relevance_diagnostic,  # ← cosine-сигналы на GREY (только статистика)
     group_valid_keywords,  # ← группировка VALID по детекторным сигналам
 )
 from filters.geo_garbage_filter import _GEO_POPULATION_CACHE  # population cache для BPF
@@ -1191,18 +1190,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             grey=result.get("keywords_grey", []),
             l0_trace=l0_trace,
         )
-
-    # RELEVANCE DIAGNOSTIC — собирает 5 cosine-сигналов на GREY-ключах.
-    # НЕ ПРИНИМАЕТ РЕШЕНИЙ. Результат пишется в result["_relevance_diag"]
-    # для последующего анализа и подбора порогов.
-    if run_l0 and result.get("keywords_grey"):
-        try:
-            _t0 = time.time()
-            result = compute_relevance_diagnostic(result, seed)
-            _timings["relevance_diag"] = round(time.time() - _t0, 4)
-        except Exception as _e:
-            logger.warning(f"[relevance_diag] failed: {_e}")
-
+    
     # L2 СЕМАНТИЧЕСКИЙ КЛАССИФИКАТОР
     if run_l2 and result.get("keywords_grey"):
         parser.tracer.before_filter("l2_filter", result.get("keywords_grey", []))
