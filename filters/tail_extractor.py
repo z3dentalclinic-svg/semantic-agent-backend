@@ -650,13 +650,88 @@ def _extract_tail_unordered(
     return tail if tail else ''
 
 
-def _is_cross_script(w1: str, w2: str) -> bool:
-    """Проверяет что слова в разных скриптах (кириллица vs латиница)."""
+# Транслитерация ру→en (для cross-script проверки)
+_RU_TO_LAT_TABLE = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'i', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+    'ъ': '', 'ы': 'i', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+}
+
+# Фонетические замены для нормализации латиницы (i↔y, ph→f и т.д.)
+_LAT_PHONETIC_PAIRS = [
+    ('ph', 'f'), ('th', 't'), ('ck', 'k'), ('qu', 'kv'),
+    ('wh', 'v'), ('x', 'ks'), ('w', 'v'), ('q', 'k'), ('y', 'i'),
+]
+
+
+def _normalize_lat_phonetic(w: str) -> str:
+    """Нормализация латиницы: ph→f, w→v, y→i и т.д. Также убирает не-буквы."""
+    w = w.lower()
+    for src, dst in _LAT_PHONETIC_PAIRS:
+        w = w.replace(src, dst)
+    return ''.join(c for c in w if 'a' <= c <= 'z')
+
+
+def _transliterate_ru(w: str) -> str:
+    """Транслитерация кириллицы → латиница (фонетическая)."""
+    w = w.lower()
+    return ''.join(_RU_TO_LAT_TABLE.get(c, c) for c in w)
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Расстояние Левенштейна (быстрая реализация)."""
+    if len(a) < len(b):
+        return _levenshtein(b, a)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+def _is_cross_script(w1: str, w2: str, threshold: float = 0.5) -> bool:
+    """
+    Проверка что слова — это cross-script вариации друг друга
+    (т.е. одно кириллицей, другое латиницей, но фонетически близкие).
+    
+    БЫЛО (БАГ): достаточно одной кириллицы в w1 и одной латиницы в w2 → True.
+    Это вызывало ложные матчи 'скутер' ↔ '100ah', 'аккумулятор' ↔ 'wpr',
+    из-за чего seed_extract в Шагах 3-4 ошибочно матчил seed на kw где
+    реально присутствует только часть seed.
+    
+    СТАЛО: транслитерируем кириллицу → латиницу, нормализуем фонетически
+    обе стороны (ph→f, y→i и т.д.), сравниваем Левенштейном с порогом.
+    """
     w1_cyr = any('\u0400' <= c <= '\u04ff' for c in w1)
     w1_lat = any('a' <= c <= 'z' for c in w1)
     w2_cyr = any('\u0400' <= c <= '\u04ff' for c in w2)
     w2_lat = any('a' <= c <= 'z' for c in w2)
-    return (w1_cyr and w2_lat) or (w1_lat and w2_cyr)
+    
+    # Должен быть один cyr, другой lat
+    if not ((w1_cyr and w2_lat) or (w1_lat and w2_cyr)):
+        return False
+    
+    cyr_word = w1 if w1_cyr else w2
+    lat_word = w2 if w1_cyr else w1
+    
+    # Транслитерируем кириллицу + нормализуем фонетически обе стороны
+    cyr_translit_norm = _normalize_lat_phonetic(_transliterate_ru(cyr_word))
+    lat_norm = _normalize_lat_phonetic(lat_word)
+    
+    if not cyr_translit_norm or not lat_norm:
+        return False
+    
+    # Левенштейн с нормализацией по max длины
+    dist = _levenshtein(cyr_translit_norm, lat_norm)
+    max_len = max(len(cyr_translit_norm), len(lat_norm))
+    similarity = 1 - dist / max_len
+    return similarity >= threshold
 
 
 def _unordered_match(
