@@ -60,11 +60,14 @@ def register_suffix_endpoint(app: FastAPI):
         cp: int = Query(None, description="Cursor position: None=конец, 0=начало строки"),
         include_letters: bool = Query(True, description="Letter Sweep — буквенный перебор"),
         city: str = Query(None, description="Город для uule гео-таргетинга (по-английски). None = столица страны."),
+        debug: int = Query(0, description="1 = добавить полную трассу (per-request entries, sources массив, request_log, summary_by_*)"),
     ):
         """
         SUFFIX MAP: Smart suffix expansion with priority matrix + tracer.
         Dual-agent: Chrome + Firefox запускаются параллельно внутри парсера.
-        uule гео-таргетинг: по умолчанию столица страны, опционально конкретный город.
+
+        Production mode (debug=0): только ключи и базовые метрики.
+        Debug mode (debug=1): + per-request trace, request_log, sources массив, summary_by_*.
         """
         sp = get_suffix_parser()
         result = await sp.parse(
@@ -79,19 +82,21 @@ def register_suffix_endpoint(app: FastAPI):
             city=city,
         )
 
-        # Format response compatible with existing HTML displayResults
-        # all_keywords now: [{keyword, sources, weight, is_suffix_expanded}, ...]
+        # Format keywords — sources только в debug
         keywords_for_html = []
         for kw_data in result.all_keywords:
-            keywords_for_html.append({
+            entry = {
                 "keyword": kw_data["keyword"],
                 "source_type": kw_data["sources"][0]["suffix_type"] if kw_data["sources"] else "?",
                 "weight": kw_data["weight"],
                 "is_suffix_expanded": True,
-                "sources": kw_data["sources"],
-            })
+            }
+            if debug:
+                entry["sources"] = kw_data["sources"]  # тяжёлое поле — массив подробностей по каждому источнику
+            keywords_for_html.append(entry)
 
-        return {
+        # Базовый ответ
+        response = {
             "method": "suffix-map",
             "seed": seed,
             "cursor_position": cp,
@@ -101,16 +106,22 @@ def register_suffix_endpoint(app: FastAPI):
             "total": len(result.all_keywords),
             "time": f"{result.total_time_ms:.0f}ms",
             "suffix_trace": {
-                "analysis": result.analysis,
                 "total_keywords": len(result.all_keywords),
                 "total_time_ms": result.total_time_ms,
                 "total_queries": result.total_queries,
                 "successful_queries": result.successful_queries,
                 "empty_queries": result.empty_queries,
                 "blocked_queries": result.blocked_queries,
-                "trace": result.trace,
-                "summary_by_type": result.summary_by_type,
-                "summary_by_suffix": result.summary_by_suffix,
-                "request_log": result.request_log,   # per-request timing для анализа нагрузки
             },
         }
+
+        # Debug-only поля
+        if debug:
+            response["suffix_trace"]["analysis"] = result.analysis
+            response["suffix_trace"]["trace"] = result.trace
+            response["suffix_trace"]["summary_by_type"] = result.summary_by_type
+            response["suffix_trace"]["summary_by_suffix"] = result.summary_by_suffix
+            response["suffix_trace"]["request_log"] = result.request_log
+            response["suffixRequestLog"] = result.request_log  # на верхний уровень для combined_parser
+
+        return response
