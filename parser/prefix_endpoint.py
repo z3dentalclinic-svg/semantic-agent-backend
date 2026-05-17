@@ -38,14 +38,13 @@ def register_prefix_endpoint(app: FastAPI):
         groups: Optional[str] = Query(None, description="Группы через запятую: G1,G2,PA,PC. None = все"),
         parallel: int = Query(10, description="Параллельных запросов на агента"),
         city: str = Query(None, description="Город для uule гео-таргетинга (по-английски). None = столица страны."),
+        debug: int = Query(0, description="1 = добавить полную трассу (per-request entries, structs массив, summary_by_group)"),
     ):
         """
         PREFIX MAP: Full prefix matrix run with dual-agent (Chrome + Firefox).
 
-        Chrome:  G1-G9 + PA (9 структур × 30 букв) + PC
-        Firefox: G1-G9 + PC only (PA даёт мусор на Firefox)
-
-        Returns keywords + detailed prefix tracer data.
+        Production mode (debug=0): только ключи и stage_stats/trace_log (лёгкие тайминги).
+        Debug mode (debug=1): + per-request trace, structs массив, summary_by_group.
         """
         pp = get_prefix_parser()
 
@@ -60,21 +59,24 @@ def register_prefix_endpoint(app: FastAPI):
             city=city,
         )
 
-        # Формируем keywords для HTML — аналог suffix_endpoint keywords_for_html
+        # Формируем keywords для HTML
         keywords_for_html = []
         for kw, structs in result.all_keywords.items():
-            keywords_for_html.append({
+            entry = {
                 "keyword": kw,
-                "structs": structs,
                 "weight": len(structs),
                 "is_prefix_expanded": True,
                 "alt_seed": kw in result.alt_seed_keywords,
-            })
+            }
+            if debug:
+                entry["structs"] = structs  # тяжёлое поле, только в дебаге
+            keywords_for_html.append(entry)
 
         # Сортировка по weight desc
         keywords_for_html.sort(key=lambda x: x["weight"], reverse=True)
 
-        return {
+        # Базовый ответ
+        response = {
             "method": "prefix-map",
             "seed": seed,
             "operator": operator,
@@ -94,10 +96,15 @@ def register_prefix_endpoint(app: FastAPI):
                 "error_queries": result.error_queries,
                 "exclusive_count": result.exclusive_count,
                 "groups_used": result.groups_used,
-                "trace": result.trace,
-                "summary_by_group": result.summary_by_group,
                 "stage_stats": result.stage_stats,
             },
-            "prefixStageStats": result.stage_stats,  # дублирую на верхний уровень для удобства анализа в JSON-экспорте
-            "prefixTraceLog": result.trace_log,      # подробный пошаговый лог
+            "prefixStageStats": result.stage_stats,  # на верхнем уровне
+            "prefixTraceLog": result.trace_log,      # лёгкий trace ~13 событий
         }
+
+        # Debug-only поля
+        if debug:
+            response["prefix_trace"]["summary_by_group"] = result.summary_by_group
+            response["prefix_trace"]["trace"] = result.trace  # per-request entries (тяжёлое)
+
+        return response
