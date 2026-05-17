@@ -1,5 +1,5 @@
 """
-FGS Parser API - Semantic keyword research with geo-filtering
+FGS1 Parser API - Semantic keyword research with geo-filtering
 """
 
 from fastapi import FastAPI, Query
