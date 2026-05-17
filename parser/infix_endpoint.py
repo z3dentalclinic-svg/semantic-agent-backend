@@ -35,15 +35,13 @@ def register_infix_endpoint(app: FastAPI):
         language: str = Query("ru", description="Язык"),
         groups: Optional[str] = Query(None, description="Группы через запятую: WC,A,B,C,D,E. None = все"),
         city: str = Query(None, description="Город для uule гео-таргетинга (по-английски). None = столица страны."),
+        debug: int = Query(0, description="1 = добавить полную трассу (per-request entries, structs массив, summary_by_gap/group)"),
     ):
         """
         INFIX MAP: Full infix matrix run (Chrome only).
 
-        E-группа: 3 структуры × 26 букв = 78 запросов на gap.
-        Остальные (WC/A/B/C/D): ~26 запросов на gap.
-        Итого: ~104 запроса на gap, ~208 на 3-токенный сид.
-
-        Returns keywords + detailed infix tracer data.
+        Production mode (debug=0): только ключи и stage_stats/trace_log (легкие тайминги).
+        Debug mode (debug=1): + per-request trace, structs массив, summary_by_gap/group.
         """
         ip = get_infix_parser()
 
@@ -59,17 +57,20 @@ def register_infix_endpoint(app: FastAPI):
 
         keywords_for_html = []
         for kw, structs in result.all_keywords.items():
-            keywords_for_html.append({
+            entry = {
                 "keyword": kw,
-                "structs": structs,
                 "weight": len(structs),
                 "exclusive": len(structs) == 1,
                 "alt_seed": kw in result.alt_seed_keywords,
-            })
+            }
+            if debug:
+                entry["structs"] = structs  # тяжёлое поле, только в дебаге
+            keywords_for_html.append(entry)
 
         keywords_for_html.sort(key=lambda x: x["weight"], reverse=True)
 
-        return {
+        # Базовый ответ — лёгкий, всегда включает только stage_stats/trace_log
+        response = {
             "method": "infix-map",
             "seed": seed,
             "keywords": keywords_for_html,
@@ -87,11 +88,16 @@ def register_infix_endpoint(app: FastAPI):
                 "error_queries": result.error_queries,
                 "exclusive_count": result.exclusive_count,
                 "groups_used": result.groups_used,
-                "summary_by_gap": result.summary_by_gap,
-                "summary_by_group": result.summary_by_group,
                 "stage_stats": result.stage_stats,
-                "trace": result.trace,
             },
-            "infixStageStats": result.stage_stats,  # дублирую на верхний уровень для удобства анализа в JSON-экспорте
-            "infixTraceLog": result.trace_log,      # подробный пошаговый лог парсера (START/MATRIX_OK/STAGE_STATS/etc)
+            "infixStageStats": result.stage_stats,  # на верхнем уровне для удобства
+            "infixTraceLog": result.trace_log,      # лёгкий trace ~12 событий
         }
+
+        # Debug-only поля
+        if debug:
+            response["infix_trace"]["summary_by_gap"] = result.summary_by_gap
+            response["infix_trace"]["summary_by_group"] = result.summary_by_group
+            response["infix_trace"]["trace"] = result.trace  # per-request entries (тяжёлое)
+
+        return response
