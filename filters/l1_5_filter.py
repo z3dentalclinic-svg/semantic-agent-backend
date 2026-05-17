@@ -255,35 +255,14 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     data['keywords_grey'] = new_grey
     data.setdefault('anchors', []).extend(new_trash)
     
-    # anchors_count для UI
+    # anchors_count для UI (если поле используется)
     if 'anchors_count' in data:
         data['anchors_count'] = len(data['anchors'])
     
-    # Trace для UI
+    # Trace для отладки — список всех ключей которые мы затрешили
+    # (parser.tracer в main.py сам подхватит этот блок через after_filter с reasons)
     existing_trace = data.get('_l1_5_trace', [])
     data['_l1_5_trace'] = existing_trace + trace_records
-    
-    # Также добавим в _trace.stages если оно есть (для отображения в pipeline)
-    if '_trace' in data and isinstance(data['_trace'], dict):
-        stages = data['_trace'].setdefault('stages', [])
-        elapsed = round(time.perf_counter() - t0, 4)
-        stages.append({
-            'name': 'l1_5_filter',
-            'input': len(grey),
-            'output': len(new_grey),
-            'valid': len(new_grey),
-            'blocked': len(new_trash),
-            'grey': len(new_grey),
-            'time': elapsed,
-        })
-        
-        # blocked_keywords для таблицы
-        blocked_map = data['_trace'].setdefault('blocked_keywords', {})
-        for tr in trace_records:
-            blocked_map[tr['keyword']] = {
-                'blocked_by': 'l1_5_filter',
-                'reason': tr['reason'],
-            }
     
     elapsed = round(time.perf_counter() - t0, 4)
     data.setdefault('_filter_timings', {})['l1_5'] = elapsed
