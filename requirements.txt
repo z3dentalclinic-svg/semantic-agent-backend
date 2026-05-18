@@ -35,3 +35,6 @@ psutil>=5.9.0
 
 # Streaming
 anthropic
+
+# RuWordNet — taxonomy для L1.5 (synonyms/hyponyms)
+ruwordnet>=0.0.4
