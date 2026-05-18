@@ -269,13 +269,22 @@ def check_semantic_anchor(
     if not candidates:
         return False, ''
     
-    # === A. Frequency-override (DeepSeek's insight) ===
-    # Если лемма кандидата уже встречается в L0_VALID — мгновенный pass.
-    # Это спасает гипонимы 'роза/тюльпан/букет' для seed 'доставка цветов',
-    # если они уже есть в L0_VALID хотя бы в одном-двух валидных ключах.
+    # === A. Frequency-override (DeepSeek's insight) + soft semantic gate ===
+    # Если лемма кандидата уже встречается в L0_VALID — pass, но только если
+    # она ещё и семантически как-то связана с anchor (cos >= 0.40 — мягкий порог).
+    # Это спасает 'роза/тюльпан/букет' (cos 0.40-0.55 к 'цвет'),
+    # но отрезает случайные общие слова типа 'график', 'таобао' (cos < 0.40).
+    SOFT_COSINE_GATE = 0.40
     for cand in candidates:
         if cand in valid_lemmas:
-            return True, f'in_valid_vocab:{cand}'
+            emb = get_word_embedding(cand)
+            if emb is None:
+                # Эмбеддинг не получен — доверяем frequency как раньше
+                return True, f'in_valid_vocab:{cand}'
+            sim_anchor = cosine_sim(emb, anchor_emb)
+            if sim_anchor >= SOFT_COSINE_GATE:
+                return True, f'in_valid_vocab:{cand}={sim_anchor:.2f}'
+            # лемма в valid но семантически далеко — НЕ override-им, идём в L5
     
     # === B. Word-level cosine + dual-cluster contrastive ===
     # Для каждого считаем contrastive score
