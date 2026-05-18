@@ -541,6 +541,173 @@ def extract_object_anchor(seed: str) -> tuple[Optional[str], Optional[str], list
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Извлечение action_anchor из seed (intent)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Глаголы/инфинитивы/действия — POS-маркеры pymorphy3
+_ACTION_POS = {'VERB', 'INFN', 'GRND', 'PRTF', 'PRTS', 'PRED'}
+
+
+def extract_action_anchor(seed: str, object_anchor: Optional[str]) -> Optional[str]:
+    """
+    Извлекает action_anchor из seed.
+    
+    Action — это intent пользователя:
+    - "доставка цветов" → action = "доставка"
+    - "купить айфон 16" → action = "купить"
+    - "имплантация зубов" → action = "имплантация"
+    - "установка кондиционера цена" → action = "установка"
+    - "аккумулятор на скутер" → action = "аккумулятор" (специальный случай: action=object)
+    
+    Приоритет:
+    1. Первое VERB/INFN — действие
+    2. Первое NOUN которое НЕ object_anchor — отглагольное существительное (доставка, установка)
+    3. Если все NOUN это object — action = object_anchor (как для аккумулятор/скутер)
+    """
+    words = seed.lower().split()
+    
+    first_verb = None
+    first_noun_non_object = None
+    
+    for w in words:
+        if re.match(r'^\d+$', w):
+            continue
+        p = morph.parse(w)[0]
+        pos = p.tag.POS
+        
+        if pos in _ACTION_POS:
+            if first_verb is None:
+                first_verb = p.normal_form
+        elif pos == 'NOUN':
+            if first_noun_non_object is None and p.normal_form != object_anchor:
+                first_noun_non_object = p.normal_form
+    
+    if first_verb:
+        return first_verb
+    if first_noun_non_object:
+        return first_noun_non_object
+    # Особый случай: единственный NOUN = object → action = object
+    return object_anchor
+
+
+def _action_root(action_lemma: str) -> str:
+    """
+    Возвращает корень action для substring-матча.
+    Берём первые 5+ символов леммы (без последней гласной/мягкого знака).
+    
+    "доставка" → "достав"
+    "купить" → "купи"  (короткий — оставим как есть)
+    "имплантация" → "импланта"
+    "установка" → "установ"
+    """
+    if not action_lemma:
+        return ''
+    s = action_lemma.lower().strip()
+    # Минимум 4 символа, обрезаем хвост (последние 1-2 буквы — окончание)
+    if len(s) >= 6:
+        return s[:-2]
+    elif len(s) >= 5:
+        return s[:-1]
+    return s
+
+
+def build_action_set(
+    seed: str,
+    action_anchor: Optional[str],
+    object_anchor: Optional[str],
+    l0_valid_kws: list[str],
+) -> tuple[set, str]:
+    """
+    Строит расширенный action-set из L0_VALID:
+    - action_anchor + его лемма
+    - VERB/INFN леммы из L0_VALID хвостов с частотой >= 3
+    - NOUN-леммы которые часто стоят первыми в kw (отглагольные)
+    
+    Возвращает: (action_set, action_root)
+        action_set: set лемм действий
+        action_root: корень для substring-матча
+    """
+    if not action_anchor:
+        return set(), ''
+    
+    action_root = _action_root(action_anchor)
+    action_set: set = {action_anchor}
+    
+    if not l0_valid_kws:
+        return action_set, action_root
+    
+    seed_words = set(seed.lower().split())
+    
+    # Counter лемм-действий и первых слов
+    from collections import Counter
+    action_candidates: Counter = Counter()
+    first_word_candidates: Counter = Counter()
+    
+    for kw in l0_valid_kws:
+        kw_low = kw.lower() if isinstance(kw, str) else ''
+        words = re.findall(r'[а-яёa-z]+', kw_low)
+        if not words:
+            continue
+        
+        seen_non_seed = False
+        for i, w in enumerate(words):
+            if w in seed_words or len(w) <= 2:
+                continue
+            p = morph.parse(w)[0]
+            pos = p.tag.POS
+            lemma = p.normal_form
+            
+            # Глаголы — точно action
+            if pos in _ACTION_POS:
+                action_candidates[lemma] += 1
+            # NOUN которые НЕ object — кандидаты в action (отглагольные)
+            elif pos == 'NOUN' and lemma != object_anchor:
+                # Первое слово kw обычно более информативно как action
+                if not seen_non_seed:
+                    first_word_candidates[lemma] += 1
+                action_candidates[lemma] += 1
+            
+            seen_non_seed = True
+    
+    # Top глаголов с частотой >= 3
+    for lemma, count in action_candidates.most_common(30):
+        if count >= 3:
+            action_set.add(lemma)
+    
+    return action_set, action_root
+
+
+def has_action(
+    kw: str,
+    action_anchor: Optional[str],
+    action_set: set,
+    action_root: str,
+) -> tuple[bool, str]:
+    """
+    Проверяет наличие action_anchor в kw:
+    1. Substring action_root (строгая проверка по корню)
+    2. Любая лемма kw ∈ action_set (мягкая проверка по синонимам)
+    """
+    if not action_anchor:
+        # Action не извлечён — пропускаем (не блокируем)
+        return True, 'no_action_anchor'
+    
+    kw_low = kw.lower()
+    
+    # 1. Substring корня
+    if action_root and action_root in kw_low:
+        return True, f'action_root:{action_root}'
+    
+    # 2. Лемма из action_set
+    for w in re.findall(r'[а-яёa-z]+', kw_low):
+        p = morph.parse(w)[0]
+        if p.normal_form in action_set:
+            return True, f'action_synonym:{p.normal_form}'
+    
+    return False, 'no_action'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Проверка anchor в kw
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -613,6 +780,133 @@ def has_anchor(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Проход 2: Action anchor (intent-фильтр)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_action_anchor(seed: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Извлекает action_anchor (действие/intent) из seed.
+    
+    action_anchor — это лемма первого NOUN или INFN/VERB в seed.
+    Это слово определяет intent (что пользователь хочет сделать).
+    
+    Также возвращается action_root — общая часть для substring match
+    однокоренных слов (берётся первые 5 символов леммы).
+    
+    Примеры:
+        "доставка цветов"             → ('доставка', 'достав')
+        "купить айфон 16"             → ('купить', 'купит') 
+        "имплантация зубов"           → ('имплантация', 'имплантац')  
+        "установка кондиционера цена" → ('установка', 'устано')
+        "аккумулятор на скутер"       → ('аккумулятор', 'аккумулят')
+    
+    Если первое слово — препозиция или союз, переходим ко следующему.
+    """
+    words = seed.lower().split()
+    
+    for w in words:
+        if re.match(r'^\d+$', w):
+            continue
+        p = morph.parse(w)[0]
+        pos = p.tag.POS
+        if pos in ('NOUN', 'INFN', 'VERB'):
+            lemma = p.normal_form
+            # root: первые 5 символов леммы, чтобы ловить морфо-вариации
+            # но не слишком короткие случайные совпадения
+            root = lemma[:min(5, max(4, len(lemma) - 2))]
+            return lemma, root
+    
+    return None, None
+
+
+def build_action_set(
+    action_anchor: str,
+    action_root: str,
+    l0_valid_kws: list[str],
+    object_anchor: Optional[str],
+) -> set[str]:
+    """
+    Расширяет action-set синонимами из L0_VALID хвостов.
+    
+    Идея: в L0_VALID хвостах ключи где seed-фраза найдена целиком. 
+    В этих хвостах могут встречаться синонимы action (например для seed 
+    'доставка цветов' — слова 'курьер', 'привезти', 'заказать').
+    
+    Собираем леммы VERB/INFN/NOUN из L0_VALID хвостов, исключаем object_anchor 
+    и его варианты. Возвращаем top-N по частоте.
+    
+    Это даёт расширение action-набора БЕЗ хардкода списков синонимов.
+    Если в L0_VALID нет 'курьер' — мы его не получим (это и есть алгоритмическая безопасность).
+    """
+    from collections import Counter
+    
+    if not action_anchor:
+        return set()
+    
+    counter: Counter = Counter()
+    for kw in l0_valid_kws:
+        kw_low = kw.lower() if isinstance(kw, str) else ''
+        words = re.findall(r'[а-яёa-z]+', kw_low)
+        for w in words:
+            if w in _STOPWORDS or len(w) <= 3:
+                continue
+            p = morph.parse(w)[0]
+            pos = p.tag.POS
+            lemma = p.normal_form
+            
+            # Исключаем object_anchor и его substring-варианты
+            if object_anchor and (lemma == object_anchor or object_anchor in lemma):
+                continue
+            
+            # Собираем кандидаты — VERB/INFN/NOUN которые ведут себя как actions
+            if pos in ('NOUN', 'INFN', 'VERB'):
+                counter[lemma] += 1
+    
+    # Top-N кандидатов с минимум 3 встречами
+    action_set = {action_anchor}
+    for lemma, count in counter.most_common(50):
+        if count >= 3:
+            action_set.add(lemma)
+    
+    return action_set
+
+
+def has_action(
+    kw: str,
+    action_anchor: Optional[str],
+    action_root: Optional[str],
+    action_set: set[str],
+) -> tuple[bool, str]:
+    """
+    Проверка action-anchor в kw.
+    
+    Два сигнала:
+    A. Substring корня action_root (например 'достав' для 'доставка' → ловит 
+       все формы: доставка/доставить/доставку/доставкой/курьерская доставка).
+    B. Лемма kw-слова входит в action_set из L0_VALID (расширение синонимов
+       через данные текущего прогона).
+    
+    Returns: (has_action, signal_name)
+    """
+    if not action_anchor or not action_root:
+        return True, 'no_action_extracted'  # safe-fail
+    
+    kw_low = kw.lower()
+    
+    # A. Substring корня
+    if action_root in kw_low:
+        return True, f'action_root:{action_root}'
+    
+    # B. Лемма в action_set
+    for w in re.findall(r'[а-яёa-z]+', kw_low):
+        p = morph.parse(w)[0]
+        if p.normal_form in action_set:
+            return True, f'action_lemma:{p.normal_form}'
+    
+    return False, 'no_action'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Главная функция фильтра
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -620,8 +914,11 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     """
     Применяет L1.5 Domain Anchor Filter к keywords_grey.
     
-    Каждый ключ в keywords_grey проверяется на наличие domain anchor.
-    Если anchor отсутствует — ключ перемещается в anchors (TRASH).
+    Два прохода:
+    1. Object anchor — есть ли в kw объект seed (или его гипоним/синоним)
+    2. Action anchor — есть ли в kw действие seed (или его синоним из L0_VALID)
+    
+    Ключ считается валидным только если ОБА прохода успешны.
     
     Безопасность:
     - Не трогает keywords (VALID от L0) и existing anchors (TRASH от L0)
@@ -672,9 +969,22 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     domain_profile = build_domain_profile(object_anchor, l0_valid_kws, seed, l0_trash_kws)
     seed_words = set(seed.lower().split())
     
+    # === Action anchor (Pass 2) — intent-фильтр ===
+    # Включён по умолчанию. Можно отключить через data['_l1_5_disable_action'] = True
+    enable_action_check = not bool(data.get('_l1_5_disable_action', False))
+    
+    action_anchor: Optional[str] = None
+    action_root: Optional[str] = None
+    action_set: set = set()
+    if enable_action_check:
+        action_anchor, action_root = extract_action_anchor(seed)
+        if action_anchor:
+            action_set = build_action_set(action_anchor, action_root, l0_valid_kws, object_anchor)
+    
     logger.info(
         f"[L1.5] seed='{seed}' → object='{object_anchor}', qualifier='{qualifier}', "
         f"synonyms({len(synonyms)}), "
+        f"action='{action_anchor}' root='{action_root}' set_size={len(action_set)} enabled={enable_action_check}, "
         f"l5_enabled={domain_profile.get('enabled', False)}"
     )
     
@@ -683,17 +993,28 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     trace_records: list = []
     l5_saves: list = []  # ключи которые спас L5 (для логирования)
     l5_misses: list = []  # ключи которые L5 не спас, но провёл анализ
+    action_misses: list = []  # ключи отрезанные на Pass 2 (нет action)
     
     for kw_item in grey:
         # kw может быть строкой или dict
         kw = kw_item if isinstance(kw_item, str) else kw_item.get('keyword', '')
         
+        # === Pass 1: object_anchor проверка ===
         ok, signal = has_anchor(
             kw, object_anchor, qualifier, qualifier_text,
             synonyms=synonyms,
             domain_profile=domain_profile,
             seed_words=seed_words,
         )
+        
+        # === Pass 2: action_anchor проверка (только если Pass 1 прошёл) ===
+        if ok and action_anchor:
+            action_ok, action_signal = has_action(kw, action_anchor, action_root, action_set)
+            if not action_ok:
+                # Pass 1 прошёл (есть object), но Pass 2 нет (нет action) → TRASH
+                ok = False
+                signal = f'{signal}|no_action'
+                action_misses.append((kw, signal))
         
         if ok:
             new_grey.append(kw_item)
@@ -703,11 +1024,18 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
             new_trash.append(kw_item)
             if signal and signal.startswith('word_cosine'):
                 l5_misses.append((kw, signal))
+            
+            # Определяем причину
+            if 'no_action' in signal:
+                reason = f'no_action (action={action_anchor}, object_passed={object_anchor})'
+            else:
+                reason = f'no_domain_anchor (object={object_anchor})'
+            
             trace_records.append({
                 'keyword': kw,
                 'label': 'TRASH',
                 'decided_by': 'l1_5',
-                'reason': f'no_domain_anchor (object={object_anchor})',
+                'reason': reason,
                 'signals': [signal] if signal else [],
             })
     
@@ -734,6 +1062,14 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         logger.info(f"[L1.5/L5] missed {len(l5_misses)} keywords (top by sim):")
         for kw, sig in high_cos_misses[:20]:
             logger.info(f"[L1.5/L5]   ✗ '{kw}' ({sig})")
+    
+    # Логируем action-промахи (Pass 2)
+    if action_misses:
+        logger.info(f"[L1.5/Pass2] cut {len(action_misses)} keywords without action '{action_anchor}':")
+        for kw, sig in action_misses[:15]:
+            logger.info(f"[L1.5/Pass2]   ✗ '{kw}' ({sig})")
+        if len(action_misses) > 15:
+            logger.info(f"[L1.5/Pass2]   ... +{len(action_misses)-15} more")
     
     # Обновляем data
     data['keywords_grey'] = new_grey
