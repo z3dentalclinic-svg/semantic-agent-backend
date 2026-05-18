@@ -1441,23 +1441,52 @@ async def l2_diagnostic():
 
 @app.get("/debug/l1_5-trace")
 async def l1_5_trace_endpoint(
-    seed: str = Query(None, description="Сид (если не указан — используется последний прогон)"),
+    seed: str = Query(None, description="Сид для диагностики (например 'аккумулятор на скутер')"),
 ):
     """
-    Возвращает L1.5 Domain Anchor Filter trace — все ключи которые отрезаны.
-    Этот endpoint полезен для отладки object_anchor extraction и FP.
+    Диагностика L1.5 Domain Anchor Filter.
     
-    Возвращает данные из последнего прогона если он хранится в _LAST_RESULT_CACHE.
-    Для production-логики используйте _l1_5_trace из ответа /api/light-search.
+    Показывает:
+    - object_anchor / qualifier извлечённые из seed
+    - Состояние RuWordNet (загружен / нет / ошибка)
+    - Synonyms / hyponyms / hypernyms для object_anchor
+    - Путь к ruwordnet.db и его размер
+    
+    Использование: GET /debug/l1_5-trace?seed=аккумулятор+на+скутер
     """
-    from filters import extract_object_anchor
+    import os
+    from filters.l1_5_filter import (
+        extract_object_anchor,
+        get_synonyms_for,
+        _get_wn,
+        _RUWORDNET_DB_PATH,
+    )
     
-    info = {"seed": seed}
+    info: dict = {"seed": seed}
+    
+    # Состояние RuWordNet DB
+    db_exists = os.path.exists(_RUWORDNET_DB_PATH)
+    info["ruwordnet_db"] = {
+        "path": _RUWORDNET_DB_PATH,
+        "exists": db_exists,
+        "size_mb": round(os.path.getsize(_RUWORDNET_DB_PATH) / 1024 / 1024, 1) if db_exists else None,
+    }
+    
+    # Попытка инициализации RuWordNet (триггерит скачивание если нужно)
+    wn = _get_wn()
+    info["ruwordnet_loaded"] = wn is not None
+    
+    # Если есть seed — проанализируем
     if seed:
         obj, qual, qtext = extract_object_anchor(seed)
         info["object_anchor"] = obj
         info["qualifier"] = qual
         info["qualifier_text"] = qtext
+        
+        if obj:
+            synonyms = get_synonyms_for(obj)
+            info["synonyms_count"] = len(synonyms)
+            info["synonyms"] = sorted(list(synonyms))[:30]  # первые 30
     
     return info
 
