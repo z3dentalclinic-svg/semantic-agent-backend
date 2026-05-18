@@ -583,13 +583,16 @@ def has_anchor(
             if lemma in synonyms:
                 return True, f'synonym_lemma:{lemma}'
     
-    # L5: Word-level MiniLM cosine (semantic anchor)
+    # L5: Word-level MiniLM cosine + dual-cluster contrastive
     if domain_profile and seed_words:
-        matched, signal = check_semantic_anchor(
+        matched, l5_signal = check_semantic_anchor(
             kw, seed_words, object_anchor, domain_profile
         )
         if matched:
-            return True, signal
+            return True, l5_signal
+        # L5 не сработал — сохраняем диагностический сигнал
+        if l5_signal:
+            return False, l5_signal
     
     return False, 'no_anchor'
 
@@ -664,6 +667,7 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     new_trash: list = []
     trace_records: list = []
     l5_saves: list = []  # ключи которые спас L5 (для логирования)
+    l5_misses: list = []  # ключи которые L5 не спас, но провёл анализ
     
     for kw_item in grey:
         # kw может быть строкой или dict
@@ -682,6 +686,8 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
                 l5_saves.append((kw, signal))
         else:
             new_trash.append(kw_item)
+            if signal and signal.startswith('word_cosine'):
+                l5_misses.append((kw, signal))
             trace_records.append({
                 'keyword': kw,
                 'label': 'TRASH',
@@ -697,6 +703,22 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
             logger.info(f"[L1.5/L5]   ✓ '{kw}' ({sig})")
         if len(l5_saves) > 15:
             logger.info(f"[L1.5/L5]   ... +{len(l5_saves)-15} more")
+    
+    # Логируем L5-промахи (для диагностики порогов)
+    if l5_misses:
+        # Особо выделяем кейсы где cosine высокий но не прошёл (порог/contrastive)
+        high_cos_misses = [(kw, sig) for kw, sig in l5_misses
+                           if 'word_cosine_trash:' in sig or 'word_cosine_low:' in sig]
+        # Сортируем по cosine (читаем число из строки)
+        def _extract_sim(sig):
+            import re as _re
+            m = _re.search(r'=(\d+\.\d+)', sig)
+            return float(m.group(1)) if m else 0.0
+        high_cos_misses.sort(key=lambda x: -_extract_sim(x[1]))
+        
+        logger.info(f"[L1.5/L5] missed {len(l5_misses)} keywords (top by sim):")
+        for kw, sig in high_cos_misses[:20]:
+            logger.info(f"[L1.5/L5]   ✗ '{kw}' ({sig})")
     
     # Обновляем data
     data['keywords_grey'] = new_grey
