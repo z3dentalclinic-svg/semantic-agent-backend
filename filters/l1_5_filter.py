@@ -101,17 +101,19 @@ def cosine_sim(v1: Optional[np.ndarray], v2: Optional[np.ndarray]) -> float:
 _domain_profile_cache: dict[str, dict] = {}
 
 
-def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str) -> dict:
+def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str,
+                          l0_trash_kws: Optional[list[str]] = None) -> dict:
     """
-    Строит профиль домена для object_anchor на основе L0_VALID хвостов.
+    Строит профиль домена для object_anchor.
     
     Возвращает:
         {
             'anchor_emb': эмбеддинг object_anchor,
-            'valid_lemmas': set(леммы из L0_VALID хвостов),
-            'threshold': адаптивный порог для cosine (>= 0.50),
-            'reference_emb': средний эмбеддинг top-релевантных слов из L0_VALID
-                             (для contrastive score)
+            'valid_lemmas': set лемм из L0_VALID хвостов,
+            'threshold': адаптивный порог cosine (>= 0.50),
+            'centroid_valid': средний эмбеддинг top-релевантных слов из L0_VALID,
+            'centroid_trash': средний эмбеддинг NOUN-лемм из L0_TRASH (для contrastive),
+            'enabled': bool — работает ли MiniLM
         }
     """
     cache_key = f"{seed}::{object_anchor}"
@@ -120,21 +122,21 @@ def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str)
     
     anchor_emb = get_word_embedding(object_anchor)
     if anchor_emb is None:
-        # MiniLM недоступен — пустой профиль
         profile = {
             'anchor_emb': None,
             'valid_lemmas': set(),
             'threshold': 0.55,
-            'reference_emb': None,
+            'centroid_valid': None,
+            'centroid_trash': None,
             'enabled': False,
         }
         _domain_profile_cache[cache_key] = profile
         return profile
     
-    # Извлекаем леммы существительных из L0_VALID
     seed_words = set(seed.lower().split())
     seed_words.update(_STOPWORDS)
     
+    # === VALID side ===
     valid_lemmas: set = set()
     for kw in l0_valid_kws:
         kw_low = kw.lower() if isinstance(kw, str) else ''
@@ -145,52 +147,83 @@ def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str)
             if p.tag.POS == 'NOUN':
                 valid_lemmas.add(p.normal_form)
     
-    # Считаем cosine для всех valid lemmas vs anchor
+    # Cosine valid lemmas vs anchor
     lemma_sims: list[tuple[str, float]] = []
-    for lemma in list(valid_lemmas)[:100]:  # ограничим
+    for lemma in list(valid_lemmas)[:100]:
         emb = get_word_embedding(lemma)
         if emb is not None:
             sim = cosine_sim(emb, anchor_emb)
             lemma_sims.append((lemma, sim))
     
-    # Адаптивный порог — p10 cosine valid lemmas (с нижней границей 0.50)
+    # Адаптивный порог
     if len(lemma_sims) >= 5:
         sims_sorted = sorted([s for _, s in lemma_sims])
         p10_idx = max(0, int(len(sims_sorted) * 0.10))
-        adaptive_threshold = sims_sorted[p10_idx]
-        threshold = max(0.50, adaptive_threshold)
+        threshold = max(0.50, sims_sorted[p10_idx])
     else:
-        threshold = 0.55  # дефолт если мало данных
+        threshold = 0.55
     
-    # Reference embedding: средний по top-10 близким к anchor словам
+    # Centroid VALID — top-10 близких к anchor
     top10 = sorted(lemma_sims, key=lambda x: -x[1])[:10]
+    centroid_valid = None
     if top10:
-        ref_embs = [get_word_embedding(l) for l, _ in top10]
-        ref_embs = [e for e in ref_embs if e is not None]
-        if ref_embs:
-            ref_emb = np.mean(ref_embs, axis=0)
-            norm = np.linalg.norm(ref_emb)
-            if norm > 0:
-                ref_emb = ref_emb / norm
-        else:
-            ref_emb = None
-    else:
-        ref_emb = None
+        embs = [get_word_embedding(l) for l, _ in top10]
+        embs = [e for e in embs if e is not None]
+        if embs:
+            centroid_valid = np.mean(embs, axis=0)
+            n = np.linalg.norm(centroid_valid)
+            if n > 0:
+                centroid_valid = centroid_valid / n
+    
+    # === TRASH side (новое — dual-cluster) ===
+    centroid_trash = None
+    trash_lemmas_for_log: list = []
+    if l0_trash_kws:
+        trash_lemmas: set = set()
+        for kw in l0_trash_kws:
+            kw_low = kw.lower() if isinstance(kw, str) else ''
+            for w in re.findall(r'[а-яёa-z]+', kw_low):
+                if w in seed_words or len(w) <= 2:
+                    continue
+                p = morph.parse(w)[0]
+                if p.tag.POS == 'NOUN':
+                    trash_lemmas.add(p.normal_form)
+        
+        # Убираем леммы которые также в VALID (они нейтральные, не помогают разделять)
+        trash_only = trash_lemmas - valid_lemmas
+        
+        if trash_only:
+            trash_embs = []
+            for lemma in list(trash_only)[:100]:
+                emb = get_word_embedding(lemma)
+                if emb is not None:
+                    trash_embs.append(emb)
+                    trash_lemmas_for_log.append(lemma)
+            
+            if len(trash_embs) >= 3:
+                centroid_trash = np.mean(trash_embs, axis=0)
+                n = np.linalg.norm(centroid_trash)
+                if n > 0:
+                    centroid_trash = centroid_trash / n
     
     profile = {
         'anchor_emb': anchor_emb,
         'valid_lemmas': valid_lemmas,
         'threshold': threshold,
-        'reference_emb': ref_emb,
+        'centroid_valid': centroid_valid,
+        'centroid_trash': centroid_trash,
         'enabled': True,
-        'top_sims': top10[:5],  # для логирования
+        'top_sims': top10[:5],
+        'trash_lemmas_sample': trash_lemmas_for_log[:5],
     }
     
     _domain_profile_cache[cache_key] = profile
     logger.info(
         f"[L1.5/L5] domain_profile for '{object_anchor}': "
         f"valid_lemmas={len(valid_lemmas)}, threshold={threshold:.2f}, "
-        f"top_sims={[(l, round(s, 2)) for l, s in top10[:5]]}"
+        f"top_sims={[(l, round(s, 2)) for l, s in top10[:5]]}, "
+        f"centroid_trash={'YES' if centroid_trash is not None else 'NO'} "
+        f"(trash_sample={trash_lemmas_for_log[:5]})"
     )
     return profile
 
@@ -202,10 +235,19 @@ def check_semantic_anchor(
     profile: dict,
 ) -> tuple[bool, str]:
     """
-    Уровень 5: word-level cosine MiniLM с adaptive threshold.
+    Уровень 5: word-level cosine MiniLM с adaptive threshold + dual-cluster.
     
-    Для каждого NOUN в kw (после фильтра seed/stopwords) считает cosine 
-    с object_anchor. Если max(cosines) >= threshold → semantic anchor.
+    Для каждого NOUN в kw считает:
+      sim_to_anchor = cos(candidate, anchor)
+      sim_to_trash  = cos(candidate, centroid_trash)
+    
+    Признаём кандидата валидным якорем если:
+      1) sim_to_anchor >= threshold (близко к anchor), И
+      2) sim_to_anchor > sim_to_trash (ближе к anchor чем к мусорному центроиду).
+    
+    Второе условие — это и есть dual-cluster contrastive score.
+    Оно отрезает слова типа 'пятёрочка' / 'график' — они близки к мусорному
+    центроиду (где много 'доставка пиццы', 'график работы') сильнее чем к anchor.
     
     Returns: (matched, signal_name)
     """
@@ -214,10 +256,11 @@ def check_semantic_anchor(
     
     anchor_emb = profile['anchor_emb']
     threshold = profile['threshold']
+    centroid_trash = profile.get('centroid_trash')
     
     kw_low = kw.lower()
     
-    # Извлекаем кандидатов — NOUN-леммы из kw (без seed-слов и stopwords)
+    # Извлекаем кандидатов
     candidates: list[str] = []
     for w in re.findall(r'[а-яёa-z]+', kw_low):
         if w in seed_words or w in _STOPWORDS or len(w) <= 2:
@@ -229,22 +272,52 @@ def check_semantic_anchor(
     if not candidates:
         return False, ''
     
-    # Считаем cosine для каждого кандидата
-    best_sim = 0.0
+    # Для каждого считаем contrastive score
     best_word = None
-    for cand in candidates[:5]:  # не более 5 кандидатов на ключ
+    best_anchor_sim = 0.0
+    best_trash_sim = 0.0
+    for cand in candidates[:5]:
         emb = get_word_embedding(cand)
         if emb is None:
             continue
-        sim = cosine_sim(emb, anchor_emb)
-        if sim > best_sim:
-            best_sim = sim
+        sim_anchor = cosine_sim(emb, anchor_emb)
+        sim_trash = cosine_sim(emb, centroid_trash) if centroid_trash is not None else 0.0
+        
+        # Берём кандидата с максимальным contrastive (anchor - trash)
+        contrastive = sim_anchor - sim_trash
+        best_contrastive = best_anchor_sim - best_trash_sim if best_word else -1.0
+        if contrastive > best_contrastive:
             best_word = cand
+            best_anchor_sim = sim_anchor
+            best_trash_sim = sim_trash
     
-    if best_sim >= threshold and best_word:
-        return True, f'word_cosine:{best_word}={best_sim:.2f}>={threshold:.2f}'
+    if not best_word:
+        return False, ''
     
-    return False, f'word_cosine_low:best={best_word}={best_sim:.2f}<{threshold:.2f}'
+    # Decision:
+    # 1) sim_anchor >= threshold (близко к anchor)
+    # 2) sim_anchor > sim_trash (ближе к anchor чем к trash-кластеру)
+    passes_threshold = best_anchor_sim >= threshold
+    passes_contrastive = best_anchor_sim > best_trash_sim
+    
+    if passes_threshold and passes_contrastive:
+        return True, (
+            f'word_cosine:{best_word}'
+            f'={best_anchor_sim:.2f}>={threshold:.2f}'
+            f',trash={best_trash_sim:.2f}'
+        )
+    
+    # Diagnostic signal для логов — почему именно отказали
+    if not passes_threshold:
+        return False, (
+            f'word_cosine_low:{best_word}'
+            f'={best_anchor_sim:.2f}<{threshold:.2f}'
+        )
+    else:  # passes_threshold but not passes_contrastive
+        return False, (
+            f'word_cosine_trash:{best_word}'
+            f'={best_anchor_sim:.2f},trash={best_trash_sim:.2f}'
+        )
 
 
 
@@ -568,13 +641,17 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     # Уровень 4: synonyms/hyponyms через RuWordNet (per-seed cache)
     synonyms = get_synonyms_for(object_anchor)
     
-    # Уровень 5: domain_profile (MiniLM word-cosine) из L0_VALID хвостов
+    # Уровень 5: domain_profile (MiniLM word-cosine + dual-cluster) из L0_VALID и L0_TRASH хвостов
     l0_trace = data.get('_l0_trace', [])
     l0_valid_kws = [
         t['keyword'] for t in l0_trace 
         if isinstance(t, dict) and t.get('label') == 'VALID'
     ]
-    domain_profile = build_domain_profile(object_anchor, l0_valid_kws, seed)
+    l0_trash_kws = [
+        t['keyword'] for t in l0_trace
+        if isinstance(t, dict) and t.get('label') == 'TRASH'
+    ]
+    domain_profile = build_domain_profile(object_anchor, l0_valid_kws, seed, l0_trash_kws)
     seed_words = set(seed.lower().split())
     
     logger.info(
