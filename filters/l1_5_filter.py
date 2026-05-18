@@ -80,7 +80,7 @@ def _get_wn():
         if db_path is None:
             _wn = False
             return None
-        _wn = RuWordNet(filename=db_path)
+        _wn = RuWordNet(db_path)
         logger.info("[L1.5] RuWordNet initialized")
         return _wn
     except ImportError:
