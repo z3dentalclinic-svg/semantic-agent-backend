@@ -826,17 +826,19 @@ def build_action_set(
     object_anchor: Optional[str],
 ) -> set[str]:
     """
-    Расширяет action-set синонимами из L0_VALID хвостов.
+    Расширяет action-set СИНОНИМАМИ action_anchor из L0_VALID хвостов.
     
-    Идея: в L0_VALID хвостах ключи где seed-фраза найдена целиком. 
-    В этих хвостах могут встречаться синонимы action (например для seed 
-    'доставка цветов' — слова 'курьер', 'привезти', 'заказать').
+    Алгоритм:
+    1. Из L0_VALID хвостов собираем леммы NOUN/INFN/VERB с частотой >= 3
+    2. Из них берём только те что **семантически близки** к action_anchor 
+       через MiniLM word-cosine (>= 0.45). Это отсеивает:
+       - Гео-слова (днепр, киев — cos с 'доставка' < 0.3)
+       - Object-слова (букет, роза — cos с 'доставка' ~ 0.3)
+       - Контакты (телефон, фото — cos с 'доставка' ~ 0.3)
+       Оставляет действительные синонимы: заказ, курьер, привезти, отправка.
     
-    Собираем леммы VERB/INFN/NOUN из L0_VALID хвостов, исключаем object_anchor 
-    и его варианты. Возвращаем top-N по частоте.
-    
-    Это даёт расширение action-набора БЕЗ хардкода списков синонимов.
-    Если в L0_VALID нет 'курьер' — мы его не получим (это и есть алгоритмическая безопасность).
+    Если MiniLM недоступен — возвращаем минимальный set из только action_anchor 
+    (без расширения). Это значит будем работать только через action_root.
     """
     from collections import Counter
     
@@ -857,16 +859,34 @@ def build_action_set(
             # Исключаем object_anchor и его substring-варианты
             if object_anchor and (lemma == object_anchor or object_anchor in lemma):
                 continue
+            # Исключаем леммы которые сами начинаются с action_root
+            # (это формы action_anchor — нам они нужны только как substring корня)
+            if action_root and lemma.startswith(action_root):
+                continue
             
-            # Собираем кандидаты — VERB/INFN/NOUN которые ведут себя как actions
             if pos in ('NOUN', 'INFN', 'VERB'):
                 counter[lemma] += 1
     
-    # Top-N кандидатов с минимум 3 встречами
+    # Кандидаты — лемм с частотой >= 3
+    candidates = [lemma for lemma, count in counter.most_common(100) if count >= 3]
+    
     action_set = {action_anchor}
-    for lemma, count in counter.most_common(50):
-        if count >= 3:
-            action_set.add(lemma)
+    
+    # Фильтруем кандидатов через MiniLM cosine к action_anchor
+    anchor_emb = get_word_embedding(action_anchor)
+    if anchor_emb is not None:
+        # Порог для action-синонимов
+        ACTION_SYNONYM_THRESHOLD = 0.45
+        for lemma in candidates:
+            emb = get_word_embedding(lemma)
+            if emb is None:
+                continue
+            sim = cosine_sim(emb, anchor_emb)
+            if sim >= ACTION_SYNONYM_THRESHOLD:
+                action_set.add(lemma)
+    else:
+        # MiniLM недоступен — работаем только по корню (минимальное расширение)
+        logger.warning("[L1.5/Pass2] MiniLM unavailable, action_set won't be expanded")
     
     return action_set
 
@@ -880,11 +900,12 @@ def has_action(
     """
     Проверка action-anchor в kw.
     
-    Два сигнала:
-    A. Substring корня action_root (например 'достав' для 'доставка' → ловит 
-       все формы: доставка/доставить/доставку/доставкой/курьерская доставка).
-    B. Лемма kw-слова входит в action_set из L0_VALID (расширение синонимов
-       через данные текущего прогона).
+    Два сигнала (применяются к каждой лемме слова в kw):
+    A. Лемма начинается с action_root — ловит однокоренные формы action.
+       НЕ через substring в kw_low, а через startswith у леммы — чтобы избежать
+       коллизий: 'подставка'.lemma = 'подставка' НЕ начинается с 'доста' → OK.
+       'доставку'.lemma = 'доставка' начинается с 'доста' → match.
+    B. Лемма в action_set (синонимы через MiniLM из L0_VALID).
     
     Returns: (has_action, signal_name)
     """
@@ -893,15 +914,15 @@ def has_action(
     
     kw_low = kw.lower()
     
-    # A. Substring корня
-    if action_root in kw_low:
-        return True, f'action_root:{action_root}'
-    
-    # B. Лемма в action_set
     for w in re.findall(r'[а-яёa-z]+', kw_low):
         p = morph.parse(w)[0]
-        if p.normal_form in action_set:
-            return True, f'action_lemma:{p.normal_form}'
+        lemma = p.normal_form
+        # A. Лемма начинается с action_root (однокоренные)
+        if lemma.startswith(action_root):
+            return True, f'action_root:{lemma}'
+        # B. Лемма в action_set (синонимы)
+        if lemma in action_set:
+            return True, f'action_lemma:{lemma}'
     
     return False, 'no_action'
 
@@ -987,6 +1008,9 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         f"action='{action_anchor}' root='{action_root}' set_size={len(action_set)} enabled={enable_action_check}, "
         f"l5_enabled={domain_profile.get('enabled', False)}"
     )
+    if action_set:
+        action_set_sample = sorted(action_set)[:20]
+        logger.info(f"[L1.5/Pass2] action_set: {action_set_sample}")
     
     new_grey: list = []
     new_trash: list = []
