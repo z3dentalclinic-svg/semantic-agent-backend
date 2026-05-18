@@ -32,9 +32,222 @@ import time
 import urllib.request
 from typing import Optional
 
+import numpy as np
+
 from .shared_morph import morph
+from .shared_model import get_embedding_model
 
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Уровень 5: MiniLM word-level cosine с adaptive threshold
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Stopwords (для фильтра nouns в kw)
+_STOPWORDS = {
+    'купить', 'заказать', 'цена', 'стоимость', 'отзывы', 'продажа', 'доставка',
+    'в', 'на', 'с', 'и', 'или', 'без', 'для', 'под', 'через', 'у', 'к', 'от',
+    'из', 'о', 'об', 'как', 'где', 'почему', 'что', 'это', 'до', 'по', 'за',
+    'про', 'со', 'но', 'же', 'ли', 'бы', 'не', 'ни', 'весь', 'все', 'всё',
+}
+
+# Кеш эмбеддингов слов (per-process)
+_embedding_cache: dict[str, np.ndarray] = {}
+
+
+def get_word_embedding(word: str) -> Optional[np.ndarray]:
+    """
+    Возвращает word-level эмбеддинг через MiniLM (с кешем).
+    Возвращает None если модель не загружена.
+    """
+    if not word:
+        return None
+    if word in _embedding_cache:
+        return _embedding_cache[word]
+    
+    model = get_embedding_model()
+    if model is None:
+        return None
+    
+    try:
+        # fastembed.embed() — генератор, передаём список из одной строки
+        embeddings = list(model.embed([word]))
+        if not embeddings:
+            return None
+        emb = np.asarray(embeddings[0], dtype=np.float32)
+        # Нормализация для cosine
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        _embedding_cache[word] = emb
+        return emb
+    except Exception as e:
+        logger.debug(f"[L1.5] Embedding failed for '{word}': {e}")
+        return None
+
+
+def cosine_sim(v1: Optional[np.ndarray], v2: Optional[np.ndarray]) -> float:
+    """Cosine similarity (для нормализованных векторов = dot product)."""
+    if v1 is None or v2 is None:
+        return 0.0
+    return float(np.dot(v1, v2))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Domain profile из L0_VALID (per-seed, кешируется)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Кеш профиля по object_anchor
+_domain_profile_cache: dict[str, dict] = {}
+
+
+def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str) -> dict:
+    """
+    Строит профиль домена для object_anchor на основе L0_VALID хвостов.
+    
+    Возвращает:
+        {
+            'anchor_emb': эмбеддинг object_anchor,
+            'valid_lemmas': set(леммы из L0_VALID хвостов),
+            'threshold': адаптивный порог для cosine (>= 0.50),
+            'reference_emb': средний эмбеддинг top-релевантных слов из L0_VALID
+                             (для contrastive score)
+        }
+    """
+    cache_key = f"{seed}::{object_anchor}"
+    if cache_key in _domain_profile_cache:
+        return _domain_profile_cache[cache_key]
+    
+    anchor_emb = get_word_embedding(object_anchor)
+    if anchor_emb is None:
+        # MiniLM недоступен — пустой профиль
+        profile = {
+            'anchor_emb': None,
+            'valid_lemmas': set(),
+            'threshold': 0.55,
+            'reference_emb': None,
+            'enabled': False,
+        }
+        _domain_profile_cache[cache_key] = profile
+        return profile
+    
+    # Извлекаем леммы существительных из L0_VALID
+    seed_words = set(seed.lower().split())
+    seed_words.update(_STOPWORDS)
+    
+    valid_lemmas: set = set()
+    for kw in l0_valid_kws:
+        kw_low = kw.lower() if isinstance(kw, str) else ''
+        for w in re.findall(r'[а-яёa-z]+', kw_low):
+            if w in seed_words or len(w) <= 2:
+                continue
+            p = morph.parse(w)[0]
+            if p.tag.POS == 'NOUN':
+                valid_lemmas.add(p.normal_form)
+    
+    # Считаем cosine для всех valid lemmas vs anchor
+    lemma_sims: list[tuple[str, float]] = []
+    for lemma in list(valid_lemmas)[:100]:  # ограничим
+        emb = get_word_embedding(lemma)
+        if emb is not None:
+            sim = cosine_sim(emb, anchor_emb)
+            lemma_sims.append((lemma, sim))
+    
+    # Адаптивный порог — p10 cosine valid lemmas (с нижней границей 0.50)
+    if len(lemma_sims) >= 5:
+        sims_sorted = sorted([s for _, s in lemma_sims])
+        p10_idx = max(0, int(len(sims_sorted) * 0.10))
+        adaptive_threshold = sims_sorted[p10_idx]
+        threshold = max(0.50, adaptive_threshold)
+    else:
+        threshold = 0.55  # дефолт если мало данных
+    
+    # Reference embedding: средний по top-10 близким к anchor словам
+    top10 = sorted(lemma_sims, key=lambda x: -x[1])[:10]
+    if top10:
+        ref_embs = [get_word_embedding(l) for l, _ in top10]
+        ref_embs = [e for e in ref_embs if e is not None]
+        if ref_embs:
+            ref_emb = np.mean(ref_embs, axis=0)
+            norm = np.linalg.norm(ref_emb)
+            if norm > 0:
+                ref_emb = ref_emb / norm
+        else:
+            ref_emb = None
+    else:
+        ref_emb = None
+    
+    profile = {
+        'anchor_emb': anchor_emb,
+        'valid_lemmas': valid_lemmas,
+        'threshold': threshold,
+        'reference_emb': ref_emb,
+        'enabled': True,
+        'top_sims': top10[:5],  # для логирования
+    }
+    
+    _domain_profile_cache[cache_key] = profile
+    logger.info(
+        f"[L1.5/L5] domain_profile for '{object_anchor}': "
+        f"valid_lemmas={len(valid_lemmas)}, threshold={threshold:.2f}, "
+        f"top_sims={[(l, round(s, 2)) for l, s in top10[:5]]}"
+    )
+    return profile
+
+
+def check_semantic_anchor(
+    kw: str,
+    seed_words: set,
+    object_anchor: str,
+    profile: dict,
+) -> tuple[bool, str]:
+    """
+    Уровень 5: word-level cosine MiniLM с adaptive threshold.
+    
+    Для каждого NOUN в kw (после фильтра seed/stopwords) считает cosine 
+    с object_anchor. Если max(cosines) >= threshold → semantic anchor.
+    
+    Returns: (matched, signal_name)
+    """
+    if not profile.get('enabled') or profile.get('anchor_emb') is None:
+        return False, ''
+    
+    anchor_emb = profile['anchor_emb']
+    threshold = profile['threshold']
+    
+    kw_low = kw.lower()
+    
+    # Извлекаем кандидатов — NOUN-леммы из kw (без seed-слов и stopwords)
+    candidates: list[str] = []
+    for w in re.findall(r'[а-яёa-z]+', kw_low):
+        if w in seed_words or w in _STOPWORDS or len(w) <= 2:
+            continue
+        p = morph.parse(w)[0]
+        if p.tag.POS == 'NOUN':
+            candidates.append(p.normal_form)
+    
+    if not candidates:
+        return False, ''
+    
+    # Считаем cosine для каждого кандидата
+    best_sim = 0.0
+    best_word = None
+    for cand in candidates[:5]:  # не более 5 кандидатов на ключ
+        emb = get_word_embedding(cand)
+        if emb is None:
+            continue
+        sim = cosine_sim(emb, anchor_emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_word = cand
+    
+    if best_sim >= threshold and best_word:
+        return True, f'word_cosine:{best_word}={best_sim:.2f}>={threshold:.2f}'
+    
+    return False, f'word_cosine_low:best={best_word}={best_sim:.2f}<{threshold:.2f}'
+
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RuWordNet — taxonomy для synonyms/hyponyms (Уровень 4 расширения anchor)
@@ -249,6 +462,8 @@ def has_anchor(
     qualifier: Optional[str],
     qualifier_text: list[str],
     synonyms: Optional[set] = None,
+    domain_profile: Optional[dict] = None,
+    seed_words: Optional[set] = None,
 ) -> tuple[bool, str]:
     """
     Проверяет наличие domain anchor в kw.
@@ -258,6 +473,7 @@ def has_anchor(
     L2: qualifier (число или текстовая форма)
     L3: лемматизация каждого слова kw, сравнение с object_anchor
     L4: RuWordNet synonyms (если переданы) — substring + лемма
+    L5: MiniLM word-cosine с adaptive threshold (если domain_profile передан)
     """
     if not object_anchor:
         return True, 'no_object_extracted'
@@ -293,6 +509,14 @@ def has_anchor(
         for lemma in kw_lemmas:
             if lemma in synonyms:
                 return True, f'synonym_lemma:{lemma}'
+    
+    # L5: Word-level MiniLM cosine (semantic anchor)
+    if domain_profile and seed_words:
+        matched, signal = check_semantic_anchor(
+            kw, seed_words, object_anchor, domain_profile
+        )
+        if matched:
+            return True, signal
     
     return False, 'no_anchor'
 
@@ -344,27 +568,41 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     # Уровень 4: synonyms/hyponyms через RuWordNet (per-seed cache)
     synonyms = get_synonyms_for(object_anchor)
     
+    # Уровень 5: domain_profile (MiniLM word-cosine) из L0_VALID хвостов
+    l0_trace = data.get('_l0_trace', [])
+    l0_valid_kws = [
+        t['keyword'] for t in l0_trace 
+        if isinstance(t, dict) and t.get('label') == 'VALID'
+    ]
+    domain_profile = build_domain_profile(object_anchor, l0_valid_kws, seed)
+    seed_words = set(seed.lower().split())
+    
     logger.info(
         f"[L1.5] seed='{seed}' → object='{object_anchor}', qualifier='{qualifier}', "
-        f"synonyms({len(synonyms)})={sorted(synonyms)[:5] if synonyms else '[]'}"
+        f"synonyms({len(synonyms)}), "
+        f"l5_enabled={domain_profile.get('enabled', False)}"
     )
     
     new_grey: list = []
     new_trash: list = []
     trace_records: list = []
-    
-    # _l0_trace для контекста (опционально)
-    l0_trace = data.get('_l0_trace', [])
-    l0_map = {t['keyword']: t for t in l0_trace if isinstance(t, dict)}
+    l5_saves: list = []  # ключи которые спас L5 (для логирования)
     
     for kw_item in grey:
         # kw может быть строкой или dict
         kw = kw_item if isinstance(kw_item, str) else kw_item.get('keyword', '')
         
-        ok, signal = has_anchor(kw, object_anchor, qualifier, qualifier_text, synonyms)
+        ok, signal = has_anchor(
+            kw, object_anchor, qualifier, qualifier_text,
+            synonyms=synonyms,
+            domain_profile=domain_profile,
+            seed_words=seed_words,
+        )
         
         if ok:
             new_grey.append(kw_item)
+            if signal.startswith('word_cosine:'):
+                l5_saves.append((kw, signal))
         else:
             new_trash.append(kw_item)
             trace_records.append({
@@ -372,8 +610,16 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
                 'label': 'TRASH',
                 'decided_by': 'l1_5',
                 'reason': f'no_domain_anchor (object={object_anchor})',
-                'signals': [],
+                'signals': [signal] if signal else [],
             })
+    
+    # Логируем L5-спасения (для диагностики)
+    if l5_saves:
+        logger.info(f"[L1.5/L5] saved {len(l5_saves)} keywords via semantic word-cosine:")
+        for kw, sig in l5_saves[:15]:
+            logger.info(f"[L1.5/L5]   ✓ '{kw}' ({sig})")
+        if len(l5_saves) > 15:
+            logger.info(f"[L1.5/L5]   ... +{len(l5_saves)-15} more")
     
     # Обновляем data
     data['keywords_grey'] = new_grey
