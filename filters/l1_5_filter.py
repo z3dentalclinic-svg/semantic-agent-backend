@@ -1,5 +1,5 @@
 """
-L1.5 Domain Anchor Filter1
+L1.5 Domain Anchor Filter
 
 Размещается между L0 и L2 в пайплайне:
     L0 → [L1.5] → L2 → L3
@@ -26,13 +26,126 @@ Anchor = главный объект seed (object_anchor) ± числовой qu
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
+import urllib.request
 from typing import Optional
 
 from .shared_morph import morph
 
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RuWordNet — taxonomy для synonyms/hyponyms (Уровень 4 расширения anchor)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_RUWORDNET_DB_URL = "https://github.com/avidale/python-ruwordnet/releases/download/0.0.4/ruwordnet-2021.db"
+_RUWORDNET_DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "_data",
+    "ruwordnet.db",
+)
+
+_wn = None  # singleton, инициализируется при первом обращении
+
+
+def _ensure_ruwordnet_db() -> Optional[str]:
+    """Скачивает БД RuWordNet один раз. Возвращает путь или None при ошибке."""
+    if os.path.exists(_RUWORDNET_DB_PATH):
+        return _RUWORDNET_DB_PATH
+    
+    try:
+        os.makedirs(os.path.dirname(_RUWORDNET_DB_PATH), exist_ok=True)
+        logger.info(f"[L1.5] Downloading RuWordNet DB (~96MB) from {_RUWORDNET_DB_URL}")
+        t0 = time.time()
+        urllib.request.urlretrieve(_RUWORDNET_DB_URL, _RUWORDNET_DB_PATH)
+        size_mb = os.path.getsize(_RUWORDNET_DB_PATH) / 1024 / 1024
+        logger.info(f"[L1.5] RuWordNet DB downloaded ({size_mb:.1f}MB) in {time.time()-t0:.1f}s")
+        return _RUWORDNET_DB_PATH
+    except Exception as e:
+        logger.warning(f"[L1.5] RuWordNet DB download failed: {e}")
+        return None
+
+
+def _get_wn():
+    """Lazy singleton — RuWordNet object."""
+    global _wn
+    if _wn is not None:
+        return _wn if _wn is not False else None
+    
+    try:
+        from ruwordnet import RuWordNet
+        db_path = _ensure_ruwordnet_db()
+        if db_path is None:
+            _wn = False
+            return None
+        _wn = RuWordNet(filename=db_path)
+        logger.info("[L1.5] RuWordNet initialized")
+        return _wn
+    except ImportError:
+        logger.warning("[L1.5] ruwordnet package not installed — synonyms disabled")
+        _wn = False
+        return None
+    except Exception as e:
+        logger.warning(f"[L1.5] RuWordNet init failed: {e} — synonyms disabled")
+        _wn = False
+        return None
+
+
+# Кеш synonyms по object_anchor (один раз на сид)
+_synonyms_cache: dict[str, set[str]] = {}
+
+
+def get_synonyms_for(object_anchor: str) -> set[str]:
+    """
+    Возвращает синонимы / гипонимы / гиперонимы object_anchor через RuWordNet.
+    
+    Для 'скутер' вернёт {'мопед', 'мотороллер', 'электроскутер', ...}
+    Для 'цветок' вернёт {'роза', 'тюльпан', 'эустома', 'букет', ...}
+    
+    Если RuWordNet недоступен — пустое множество.
+    Кешируется per-anchor.
+    """
+    if not object_anchor:
+        return set()
+    
+    if object_anchor in _synonyms_cache:
+        return _synonyms_cache[object_anchor]
+    
+    wn = _get_wn()
+    if not wn:
+        _synonyms_cache[object_anchor] = set()
+        return set()
+    
+    related: set[str] = set()
+    try:
+        senses = wn.get_senses(object_anchor)
+        for sense in senses:
+            synset = sense.synset
+            # Гипонимы (виды) — наследники
+            for h in synset.hyponyms:
+                for s in h.senses:
+                    related.add(s.name.lower())
+            # Синонимы (тот же synset)
+            for s in synset.senses:
+                related.add(s.name.lower())
+            # Гиперонимы (родители) — обобщения (для подстраховки)
+            for h in synset.hypernyms:
+                for s in h.senses:
+                    related.add(s.name.lower())
+    except Exception as e:
+        logger.debug(f"[L1.5] RuWordNet lookup error for '{object_anchor}': {e}")
+    
+    related.discard(object_anchor.lower())
+    _synonyms_cache[object_anchor] = related
+    
+    if related:
+        logger.info(f"[L1.5] RuWordNet synonyms for '{object_anchor}' ({len(related)}): {sorted(related)[:10]}")
+    else:
+        logger.info(f"[L1.5] RuWordNet: no synonyms for '{object_anchor}'")
+    
+    return related
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,6 +248,7 @@ def has_anchor(
     object_anchor: Optional[str],
     qualifier: Optional[str],
     qualifier_text: list[str],
+    synonyms: Optional[set] = None,
 ) -> tuple[bool, str]:
     """
     Проверяет наличие domain anchor в kw.
@@ -143,13 +257,9 @@ def has_anchor(
     L1: substring match object_anchor в kw_lower
     L2: qualifier (число или текстовая форма)
     L3: лемматизация каждого слова kw, сравнение с object_anchor
-    
-    Returns:
-        (has_anchor, signal_name)
-        signal_name — какой именно сигнал сработал (для trace)
+    L4: RuWordNet synonyms (если переданы) — substring + лемма
     """
     if not object_anchor:
-        # Не удалось извлечь object — пропускаем (не трашим)
         return True, 'no_object_extracted'
     
     kw_low = kw.lower()
@@ -160,19 +270,29 @@ def has_anchor(
     
     # L2: Qualifier (число)
     if qualifier:
-        # Точное число как отдельный токен (не часть 161, 166)
         if re.search(rf'(?<!\d){qualifier}(?!\d)', kw_low):
             return True, 'qualifier_digit'
-        # Текстовая форма ('шестнадцатый')
         for txt in qualifier_text:
             if txt in kw_low:
                 return True, 'qualifier_text'
     
-    # L3: Лемматизация — для слов где substring не сработал (опечатки, формы)
-    for w in re.findall(r'[а-яёa-z]+', kw_low):
+    # L3: Лемматизация — собираем леммы kw
+    kw_words = re.findall(r'[а-яёa-z]+', kw_low)
+    kw_lemmas = set()
+    for w in kw_words:
         p = morph.parse(w)[0]
+        kw_lemmas.add(p.normal_form)
         if p.normal_form == object_anchor:
             return True, 'lemma'
+    
+    # L4: RuWordNet synonyms (substring + лемма)
+    if synonyms:
+        for syn in synonyms:
+            if syn in kw_low:
+                return True, f'synonym_substring:{syn}'
+        for lemma in kw_lemmas:
+            if lemma in synonyms:
+                return True, f'synonym_lemma:{lemma}'
     
     return False, 'no_anchor'
 
@@ -221,8 +341,12 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         data.setdefault('_filter_timings', {})['l1_5'] = round(time.perf_counter() - t0, 4)
         return data
     
+    # Уровень 4: synonyms/hyponyms через RuWordNet (per-seed cache)
+    synonyms = get_synonyms_for(object_anchor)
+    
     logger.info(
-        f"[L1.5] seed='{seed}' → object='{object_anchor}', qualifier='{qualifier}'"
+        f"[L1.5] seed='{seed}' → object='{object_anchor}', qualifier='{qualifier}', "
+        f"synonyms({len(synonyms)})={sorted(synonyms)[:5] if synonyms else '[]'}"
     )
     
     new_grey: list = []
@@ -237,7 +361,7 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         # kw может быть строкой или dict
         kw = kw_item if isinstance(kw_item, str) else kw_item.get('keyword', '')
         
-        ok, signal = has_anchor(kw, object_anchor, qualifier, qualifier_text)
+        ok, signal = has_anchor(kw, object_anchor, qualifier, qualifier_text, synonyms)
         
         if ok:
             new_grey.append(kw_item)
