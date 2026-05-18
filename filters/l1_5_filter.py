@@ -235,25 +235,22 @@ def check_semantic_anchor(
     profile: dict,
 ) -> tuple[bool, str]:
     """
-    Уровень 5: word-level cosine MiniLM с adaptive threshold + dual-cluster.
+    Уровень 5: проверка семантического anchor в kw.
     
-    Для каждого NOUN в kw считает:
-      sim_to_anchor = cos(candidate, anchor)
-      sim_to_trash  = cos(candidate, centroid_trash)
-    
-    Признаём кандидата валидным якорем если:
-      1) sim_to_anchor >= threshold (близко к anchor), И
-      2) sim_to_anchor > sim_to_trash (ближе к anchor чем к мусорному центроиду).
-    
-    Второе условие — это и есть dual-cluster contrastive score.
-    Оно отрезает слова типа 'пятёрочка' / 'график' — они близки к мусорному
-    центроиду (где много 'доставка пиццы', 'график работы') сильнее чем к anchor.
+    Каскад (от дешёвого к дорогому):
+      A. Frequency-override: если лемма кандидата уже встречается в L0_VALID 
+         текущего прогона — мгновенный TRUE. Это сильный сигнал что слово 
+         доменно-валидно (его уже подтвердил L0 в других ключах).
+      B. Word-level cosine MiniLM + dual-cluster contrastive (как раньше):
+         - sim_to_anchor >= threshold
+         - sim_to_anchor > sim_to_trash
     
     Returns: (matched, signal_name)
     """
     if not profile.get('enabled') or profile.get('anchor_emb') is None:
         return False, ''
     
+    valid_lemmas = profile.get('valid_lemmas', set())
     anchor_emb = profile['anchor_emb']
     threshold = profile['threshold']
     centroid_trash = profile.get('centroid_trash')
@@ -272,6 +269,15 @@ def check_semantic_anchor(
     if not candidates:
         return False, ''
     
+    # === A. Frequency-override (DeepSeek's insight) ===
+    # Если лемма кандидата уже встречается в L0_VALID — мгновенный pass.
+    # Это спасает гипонимы 'роза/тюльпан/букет' для seed 'доставка цветов',
+    # если они уже есть в L0_VALID хотя бы в одном-двух валидных ключах.
+    for cand in candidates:
+        if cand in valid_lemmas:
+            return True, f'in_valid_vocab:{cand}'
+    
+    # === B. Word-level cosine + dual-cluster contrastive ===
     # Для каждого считаем contrastive score
     best_word = None
     best_anchor_sim = 0.0
@@ -682,7 +688,7 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         
         if ok:
             new_grey.append(kw_item)
-            if signal.startswith('word_cosine:'):
+            if signal.startswith('word_cosine:') or signal.startswith('in_valid_vocab:'):
                 l5_saves.append((kw, signal))
         else:
             new_trash.append(kw_item)
