@@ -664,17 +664,23 @@ def build_action_set(
     """
     Расширяет action-set СИНОНИМАМИ action_anchor из L0_VALID хвостов.
     
-    Алгоритм:
-    1. Из L0_VALID хвостов собираем леммы NOUN/INFN/VERB с частотой >= 3
-    2. Из них берём только те что **семантически близки** к action_anchor 
-       через MiniLM word-cosine (>= 0.45). Это отсеивает:
-       - Гео-слова (днепр, киев — cos с 'доставка' < 0.3)
-       - Object-слова (букет, роза — cos с 'доставка' ~ 0.3)
-       - Контакты (телефон, фото — cos с 'доставка' ~ 0.3)
-       Оставляет действительные синонимы: заказ, курьер, привезти, отправка.
+    Алгоритм (БЕЗ MiniLM — он на multilingual слишком плотно склеивает все 
+    коммерческие слова, и cos(букет, доставка) выходит 0.5+, что бесполезно):
     
-    Если MiniLM недоступен — возвращаем минимальный set из только action_anchor 
-    (без расширения). Это значит будем работать только через action_root.
+    1. Из L0_VALID собираем только VERB/INFN леммы — это бесспорно actions
+    2. Объект и его substring-варианты — исключаем
+    3. NOUN-леммы которые начинаются с action_root (`доста`) уже ловятся substring 
+       проверкой, их добавлять в set не нужно (они отрезаются через `lemma.startswith`)
+    4. NOUN-леммы которые НЕ глаголы — НЕ добавляем (это объекты/гео/контакты)
+    
+    Результат: только глаголы из L0_VALID. Это `заказать`, `купить` (если в VALID),
+    `привезти`, `доставить` (но эти уже через action_root). 
+    
+    Жертвуем тем что не поймаем NOUN-action типа 'курьер' (но 'курьерская' 
+    поймается через action_root от 'доставка'? Нет, корень другой).
+    
+    КОМПРОМИСС: 'курьер цветы киев' → не имеет VERB → no_action → TRASH.
+    Но в реальной разметке таких ключей мало (~1-2%).
     """
     from collections import Counter
     
@@ -696,33 +702,19 @@ def build_action_set(
             if object_anchor and (lemma == object_anchor or object_anchor in lemma):
                 continue
             # Исключаем леммы которые сами начинаются с action_root
-            # (это формы action_anchor — нам они нужны только как substring корня)
+            # (они уже ловятся через substring в has_action)
             if action_root and lemma.startswith(action_root):
                 continue
             
-            if pos in ('NOUN', 'INFN', 'VERB'):
+            # Берём ТОЛЬКО глаголы — это и есть actions без шума
+            if pos in ('INFN', 'VERB'):
                 counter[lemma] += 1
     
-    # Кандидаты — лемм с частотой >= 3
-    candidates = [lemma for lemma, count in counter.most_common(100) if count >= 3]
-    
     action_set = {action_anchor}
-    
-    # Фильтруем кандидатов через MiniLM cosine к action_anchor
-    anchor_emb = get_word_embedding(action_anchor)
-    if anchor_emb is not None:
-        # Порог для action-синонимов
-        ACTION_SYNONYM_THRESHOLD = 0.45
-        for lemma in candidates:
-            emb = get_word_embedding(lemma)
-            if emb is None:
-                continue
-            sim = cosine_sim(emb, anchor_emb)
-            if sim >= ACTION_SYNONYM_THRESHOLD:
-                action_set.add(lemma)
-    else:
-        # MiniLM недоступен — работаем только по корню (минимальное расширение)
-        logger.warning("[L1.5/Pass2] MiniLM unavailable, action_set won't be expanded")
+    # Top N глаголов с частотой >= 3
+    for lemma, count in counter.most_common(30):
+        if count >= 3:
+            action_set.add(lemma)
     
     return action_set
 
