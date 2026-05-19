@@ -345,15 +345,27 @@ def check_semantic_anchor(
     if not candidates:
         return False, ''
     
-    # === A. Object-neighbors override (v4 position-aware) ===
-    # Whitelist из L0_VALID хвостов: только леммы которые встречаются 
-    # в окне ±2 от object_anchor. Это даёт чистый доменный словарь.
+    # === A. Object-neighbors override (v4.2 — с cosine gate) ===
+    # Whitelist из L0_VALID хвостов: лемма должна:
+    # 1) Встречаться в окне ±2 от object_anchor в L0_VALID хотя бы в 2 ключах
+    # 2) Быть семантически связанной с object_anchor (cos >= 0.40)
     # 
-    # Спасает: роза/букет (стоят рядом с цветок в L0_VALID)
-    # Не пропускает: яндекс/карта/билет (далеко от цветка в kw)
+    # Это блокирует "вольт/ампер" в окне "скутер" (cos ~0.25 — не доменно),
+    # но пропускает "роза/букет" (cos 0.44/0.50) и "сузуки" (cos 0.40).
+    # 
+    # Если кандидат в neighbors но cos низкий — НЕ override-им, идём в L5/L6.
+    D4_COSINE_GATE = 0.40
     for cand in candidates:
-        if cand in object_neighbors:
-            return True, f'in_object_neighbors:{cand}'
+        if cand not in object_neighbors:
+            continue
+        emb = get_word_embedding(cand)
+        if emb is None:
+            # без эмбеддинга доверяем frequency
+            return True, f'in_object_neighbors:{cand}(no_emb)'
+        sim_anchor = cosine_sim(emb, anchor_emb)
+        if sim_anchor >= D4_COSINE_GATE:
+            return True, f'in_object_neighbors:{cand}=cos{sim_anchor:.2f}'
+        # иначе — не override, идём в L5
     
     # === B. Word-level cosine + dual-cluster contrastive ===
     # Для каждого считаем contrastive score
