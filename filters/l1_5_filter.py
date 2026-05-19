@@ -614,21 +614,48 @@ def has_anchor(
     domain_profile: Optional[dict] = None,
     seed_words: Optional[set] = None,
     l0_pos_signals: Optional[list] = None,
+    seed_content_lemmas: Optional[set] = None,
 ) -> tuple[bool, str]:
     """
     Проверяет наличие domain anchor в kw.
     
-    Уровни проверки (от мягкого к жёсткому):
-    L1: substring match object_anchor в kw_lower
-    L2: qualifier (число или текстовая форма)
-    L3: лемматизация каждого слова kw, сравнение с object_anchor
-    L4: RuWordNet synonyms (если переданы) — substring + лемма
-    L5: MiniLM scoring (cosine + L0_BONUS + NEIGHBORS_BONUS)
+    Уровни проверки (от жёсткого к мягкому):
+    L0_HARD: kw содержит хотя бы одну лемму из seed-фразы (object/action леммы).
+             Если нет НИ ОДНОГО seed-слова — мгновенный TRASH. Это режет ключи 
+             типа 'букет до 300 грн' для seed 'доставка цветов' — там нет ни 
+             'доставка', ни 'цветов'/'цвет', значит ключ не про этот домен.
+    L1: substring object_anchor в kw_low
+    L2: qualifier (число)
+    L3: лемма == object_anchor
+    L4: RuWordNet synonyms
+    L5: MiniLM scoring (cosine + bonuses)
     """
     if not object_anchor:
         return True, 'no_object_extracted'
     
     kw_low = kw.lower()
+    
+    # Леммы kw (сразу собираем для всех проверок ниже)
+    kw_words = re.findall(r'[а-яёa-z]+', kw_low)
+    kw_lemmas: set = set()
+    for w in kw_words:
+        p = morph.parse(w)[0]
+        kw_lemmas.add(p.normal_form)
+    
+    # === L0_HARD: содержит ли kw хотя бы одну лемму из seed-фразы ===
+    # Это сильный guard для случаев когда в kw НЕТ слов из домена.
+    # Например для seed='доставка цветов' (seed_content_lemmas={'доставка','цвет'}):
+    #   'букет до 300 грн' (леммы={букет,до,300,грн}) → нет пересечения → TRASH
+    #   'розы доставка киев' (леммы={роза,доставка,киев}) → есть 'доставка' → продолжаем
+    # 
+    # Дополнительно проверяем substring object_anchor (для морфо-вариантов 
+    # которые лемматизатор может не свернуть к object_anchor).
+    if seed_content_lemmas:
+        has_seed_lemma = bool(kw_lemmas & seed_content_lemmas)
+        # Substring fallback на object_anchor (на случай если лемматизатор не справился)
+        has_object_substring = object_anchor in kw_low
+        if not has_seed_lemma and not has_object_substring:
+            return False, 'no_seed_lemma'
     
     # L1: Substring object_anchor
     if object_anchor in kw_low:
@@ -642,14 +669,9 @@ def has_anchor(
             if txt in kw_low:
                 return True, 'qualifier_text'
     
-    # L3: Лемматизация — собираем леммы kw
-    kw_words = re.findall(r'[а-яёa-z]+', kw_low)
-    kw_lemmas = set()
-    for w in kw_words:
-        p = morph.parse(w)[0]
-        kw_lemmas.add(p.normal_form)
-        if p.normal_form == object_anchor:
-            return True, 'lemma'
+    # L3: лемма == object_anchor
+    if object_anchor in kw_lemmas:
+        return True, 'lemma'
     
     # L4: RuWordNet synonyms (substring + лемма)
     if synonyms:
@@ -668,7 +690,6 @@ def has_anchor(
         )
         if matched:
             return True, l5_signal
-        # L5 не сработал — сохраняем диагностический сигнал
         if l5_signal:
             return False, l5_signal
     
@@ -983,6 +1004,21 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     domain_profile = build_domain_profile(object_anchor, l0_valid_kws, seed, l0_trash_kws)
     seed_words = set(seed.lower().split())
     
+    # === Seed content lemmas (для L0_HARD guard в has_anchor) ===
+    # Леммы всех content-слов из seed-фразы (исключая stopwords/предлоги).
+    # Если в kw нет НИ ОДНОЙ из этих лемм И нет substring object_anchor — TRASH.
+    # Например для seed='доставка цветов' → {'доставка', 'цвет'}.
+    # 'букет до 300 грн' → леммы {букет, грн} — нет пересечения → TRASH.
+    seed_content_lemmas: set = set()
+    for sw in seed.lower().split():
+        if sw in _STOPWORDS or len(sw) <= 2:
+            continue
+        p = morph.parse(sw)[0]
+        if p.tag.POS in ('NOUN', 'INFN', 'VERB', 'ADJF', 'PRTF', 'ADJS'):
+            seed_content_lemmas.add(p.normal_form)
+    
+    logger.info(f"[L1.5] seed_content_lemmas: {sorted(seed_content_lemmas)}")
+    
     # === Action anchor (Pass 2) — intent-фильтр ===
     # Включён по умолчанию. Можно отключить через data['_l1_5_disable_action'] = True
     enable_action_check = not bool(data.get('_l1_5_disable_action', False))
@@ -1036,6 +1072,7 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
             domain_profile=domain_profile,
             seed_words=seed_words,
             l0_pos_signals=kw_l0_signals,
+            seed_content_lemmas=seed_content_lemmas,
         )
         
         # === Pass 2: action_anchor проверка (только если Pass 1 прошёл) ===
