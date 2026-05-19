@@ -843,16 +843,23 @@ def has_action(
     action_anchor: Optional[str],
     action_root: Optional[str],
     action_set: set[str],
+    object_anchor: Optional[str] = None,
 ) -> tuple[bool, str]:
     """
     Проверка action-anchor в kw.
     
-    Два сигнала (применяются к каждой лемме слова в kw):
-    A. Лемма начинается с action_root — ловит однокоренные формы action.
-       НЕ через substring в kw_low, а через startswith у леммы — чтобы избежать
-       коллизий: 'подставка'.lemma = 'подставка' НЕ начинается с 'доста' → OK.
-       'доставку'.lemma = 'доставка' начинается с 'доста' → match.
-    B. Лемма в action_set (синонимы через MiniLM из L0_VALID).
+    Три сигнала:
+    A. Лемма начинается с action_root — однокоренные формы action_anchor
+       (например 'доста' → доставка/доставку/доставленный).
+       Через лемму чтобы избежать коллизии 'подставка' ≠ 'доста'.
+    B. Лемма в action_set (синонимы через MiniLM из L0_VALID/GREY:
+       курьер/привезти/акб/батарея).
+    C. Positional fallback — первое слово kw это NOUN, не равно object_anchor 
+       и не его substring, а в kw присутствует object_anchor (substring).
+       Это структурный сигнал: слово стоит в той же позиции что action в seed,
+       значит ведёт себя как action. Спасает аббревиатуры/редкие синонимы 
+       которые MiniLM не различает (типа 'акб' — cos с 'аккумулятор' < 0.5,
+       но позиционно равен action).
     
     Returns: (has_action, signal_name)
     """
@@ -870,6 +877,29 @@ def has_action(
         # B. Лемма в action_set (синонимы)
         if lemma in action_set:
             return True, f'action_lemma:{lemma}'
+    
+    # C. Positional fallback — первое слово KOROTKOE NOUN (≤4 символа,
+    # как аббревиатура), не равно object_anchor, при наличии object_anchor
+    # substring в kw.
+    # 
+    # Это структурный сигнал: короткое слово на pos 0 в kw с объектом — 
+    # вероятно аббревиатура action (типа 'акб' для 'аккумулятор').
+    # 
+    # Ограничение длиной отрезает FP типа 'подставка для цветов'
+    # (подставка — 9 букв, не аббревиатура, не action).
+    MAX_ABBREV_LEN = 4
+    if object_anchor and object_anchor in kw_low:
+        words = re.findall(r'[а-яёa-z]+', kw_low)
+        if words:
+            first = words[0]
+            if 2 <= len(first) <= MAX_ABBREV_LEN:
+                p_first = morph.parse(first)[0]
+                first_lemma = p_first.normal_form
+                if (p_first.tag.POS == 'NOUN'
+                    and first_lemma != object_anchor
+                    and not first_lemma.startswith(object_anchor)
+                    and object_anchor not in first_lemma):
+                    return True, f'action_abbrev_pos0:{first_lemma}'
     
     return False, 'no_action'
 
@@ -1010,7 +1040,7 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         
         # === Pass 2: action_anchor проверка (только если Pass 1 прошёл) ===
         if ok and action_anchor:
-            action_ok, action_signal = has_action(kw, action_anchor, action_root, action_set)
+            action_ok, action_signal = has_action(kw, action_anchor, action_root, action_set, object_anchor=object_anchor)
             if not action_ok:
                 # Pass 1 прошёл (есть object), но Pass 2 нет (нет action) → TRASH
                 ok = False
