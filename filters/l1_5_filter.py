@@ -138,14 +138,68 @@ def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str,
     
     # === VALID side ===
     valid_lemmas: set = set()
+    
+    # v4.1: object_neighbors — леммы которые встречаются в окне ±2 от
+    # object_anchor в L0_VALID ХОТЯ БЫ В 2 РАЗНЫХ ключах. Это даёт чистый 
+    # доменный словарь.
+    # 
+    # Улучшения относительно v4.0:
+    # - min_freq=2 (раньше: 1) — отрезает single-shot шум типа "4room", "флаур"
+    # - только NOUN (раньше: NOUN+ADJF+PRTF) — прилагательные/причастия добавляли шум
+    object_neighbors: set = set()
+    WINDOW = 2
+    MIN_FREQ_NEIGHBORS = 2
+    
+    from collections import Counter as _Counter
+    _neighbor_counter: _Counter = _Counter()
+    
     for kw in l0_valid_kws:
         kw_low = kw.lower() if isinstance(kw, str) else ''
-        for w in re.findall(r'[а-яёa-z]+', kw_low):
-            if w in seed_words or len(w) <= 2:
+        words_in_kw = re.findall(r'[а-яёa-z]+', kw_low)
+        
+        # Лемматизируем всё слово для скана
+        kw_lemmas_pos: list = []  # [(lemma, pos, idx, w)] 
+        for idx, w in enumerate(words_in_kw):
+            if len(w) <= 2:
                 continue
             p = morph.parse(w)[0]
-            if p.tag.POS == 'NOUN':
-                valid_lemmas.add(p.normal_form)
+            lemma = p.normal_form
+            pos = p.tag.POS
+            
+            # Базовый valid_lemmas — все NOUN-леммы (как раньше) — пока сохраним
+            # на случай если где-то ещё используется
+            if pos == 'NOUN' and w not in seed_words:
+                valid_lemmas.add(lemma)
+            
+            kw_lemmas_pos.append((lemma, pos, idx, w))
+        
+        # Найти позиции anchor-слов (object_anchor или начинается с него)
+        anchor_positions = []
+        for lemma, pos, idx, w in kw_lemmas_pos:
+            if object_anchor and (lemma == object_anchor or lemma.startswith(object_anchor)):
+                anchor_positions.append(idx)
+        
+        if not anchor_positions:
+            continue
+        
+        # Собираем уникальные leмы окна для ЭТОГО kw (per-kw set),
+        # чтобы повторы внутри одного kw не накачивали счётчик
+        kw_window_lemmas: set = set()
+        for anchor_idx in anchor_positions:
+            for lemma, pos, idx, w in kw_lemmas_pos:
+                if abs(idx - anchor_idx) > WINDOW or idx == anchor_idx:
+                    continue
+                if w in seed_words or len(w) <= 2:
+                    continue
+                # ТОЛЬКО NOUN (без ADJF/PRTF — они добавляют шум)
+                if pos == 'NOUN':
+                    kw_window_lemmas.add(lemma)
+        
+        for n in kw_window_lemmas:
+            _neighbor_counter[n] += 1
+    
+    # Финальный set — леммы с MIN_FREQ_NEIGHBORS+ встреч
+    object_neighbors = {n for n, c in _neighbor_counter.items() if c >= MIN_FREQ_NEIGHBORS}
     
     # Cosine valid lemmas vs anchor
     lemma_sims: list[tuple[str, float]] = []
@@ -156,12 +210,15 @@ def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str,
             lemma_sims.append((lemma, sim))
     
     # Адаптивный порог
+    # v4.1: снижен до 0.45 (было 0.50) — для спасения гипонимов где
+    # cos(гипоним, anchor) на грани (роза=0.44, тюльпан=0.42).
+    # Контраст с trash-кластером отключён ниже через guard если он шумный.
     if len(lemma_sims) >= 5:
         sims_sorted = sorted([s for _, s in lemma_sims])
         p10_idx = max(0, int(len(sims_sorted) * 0.10))
-        threshold = max(0.50, sims_sorted[p10_idx])
+        threshold = max(0.45, sims_sorted[p10_idx])
     else:
-        threshold = 0.55
+        threshold = 0.50
     
     # Centroid VALID — top-10 близких к anchor
     top10 = sorted(lemma_sims, key=lambda x: -x[1])[:10]
@@ -205,10 +262,27 @@ def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str,
                 n = np.linalg.norm(centroid_trash)
                 if n > 0:
                     centroid_trash = centroid_trash / n
+                
+                # Safety guard: если centroid_trash семантически близок к anchor
+                # (cos > 0.55) — это значит L0_TRASH содержит много слов из того же 
+                # тематического кластера что anchor (например для 'скутер' в L0_TRASH 
+                # сидят украинские варианты с теми же мото-словами). В таком случае
+                # contrastive проверка будет работать ПРОТИВ нас: гипонимы 'мопед' 
+                # окажутся ближе к этому шумному trash-кластеру чем к anchor.
+                # Отключаем centroid_trash.
+                trash_anchor_sim = cosine_sim(centroid_trash, anchor_emb)
+                if trash_anchor_sim > 0.55:
+                    logger.warning(
+                        f"[L1.5/L5] centroid_trash disabled — too close to anchor "
+                        f"(cos={trash_anchor_sim:.2f}). Trash sample looks like "
+                        f"noisy variants of the seed itself."
+                    )
+                    centroid_trash = None
     
     profile = {
         'anchor_emb': anchor_emb,
         'valid_lemmas': valid_lemmas,
+        'object_neighbors': object_neighbors,  # NEW: leхемы в окне ±2 от anchor в L0_VALID
         'threshold': threshold,
         'centroid_valid': centroid_valid,
         'centroid_trash': centroid_trash,
@@ -220,10 +294,12 @@ def build_domain_profile(object_anchor: str, l0_valid_kws: list[str], seed: str,
     _domain_profile_cache[cache_key] = profile
     logger.info(
         f"[L1.5/L5] domain_profile for '{object_anchor}': "
-        f"valid_lemmas={len(valid_lemmas)}, threshold={threshold:.2f}, "
+        f"valid_lemmas={len(valid_lemmas)}, "
+        f"object_neighbors={len(object_neighbors)} (window±{WINDOW}, min_freq={MIN_FREQ_NEIGHBORS}, NOUN only): "
+        f"{sorted(object_neighbors)[:20]}, "
+        f"threshold={threshold:.2f}, "
         f"top_sims={[(l, round(s, 2)) for l, s in top10[:5]]}, "
         f"centroid_trash={'YES' if centroid_trash is not None else 'NO'} "
-        f"(trash_sample={trash_lemmas_for_log[:5]})"
     )
     return profile
 
@@ -250,7 +326,7 @@ def check_semantic_anchor(
     if not profile.get('enabled') or profile.get('anchor_emb') is None:
         return False, ''
     
-    valid_lemmas = profile.get('valid_lemmas', set())
+    object_neighbors = profile.get('object_neighbors', set())
     anchor_emb = profile['anchor_emb']
     threshold = profile['threshold']
     centroid_trash = profile.get('centroid_trash')
@@ -269,22 +345,15 @@ def check_semantic_anchor(
     if not candidates:
         return False, ''
     
-    # === A. Frequency-override (DeepSeek's insight) + soft semantic gate ===
-    # Если лемма кандидата уже встречается в L0_VALID — pass, но только если
-    # она ещё и семантически как-то связана с anchor (cos >= 0.40 — мягкий порог).
-    # Это спасает 'роза/тюльпан/букет' (cos 0.40-0.55 к 'цвет'),
-    # но отрезает случайные общие слова типа 'график', 'таобао' (cos < 0.40).
-    SOFT_COSINE_GATE = 0.40
+    # === A. Object-neighbors override (v4 position-aware) ===
+    # Whitelist из L0_VALID хвостов: только леммы которые встречаются 
+    # в окне ±2 от object_anchor. Это даёт чистый доменный словарь.
+    # 
+    # Спасает: роза/букет (стоят рядом с цветок в L0_VALID)
+    # Не пропускает: яндекс/карта/билет (далеко от цветка в kw)
     for cand in candidates:
-        if cand in valid_lemmas:
-            emb = get_word_embedding(cand)
-            if emb is None:
-                # Эмбеддинг не получен — доверяем frequency как раньше
-                return True, f'in_valid_vocab:{cand}'
-            sim_anchor = cosine_sim(emb, anchor_emb)
-            if sim_anchor >= SOFT_COSINE_GATE:
-                return True, f'in_valid_vocab:{cand}={sim_anchor:.2f}'
-            # лемма в valid но семантически далеко — НЕ override-им, идём в L5
+        if cand in object_neighbors:
+            return True, f'in_object_neighbors:{cand}'
     
     # === B. Word-level cosine + dual-cluster contrastive ===
     # Для каждого считаем contrastive score
