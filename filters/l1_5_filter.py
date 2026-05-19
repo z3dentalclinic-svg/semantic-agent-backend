@@ -309,17 +309,23 @@ def check_semantic_anchor(
     seed_words: set,
     object_anchor: str,
     profile: dict,
+    l0_pos_signals: Optional[list] = None,
 ) -> tuple[bool, str]:
     """
-    Уровень 5: проверка семантического anchor в kw.
+    Уровень 5 (v4.3 — scoring-based):
+    Объединяет несколько слабых сигналов в один score:
     
-    Каскад (от дешёвого к дорогому):
-      A. Frequency-override: если лемма кандидата уже встречается в L0_VALID 
-         текущего прогона — мгновенный TRUE. Это сильный сигнал что слово 
-         доменно-валидно (его уже подтвердил L0 в других ключах).
-      B. Word-level cosine MiniLM + dual-cluster contrastive (как раньше):
-         - sim_to_anchor >= threshold
-         - sim_to_anchor > sim_to_trash
+      score(cand) = cos(cand, anchor)
+                  + L0_BONUS если у kw есть positive signal от L0
+                  + NEIGHBORS_BONUS если cand в object_neighbors
+    
+    Pass если max(score) >= SCORE_THRESHOLD.
+    
+    Это позволяет:
+    - Спасти гипонимы (роза/тюльпан) у которых низкий cos 0.42-0.44, 
+      но есть L0 geo signal — bonus вытягивает score >= 0.50
+    - Зарезать параметры (вольт/ампер) — cos 0.43, нет L0 signal — 
+      score 0.43-0.48 < 0.50 → TRASH
     
     Returns: (matched, signal_name)
     """
@@ -328,8 +334,13 @@ def check_semantic_anchor(
     
     object_neighbors = profile.get('object_neighbors', set())
     anchor_emb = profile['anchor_emb']
-    threshold = profile['threshold']
-    centroid_trash = profile.get('centroid_trash')
+    
+    # Параметры scoring
+    SCORE_THRESHOLD = 0.50
+    L0_BONUS = 0.10
+    NEIGHBORS_BONUS = 0.05
+    
+    has_l0_signal = bool(l0_pos_signals)
     
     kw_low = kw.lower()
     
@@ -345,75 +356,41 @@ def check_semantic_anchor(
     if not candidates:
         return False, ''
     
-    # === A. Object-neighbors override (v4.2 — с cosine gate) ===
-    # Whitelist из L0_VALID хвостов: лемма должна:
-    # 1) Встречаться в окне ±2 от object_anchor в L0_VALID хотя бы в 2 ключах
-    # 2) Быть семантически связанной с object_anchor (cos >= 0.40)
-    # 
-    # Это блокирует "вольт/ампер" в окне "скутер" (cos ~0.25 — не доменно),
-    # но пропускает "роза/букет" (cos 0.44/0.50) и "сузуки" (cos 0.40).
-    # 
-    # Если кандидат в neighbors но cos низкий — НЕ override-им, идём в L5/L6.
-    D4_COSINE_GATE = 0.40
-    for cand in candidates:
-        if cand not in object_neighbors:
-            continue
-        emb = get_word_embedding(cand)
-        if emb is None:
-            # без эмбеддинга доверяем frequency
-            return True, f'in_object_neighbors:{cand}(no_emb)'
-        sim_anchor = cosine_sim(emb, anchor_emb)
-        if sim_anchor >= D4_COSINE_GATE:
-            return True, f'in_object_neighbors:{cand}=cos{sim_anchor:.2f}'
-        # иначе — не override, идём в L5
-    
-    # === B. Word-level cosine + dual-cluster contrastive ===
-    # Для каждого считаем contrastive score
+    # Для каждого считаем score
+    best_score = 0.0
     best_word = None
-    best_anchor_sim = 0.0
-    best_trash_sim = 0.0
+    best_breakdown = ''
+    
     for cand in candidates[:5]:
         emb = get_word_embedding(cand)
         if emb is None:
             continue
         sim_anchor = cosine_sim(emb, anchor_emb)
-        sim_trash = cosine_sim(emb, centroid_trash) if centroid_trash is not None else 0.0
         
-        # Берём кандидата с максимальным contrastive (anchor - trash)
-        contrastive = sim_anchor - sim_trash
-        best_contrastive = best_anchor_sim - best_trash_sim if best_word else -1.0
-        if contrastive > best_contrastive:
+        bonus = 0.0
+        sources = []
+        if has_l0_signal:
+            bonus += L0_BONUS
+            sources.append(f'L0={"+".join(l0_pos_signals)}')
+        if cand in object_neighbors:
+            bonus += NEIGHBORS_BONUS
+            sources.append('neigh')
+        
+        score = sim_anchor + bonus
+        if score > best_score:
+            best_score = score
             best_word = cand
-            best_anchor_sim = sim_anchor
-            best_trash_sim = sim_trash
+            sources_str = '|'.join(sources) if sources else 'none'
+            best_breakdown = f'{cand}=cos{sim_anchor:.2f}+{bonus:.2f}({sources_str})={score:.2f}'
     
     if not best_word:
         return False, ''
     
-    # Decision:
-    # 1) sim_anchor >= threshold (близко к anchor)
-    # 2) sim_anchor > sim_trash (ближе к anchor чем к trash-кластеру)
-    passes_threshold = best_anchor_sim >= threshold
-    passes_contrastive = best_anchor_sim > best_trash_sim
+    if best_score >= SCORE_THRESHOLD:
+        return True, f'score:{best_breakdown}>={SCORE_THRESHOLD}'
     
-    if passes_threshold and passes_contrastive:
-        return True, (
-            f'word_cosine:{best_word}'
-            f'={best_anchor_sim:.2f}>={threshold:.2f}'
-            f',trash={best_trash_sim:.2f}'
-        )
-    
-    # Diagnostic signal для логов — почему именно отказали
-    if not passes_threshold:
-        return False, (
-            f'word_cosine_low:{best_word}'
-            f'={best_anchor_sim:.2f}<{threshold:.2f}'
-        )
-    else:  # passes_threshold but not passes_contrastive
-        return False, (
-            f'word_cosine_trash:{best_word}'
-            f'={best_anchor_sim:.2f},trash={best_trash_sim:.2f}'
-        )
+    # Diagnostic signal для логов — почему отказали
+    return False, f'score_low:{best_breakdown}<{SCORE_THRESHOLD}'
 
 
 
@@ -636,6 +613,7 @@ def has_anchor(
     synonyms: Optional[set] = None,
     domain_profile: Optional[dict] = None,
     seed_words: Optional[set] = None,
+    l0_pos_signals: Optional[list] = None,
 ) -> tuple[bool, str]:
     """
     Проверяет наличие domain anchor в kw.
@@ -645,7 +623,7 @@ def has_anchor(
     L2: qualifier (число или текстовая форма)
     L3: лемматизация каждого слова kw, сравнение с object_anchor
     L4: RuWordNet synonyms (если переданы) — substring + лемма
-    L5: MiniLM word-cosine с adaptive threshold (если domain_profile передан)
+    L5: MiniLM scoring (cosine + L0_BONUS + NEIGHBORS_BONUS)
     """
     if not object_anchor:
         return True, 'no_object_extracted'
@@ -682,10 +660,11 @@ def has_anchor(
             if lemma in synonyms:
                 return True, f'synonym_lemma:{lemma}'
     
-    # L5: Word-level MiniLM cosine + dual-cluster contrastive
+    # L5: MiniLM scoring (cosine + bonuses)
     if domain_profile and seed_words:
         matched, l5_signal = check_semantic_anchor(
-            kw, seed_words, object_anchor, domain_profile
+            kw, seed_words, object_anchor, domain_profile,
+            l0_pos_signals=l0_pos_signals,
         )
         if matched:
             return True, l5_signal
@@ -896,6 +875,22 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         t['keyword'] for t in l0_trace
         if isinstance(t, dict) and t.get('label') == 'TRASH'
     ]
+    
+    # Map kw → positive L0 signals для bonus в L5 scoring
+    # Positive signals (geo, commerce, info_intent, action, conjunctive, reputation, 
+    # product_spec) — это сигналы что L0 уже распознал в kw знакомую коммерческую 
+    # структуру. Мы добавляем bonus к score таким ключам.
+    l0_signals_map: dict = {}
+    for t in l0_trace:
+        if not isinstance(t, dict):
+            continue
+        sigs = t.get('signals', [])
+        if not sigs:
+            continue
+        pos_sigs = [s for s in sigs if not s.startswith('-')]
+        if pos_sigs:
+            l0_signals_map[t.get('keyword', '')] = pos_sigs
+    
     domain_profile = build_domain_profile(object_anchor, l0_valid_kws, seed, l0_trash_kws)
     seed_words = set(seed.lower().split())
     
@@ -932,12 +927,16 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         # kw может быть строкой или dict
         kw = kw_item if isinstance(kw_item, str) else kw_item.get('keyword', '')
         
+        # Получаем L0 positive signals для этого kw (если есть)
+        kw_l0_signals = l0_signals_map.get(kw, [])
+        
         # === Pass 1: object_anchor проверка ===
         ok, signal = has_anchor(
             kw, object_anchor, qualifier, qualifier_text,
             synonyms=synonyms,
             domain_profile=domain_profile,
             seed_words=seed_words,
+            l0_pos_signals=kw_l0_signals,
         )
         
         # === Pass 2: action_anchor проверка (только если Pass 1 прошёл) ===
@@ -951,11 +950,11 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
         
         if ok:
             new_grey.append(kw_item)
-            if signal.startswith('word_cosine:') or signal.startswith('in_valid_vocab:'):
+            if signal.startswith('score:') or signal.startswith('word_cosine:') or signal.startswith('in_valid_vocab:') or signal.startswith('in_object_neighbors:'):
                 l5_saves.append((kw, signal))
         else:
             new_trash.append(kw_item)
-            if signal and signal.startswith('word_cosine'):
+            if signal and (signal.startswith('score_low') or signal.startswith('word_cosine')):
                 l5_misses.append((kw, signal))
             
             # Определяем причину
