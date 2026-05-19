@@ -720,33 +720,37 @@ def build_action_set(
     action_root: str,
     l0_valid_kws: list[str],
     object_anchor: Optional[str],
+    l0_grey_kws: Optional[list[str]] = None,
 ) -> set[str]:
     """
-    Расширяет action-set СИНОНИМАМИ action_anchor из L0_VALID хвостов.
+    Action_set = action_anchor + синонимы.
     
-    Алгоритм (БЕЗ MiniLM — он на multilingual слишком плотно склеивает все 
-    коммерческие слова, и cos(букет, доставка) выходит 0.5+, что бесполезно):
+    Источники синонимов:
     
-    1. Из L0_VALID собираем только VERB/INFN леммы — это бесспорно actions
-    2. Объект и его substring-варианты — исключаем
-    3. NOUN-леммы которые начинаются с action_root (`доста`) уже ловятся substring 
-       проверкой, их добавлять в set не нужно (они отрезаются через `lemma.startswith`)
-    4. NOUN-леммы которые НЕ глаголы — НЕ добавляем (это объекты/гео/контакты)
+    1. VERB/INFN из L0_VALID хвостов с частотой >=3 (бесспорно actions —
+       'купить', 'заказать', 'привезти' если они есть в VALID).
     
-    Результат: только глаголы из L0_VALID. Это `заказать`, `купить` (если в VALID),
-    `привезти`, `доставить` (но эти уже через action_root). 
+    2. NOUN-леммы из L0_VALID+L0_GREY которые семантически близки к 
+       action_anchor через MiniLM (cos >= 0.50). 
+       
+       Это спасает NOUN-синонимы action: для 'аккумулятор' это 'акб', 
+       'батарея' (cos ~0.55-0.65 — прямые синонимы).
+       Не пускает 'букет/днепр' (cos < 0.30 — далеко от action).
+       
+       Использует L0_GREY как источник потому что некоторые синонимы 
+       (акб/батарея) есть только в GREY, не в VALID (L0 их зарезал
+       за отсутствие seed-слова).
     
-    Жертвуем тем что не поймаем NOUN-action типа 'курьер' (но 'курьерская' 
-    поймается через action_root от 'доставка'? Нет, корень другой).
-    
-    КОМПРОМИСС: 'курьер цветы киев' → не имеет VERB → no_action → TRASH.
-    Но в реальной разметке таких ключей мало (~1-2%).
+    Объект и однокоренные action — исключаем.
     """
     from collections import Counter
     
     if not action_anchor:
         return set()
     
+    action_set = {action_anchor}
+    
+    # === Источник 1: VERB/INFN из L0_VALID ===
     counter: Counter = Counter()
     for kw in l0_valid_kws:
         kw_low = kw.lower() if isinstance(kw, str) else ''
@@ -758,23 +762,78 @@ def build_action_set(
             pos = p.tag.POS
             lemma = p.normal_form
             
-            # Исключаем object_anchor и его substring-варианты
             if object_anchor and (lemma == object_anchor or object_anchor in lemma):
                 continue
-            # Исключаем леммы которые сами начинаются с action_root
-            # (они уже ловятся через substring в has_action)
             if action_root and lemma.startswith(action_root):
                 continue
             
-            # Берём ТОЛЬКО глаголы — это и есть actions без шума
             if pos in ('INFN', 'VERB'):
                 counter[lemma] += 1
     
-    action_set = {action_anchor}
-    # Top N глаголов с частотой >= 3
     for lemma, count in counter.most_common(30):
         if count >= 3:
             action_set.add(lemma)
+    
+    # === Источник 2: NOUN-синонимы action через MiniLM cosine ===
+    # Берём NOUN из L0_VALID + L0_GREY, оставляем только семантически 
+    # близкие к action_anchor (cos >= 0.50).
+    # 
+    # КРИТИЧНО: исключаем леммы которые БОЛЕЕ близки к object_anchor чем 
+    # к action_anchor — это object-стороны (букет/роза для цветов).
+    ACTION_SYN_THRESHOLD = 0.50
+    anchor_emb = get_word_embedding(action_anchor)
+    object_emb = get_word_embedding(object_anchor) if object_anchor else None
+    
+    if anchor_emb is not None:
+        # Собираем кандидатов: NOUN-леммы из VALID + GREY
+        all_kws = (l0_valid_kws or []) + (l0_grey_kws or [])
+        candidate_lemmas: set = set()
+        for kw in all_kws:
+            kw_low = kw.lower() if isinstance(kw, str) else ''
+            for w in re.findall(r'[а-яёa-z]+', kw_low):
+                if w in _STOPWORDS or len(w) <= 2:
+                    continue
+                p = morph.parse(w)[0]
+                pos = p.tag.POS
+                lemma = p.normal_form
+                
+                if pos != 'NOUN':
+                    continue
+                if object_anchor and (lemma == object_anchor or object_anchor in lemma):
+                    continue
+                if action_root and lemma.startswith(action_root):
+                    continue
+                if lemma in action_set:
+                    continue
+                candidate_lemmas.add(lemma)
+        
+        # Фильтруем через MiniLM cos
+        synonyms_added = []
+        for lemma in candidate_lemmas:
+            emb = get_word_embedding(lemma)
+            if emb is None:
+                continue
+            sim_action = cosine_sim(emb, anchor_emb)
+            if sim_action < ACTION_SYN_THRESHOLD:
+                continue
+            
+            # Проверка стороны: если object_anchor существует и кандидат 
+            # ближе к нему чем к action_anchor — это object-side, не action.
+            # Это блокирует попадание гипонимов (букет/роза) в action_set.
+            if object_emb is not None:
+                sim_object = cosine_sim(emb, object_emb)
+                if sim_object > sim_action:
+                    continue  # это object-сторона
+            
+            action_set.add(lemma)
+            synonyms_added.append((lemma, sim_action))
+        
+        if synonyms_added:
+            synonyms_added.sort(key=lambda x: -x[1])
+            logger.info(
+                f"[L1.5/Pass2] action NOUN-synonyms (cos>={ACTION_SYN_THRESHOLD}): "
+                f"{[(l, round(s, 2)) for l, s in synonyms_added[:15]]}"
+            )
     
     return action_set
 
@@ -904,7 +963,17 @@ def apply_l1_5_filter(data: dict, seed: str) -> dict:
     if enable_action_check:
         action_anchor, action_root = extract_action_anchor(seed)
         if action_anchor:
-            action_set = build_action_set(action_anchor, action_root, l0_valid_kws, object_anchor)
+            # Передаём GREY-ключи как источник синонимов action — там могут 
+            # быть 'акб', 'батарея' и т.п. синонимы action_anchor 
+            # которые L0 не пометил VALID но через MiniLM cos они близкие
+            grey_kws_for_action = [
+                kw if isinstance(kw, str) else kw.get('keyword', '')
+                for kw in grey
+            ]
+            action_set = build_action_set(
+                action_anchor, action_root, l0_valid_kws, object_anchor,
+                l0_grey_kws=grey_kws_for_action,
+            )
     
     logger.info(
         f"[L1.5] seed='{seed}' → object='{object_anchor}', qualifier='{qualifier}', "
