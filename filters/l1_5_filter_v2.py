@@ -88,7 +88,8 @@ def is_content_word(parse) -> bool:
     if not pos or pos in _NON_CONTENT_POS:
         return False
     # Apro = местоименное (весь/тот/мой/такой) — функциональное, не content
-    if 'Apro' in parse.tag:
+    # str(parse.tag) — pymorphy3 валидирует граммему через `in parse.tag` и не знает Apro
+    if 'Apro' in str(parse.tag):
         return False
     return True
 
