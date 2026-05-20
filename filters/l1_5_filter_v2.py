@@ -224,7 +224,9 @@ def classify_lemmas(
         positions, _ = extract_lemmas(kw)
         if not positions:
             continue
-        n = len(positions)
+        # max_idx — максимальный исходный индекс среди positions (для определения 
+        # "последней позиции в kw"). idx это позиция в исходном kw, не в positions.
+        max_idx = max(idx for _, _, _, idx in positions)
         
         # Найти anchor-позиции (где находится object_anchor или substring)
         anchor_indices = [
@@ -240,29 +242,25 @@ def classify_lemmas(
                 continue
             
             total[lemma] += 1
-            # Нормализованная позиция (для dispersion):
-            # 0 - первая, n-1 - последняя
             positions_set[lemma].add(idx)
             
-            # Объект слот = позиция РЯДОМ с anchor или позиция самого anchor если 
-            # anchor отсутствует. Используем:
-            # - если anchor есть в kw, object-slot позиции совпадают с anchor_indices
-            # - или позиции непосредственно после anchor (объект-зависимое слово)
+            # Объект слот = позиция РЯДОМ с anchor (соседи)
             for a_idx in anchor_indices:
                 if abs(idx - a_idx) <= 1 and idx != a_idx:
                     object_slot[lemma] += 1
                     break
             
             # Если в kw нет anchor — лемма может занимать позицию object 
-            # сама по себе. Считаем object_slot также для лемм в kw БЕЗ anchor 
-            # если лемма стоит на последней позиции (типичное место объекта).
-            if not anchor_indices and idx == n - 1:
+            # сама по себе. Считаем object_slot если лемма на последней позиции.
+            if not anchor_indices and idx == max_idx:
                 object_slot[lemma] += 1
             
-            # Head = соседняя лемма слева
+            # Head = соседняя лемма слева (по idx в kw, не индексу списка)
             if idx > 0:
-                left_lemma, _, _, _ = positions[idx - 1]
-                heads_set[lemma].add(left_lemma)
+                for other_lemma, _, _, other_idx in positions:
+                    if other_idx == idx - 1:
+                        heads_set[lemma].add(other_lemma)
+                        break
     
     core_object = set()
     generic_context = set()
