@@ -642,6 +642,25 @@ def has_anchor(
         p = morph.parse(w)[0]
         kw_lemmas.add(p.normal_form)
     
+    # === QUALIFIER_HARD guard ===
+    # Если в seed есть число-qualifier ('16' для 'айфон 16', '10' для 
+    # 'грузоперевозки 10 тонн') — это число ОБЯЗАТЕЛЬНО должно быть в kw, 
+    # иначе ключ про другую модификацию/спецификацию продукта.
+    # 
+    # 'грузоперевозки 5т' для seed 'грузоперевозки 10 тонн' → нет '10' → TRASH
+    # 'купить айфон 14' для seed 'купить айфон 16' → нет '16' → TRASH
+    # 'купить айфон 16 pro' → есть '16' → продолжаем
+    if qualifier:
+        has_qualifier = bool(re.search(rf'(?<!\d){qualifier}(?!\d)', kw_low))
+        # Также проверяем словесные формы (если есть)
+        if not has_qualifier and qualifier_text:
+            for txt in qualifier_text:
+                if txt in kw_low:
+                    has_qualifier = True
+                    break
+        if not has_qualifier:
+            return False, f'no_qualifier:{qualifier}'
+    
     # === L0_HARD: содержит ли kw хотя бы одну лемму из seed-фразы ===
     # Это сильный guard для случаев когда в kw НЕТ слов из домена.
     # Например для seed='доставка цветов' (seed_content_lemmas={'доставка','цвет'}):
