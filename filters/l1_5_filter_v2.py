@@ -54,15 +54,44 @@ morph = pymorphy3.MorphAnalyzer(lang='ru')
 # Константы
 # ────────────────────────────────────────────────────────────────────────────
 
-_STOPWORDS = {
-    'купить', 'заказать', 'цена', 'стоимость', 'отзывы', 'продажа', 'доставка',
-    'в', 'на', 'с', 'и', 'или', 'без', 'для', 'под', 'через', 'у', 'к', 'от',
-    'из', 'о', 'об', 'как', 'где', 'почему', 'что', 'это', 'до', 'по', 'за',
-    'про', 'со', 'но', 'же', 'ли', 'бы', 'не', 'ни', 'весь', 'все', 'всё',
+# ────────────────────────────────────────────────────────────────────────────
+# Constants
+# ────────────────────────────────────────────────────────────────────────────
+
+# POS-теги которые НЕ являются content-словами.
+# Через них фильтруем "функциональные" слова без знания их списка.
+_NON_CONTENT_POS = {
+    'PREP',   # предлоги (в, на, с, для, без, через, до, по, за, у, к, от, из)
+    'CONJ',   # союзы (и, или, как, что, но, ли, когда, если)
+    'PRCL',   # частицы (это, же, бы, не, ни, всё)
+    'INTJ',   # междометия
+    'ADVB',   # наречия (где, почему, там, тут, как)
+    'COMP',   # компаративы (лучше, хуже)
+    'NUMR',   # числительные (один, два) — числа из текста идут через regex
+    'NPRO',   # местоимения (я, он, она, мы, кто)
 }
 
-# Предлоги исключаются из seed_content_lemmas
-_PREP_POS = {'PREP', 'CONJ', 'PRCL', 'INTJ'}
+
+def is_content_word(parse) -> bool:
+    """
+    Является ли слово content-словом (значимым для темы).
+    
+    Использует POS и грамматические признаки pymorphy3 — без списков слов.
+    Cross-niche: работает на любом русском тексте.
+    
+    Исключения:
+    - POS из _NON_CONTENT_POS (предлоги, союзы, частицы, и т.д.)
+    - Apro — местоименные прилагательные (весь, тот, этот, мой, свой, какой, другой)
+    - Anph — анафорические местоимения
+    """
+    pos = parse.tag.POS
+    if not pos or pos in _NON_CONTENT_POS:
+        return False
+    # Apro = местоименное (весь/тот/мой/такой) — функциональное, не content
+    if 'Apro' in parse.tag:
+        return False
+    return True
+
 
 # L0 positive signals которые мы используем как weak booster.
 # ИСКЛЮЧАЕМ geo — он шумит (например 'доставка подарков на дом киев' получает geo)
@@ -133,14 +162,15 @@ def extract_lemmas(text: str, exclude: Optional[set] = None) -> tuple[list[tuple
 
 def extract_seed_content_lemmas(seed: str) -> set[str]:
     """
-    Леммы content-слов seed: NOUN/INFN/VERB/ADJF/PRTF, исключая стопворды/предлоги.
+    Леммы content-слов seed.
+    Content определяется через POS и грамматические признаки (без списков).
     """
     result = set()
     for sw in seed.lower().split():
-        if sw in _STOPWORDS or len(sw) <= 2:
+        if len(sw) <= 2:
             continue
         p = morph.parse(sw)[0]
-        if p.tag.POS and p.tag.POS not in _PREP_POS and p.tag.POS != 'NUMR':
+        if is_content_word(p):
             result.add(p.normal_form)
     return result
 
@@ -162,7 +192,7 @@ def extract_object_anchor(seed: str) -> Optional[str]:
     """
     result = None
     for sw in seed.lower().split():
-        if sw in _STOPWORDS or len(sw) <= 2:
+        if len(sw) <= 2:
             continue
         p = morph.parse(sw)[0]
         if p.tag.POS == 'NOUN':
@@ -176,10 +206,10 @@ def extract_action_anchor(seed: str) -> tuple[Optional[str], Optional[str]]:
     action_root = первые 5 символов action_anchor.
     """
     for sw in seed.lower().split():
-        if sw in _STOPWORDS or len(sw) <= 2:
+        if len(sw) <= 2:
             continue
         p = morph.parse(sw)[0]
-        if p.tag.POS in ('NOUN', 'INFN', 'VERB'):
+        if is_content_word(p) and p.tag.POS in ('NOUN', 'INFN', 'VERB'):
             return p.normal_form, p.normal_form[:5]
     return None, None
 
@@ -236,9 +266,9 @@ def classify_lemmas(
         ]
         
         for lemma, pos, w, idx in positions:
-            if w in seed_words or w in _STOPWORDS or len(w) <= 2:
+            if w in seed_words or len(w) <= 2:
                 continue
-            if pos != 'NOUN':
+            if pos != 'NOUN':  # только NOUN-кандидаты в объект
                 continue
             
             total[lemma] += 1
@@ -336,9 +366,9 @@ def build_object_neighbors(
             for lemma, pos, w, idx in positions:
                 if abs(idx - a_idx) > window or idx == a_idx:
                     continue
-                if w in seed_words or w in _STOPWORDS or len(w) <= 2:
+                if w in seed_words or len(w) <= 2:
                     continue
-                if pos == 'NOUN':
+                if pos == 'NOUN':  # только NOUN — фильтр через POS
                     kw_neighbors.add(lemma)
         
         for n in kw_neighbors:
@@ -449,7 +479,7 @@ def build_action_set(
     for kw in l0_valid_kws:
         kw_low = kw.lower() if isinstance(kw, str) else ''
         for w in re.findall(r'[а-яёa-z]+', kw_low):
-            if w in _STOPWORDS or len(w) <= 3:
+            if len(w) <= 3:
                 continue
             p = morph.parse(w)[0]
             pos = p.tag.POS
@@ -460,6 +490,7 @@ def build_action_set(
             if action_root and lemma.startswith(action_root):
                 continue
             
+            # Только глаголы — фильтр через POS
             if pos in ('INFN', 'VERB'):
                 counter[lemma] += 1
     
@@ -509,11 +540,11 @@ def collect_evidence(
     weak = []
     
     kw_low = kw.lower()
-    positions, kw_lemmas = extract_lemmas(kw, exclude=seed_words | _STOPWORDS)
+    positions, kw_lemmas = extract_lemmas(kw, exclude=seed_words)
     
-    # NOUN-кандидаты
+    # NOUN-кандидаты (фильтр через POS, не через список слов)
     candidates = [(lemma, w, idx) for lemma, pos, w, idx in positions 
-                  if pos == 'NOUN' and lemma not in seed_words and lemma not in _STOPWORDS]
+                  if pos == 'NOUN' and lemma not in seed_words]
     
     for cand_lemma, cand_word, cand_idx in candidates:
         # Пропускаем generic слова
