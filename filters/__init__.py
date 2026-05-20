@@ -24,6 +24,7 @@ from .relevance_filter import filter_relevant_keywords
 from .l0_filter import apply_l0_filter
 from .l2_filter import L2Classifier, apply_l2_filter
 from .l1_5_filter import apply_l1_5_filter, extract_object_anchor
+from .l1_5_filter_v2 import apply_l1_5_filter_v2
 from .l3_filter import apply_l3_filter, L3Config
 from .keyword_grouping import group_valid_keywords, get_group_label
 
@@ -65,6 +66,7 @@ __all__ = [
     'apply_l3_filter',
     'L3Config',
     'apply_l1_5_filter',
+    'apply_l1_5_filter_v2',
     'extract_object_anchor',
     'group_valid_keywords',
     'get_group_label',
