@@ -17,6 +17,7 @@ E5-large Model для L1.5 — отдельный singleton.
 """
 
 import logging
+import os
 from typing import Optional
 import numpy as np
 
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 _e5_model = None
 _e5_loading = False
 _E5_MODEL_NAME = "intfloat/multilingual-e5-large"
+
+# Persistent disk для модели (по умолчанию fastembed качает в /tmp, лимит 2GB
+# на Render → eviction. E5-large ~2.2GB не помещается).
+_E5_CACHE_DIR = "/var/data/models"
+try:
+    os.makedirs(_E5_CACHE_DIR, exist_ok=True)
+except Exception as _e:
+    logger.error(f"[E5/L1.5] Cannot create {_E5_CACHE_DIR}: {_e}. Falling back to default cache.")
+    _E5_CACHE_DIR = None
 
 # Кеш эмбеддингов слов
 _word_emb_cache: dict = {}
@@ -51,8 +61,12 @@ def get_e5_model():
     try:
         from fastembed import TextEmbedding
         logger.info(f"[E5/L1.5] Loading {_E5_MODEL_NAME}...")
+        logger.info(f"[E5/L1.5] cache_dir={_E5_CACHE_DIR or 'default(/tmp)'}")
         logger.info("[E5/L1.5] First-time download ~2.2GB, may take 1-2 minutes")
-        _e5_model = TextEmbedding(_E5_MODEL_NAME)
+        if _E5_CACHE_DIR:
+            _e5_model = TextEmbedding(_E5_MODEL_NAME, cache_dir=_E5_CACHE_DIR)
+        else:
+            _e5_model = TextEmbedding(_E5_MODEL_NAME)
         logger.info("[E5/L1.5] Loaded successfully (1024-dim embeddings)")
     except Exception as e:
         logger.error(f"[E5/L1.5] Failed to load E5-large: {e}")
