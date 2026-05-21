@@ -459,7 +459,6 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
 
     # ── Прогон GREY
     new_grey: List[str] = []
-    grey_promoted_traces: List[dict] = []
     trash_traces: List[dict] = []
 
     for kw in grey_keywords:
@@ -499,13 +498,8 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         all_other_ok = all(ok for ok, _ in other_results)
 
         if obj_ok and act_ok and all_other_ok:
+            # PASS → keywords_grey. В trace НЕ пишем (как остальные фильтры).
             new_grey.append(kw)
-            grey_promoted_traces.append({
-                'keyword': kw, 'label': 'GREY', 'decided_by': 'l1_5_v3',
-                'reason': 'all_axes_proven',
-                'signals': [f'obj={obj_reason}', f'act={act_reason}']
-                          + [f'other={r}' for _, r in other_results],
-            })
         else:
             failed: List[str] = []
             if not obj_ok:
@@ -523,7 +517,6 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     # ── Обновление prev_result
     prev_result['keywords_grey'] = new_grey
     prev_result['keywords_grey_count'] = len(new_grey)
-    prev_result['_l1_5_trace'].extend(grey_promoted_traces)
     prev_result['_l1_5_trace'].extend(trash_traces)
 
     logger.info(
