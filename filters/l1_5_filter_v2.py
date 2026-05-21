@@ -1,845 +1,476 @@
 """
-L1.5 v2 — Semantic Anchor Filter с инвертированной логикой.
+L1.5 v3 — TRASH filter (двухосевая логика).
 
-ВАЖНО: этот фильтр использует E5-large (intfloat/multilingual-e5-large) — 
-отдельную модель, более качественную чем MiniLM. Остальные фильтры (L0, L2, 
-CategoryMismatch) продолжают использовать MiniLM через shared_model.py.
+КОНЦЕПЦИЯ:
+- Default = TRASH
+- Spasaem v GREY если ДОКАЗАНЫ ОБЕ оси: action И object
+- Никогда не возвращает VALID — это работа L2/L3
+- Для одноосевого seed (только object или только action) — одной оси достаточно
 
-АРХИТЕКТУРА:
-  Default = TRASH. Ключ должен ДОКАЗАТЬ свою валидность через сигналы.
+ОСИ:
+- AXIS_OBJECT: substring | прямая лемма | RuWordNet synonym | E5 hyponym (cos≥0.78 + в neighbors)
+- AXIS_ACTION: substring | прямая лемма | RuWordNet synonym | E5 synonym (cos≥0.85)
 
-ШАГИ:
-  1. HARD GATES — мгновенный TRASH:
-     - QUALIFIER_HARD: если seed имеет число и его нет в kw
-     - SEED_LEMMA_HARD: если в kw нет ни одной content-леммы seed 
-       И нет substring object_anchor
-  
-  2. HARD PASS — мгновенный VALID:
-     - Все seed-content-леммы присутствуют + есть action
-  
-  3. EVIDENCE-BASED для borderline кейсов:
-     - 3-class классификация L0_VALID лемм через slot_ratio + dispersion:
-       CORE_OBJECT / GENERIC_CONTEXT / TAIL_NOISE
-     - Сбор strong/weak сигналов для каждого NOUN-кандидата
-     - Adaptive policy по signal_density (broad vs tech domain)
-  
-  4. РЕШЕНИЕ:
-     - 2+ strong signals + action → VALID
-     - 1 strong + 1 weak + action → GREY (борделайн → L3)
-     - Иначе → TRASH
+Двойной фильтр для гипонимов (cos + neighbors) спасает от false friends:
+- роза→цвет: cos 0.8, есть в L0_VALID neighbors → hyponym ✓
+- подставка→доставка: cos 0.86, но не в neighbors → false friend ✗
+- пятёрочка→цвет: cos 0.55, не в neighbors → false friend ✗
 
-ПОРОГИ для E5-large:
-  E5 даёт значения в районе 0.75-0.95 для семантически близких пар.
-  Это ВЫШЕ чем MiniLM (0.4-0.6). Поэтому пороги COS_HIGH/MID повышены.
+LONG SEEDS (3+ content_lemmas):
+Все content_lemmas обязательны. action_anchor + object_anchor через все методы,
+"прочие" content_lemmas (например, geo `буковель`) — только substring/lemma/synonym.
 """
 
-from __future__ import annotations
 import logging
 import re
-import time
-from collections import Counter, defaultdict
-from typing import Optional
-
-import pymorphy3
-import numpy as np
-
-# E5-large — отдельная модель для L1.5
-from .e5_model import get_e5_word_embedding, e5_cosine_sim
+from typing import List, Dict, Set, Tuple, Optional, Any
+from collections import Counter
 
 logger = logging.getLogger(__name__)
-morph = pymorphy3.MorphAnalyzer(lang='ru')
 
+# ─── pymorphy3 ───────────────────────────────────────────────────────────
+try:
+    import pymorphy3
+    _morph = pymorphy3.MorphAnalyzer()
+except Exception as e:
+    _morph = None
+    logger.error(f"[L1.5/v3] pymorphy3 not available: {e}")
 
-# ────────────────────────────────────────────────────────────────────────────
-# Константы
-# ────────────────────────────────────────────────────────────────────────────
+# ─── RuWordNet (optional) ────────────────────────────────────────────────
+try:
+    from ruwordnet import RuWordNet
+    _rwn = RuWordNet()
+except Exception:
+    _rwn = None
 
-# ────────────────────────────────────────────────────────────────────────────
-# Constants
-# ────────────────────────────────────────────────────────────────────────────
+# ─── E5 model ────────────────────────────────────────────────────────────
+try:
+    from .e5_model import get_e5_word_embedding, e5_cosine_sim, is_e5_loaded
+except Exception:
+    try:
+        from e5_model import get_e5_word_embedding, e5_cosine_sim, is_e5_loaded
+    except Exception:
+        def get_e5_word_embedding(w): return None
+        def e5_cosine_sim(a, b): return 0.0
+        def is_e5_loaded(): return False
 
-# POS-теги которые НЕ являются content-словами.
-# Через них фильтруем "функциональные" слова без знания их списка.
+# ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
+COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
+COS_ACTION_HIGH = 0.85    # порог cos для синонимов action (без neighbors, выше)
+NEIGHBOR_WINDOW = 2
+NEIGHBOR_MIN_FREQ = 2
+
+# Non-content POS (фильтруем при extraction content_lemmas)
 _NON_CONTENT_POS = {
-    'PREP',   # предлоги (в, на, с, для, без, через, до, по, за, у, к, от, из)
-    'CONJ',   # союзы (и, или, как, что, но, ли, когда, если)
-    'PRCL',   # частицы (это, же, бы, не, ни, всё)
-    'INTJ',   # междометия
-    'ADVB',   # наречия (где, почему, там, тут, как)
-    'COMP',   # компаративы (лучше, хуже)
-    'NUMR',   # числительные (один, два) — числа из текста идут через regex
-    'NPRO',   # местоимения (я, он, она, мы, кто)
+    'PREP', 'CONJ', 'PRCL', 'INTJ',
+    'ADVB', 'COMP', 'NUMR', 'NPRO',
 }
 
+# Global parses cache (uniq tokens per request)
+_parses_cache: Dict[str, Any] = {}
 
-def is_content_word(parse) -> bool:
-    """
-    Является ли слово content-словом (значимым для темы).
-    
-    Использует POS и грамматические признаки pymorphy3 — без списков слов.
-    Cross-niche: работает на любом русском тексте.
-    
-    Исключения:
-    - POS из _NON_CONTENT_POS (предлоги, союзы, частицы, и т.д.)
-    - Apro — местоименные прилагательные (весь, тот, этот, мой, свой, какой, другой)
-    - Anph — анафорические местоимения
-    """
+
+# ─── Утилиты ─────────────────────────────────────────────────────────────
+
+def _is_content_word(parse) -> bool:
+    """POS-фильтр без хардкод-списка стопвордов."""
     pos = parse.tag.POS
     if not pos or pos in _NON_CONTENT_POS:
         return False
-    # Apro = местоименное (весь/тот/мой/такой) — функциональное, не content
-    # str(parse.tag) — pymorphy3 валидирует граммему через `in parse.tag` и не знает Apro
-    if 'Apro' in str(parse.tag):
+    if 'Apro' in str(parse.tag):  # местоименные прилагательные (весь/тот/мой/свой)
         return False
     return True
 
 
-# L0 positive signals которые мы используем как weak booster.
-# ИСКЛЮЧАЕМ geo — он шумит (например 'доставка подарков на дом киев' получает geo)
-_USEFUL_L0_SIGNALS = {
-    'commerce', 'action', 'brand', 'reputation', 'info_intent',
-    'contacts', 'location', 'type_spec', 'verb_modifier', 'conjunctive',
-}
-
-# Пороги для 3-class классификации
-SLOT_RATIO_CORE = 0.35       # лемма в object-slot >=35% — CORE
-DISPERSION_GENERIC = 3       # лемма в 3+ разных контекстах — GENERIC
-
-# Пороги MiniLM cos — старые значения для справки
-# MiniLM:  COS_HIGH = 0.55, COS_MID = 0.40, COS_ACTION_SYN = 0.55
-# 
-# E5-large даёт значения значительно выше для близких пар:
-# - Истинные синонимы (мопед/скутер): ожидаем 0.85-0.92
-# - Гипонимы (роза/цветок): ожидаем 0.78-0.88
-# - Связанные слова (дом/доставка): ожидаем 0.70-0.80
-# - Несвязанные: 0.60-0.70 (E5 даёт высокий baseline для всех русских слов)
-#
-# Поэтому пороги для E5 поднимаем. Будем калибровать на проде.
-COS_HIGH = 0.82              # сильный сигнал — синоним
-COS_MID = 0.75               # слабый сигнал — связанное слово
-COS_ACTION_SYN = 0.82        # для action синонимов
-
-# Adaptive policy
-SIGNAL_DENSITY_BROAD = 0.10  # >=10% L0 positive — broad domain
-
-# Position fallback
-MAX_ABBREV_LEN = 4           # короткое слово ≤4 буквы — кандидат на аббревиатуру
-
-# Финальные пороги для решения
-STRONG_FOR_VALID = 2         # 2+ strong → VALID
-WEAK_FOR_GREY = 2            # 1 strong + 1 weak (или 2 weak) → GREY
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r'[a-zа-яёіїєґ0-9]+', text.lower())
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Утилиты
-# ────────────────────────────────────────────────────────────────────────────
-
-def extract_lemmas(text: str, exclude: Optional[set] = None) -> tuple[list[tuple[str, str, str, int]], set[str]]:
-    """
-    Парсит kw, возвращает:
-      positions: [(lemma, POS, word, index)] — позиции и леммы
-      lemmas: set всех лемм (для быстрых проверок in)
-    """
-    if exclude is None:
-        exclude = set()
-    
-    text_low = text.lower() if isinstance(text, str) else ''
-    words = re.findall(r'[а-яёa-z]+', text_low)
-    
-    positions = []
-    lemmas = set()
-    for idx, w in enumerate(words):
-        if len(w) <= 2:
-            continue
-        p = morph.parse(w)[0]
-        lemma = p.normal_form
-        pos = str(p.tag.POS) if p.tag.POS else ''
-        positions.append((lemma, pos, w, idx))
-        if w not in exclude:
-            lemmas.add(lemma)
-    
-    return positions, lemmas
+def _parse_top(word: str):
+    """Top pymorphy3 parse с кешированием."""
+    if _morph is None:
+        return None
+    if word in _parses_cache:
+        return _parses_cache[word]
+    parses = _morph.parse(word)
+    p = parses[0] if parses else None
+    _parses_cache[word] = p
+    return p
 
 
-def extract_seed_content_lemmas(seed: str) -> set[str]:
-    """
-    Леммы content-слов seed.
-    Content определяется через POS и грамматические признаки (без списков).
-    """
-    result = set()
-    for sw in seed.lower().split():
-        if len(sw) <= 2:
-            continue
-        p = morph.parse(sw)[0]
-        if is_content_word(p):
-            result.add(p.normal_form)
-    return result
-
-
-def extract_qualifier(seed: str) -> tuple[Optional[str], list[str]]:
-    """
-    Извлекает qualifier (число) и его текстовые формы.
-    """
-    seed_low = seed.lower()
-    m = re.search(r'(?<!\d)(\d+)(?!\d)', seed_low)
-    if not m:
-        return None, []
-    return m.group(1), []
-
-
-def extract_object_anchor(seed: str) -> Optional[str]:
-    """
-    Object anchor = последний NOUN в seed.
-    """
-    result = None
-    for sw in seed.lower().split():
-        if len(sw) <= 2:
-            continue
-        p = morph.parse(sw)[0]
-        if p.tag.POS == 'NOUN':
-            result = p.normal_form
-    return result
-
-
-def extract_action_anchor(seed: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Action anchor = первое значимое слово seed (NOUN/INFN/VERB).
-    action_root = первые 5 символов action_anchor.
-    """
-    for sw in seed.lower().split():
-        if len(sw) <= 2:
-            continue
-        p = morph.parse(sw)[0]
-        if is_content_word(p) and p.tag.POS in ('NOUN', 'INFN', 'VERB'):
-            return p.normal_form, p.normal_form[:5]
-    return None, None
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# 3-class классификация лемм
-# ────────────────────────────────────────────────────────────────────────────
-
-def classify_lemmas(
-    l0_valid_kws: list[str],
-    seed_words: set,
-    object_anchor: str,
-) -> tuple[set[str], set[str], dict]:
-    """
-    Классифицирует леммы из L0_VALID на 3 класса:
-      CORE_OBJECT — лемма в object-slot часто (slot_ratio >= SLOT_RATIO_CORE)
-                   И dispersion низкая (< DISPERSION_GENERIC)
-      GENERIC_CONTEXT — высокая dispersion, низкий slot_ratio
-      TAIL_NOISE — всё остальное (одна встреча, единичный slot)
-    
-    Object-slot определяем как:
-      - Позиция следующая после object_anchor (если object в kw)
-      - Позиция аналогичная object_anchor по индексу в seed-структуре
-    
-    Возвращает:
-      core_object: set лемм-кандидатов в object
-      generic: set generic слов (для штрафа)
-      stats: dict с метриками для логирования
-    """
-    # Считаем для каждой леммы:
-    # - total_count: всего встреч
-    # - object_slot_count: встреч в позиции object 
-    # - distinct_positions: уникальные индексы позиций (нормированных)
-    # - distinct_heads: уникальные соседи слева
-    
-    total = Counter()
-    object_slot = Counter()
-    positions_set = defaultdict(set)  # lemma → {норм_позиция}
-    heads_set = defaultdict(set)      # lemma → {лемма_слева}
-    
-    for kw in l0_valid_kws:
-        positions, _ = extract_lemmas(kw)
-        if not positions:
-            continue
-        # max_idx — максимальный исходный индекс среди positions (для определения 
-        # "последней позиции в kw"). idx это позиция в исходном kw, не в positions.
-        max_idx = max(idx for _, _, _, idx in positions)
-        
-        # Найти anchor-позиции (где находится object_anchor или substring)
-        anchor_indices = [
-            idx for lemma, pos, w, idx in positions
-            if object_anchor and (lemma == object_anchor or lemma.startswith(object_anchor)
-                                  or object_anchor in lemma)
-        ]
-        
-        for lemma, pos, w, idx in positions:
-            if w in seed_words or len(w) <= 2:
-                continue
-            if pos != 'NOUN':  # только NOUN-кандидаты в объект
-                continue
-            
-            total[lemma] += 1
-            positions_set[lemma].add(idx)
-            
-            # Объект слот = позиция РЯДОМ с anchor (соседи)
-            for a_idx in anchor_indices:
-                if abs(idx - a_idx) <= 1 and idx != a_idx:
-                    object_slot[lemma] += 1
-                    break
-            
-            # Если в kw нет anchor — лемма может занимать позицию object 
-            # сама по себе. Считаем object_slot если лемма на последней позиции.
-            if not anchor_indices and idx == max_idx:
-                object_slot[lemma] += 1
-            
-            # Head = соседняя лемма слева (по idx в kw, не индексу списка)
-            if idx > 0:
-                for other_lemma, _, _, other_idx in positions:
-                    if other_idx == idx - 1:
-                        heads_set[lemma].add(other_lemma)
-                        break
-    
-    core_object = set()
-    generic_context = set()
-    tail_noise = set()
-    
-    metrics = {}
-    
-    for lemma, cnt in total.items():
-        if cnt < 2:
-            tail_noise.add(lemma)
-            continue
-        slot_ratio = object_slot[lemma] / cnt if cnt else 0
-        dispersion = len(positions_set[lemma]) + len(heads_set[lemma])
-        
-        metrics[lemma] = {
-            'total': cnt,
-            'object_slot': object_slot[lemma],
-            'slot_ratio': round(slot_ratio, 2),
-            'dispersion': dispersion,
-        }
-        
-        # CORE_OBJECT: высокий slot_ratio
-        if slot_ratio >= SLOT_RATIO_CORE:
-            core_object.add(lemma)
-        # GENERIC_CONTEXT: высокая dispersion И низкий slot_ratio
-        elif dispersion >= DISPERSION_GENERIC and slot_ratio < SLOT_RATIO_CORE:
-            generic_context.add(lemma)
-        # TAIL_NOISE: всё остальное (низкая частота)
-        else:
-            tail_noise.add(lemma)
-    
-    stats = {
-        'core_object': sorted(core_object),
-        'generic_context': sorted(generic_context),
-        'tail_noise_size': len(tail_noise),
-        'metrics_sample': {l: metrics[l] for l in sorted(metrics)[:20]},
-    }
-    
-    return core_object, generic_context, stats
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Сбор object_neighbors для weak booster
-# ────────────────────────────────────────────────────────────────────────────
-
-def build_object_neighbors(
-    l0_valid_kws: list[str],
-    seed_words: set,
-    object_anchor: str,
-    window: int = 2,
-    min_freq: int = 2,
-) -> set[str]:
-    """
-    Леммы которые встречаются в окне ±window от object_anchor в L0_VALID 
-    хотя бы в min_freq разных ключах.
-    """
-    counter: Counter = Counter()
-    
-    for kw in l0_valid_kws:
-        positions, _ = extract_lemmas(kw)
-        if not positions:
-            continue
-        
-        anchor_indices = [
-            idx for lemma, pos, w, idx in positions
-            if object_anchor and (lemma == object_anchor or lemma.startswith(object_anchor))
-        ]
-        if not anchor_indices:
-            continue
-        
-        kw_neighbors = set()
-        for a_idx in anchor_indices:
-            for lemma, pos, w, idx in positions:
-                if abs(idx - a_idx) > window or idx == a_idx:
-                    continue
-                if w in seed_words or len(w) <= 2:
-                    continue
-                if pos == 'NOUN':  # только NOUN — фильтр через POS
-                    kw_neighbors.add(lemma)
-        
-        for n in kw_neighbors:
-            counter[n] += 1
-    
-    return {n for n, c in counter.items() if c >= min_freq}
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# L0 signals анализ
-# ────────────────────────────────────────────────────────────────────────────
-
-def build_l0_signals_map(l0_trace: list) -> tuple[dict, float]:
-    """
-    Строит map kw → list of useful L0 positive signals.
-    Возвращает (map, signal_density) где signal_density = доля GREY с useful signals.
-    """
-    signals_map = {}
-    grey_count = 0
-    grey_with_useful = 0
-    
-    for t in l0_trace:
-        if not isinstance(t, dict):
-            continue
-        kw = t.get('keyword', '')
-        label = t.get('label', '')
-        sigs = t.get('signals', [])
-        
-        if not sigs:
-            continue
-        
-        useful = [s for s in sigs if not s.startswith('-') and s in _USEFUL_L0_SIGNALS]
-        if useful:
-            signals_map[kw] = useful
-        
-        if label == 'GREY':
-            grey_count += 1
-            if useful:
-                grey_with_useful += 1
-    
-    density = grey_with_useful / grey_count if grey_count else 0.0
-    return signals_map, density
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Action check
-# ────────────────────────────────────────────────────────────────────────────
-
-def has_action(
-    kw: str,
-    action_anchor: Optional[str],
-    action_root: Optional[str],
-    action_set: set[str],
-    object_anchor: Optional[str] = None,
-) -> tuple[bool, str]:
-    """
-    A. lemma.startswith(action_root) — однокоренные
-    B. lemma in action_set — синонимы
-    C. position fallback — короткое NOUN (2-4 буквы) на pos 0 + object substring в kw
-    """
-    if not action_anchor or not action_root:
-        return True, 'no_action_extracted'
-    
-    kw_low = kw.lower()
-    
-    for w in re.findall(r'[а-яёa-z]+', kw_low):
-        p = morph.parse(w)[0]
-        lemma = p.normal_form
-        if lemma.startswith(action_root):
-            return True, f'action_root:{lemma}'
-        if lemma in action_set:
-            return True, f'action_lemma:{lemma}'
-    
-    if object_anchor and object_anchor in kw_low:
-        words = re.findall(r'[а-яёa-z]+', kw_low)
-        if words:
-            first = words[0]
-            if 2 <= len(first) <= MAX_ABBREV_LEN:
-                p_first = morph.parse(first)[0]
-                first_lemma = p_first.normal_form
-                if (p_first.tag.POS == 'NOUN'
-                    and first_lemma != object_anchor
-                    and not first_lemma.startswith(object_anchor)
-                    and object_anchor not in first_lemma):
-                    return True, f'action_abbrev_pos0:{first_lemma}'
-    
-    return False, 'no_action'
-
-
-def build_action_set(
-    action_anchor: str,
-    action_root: str,
-    l0_valid_kws: list[str],
-    object_anchor: Optional[str],
-) -> set[str]:
-    """
-    Action set = action_anchor + VERB/INFN из L0_VALID с freq>=3.
-    
-    Без MiniLM-расширения NOUN — оно даёт массу FP в action_set 
-    (букет/подставка/телек/пойзона/купянск близки к 'доставка' по cos).
-    """
-    if not action_anchor:
+def _get_synonyms(lemma: str) -> Set[str]:
+    """Synonyms из RuWordNet (если доступен)."""
+    if _rwn is None or not lemma:
         return set()
-    
-    action_set = {action_anchor}
+    try:
+        syns = set()
+        senses = _rwn.get_senses(lemma)
+        for sense in senses:
+            for s in sense.synset.senses:
+                if s.lemma and s.lemma.lower() != lemma:
+                    syns.add(s.lemma.lower())
+        return syns
+    except Exception:
+        return set()
+
+
+# ─── Разбор seed ─────────────────────────────────────────────────────────
+
+def _extract_seed_structure(seed: str) -> Dict[str, Any]:
+    """
+    Возвращает:
+      content_lemmas: List[str] — все content-леммы seed
+      action_anchor:  Optional[str] — первая VERB/INFN или первое content NOUN
+      object_anchor:  Optional[str] — последнее content NOUN (отличное от action)
+      qualifier:      Optional[str] — число из seed (если есть)
+    """
+    tokens = _tokenize(seed)
+    content_parses = []
+    for tok in tokens:
+        p = _parse_top(tok)
+        if p is None:
+            continue
+        if _is_content_word(p):
+            content_parses.append(p)
+
+    content_lemmas = [p.normal_form for p in content_parses]
+
+    # Action: первый VERB/INFN, иначе первый NOUN-кандидат
+    action_anchor = None
+    for p in content_parses:
+        if p.tag.POS in {'VERB', 'INFN'}:
+            action_anchor = p.normal_form
+            break
+    if action_anchor is None and content_parses:
+        action_anchor = content_parses[0].normal_form
+
+    # Object: последний NOUN ≠ action
+    object_anchor = None
+    for p in reversed(content_parses):
+        if p.tag.POS == 'NOUN' and p.normal_form != action_anchor:
+            object_anchor = p.normal_form
+            break
+
+    # Single-content seed: единственная лемма = object, action=None
+    if object_anchor is None and len(content_parses) == 1:
+        object_anchor = content_parses[0].normal_form
+        action_anchor = None
+
+    nums = re.findall(r'\d+', seed)
+    qualifier = nums[0] if nums else None
+
+    return {
+        'content_lemmas': content_lemmas,
+        'action_anchor': action_anchor,
+        'object_anchor': object_anchor,
+        'qualifier': qualifier,
+    }
+
+
+# ─── object_neighbors из L0_VALID ────────────────────────────────────────
+
+def _build_object_neighbors(
+    l0_valid_keywords: List[str],
+    object_anchor: str,
+    window: int = NEIGHBOR_WINDOW,
+    min_freq: int = NEIGHBOR_MIN_FREQ,
+) -> Set[str]:
+    """
+    Леммы NOUN которые встречались в окне ±window от object_anchor
+    минимум в min_freq L0_VALID ключах.
+    """
+    if _morph is None or not object_anchor:
+        return set()
+
     counter: Counter = Counter()
-    
-    for kw in l0_valid_kws:
-        kw_low = kw.lower() if isinstance(kw, str) else ''
-        for w in re.findall(r'[а-яёa-z]+', kw_low):
-            if len(w) <= 3:
-                continue
-            p = morph.parse(w)[0]
-            pos = p.tag.POS
-            lemma = p.normal_form
-            
-            if object_anchor and (lemma == object_anchor or object_anchor in lemma):
-                continue
-            if action_root and lemma.startswith(action_root):
-                continue
-            
-            # Только глаголы — фильтр через POS
-            if pos in ('INFN', 'VERB'):
-                counter[lemma] += 1
-    
-    for lemma, count in counter.most_common(30):
-        if count >= 3:
-            action_set.add(lemma)
-    
-    return action_set
+    for kw in l0_valid_keywords:
+        tokens = _tokenize(kw)
+        if not tokens:
+            continue
+        parses = [_parse_top(t) for t in tokens]
+        lemmas = [p.normal_form if p else None for p in parses]
+
+        # позиции anchor (substring или лемма)
+        anchor_positions = [
+            i for i, (tok, lem) in enumerate(zip(tokens, lemmas))
+            if (object_anchor in tok) or (lem == object_anchor)
+        ]
+        if not anchor_positions:
+            continue
+
+        # уникальные леммы NOUN в окне для этого kw (избегаем двойного счёта)
+        seen_in_kw: Set[str] = set()
+        for pos in anchor_positions:
+            for j in range(max(0, pos - window), min(len(tokens), pos + window + 1)):
+                if j == pos:
+                    continue
+                p = parses[j]
+                if p is None or p.tag.POS != 'NOUN':
+                    continue
+                lem = p.normal_form
+                if not lem or lem == object_anchor:
+                    continue
+                seen_in_kw.add(lem)
+        for lem in seen_in_kw:
+            counter[lem] += 1
+
+    return {lem for lem, freq in counter.items() if freq >= min_freq}
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Сбор evidence для кандидата
-# ────────────────────────────────────────────────────────────────────────────
+# ─── Доказательство осей ─────────────────────────────────────────────────
 
-def collect_evidence(
-    kw: str,
-    object_anchor: str,
+def _prove_object(
+    kw_tokens: List[str],
+    kw_lemmas: List[Optional[str]],
+    kw_parses: List[Any],
+    object_anchor: Optional[str],
+    object_neighbors: Set[str],
+    object_synonyms: Set[str],
+) -> Tuple[bool, str]:
+    """Возвращает (proven, reason). Если object_anchor=None — ось не нужна."""
+    if not object_anchor:
+        return True, 'no_object_in_seed'
+
+    kw_low = ' '.join(kw_tokens)
+
+    # 1. substring
+    if object_anchor in kw_low:
+        return True, f'substring:{object_anchor}'
+
+    # 2. прямая лемма
+    for lem in kw_lemmas:
+        if lem == object_anchor:
+            return True, f'lemma:{object_anchor}'
+
+    # 3. RuWordNet synonym
+    for lem in kw_lemmas:
+        if lem and lem in object_synonyms:
+            return True, f'ruwordnet:{lem}'
+
+    # 4. E5 hyponym (cos≥0.78 + в neighbors)
+    if is_e5_loaded() and object_neighbors:
+        anchor_emb = get_e5_word_embedding(object_anchor)
+        if anchor_emb is not None:
+            best_cos = 0.0
+            best_lem = None
+            for p, lem in zip(kw_parses, kw_lemmas):
+                if p is None or lem is None:
+                    continue
+                if p.tag.POS != 'NOUN':
+                    continue
+                if lem == object_anchor or lem not in object_neighbors:
+                    continue
+                cand_emb = get_e5_word_embedding(lem)
+                if cand_emb is None:
+                    continue
+                cos = e5_cosine_sim(anchor_emb, cand_emb)
+                if cos > best_cos:
+                    best_cos = cos
+                    best_lem = lem
+            if best_lem and best_cos >= COS_OBJECT_HIGH:
+                return True, f'hyponym:{best_lem}({best_cos:.2f})'
+
+    # 5. abbrev_pos0: NOUN ≤4 буквы на pos 0 + в neighbors (slot match для аббревиатур)
+    if kw_parses and kw_parses[0] is not None:
+        p0 = kw_parses[0]
+        lem0 = kw_lemmas[0]
+        if p0.tag.POS == 'NOUN' and lem0 and len(kw_tokens[0]) <= 4:
+            if lem0 in object_neighbors:
+                return True, f'abbrev_pos0:{lem0}'
+
+    return False, 'no_object_proof'
+
+
+def _prove_action(
+    kw_tokens: List[str],
+    kw_lemmas: List[Optional[str]],
+    kw_parses: List[Any],
     action_anchor: Optional[str],
-    seed_words: set,
-    core_object: set,
-    generic_context: set,
-    object_neighbors: set,
-    object_emb: Optional[np.ndarray],
-    action_emb: Optional[np.ndarray],
-    ruwordnet_synonyms: set,
-    is_broad_domain: bool,
-    kw_l0_signals: list,
-) -> tuple[list, list]:
-    """
-    Собирает strong и weak сигналы для kw.
-    
-    STRONG сигналы:
-      S1. CORE_OBJECT — лемма-кандидат имеет высокий slot_ratio в L0_VALID
-      S2. high_cos_object (≥0.55) И (в neighbors ИЛИ tech domain)
-      S3. RuWordNet synonym
-      S4. action_synonym через MiniLM cos (≥0.55 к action_anchor) + защита от object-side
-      S5. brand-like latin token (для iphone-like)
-    
-    WEAK сигналы:
-      W1. mid_cos_object (0.40-0.55)
-      W2. в neighbors (но не CORE)
-      W3. L0 positive signal (commerce/brand/etc, без geo)
-    
-    GENERIC_CONTEXT — антисигнал (если кандидат там — игнорируем)
-    """
-    strong = []
-    weak = []
-    
-    kw_low = kw.lower()
-    positions, kw_lemmas = extract_lemmas(kw, exclude=seed_words)
-    
-    # NOUN-кандидаты (фильтр через POS, не через список слов)
-    candidates = [(lemma, w, idx) for lemma, pos, w, idx in positions 
-                  if pos == 'NOUN' and lemma not in seed_words]
-    
-    for cand_lemma, cand_word, cand_idx in candidates:
-        # Пропускаем generic слова
-        if cand_lemma in generic_context:
-            continue
-        
-        # S3: RuWordNet
-        if cand_lemma in ruwordnet_synonyms or cand_word in ruwordnet_synonyms:
-            strong.append(('ruwordnet', cand_lemma))
-            continue  # уже сильный, другие сигналы не нужны
-        
-        # S1: CORE_OBJECT
-        if cand_lemma in core_object:
-            strong.append(('core_object', cand_lemma))
-        
-        # MiniLM cos к object
-        cos_obj = 0.0
-        if object_emb is not None:
-            emb = get_e5_word_embedding(cand_lemma)
-            if emb is not None:
-                cos_obj = e5_cosine_sim(emb, object_emb)
-        
-        # S2: high_cos_object
-        if cos_obj >= COS_HIGH:
-            # Для broad domain — требуем подтверждения через neighbors
-            # Для tech domain — high_cos сам по себе strong (т.к. L0 не помогает)
-            if cand_lemma in object_neighbors:
-                strong.append(('high_cos_neigh', cand_lemma, round(cos_obj, 2)))
-            elif not is_broad_domain:  # tech domain
-                strong.append(('high_cos_tech', cand_lemma, round(cos_obj, 2)))
-            else:  # broad domain без neighbors — подозрительно (false friend)
-                weak.append(('high_cos_unverified', cand_lemma, round(cos_obj, 2)))
-        elif cos_obj >= COS_MID:
-            # W1: mid_cos
-            weak.append(('mid_cos', cand_lemma, round(cos_obj, 2)))
-        
-        # W2: в neighbors но не CORE
-        if cand_lemma in object_neighbors and cand_lemma not in core_object:
-            # уже могло быть добавлено через high_cos_neigh
-            if not any(s[0] == 'high_cos_neigh' and s[1] == cand_lemma for s in strong):
-                weak.append(('in_neighbors', cand_lemma))
-        
-        # S4: action_synonym через MiniLM
-        if action_emb is not None and cos_obj < COS_HIGH:
-            emb_cand = get_e5_word_embedding(cand_lemma)
-            if emb_cand is not None:
-                cos_act = e5_cosine_sim(emb_cand, action_emb)
-                if cos_act >= COS_ACTION_SYN and cos_act > cos_obj:
-                    # Защита от object-side: если cand ближе к object чем к action — пропускаем
-                    strong.append(('action_synonym', cand_lemma, round(cos_act, 2)))
-    
-    # W3: L0 positive signals
-    if kw_l0_signals:
-        weak.append(('l0_positive', kw_l0_signals))
-    
-    return strong, weak
+    action_synonyms: Set[str],
+) -> Tuple[bool, str]:
+    """Возвращает (proven, reason). Если action_anchor=None — ось не нужна."""
+    if not action_anchor:
+        return True, 'no_action_in_seed'
+
+    kw_low = ' '.join(kw_tokens)
+
+    # 1. substring
+    if action_anchor in kw_low:
+        return True, f'substring:{action_anchor}'
+
+    # 2. прямая лемма
+    for lem in kw_lemmas:
+        if lem == action_anchor:
+            return True, f'lemma:{action_anchor}'
+
+    # 3. RuWordNet synonym
+    for lem in kw_lemmas:
+        if lem and lem in action_synonyms:
+            return True, f'ruwordnet:{lem}'
+
+    # 4. E5 synonym (cos≥0.85, без neighbors — higher bar)
+    if is_e5_loaded():
+        anchor_emb = get_e5_word_embedding(action_anchor)
+        if anchor_emb is not None:
+            best_cos = 0.0
+            best_lem = None
+            for p, lem in zip(kw_parses, kw_lemmas):
+                if p is None or lem is None:
+                    continue
+                if p.tag.POS not in {'NOUN', 'VERB', 'INFN'}:
+                    continue
+                if lem == action_anchor:
+                    continue
+                cand_emb = get_e5_word_embedding(lem)
+                if cand_emb is None:
+                    continue
+                cos = e5_cosine_sim(anchor_emb, cand_emb)
+                if cos > best_cos:
+                    best_cos = cos
+                    best_lem = lem
+            if best_lem and best_cos >= COS_ACTION_HIGH:
+                return True, f'action_syn:{best_lem}({best_cos:.2f})'
+
+    return False, 'no_action_proof'
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Главная функция фильтра
-# ────────────────────────────────────────────────────────────────────────────
-
-def classify_kw(
-    kw: str,
-    seed_words: set,
-    seed_content_lemmas: set,
-    qualifier: Optional[str],
-    qualifier_text: list[str],
-    object_anchor: str,
-    action_anchor: Optional[str],
-    action_root: Optional[str],
-    action_set: set,
-    core_object: set,
-    generic_context: set,
-    object_neighbors: set,
-    object_emb: Optional[np.ndarray],
-    action_emb: Optional[np.ndarray],
-    ruwordnet_synonyms: set,
-    is_broad_domain: bool,
-    kw_l0_signals: list,
-) -> tuple[str, str]:
+def _prove_other_lemma(
+    lemma: str,
+    kw_tokens: List[str],
+    kw_lemmas: List[Optional[str]],
+    synonyms: Set[str],
+) -> Tuple[bool, str]:
     """
-    Классифицирует kw → ('VALID' | 'GREY' | 'TRASH', signal_str)
+    Для содержательных лемм seed (не action, не object) — например, гео `буковель`.
+    Только substring/lemma/synonym. Без cos (нет смысла для гео).
     """
-    kw_low = kw.lower()
-    
-    # ═══ ШАГ 1: HARD GATES (мгновенный TRASH) ═══
-    
-    # 1A: qualifier-required
-    if qualifier:
-        has_qual = bool(re.search(rf'(?<!\d){qualifier}(?!\d)', kw_low))
-        if not has_qual and qualifier_text:
-            for txt in qualifier_text:
-                if txt in kw_low:
-                    has_qual = True
-                    break
-        if not has_qual:
-            return 'TRASH', f'no_qualifier:{qualifier}'
-    
-    # 1B: seed-lemma-required
-    positions, kw_lemmas = extract_lemmas(kw)
-    has_any_seed_lemma = bool(kw_lemmas & seed_content_lemmas)
-    has_object_substring = object_anchor and object_anchor in kw_low
-    
-    if not has_any_seed_lemma and not has_object_substring:
-        return 'TRASH', 'no_seed_lemma'
-    
-    # ═══ ШАГ 2: HARD PASS (все seed-слова присутствуют + action) ═══
-    
-    # Проверяем каждую seed-content-лемму на присутствие в kw (substring или лемма)
-    all_seed_present = True
-    for seed_lemma in seed_content_lemmas:
-        if seed_lemma in kw_lemmas:
-            continue
-        # substring check (для морфо-вариантов)
-        if any(seed_lemma in w for _, _, w, _ in positions):
-            continue
-        all_seed_present = False
-        break
-    
-    action_ok, action_signal = has_action(
-        kw, action_anchor, action_root, action_set, object_anchor=object_anchor
-    )
-    
-    if all_seed_present and action_ok:
-        return 'VALID', f'all_seed_words|{action_signal}'
-    
-    # ═══ ШАГ 3: EVIDENCE-BASED ═══
-    
-    if not action_ok:
-        # Без action даже сильные object-сигналы не дают VALID
-        # Но если все seed-слова есть — может быть GREY
-        if all_seed_present:
-            return 'GREY', f'all_seed|no_action'
-        return 'TRASH', f'partial_seed|{action_signal}'
-    
-    # Собираем evidence
-    strong, weak = collect_evidence(
-        kw, object_anchor, action_anchor, seed_words,
-        core_object, generic_context, object_neighbors,
-        object_emb, action_emb, ruwordnet_synonyms,
-        is_broad_domain, kw_l0_signals,
-    )
-    
-    # Также проверка object_anchor substring/лемма как strong сигнал
-    if has_object_substring or object_anchor in kw_lemmas:
-        strong.append(('object_anchor',))
-    
-    # ═══ ШАГ 4: РЕШЕНИЕ ═══
-    
-    n_strong = len(strong)
-    n_weak = len(weak)
-    
-    signal_str = f'strong={strong}|weak={weak}'
-    
-    # VALID: 2+ strong
-    if n_strong >= STRONG_FOR_VALID:
-        return 'VALID', f'multi_strong|{signal_str}'
-    
-    # VALID: 1 strong + action есть + это object_anchor сам
-    if n_strong >= 1 and any(s[0] == 'object_anchor' for s in strong):
-        return 'VALID', f'object_strong|{signal_str}'
-    
-    # GREY: 1 strong (не object) или 2 weak
-    if n_strong >= 1 or n_weak >= WEAK_FOR_GREY:
-        return 'GREY', f'borderline|{signal_str}'
-    
-    return 'TRASH', f'insufficient_evidence|{signal_str}'
+    kw_low = ' '.join(kw_tokens)
+    if lemma in kw_low:
+        return True, f'substring:{lemma}'
+    for lem in kw_lemmas:
+        if lem == lemma:
+            return True, f'lemma:{lemma}'
+    for lem in kw_lemmas:
+        if lem and lem in synonyms:
+            return True, f'ruwordnet:{lem}'
+    return False, f'no_proof:{lemma}'
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Главная функция фильтра — entry point
-# ────────────────────────────────────────────────────────────────────────────
+# ─── Main entry ──────────────────────────────────────────────────────────
 
-def apply_l1_5_filter_v2(data: dict, seed: str) -> dict:
+def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     """
-    L1.5 v2 — Default TRASH, спасаем через evidence.
+    TRASH-filter. Прибирает GREY-список из prev_result.
+    Никогда не модифицирует keywords (L0 VALID) и не добавляет туда новых.
     """
-    t_start = time.time()
-    
-    # Подготовка из seed
-    seed_content_lemmas = extract_seed_content_lemmas(seed)
-    qualifier, qualifier_text = extract_qualifier(seed)
-    object_anchor = extract_object_anchor(seed)
-    action_anchor, action_root = extract_action_anchor(seed)
-    seed_words = set(seed.lower().split())
-    
+    grey_keywords: List[str] = prev_result.get('keywords_grey', []) or []
+    prev_result.setdefault('_l1_5_trace', [])
+
+    if not grey_keywords:
+        logger.info("[L1.5/v3] empty GREY input — nothing to do")
+        return prev_result
+
+    # ── Парсинг seed
+    seed_struct = _extract_seed_structure(seed)
+    content_lemmas = seed_struct['content_lemmas']
+    action_anchor = seed_struct['action_anchor']
+    object_anchor = seed_struct['object_anchor']
+    qualifier = seed_struct['qualifier']
+
+    # other_lemmas: content_lemmas минус action и object
+    other_lemmas = [
+        lem for lem in content_lemmas
+        if lem != action_anchor and lem != object_anchor
+    ]
+
     logger.info(
-        f"[L1.5/v2] seed='{seed}' object='{object_anchor}' "
-        f"action='{action_anchor}' root='{action_root}' "
-        f"qualifier='{qualifier}' "
-        f"seed_content_lemmas={sorted(seed_content_lemmas)}"
+        f"[L1.5/v3] seed={seed!r} action={action_anchor!r} object={object_anchor!r} "
+        f"other={other_lemmas} qualifier={qualifier!r}"
     )
-    
-    # L0 trace
-    l0_trace = data.get('_l0_trace', [])
-    l0_valid_kws = [t['keyword'] for t in l0_trace 
-                    if isinstance(t, dict) and t.get('label') == 'VALID']
-    
-    # L0 signals map + density
-    l0_signals_map, signal_density = build_l0_signals_map(l0_trace)
-    is_broad_domain = signal_density >= SIGNAL_DENSITY_BROAD
-    
+
+    # ── Подготовка ресурсов
+    l0_valid = prev_result.get('keywords', []) or []
+    object_neighbors = _build_object_neighbors(l0_valid, object_anchor) if object_anchor else set()
+    object_synonyms = _get_synonyms(object_anchor) if object_anchor else set()
+    action_synonyms = _get_synonyms(action_anchor) if action_anchor else set()
+    other_synonyms = {lem: _get_synonyms(lem) for lem in other_lemmas}
+
     logger.info(
-        f"[L1.5/v2] L0 signal_density={signal_density:.2f}, "
-        f"domain_type={'broad' if is_broad_domain else 'tech'}"
+        f"[L1.5/v3] neighbors({object_anchor})={len(object_neighbors)} "
+        f"obj_syn={len(object_synonyms)} act_syn={len(action_synonyms)}"
     )
-    
-    # 3-class классификация лемм
-    if object_anchor:
-        core_object, generic_context, lemma_stats = classify_lemmas(
-            l0_valid_kws, seed_words, object_anchor
-        )
-        logger.info(
-            f"[L1.5/v2] lemma classes: CORE={lemma_stats['core_object'][:20]}, "
-            f"GENERIC={lemma_stats['generic_context'][:20]}, "
-            f"TAIL_size={lemma_stats['tail_noise_size']}"
-        )
-    else:
-        core_object, generic_context = set(), set()
-    
-    # object_neighbors (window-based)
-    object_neighbors = build_object_neighbors(
-        l0_valid_kws, seed_words, object_anchor
-    ) if object_anchor else set()
-    
-    # action_set
-    action_set = set()
-    if action_anchor and action_root:
-        action_set = build_action_set(action_anchor, action_root, l0_valid_kws, object_anchor)
-    
-    # Эмбеддинги
-    object_emb = get_e5_word_embedding(object_anchor) if object_anchor else None
-    action_emb = get_e5_word_embedding(action_anchor) if action_anchor else None
-    
-    # RuWordNet synonyms — пока пустые (если есть data['_anchors_synonyms'] — берём оттуда)
-    ruwordnet_synonyms = set(data.get('_anchors_synonyms', []))
-    
-    # GREY input
-    grey = data.get('keywords_grey', [])
-    if not grey:
-        logger.info(f"[L1.5/v2] no GREY to filter, skipping")
-        return data
-    
-    new_valid = []
-    new_grey = []
-    new_trash = []
-    
-    trace_entries = []
-    
-    for kw_item in grey:
-        kw = kw_item if isinstance(kw_item, str) else kw_item.get('keyword', '')
-        if not kw:
-            continue
-        
-        kw_l0_signals = l0_signals_map.get(kw, [])
-        
-        label, signal = classify_kw(
-            kw, seed_words, seed_content_lemmas, qualifier, qualifier_text,
-            object_anchor, action_anchor, action_root, action_set,
-            core_object, generic_context, object_neighbors,
-            object_emb, action_emb, ruwordnet_synonyms,
-            is_broad_domain, kw_l0_signals,
-        )
-        
-        if label == 'VALID':
-            new_valid.append(kw_item)
-        elif label == 'GREY':
-            new_grey.append(kw_item)
-        else:  # TRASH
-            new_trash.append(kw_item)
-            trace_entries.append({
-                'keyword': kw,
-                'label': 'TRASH',
-                'decided_by': 'l1_5_v2',
-                'reason': f"l1_5_v2 ({label})",
-                'signals': [signal[:200]],
+
+    # ── Прогон GREY
+    new_grey: List[str] = []
+    grey_promoted_traces: List[dict] = []
+    trash_traces: List[dict] = []
+
+    for kw in grey_keywords:
+        tokens = _tokenize(kw)
+        if not tokens:
+            trash_traces.append({
+                'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
+                'reason': 'empty_tokens', 'signals': [],
             })
-    
-    # Промотируем VALID в data['keywords'] (это новая версия — Pass даёт VALID не GREY)
-    existing_keywords = list(data.get('keywords', []))
-    existing_keywords.extend(new_valid)
-    data['keywords'] = existing_keywords
-    data['keywords_grey'] = new_grey
-    
-    # Trace для отладки
-    data.setdefault('_l1_5_trace', []).extend(trace_entries)
-    
+            continue
+
+        # QUALIFIER_HARD
+        if qualifier and qualifier not in tokens:
+            trash_traces.append({
+                'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
+                'reason': f'qualifier_missing:{qualifier}', 'signals': [],
+            })
+            continue
+
+        parses = [_parse_top(t) for t in tokens]
+        lemmas = [p.normal_form if p else None for p in parses]
+
+        # ОСИ
+        obj_ok, obj_reason = _prove_object(
+            tokens, lemmas, parses, object_anchor, object_neighbors, object_synonyms
+        )
+        act_ok, act_reason = _prove_action(
+            tokens, lemmas, parses, action_anchor, action_synonyms
+        )
+
+        # OTHER (для 3+ word seeds)
+        other_results: List[Tuple[bool, str]] = []
+        for lem in other_lemmas:
+            ok, reason = _prove_other_lemma(lem, tokens, lemmas, other_synonyms.get(lem, set()))
+            other_results.append((ok, reason))
+
+        all_other_ok = all(ok for ok, _ in other_results)
+
+        if obj_ok and act_ok and all_other_ok:
+            new_grey.append(kw)
+            grey_promoted_traces.append({
+                'keyword': kw, 'label': 'GREY', 'decided_by': 'l1_5_v3',
+                'reason': 'all_axes_proven',
+                'signals': [f'obj={obj_reason}', f'act={act_reason}']
+                          + [f'other={r}' for _, r in other_results],
+            })
+        else:
+            failed: List[str] = []
+            if not obj_ok:
+                failed.append(f'obj={obj_reason}')
+            if not act_ok:
+                failed.append(f'act={act_reason}')
+            for ok, reason in other_results:
+                if not ok:
+                    failed.append(f'other={reason}')
+            trash_traces.append({
+                'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
+                'reason': 'axis_unproven', 'signals': failed,
+            })
+
+    # ── Обновление prev_result
+    prev_result['keywords_grey'] = new_grey
+    prev_result['keywords_grey_count'] = len(new_grey)
+    prev_result['_l1_5_trace'].extend(grey_promoted_traces)
+    prev_result['_l1_5_trace'].extend(trash_traces)
+
     logger.info(
-        f"[L1.5/v2] grey: {len(grey)} → "
-        f"VALID promoted: {len(new_valid)}, "
-        f"GREY remaining: {len(new_grey)}, "
-        f"TRASH: {len(new_trash)}, "
-        f"elapsed: {time.time()-t_start:.2f}s"
+        f"[L1.5/v3] {len(grey_keywords)} → GREY={len(new_grey)}, TRASH={len(trash_traces)}"
     )
-    
-    return data
+
+    return prev_result
