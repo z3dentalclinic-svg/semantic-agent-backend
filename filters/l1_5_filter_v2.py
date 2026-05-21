@@ -37,15 +37,86 @@ except Exception as e:
     logger.error(f"[L1.5/v3] pymorphy3 not available: {e}")
 
 # ─── RuWordNet (optional) ────────────────────────────────────────────────
-_rwn = None
-try:
-    from ruwordnet import RuWordNet
-    _rwn = RuWordNet()
-    logger.info("[L1.5/v3] RuWordNet loaded")
-except ImportError as e:
-    logger.warning(f"[L1.5/v3] RuWordNet not installed (pip install ruwordnet): {e}")
-except Exception as e:
-    logger.warning(f"[L1.5/v3] RuWordNet init failed: {e}")
+# Пакет ruwordnet>=0.0.4 НЕ содержит БД в комплекте. БД нужно скачивать
+# отдельно командой `python -m ruwordnet download`, которая качает файл в
+# `<package>/static/ruwordnet-2021.db`. Эта папка пересоздаётся при каждом
+# деплое Render → download пришлось бы повторять. Поэтому качаем БД сами в
+# persistent disk `/var/data/models/`, при первом старте сервиса.
+
+_RWN_DB_DIR = "/var/data/models"
+_RWN_DB_PATH = f"{_RWN_DB_DIR}/ruwordnet-2021.db"
+_RWN_DB_URL = (
+    "https://github.com/avidale/python-ruwordnet/releases/download/"
+    "0.0.4/ruwordnet-2021.db"
+)
+
+
+def _ensure_ruwordnet_db() -> bool:
+    """
+    Гарантирует наличие БД RuWordNet на persistent disk.
+    Возвращает True если файл готов к использованию.
+    """
+    import os
+    import urllib.request
+
+    if os.path.exists(_RWN_DB_PATH):
+        try:
+            size_mb = os.path.getsize(_RWN_DB_PATH) / 1e6
+            logger.info(f"[L1.5/v3] RuWordNet DB found at {_RWN_DB_PATH} ({size_mb:.1f} MB)")
+        except Exception:
+            pass
+        return True
+
+    try:
+        os.makedirs(_RWN_DB_DIR, exist_ok=True)
+    except Exception as e:
+        logger.error(f"[L1.5/v3] Cannot create dir {_RWN_DB_DIR}: {e}")
+        return False
+
+    tmp_path = _RWN_DB_PATH + ".tmp"
+    try:
+        logger.info(f"[L1.5/v3] RuWordNet DB not found, downloading from {_RWN_DB_URL}")
+        # Тот же подход что и в `python -m ruwordnet download` (urlretrieve).
+        # Сохраняем во временный файл и атомарно переименовываем — если
+        # download прерван, повреждённый файл не останется как валидный.
+        urllib.request.urlretrieve(_RWN_DB_URL, tmp_path)
+        size_mb = os.path.getsize(tmp_path) / 1e6
+        os.rename(tmp_path, _RWN_DB_PATH)
+        logger.info(f"[L1.5/v3] RuWordNet DB downloaded: {_RWN_DB_PATH} ({size_mb:.1f} MB)")
+        return True
+    except Exception as e:
+        logger.error(f"[L1.5/v3] Failed to download RuWordNet DB: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def _init_ruwordnet():
+    """Возвращает экземпляр RuWordNet или None (если БД не доступна)."""
+    try:
+        from ruwordnet import RuWordNet
+    except ImportError as e:
+        logger.warning(f"[L1.5/v3] RuWordNet package not installed: {e}")
+        return None
+
+    if not _ensure_ruwordnet_db():
+        return None
+
+    try:
+        rwn = RuWordNet(filename_or_session=_RWN_DB_PATH)
+        # Sanity-check: пробуем простой запрос. Если БД повреждена — здесь упадёт.
+        _ = rwn.get_senses("тест")
+        logger.info(f"[L1.5/v3] RuWordNet loaded from {_RWN_DB_PATH}")
+        return rwn
+    except Exception as e:
+        logger.error(f"[L1.5/v3] RuWordNet init failed: {e}")
+        return None
+
+
+_rwn = _init_ruwordnet()
 
 # ─── E5 model — НЕ молча глотаем ошибки импорта ─────────────────────────
 _E5_IMPORT_OK = False
