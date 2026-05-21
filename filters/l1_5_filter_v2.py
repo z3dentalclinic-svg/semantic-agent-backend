@@ -37,22 +37,58 @@ except Exception as e:
     logger.error(f"[L1.5/v3] pymorphy3 not available: {e}")
 
 # ─── RuWordNet (optional) ────────────────────────────────────────────────
+_rwn = None
 try:
     from ruwordnet import RuWordNet
     _rwn = RuWordNet()
-except Exception:
-    _rwn = None
+    logger.info("[L1.5/v3] RuWordNet loaded")
+except ImportError as e:
+    logger.warning(f"[L1.5/v3] RuWordNet not installed (pip install ruwordnet): {e}")
+except Exception as e:
+    logger.warning(f"[L1.5/v3] RuWordNet init failed: {e}")
 
-# ─── E5 model ────────────────────────────────────────────────────────────
+# ─── E5 model — НЕ молча глотаем ошибки импорта ─────────────────────────
+_E5_IMPORT_OK = False
+get_e5_word_embedding = None
+e5_cosine_sim = None
+get_e5_model = None
+
 try:
-    from .e5_model import get_e5_word_embedding, e5_cosine_sim, is_e5_loaded
-except Exception:
+    from .e5_model import (
+        get_e5_word_embedding as _gee,
+        e5_cosine_sim as _ecs,
+        get_e5_model as _gem,
+    )
+    get_e5_word_embedding = _gee
+    e5_cosine_sim = _ecs
+    get_e5_model = _gem
+    _E5_IMPORT_OK = True
+    logger.info("[L1.5/v3] E5 module imported via relative path")
+except Exception as e_rel:
+    logger.warning(f"[L1.5/v3] relative import of e5_model failed: {e_rel}")
     try:
-        from e5_model import get_e5_word_embedding, e5_cosine_sim, is_e5_loaded
-    except Exception:
-        def get_e5_word_embedding(w): return None
-        def e5_cosine_sim(a, b): return 0.0
-        def is_e5_loaded(): return False
+        from e5_model import (
+            get_e5_word_embedding as _gee,
+            e5_cosine_sim as _ecs,
+            get_e5_model as _gem,
+        )
+        get_e5_word_embedding = _gee
+        e5_cosine_sim = _ecs
+        get_e5_model = _gem
+        _E5_IMPORT_OK = True
+        logger.info("[L1.5/v3] E5 module imported via absolute path")
+    except Exception as e_abs:
+        logger.error(f"[L1.5/v3] absolute import of e5_model also failed: {e_abs}")
+        logger.error("[L1.5/v3] E5 unavailable — semantic axes will use only substring/lemma/ruwordnet/neighbors")
+
+        def get_e5_word_embedding(w):
+            return None
+
+        def e5_cosine_sim(a, b):
+            return 0.0
+
+        def get_e5_model():
+            return None
 
 # ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
 COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
@@ -248,7 +284,9 @@ def _prove_object(
             return True, f'ruwordnet:{lem}'
 
     # 4. E5 hyponym (cos≥0.78 + в neighbors)
-    if is_e5_loaded() and object_neighbors:
+    # ВАЖНО: вызываем get_e5_word_embedding напрямую — он сам лениво загрузит модель.
+    # Никаких is_e5_loaded() guard — иначе chicken-egg (модель никогда не грузится).
+    if object_neighbors:
         anchor_emb = get_e5_word_embedding(object_anchor)
         if anchor_emb is not None:
             best_cos = 0.0
@@ -309,27 +347,26 @@ def _prove_action(
             return True, f'ruwordnet:{lem}'
 
     # 4. E5 synonym (cos≥0.85, без neighbors — higher bar)
-    if is_e5_loaded():
-        anchor_emb = get_e5_word_embedding(action_anchor)
-        if anchor_emb is not None:
-            best_cos = 0.0
-            best_lem = None
-            for p, lem in zip(kw_parses, kw_lemmas):
-                if p is None or lem is None:
-                    continue
-                if p.tag.POS not in {'NOUN', 'VERB', 'INFN'}:
-                    continue
-                if lem == action_anchor:
-                    continue
-                cand_emb = get_e5_word_embedding(lem)
-                if cand_emb is None:
-                    continue
-                cos = e5_cosine_sim(anchor_emb, cand_emb)
-                if cos > best_cos:
-                    best_cos = cos
-                    best_lem = lem
-            if best_lem and best_cos >= COS_ACTION_HIGH:
-                return True, f'action_syn:{best_lem}({best_cos:.2f})'
+    anchor_emb = get_e5_word_embedding(action_anchor)
+    if anchor_emb is not None:
+        best_cos = 0.0
+        best_lem = None
+        for p, lem in zip(kw_parses, kw_lemmas):
+            if p is None or lem is None:
+                continue
+            if p.tag.POS not in {'NOUN', 'VERB', 'INFN'}:
+                continue
+            if lem == action_anchor:
+                continue
+            cand_emb = get_e5_word_embedding(lem)
+            if cand_emb is None:
+                continue
+            cos = e5_cosine_sim(anchor_emb, cand_emb)
+            if cos > best_cos:
+                best_cos = cos
+                best_lem = lem
+        if best_lem and best_cos >= COS_ACTION_HIGH:
+            return True, f'action_syn:{best_lem}({best_cos:.2f})'
 
     return False, 'no_action_proof'
 
@@ -369,6 +406,26 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     if not grey_keywords:
         logger.info("[L1.5/v3] empty GREY input — nothing to do")
         return prev_result
+
+    # ── E5 warmup + диагностика. Грузим модель один раз ДО прогона.
+    # Без warmup — chicken-egg, модель не загрузится никогда.
+    e5_status = "DISABLED (import failed)"
+    if _E5_IMPORT_OK:
+        try:
+            model = get_e5_model()
+            if model is not None:
+                # Прогрев на тест-слове чтобы убедиться что embed работает
+                test_emb = get_e5_word_embedding("тест")
+                if test_emb is not None:
+                    e5_status = f"OK (dim={len(test_emb)})"
+                else:
+                    e5_status = "LOADED but embed returned None"
+            else:
+                e5_status = "FAILED (get_e5_model returned None)"
+        except Exception as e:
+            e5_status = f"ERROR: {e}"
+    logger.info(f"[L1.5/v3] E5 status: {e5_status}")
+    logger.info(f"[L1.5/v3] RuWordNet status: {'OK' if _rwn is not None else 'DISABLED'}")
 
     # ── Парсинг seed
     seed_struct = _extract_seed_structure(seed)
