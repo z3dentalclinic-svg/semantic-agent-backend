@@ -93,6 +93,7 @@ except Exception as e_rel:
 # ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
 COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
 COS_ACTION_HIGH = 0.85    # порог cos для синонимов action (без neighbors, выше)
+COS_GAP_MIN = 0.15        # минимальная разница (cos_obj - cos_act) — отсекает атрибуты процесса
 NEIGHBOR_WINDOW = 2
 NEIGHBOR_MIN_FREQ = 2
 
@@ -267,14 +268,19 @@ def _prove_object(
     object_neighbors: Set[str],
     object_synonyms: Set[str],
     excluded_lemmas: Set[str],
+    action_anchor: Optional[str],
+    seed_content_lemmas: Set[str],
 ) -> Tuple[bool, dict]:
     """
     Возвращает (proven, diag).
     diag = {
         'method': 'substring|lemma|ruwordnet|hyponym|abbrev_pos0|none',
         'matched_lemma': str | None,
-        'best_cos': float,           # лучший cos если E5 запускался, иначе None
-        'all_cos': [{'lemma':..., 'cos':..., 'in_neighbors':bool}, ...],
+        'best_cos': float,           # cos к object_anchor у лучшего кандидата
+        'best_cos_act': float,       # cos к action_anchor у того же кандидата
+        'best_gap': float,           # best_cos - best_cos_act
+        'all_cos': [{'lemma':..., 'cos_obj':..., 'cos_act':..., 'gap':...,
+                     'in_neighbors':bool, 'in_seed':bool}, ...],
         'reason': human-readable
     }
     """
@@ -282,6 +288,8 @@ def _prove_object(
         'method': 'none',
         'matched_lemma': None,
         'best_cos': None,
+        'best_cos_act': None,
+        'best_gap': None,
         'all_cos': [],
         'reason': '',
     }
@@ -316,12 +324,20 @@ def _prove_object(
             diag['reason'] = f'ruwordnet:{lem}'
             return True, diag
 
-    # 4. E5 hyponym (cos≥COS_OBJECT_HIGH + в neighbors). Считаем cos для ВСЕХ NOUN
-    # независимо от neighbors-фильтра — пишем в all_cos для диагностики.
+    # 4. E5 hyponym с GAP-тестом.
+    # Для каждого NOUN-кандидата считаем cos и к object_anchor и к action_anchor.
+    # Гипоним object имеет ВЫСОКИЙ cos_obj и НИЗКИЙ cos_act → большой gap.
+    # Атрибут процесса (цена, отзыв, оплата) имеет высокий cos к обоим → маленький gap → skip.
+    # BYPASS: если лемма из seed_content_lemmas — принимаем сразу (не атрибут seed-юзера).
     anchor_emb = get_e5_word_embedding(object_anchor)
+    action_emb = get_e5_word_embedding(action_anchor) if action_anchor else None
+
     if anchor_emb is not None:
-        best_cos_overall = 0.0
+        best_score = -1.0  # ранжируем по gap
         best_lem_overall = None
+        best_cos_obj = 0.0
+        best_cos_act = 0.0
+
         for p, lem in zip(kw_parses, kw_lemmas):
             if p is None or lem is None:
                 continue
@@ -332,30 +348,83 @@ def _prove_object(
             cand_emb = get_e5_word_embedding(lem)
             if cand_emb is None:
                 continue
-            cos = e5_cosine_sim(anchor_emb, cand_emb)
+            cos_obj = e5_cosine_sim(anchor_emb, cand_emb)
+            cos_act = e5_cosine_sim(action_emb, cand_emb) if action_emb is not None else 0.0
+            gap = cos_obj - cos_act
             in_n = lem in object_neighbors
-            diag['all_cos'].append({'lemma': lem, 'cos': round(cos, 3), 'in_neighbors': in_n})
-            # лучший cos среди тех что в neighbors
-            if in_n and cos > best_cos_overall:
-                best_cos_overall = cos
+            in_seed = lem in seed_content_lemmas
+
+            diag['all_cos'].append({
+                'lemma': lem,
+                'cos_obj': round(cos_obj, 3),
+                'cos_act': round(cos_act, 3),
+                'gap': round(gap, 3),
+                'in_neighbors': in_n,
+                'in_seed': in_seed,
+            })
+
+            # BYPASS для лемм из seed: принимаем независимо от gap
+            if in_seed and cos_obj >= COS_OBJECT_HIGH:
+                if cos_obj > best_score:
+                    best_score = cos_obj
+                    best_lem_overall = lem
+                    best_cos_obj = cos_obj
+                    best_cos_act = cos_act
+                continue
+
+            # Обычная проверка: cos≥порог, в neighbors, gap≥COS_GAP_MIN
+            if not in_n:
+                continue
+            if cos_obj < COS_OBJECT_HIGH:
+                continue
+            if gap < COS_GAP_MIN:
+                continue
+
+            if gap > best_score:
+                best_score = gap
                 best_lem_overall = lem
-        diag['best_cos'] = round(best_cos_overall, 3) if best_lem_overall else None
-        if best_lem_overall and best_cos_overall >= COS_OBJECT_HIGH:
+                best_cos_obj = cos_obj
+                best_cos_act = cos_act
+
+        if best_lem_overall:
+            diag['best_cos'] = round(best_cos_obj, 3)
+            diag['best_cos_act'] = round(best_cos_act, 3)
+            diag['best_gap'] = round(best_cos_obj - best_cos_act, 3)
             diag['method'] = 'hyponym'
             diag['matched_lemma'] = best_lem_overall
-            diag['reason'] = f'hyponym:{best_lem_overall}({best_cos_overall:.2f})'
+            diag['reason'] = (
+                f'hyponym:{best_lem_overall}'
+                f'(obj={best_cos_obj:.2f},act={best_cos_act:.2f},gap={best_cos_obj-best_cos_act:+.2f})'
+            )
             return True, diag
 
-    # 5. abbrev_pos0
+    # 5. abbrev_pos0 — короткое NOUN на pos 0 + в neighbors + gap-тест против action
+    # (без gap может пропустить атрибуты типа "цена" в ключе "цены доставки").
     if kw_parses and kw_parses[0] is not None:
         p0 = kw_parses[0]
         lem0 = kw_lemmas[0]
         if p0.tag.POS == 'NOUN' and lem0 and len(kw_tokens[0]) <= 4:
             if lem0 in object_neighbors and lem0 not in excluded_lemmas:
-                diag['method'] = 'abbrev_pos0'
-                diag['matched_lemma'] = lem0
-                diag['reason'] = f'abbrev_pos0:{lem0}'
-                return True, diag
+                # gap-тест: проверяем что лемма ближе к object чем к action
+                cand_emb0 = get_e5_word_embedding(lem0)
+                if cand_emb0 is not None and anchor_emb is not None:
+                    cos_obj0 = e5_cosine_sim(anchor_emb, cand_emb0)
+                    cos_act0 = (e5_cosine_sim(action_emb, cand_emb0)
+                                if action_emb is not None else 0.0)
+                    if (cos_obj0 - cos_act0) >= COS_GAP_MIN or lem0 in seed_content_lemmas:
+                        diag['method'] = 'abbrev_pos0'
+                        diag['matched_lemma'] = lem0
+                        diag['reason'] = (
+                            f'abbrev_pos0:{lem0}'
+                            f'(obj={cos_obj0:.2f},act={cos_act0:.2f})'
+                        )
+                        return True, diag
+                else:
+                    # без E5 — старая логика (но это редко: E5 должен работать)
+                    diag['method'] = 'abbrev_pos0'
+                    diag['matched_lemma'] = lem0
+                    diag['reason'] = f'abbrev_pos0:{lem0}(no_e5)'
+                    return True, diag
 
     diag['reason'] = 'no_object_proof'
     return False, diag
@@ -574,7 +643,7 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         # ОСИ
         obj_ok, obj_diag = _prove_object(
             tokens, lemmas, parses, object_anchor, object_neighbors, object_synonyms,
-            excluded_lemmas
+            excluded_lemmas, action_anchor, set(content_lemmas)
         )
         act_ok, act_diag = _prove_action(
             tokens, lemmas, parses, action_anchor, action_synonyms
