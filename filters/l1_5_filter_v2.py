@@ -208,12 +208,16 @@ def _extract_seed_structure(seed: str) -> Dict[str, Any]:
 def _build_object_neighbors(
     l0_valid_keywords: List[str],
     object_anchor: str,
+    excluded_lemmas: Set[str],
     window: int = NEIGHBOR_WINDOW,
     min_freq: int = NEIGHBOR_MIN_FREQ,
 ) -> Set[str]:
     """
     Леммы NOUN которые встречались в окне ±window от object_anchor
     минимум в min_freq L0_VALID ключах.
+
+    excluded_lemmas — содержательные леммы seed (action_anchor, others),
+    их исключаем из neighbors, чтобы action не пролезал как object_hyponym.
     """
     if _morph is None or not object_anchor:
         return set()
@@ -244,7 +248,7 @@ def _build_object_neighbors(
                 if p is None or p.tag.POS != 'NOUN':
                     continue
                 lem = p.normal_form
-                if not lem or lem == object_anchor:
+                if not lem or lem == object_anchor or lem in excluded_lemmas:
                     continue
                 seen_in_kw.add(lem)
         for lem in seen_in_kw:
@@ -262,61 +266,99 @@ def _prove_object(
     object_anchor: Optional[str],
     object_neighbors: Set[str],
     object_synonyms: Set[str],
-) -> Tuple[bool, str]:
-    """Возвращает (proven, reason). Если object_anchor=None — ось не нужна."""
+    excluded_lemmas: Set[str],
+) -> Tuple[bool, dict]:
+    """
+    Возвращает (proven, diag).
+    diag = {
+        'method': 'substring|lemma|ruwordnet|hyponym|abbrev_pos0|none',
+        'matched_lemma': str | None,
+        'best_cos': float,           # лучший cos если E5 запускался, иначе None
+        'all_cos': [{'lemma':..., 'cos':..., 'in_neighbors':bool}, ...],
+        'reason': human-readable
+    }
+    """
+    diag = {
+        'method': 'none',
+        'matched_lemma': None,
+        'best_cos': None,
+        'all_cos': [],
+        'reason': '',
+    }
+
     if not object_anchor:
-        return True, 'no_object_in_seed'
+        diag['method'] = 'no_object_in_seed'
+        diag['reason'] = 'no_object_in_seed'
+        return True, diag
 
     kw_low = ' '.join(kw_tokens)
 
     # 1. substring
     if object_anchor in kw_low:
-        return True, f'substring:{object_anchor}'
+        diag['method'] = 'substring'
+        diag['matched_lemma'] = object_anchor
+        diag['reason'] = f'substring:{object_anchor}'
+        return True, diag
 
     # 2. прямая лемма
     for lem in kw_lemmas:
         if lem == object_anchor:
-            return True, f'lemma:{object_anchor}'
+            diag['method'] = 'lemma'
+            diag['matched_lemma'] = object_anchor
+            diag['reason'] = f'lemma:{object_anchor}'
+            return True, diag
 
     # 3. RuWordNet synonym
     for lem in kw_lemmas:
         if lem and lem in object_synonyms:
-            return True, f'ruwordnet:{lem}'
+            diag['method'] = 'ruwordnet'
+            diag['matched_lemma'] = lem
+            diag['reason'] = f'ruwordnet:{lem}'
+            return True, diag
 
-    # 4. E5 hyponym (cos≥0.78 + в neighbors)
-    # ВАЖНО: вызываем get_e5_word_embedding напрямую — он сам лениво загрузит модель.
-    # Никаких is_e5_loaded() guard — иначе chicken-egg (модель никогда не грузится).
-    if object_neighbors:
-        anchor_emb = get_e5_word_embedding(object_anchor)
-        if anchor_emb is not None:
-            best_cos = 0.0
-            best_lem = None
-            for p, lem in zip(kw_parses, kw_lemmas):
-                if p is None or lem is None:
-                    continue
-                if p.tag.POS != 'NOUN':
-                    continue
-                if lem == object_anchor or lem not in object_neighbors:
-                    continue
-                cand_emb = get_e5_word_embedding(lem)
-                if cand_emb is None:
-                    continue
-                cos = e5_cosine_sim(anchor_emb, cand_emb)
-                if cos > best_cos:
-                    best_cos = cos
-                    best_lem = lem
-            if best_lem and best_cos >= COS_OBJECT_HIGH:
-                return True, f'hyponym:{best_lem}({best_cos:.2f})'
+    # 4. E5 hyponym (cos≥COS_OBJECT_HIGH + в neighbors). Считаем cos для ВСЕХ NOUN
+    # независимо от neighbors-фильтра — пишем в all_cos для диагностики.
+    anchor_emb = get_e5_word_embedding(object_anchor)
+    if anchor_emb is not None:
+        best_cos_overall = 0.0
+        best_lem_overall = None
+        for p, lem in zip(kw_parses, kw_lemmas):
+            if p is None or lem is None:
+                continue
+            if p.tag.POS != 'NOUN':
+                continue
+            if lem == object_anchor or lem in excluded_lemmas:
+                continue
+            cand_emb = get_e5_word_embedding(lem)
+            if cand_emb is None:
+                continue
+            cos = e5_cosine_sim(anchor_emb, cand_emb)
+            in_n = lem in object_neighbors
+            diag['all_cos'].append({'lemma': lem, 'cos': round(cos, 3), 'in_neighbors': in_n})
+            # лучший cos среди тех что в neighbors
+            if in_n and cos > best_cos_overall:
+                best_cos_overall = cos
+                best_lem_overall = lem
+        diag['best_cos'] = round(best_cos_overall, 3) if best_lem_overall else None
+        if best_lem_overall and best_cos_overall >= COS_OBJECT_HIGH:
+            diag['method'] = 'hyponym'
+            diag['matched_lemma'] = best_lem_overall
+            diag['reason'] = f'hyponym:{best_lem_overall}({best_cos_overall:.2f})'
+            return True, diag
 
-    # 5. abbrev_pos0: NOUN ≤4 буквы на pos 0 + в neighbors (slot match для аббревиатур)
+    # 5. abbrev_pos0
     if kw_parses and kw_parses[0] is not None:
         p0 = kw_parses[0]
         lem0 = kw_lemmas[0]
         if p0.tag.POS == 'NOUN' and lem0 and len(kw_tokens[0]) <= 4:
-            if lem0 in object_neighbors:
-                return True, f'abbrev_pos0:{lem0}'
+            if lem0 in object_neighbors and lem0 not in excluded_lemmas:
+                diag['method'] = 'abbrev_pos0'
+                diag['matched_lemma'] = lem0
+                diag['reason'] = f'abbrev_pos0:{lem0}'
+                return True, diag
 
-    return False, 'no_object_proof'
+    diag['reason'] = 'no_object_proof'
+    return False, diag
 
 
 def _prove_action(
@@ -325,28 +367,47 @@ def _prove_action(
     kw_parses: List[Any],
     action_anchor: Optional[str],
     action_synonyms: Set[str],
-) -> Tuple[bool, str]:
-    """Возвращает (proven, reason). Если action_anchor=None — ось не нужна."""
+) -> Tuple[bool, dict]:
+    """Возвращает (proven, diag). Структура diag — как у _prove_object."""
+    diag = {
+        'method': 'none',
+        'matched_lemma': None,
+        'best_cos': None,
+        'all_cos': [],
+        'reason': '',
+    }
+
     if not action_anchor:
-        return True, 'no_action_in_seed'
+        diag['method'] = 'no_action_in_seed'
+        diag['reason'] = 'no_action_in_seed'
+        return True, diag
 
     kw_low = ' '.join(kw_tokens)
 
     # 1. substring
     if action_anchor in kw_low:
-        return True, f'substring:{action_anchor}'
+        diag['method'] = 'substring'
+        diag['matched_lemma'] = action_anchor
+        diag['reason'] = f'substring:{action_anchor}'
+        return True, diag
 
     # 2. прямая лемма
     for lem in kw_lemmas:
         if lem == action_anchor:
-            return True, f'lemma:{action_anchor}'
+            diag['method'] = 'lemma'
+            diag['matched_lemma'] = action_anchor
+            diag['reason'] = f'lemma:{action_anchor}'
+            return True, diag
 
     # 3. RuWordNet synonym
     for lem in kw_lemmas:
         if lem and lem in action_synonyms:
-            return True, f'ruwordnet:{lem}'
+            diag['method'] = 'ruwordnet'
+            diag['matched_lemma'] = lem
+            diag['reason'] = f'ruwordnet:{lem}'
+            return True, diag
 
-    # 4. E5 synonym (cos≥0.85, без neighbors — higher bar)
+    # 4. E5 synonym (cos≥COS_ACTION_HIGH, без neighbors)
     anchor_emb = get_e5_word_embedding(action_anchor)
     if anchor_emb is not None:
         best_cos = 0.0
@@ -362,13 +423,19 @@ def _prove_action(
             if cand_emb is None:
                 continue
             cos = e5_cosine_sim(anchor_emb, cand_emb)
+            diag['all_cos'].append({'lemma': lem, 'cos': round(cos, 3)})
             if cos > best_cos:
                 best_cos = cos
                 best_lem = lem
+        diag['best_cos'] = round(best_cos, 3) if best_lem else None
         if best_lem and best_cos >= COS_ACTION_HIGH:
-            return True, f'action_syn:{best_lem}({best_cos:.2f})'
+            diag['method'] = 'action_syn'
+            diag['matched_lemma'] = best_lem
+            diag['reason'] = f'action_syn:{best_lem}({best_cos:.2f})'
+            return True, diag
 
-    return False, 'no_action_proof'
+    diag['reason'] = 'no_action_proof'
+    return False, diag
 
 
 def _prove_other_lemma(
@@ -440,14 +507,25 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         if lem != action_anchor and lem != object_anchor
     ]
 
+    # excluded_lemmas: action + others. Эти леммы не должны ловиться
+    # как object_hyponym (action часто в neighbors с высокой частотой —
+    # риск что action_anchor пролезет как object).
+    excluded_lemmas: Set[str] = set()
+    if action_anchor:
+        excluded_lemmas.add(action_anchor)
+    excluded_lemmas.update(other_lemmas)
+
     logger.info(
         f"[L1.5/v3] seed={seed!r} action={action_anchor!r} object={object_anchor!r} "
-        f"other={other_lemmas} qualifier={qualifier!r}"
+        f"other={other_lemmas} qualifier={qualifier!r} excluded={excluded_lemmas}"
     )
 
     # ── Подготовка ресурсов
     l0_valid = prev_result.get('keywords', []) or []
-    object_neighbors = _build_object_neighbors(l0_valid, object_anchor) if object_anchor else set()
+    object_neighbors = (
+        _build_object_neighbors(l0_valid, object_anchor, excluded_lemmas)
+        if object_anchor else set()
+    )
     object_synonyms = _get_synonyms(object_anchor) if object_anchor else set()
     action_synonyms = _get_synonyms(action_anchor) if action_anchor else set()
     other_synonyms = {lem: _get_synonyms(lem) for lem in other_lemmas}
@@ -457,9 +535,12 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         f"obj_syn={len(object_synonyms)} act_syn={len(action_synonyms)}"
     )
 
-    # ── Прогон GREY
+    # ── Прогон GREY.
+    # _l1_5_trace — только TRASH (для UI, чтобы GREY не показывались как заблокированные).
+    # _l1_5_diag  — полный диагностический trace по всем ключам (для калибровки порогов).
     new_grey: List[str] = []
     trash_traces: List[dict] = []
+    full_diag: List[dict] = []
 
     for kw in grey_keywords:
         tokens = _tokenize(kw)
@@ -468,13 +549,22 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
                 'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
                 'reason': 'empty_tokens', 'signals': [],
             })
+            full_diag.append({
+                'keyword': kw, 'label': 'TRASH',
+                'reason': 'empty_tokens', 'obj': None, 'act': None,
+            })
             continue
 
         # QUALIFIER_HARD
         if qualifier and qualifier not in tokens:
+            r = f'qualifier_missing:{qualifier}'
             trash_traces.append({
                 'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
-                'reason': f'qualifier_missing:{qualifier}', 'signals': [],
+                'reason': r, 'signals': [],
+            })
+            full_diag.append({
+                'keyword': kw, 'label': 'TRASH',
+                'reason': r, 'obj': None, 'act': None,
             })
             continue
 
@@ -482,45 +572,66 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         lemmas = [p.normal_form if p else None for p in parses]
 
         # ОСИ
-        obj_ok, obj_reason = _prove_object(
-            tokens, lemmas, parses, object_anchor, object_neighbors, object_synonyms
+        obj_ok, obj_diag = _prove_object(
+            tokens, lemmas, parses, object_anchor, object_neighbors, object_synonyms,
+            excluded_lemmas
         )
-        act_ok, act_reason = _prove_action(
+        act_ok, act_diag = _prove_action(
             tokens, lemmas, parses, action_anchor, action_synonyms
         )
 
-        # OTHER (для 3+ word seeds)
+        # OTHER (для 3+ word seeds) — без cos, просто substring/lemma/synonym
         other_results: List[Tuple[bool, str]] = []
         for lem in other_lemmas:
             ok, reason = _prove_other_lemma(lem, tokens, lemmas, other_synonyms.get(lem, set()))
             other_results.append((ok, reason))
-
         all_other_ok = all(ok for ok, _ in other_results)
+        other_reasons = [r for _, r in other_results]
 
         if obj_ok and act_ok and all_other_ok:
-            # PASS → keywords_grey. В trace НЕ пишем (как остальные фильтры).
             new_grey.append(kw)
+            label = 'GREY'
+            reason = 'all_axes_proven'
         else:
+            label = 'TRASH'
             failed: List[str] = []
             if not obj_ok:
-                failed.append(f'obj={obj_reason}')
+                failed.append('obj')
             if not act_ok:
-                failed.append(f'act={act_reason}')
-            for ok, reason in other_results:
+                failed.append('act')
+            for ok, r in other_results:
                 if not ok:
-                    failed.append(f'other={reason}')
+                    failed.append(f'other:{r}')
+            reason = 'axis_unproven:' + ','.join(failed)
+            # короткие signals для UI
+            ui_signals = [f'obj={obj_diag["reason"]}', f'act={act_diag["reason"]}']
+            for r in other_reasons:
+                ui_signals.append(f'other={r}')
             trash_traces.append({
                 'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
-                'reason': 'axis_unproven', 'signals': failed,
+                'reason': reason, 'signals': ui_signals,
             })
+
+        # полный диагностический trace для калибровки
+        full_diag.append({
+            'keyword': kw,
+            'label': label,
+            'reason': reason,
+            'obj': obj_diag,           # method, matched_lemma, best_cos, all_cos
+            'act': act_diag,           # same
+            'other': other_reasons,
+        })
 
     # ── Обновление prev_result
     prev_result['keywords_grey'] = new_grey
     prev_result['keywords_grey_count'] = len(new_grey)
     prev_result['_l1_5_trace'].extend(trash_traces)
+    prev_result.setdefault('_l1_5_diag', []).extend(full_diag)
 
+    grey_n = sum(1 for t in full_diag if t['label'] == 'GREY')
+    trash_n = sum(1 for t in full_diag if t['label'] == 'TRASH')
     logger.info(
-        f"[L1.5/v3] {len(grey_keywords)} → GREY={len(new_grey)}, TRASH={len(trash_traces)}"
+        f"[L1.5/v3] {len(grey_keywords)} → GREY={grey_n}, TRASH={trash_n}"
     )
 
     return prev_result
