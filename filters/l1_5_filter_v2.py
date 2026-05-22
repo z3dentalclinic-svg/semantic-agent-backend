@@ -176,6 +176,7 @@ _NON_CONTENT_POS = {
 
 # Global parses cache (uniq tokens per request)
 _parses_cache: Dict[str, Any] = {}
+_all_parses_cache: Dict[str, List[Any]] = {}
 
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────
@@ -206,36 +207,189 @@ def _parse_top(word: str):
     return p
 
 
+def _parse_all(word: str) -> List[Any]:
+    """Все pymorphy парсы слова. Нужно для устойчивости к омонимам:
+    например 'цветов' имеет парсы 'цвет' (окраска) и 'цветок' (растение)."""
+    if _morph is None:
+        return []
+    if word in _all_parses_cache:
+        return _all_parses_cache[word]
+    parses = _morph.parse(word) or []
+    _all_parses_cache[word] = parses
+    return parses
+
+
+def _token_lemmas(word: str, pos_filter: Optional[Set[str]] = None) -> Set[str]:
+    """Все возможные normal_form для токена, с опциональным POS-фильтром.
+
+    Решает проблему омонимов: 'цветов' -> {'цвет', 'цветок'}. Все сравнения
+    лемм должны идти через эту функцию, не через _parse_top().normal_form.
+    """
+    out: Set[str] = set()
+    for p in _parse_all(word):
+        if p.normal_form is None:
+            continue
+        if pos_filter is None or p.tag.POS in pos_filter:
+            out.add(p.normal_form)
+    return out
+
+
 def _get_synonyms(lemma: str) -> Set[str]:
-    """Synonyms из RuWordNet (если доступен)."""
+    """Лексика близкая к лемме из RuWordNet (если доступен).
+
+    Берём:
+    1. Synonyms — леммы того же synset (доставка ↔ привоз)
+    2. Hyponyms — дочерние synset (цветок → роза, тюльпан, букет, эустома)
+    3. POS-synonyms — мост между частями речи (доставка ↔ доставлять)
+    4. Derivations — словообразовательные пары на уровне sense
+       (доставлять → доставка, доставщик)
+
+    Расширение synset.senses одного синсета само по себе бесполезно для нашей
+    задачи (для 'цветок' оно даёт {цвет} — близкий smysl, но не гипонимы).
+    Главную ценность дают hyponyms.
+    """
     if _rwn is None or not lemma:
         return set()
     try:
-        syns = set()
+        syns: Set[str] = set()
         senses = _rwn.get_senses(lemma)
         for sense in senses:
+            # 1. Synonyms (одного synset)
             for s in sense.synset.senses:
                 if s.lemma and s.lemma.lower() != lemma:
                     syns.add(s.lemma.lower())
+            # 2. Hyponyms (дочерние synset — роза для цветок)
+            for hypo_synset in sense.synset.hyponyms:
+                for s in hypo_synset.senses:
+                    if s.lemma:
+                        syns.add(s.lemma.lower())
+            # 3. POS-synonyms (мост между частями речи)
+            for ps_synset in sense.synset.pos_synonyms:
+                for s in ps_synset.senses:
+                    if s.lemma and s.lemma.lower() != lemma:
+                        syns.add(s.lemma.lower())
+            # 4. Derivations (sense-level словообразование)
+            for deriv in sense.derivations:
+                if deriv.lemma and deriv.lemma.lower() != lemma:
+                    syns.add(deriv.lemma.lower())
         return syns
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[L1.5/v3] _get_synonyms({lemma!r}) failed: {e}")
         return set()
 
 
+def _has_verb_derivation(lemma: str) -> bool:
+    """Есть ли у леммы VERB/INFN-производное в RuWordNet?
+
+    Используется для определения action-noun: отглагольные существительные
+    (доставка, ремонт, продажа) имеют verb-counterpart, природные предметы
+    (цветок, квартира) — нет.
+
+    Возвращает False если RuWordNet недоступен → caller использует fallback.
+    """
+    if _rwn is None or not lemma:
+        return False
+    try:
+        senses = _rwn.get_senses(lemma)
+        for sense in senses:
+            # Проверяем POS-synonyms (synset мостит части речи)
+            for ps_synset in sense.synset.pos_synonyms:
+                pos = (ps_synset.part_of_speech or '').upper()
+                if pos.startswith('V'):  # V / VERB
+                    return True
+            # Проверяем sense-level derivations
+            for deriv in sense.derivations:
+                if deriv.synset is None:
+                    continue
+                pos = (deriv.synset.part_of_speech or '').upper()
+                if pos.startswith('V'):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 # ─── Разбор seed ─────────────────────────────────────────────────────────
+
+def _pick_token_parse(token: str) -> Optional[Any]:
+    """Выбор parse для одного токена seed с учётом RuWordNet.
+
+    Pymorphy top даёт самый частотный смысл. Для омонимов (цветов →
+    цвет/цветок, замок → замок/замок) этого недостаточно: для слова 'цветов'
+    оба парса имеют равный score 0.5 и top — недетерминированный.
+
+    Эвристика выбора:
+      1. Если RWN доступен и среди парсов есть несколько NOUN с поддержкой
+         в RWN — выбираем тот у кого больше hyponyms. Это устойчивый признак
+         "конкретного" существительного (цветок имеет {роза, тюльпан, букет,
+         эустома, ...}, цвет-окраска имеет существенно меньше или 0).
+      2. Если только один NOUN с поддержкой — берём его.
+      3. Если RWN нет или ни один не в RWN — берём top content-парс.
+    """
+    parses = _parse_all(token)
+    if not parses:
+        return None
+
+    content_parses = [p for p in parses if _is_content_word(p)]
+    if not content_parses:
+        return parses[0]
+
+    if _rwn is not None:
+        # Собираем NOUN-парсы найденные в RWN с числом их hyponyms
+        rwn_noun_candidates: List[Tuple[Any, int]] = []
+        seen_lemmas: Set[str] = set()
+        for p in content_parses:
+            if p.tag.POS != 'NOUN':
+                continue
+            if p.normal_form in seen_lemmas:
+                continue
+            seen_lemmas.add(p.normal_form)
+            try:
+                senses = _rwn.get_senses(p.normal_form)
+            except Exception:
+                continue
+            if not senses:
+                continue
+            # Считаем суммарное число hyponyms по всем sense'ам
+            hypo_count = 0
+            try:
+                for sense in senses:
+                    for hypo in sense.synset.hyponyms:
+                        hypo_count += len(hypo.senses)
+            except Exception:
+                pass
+            rwn_noun_candidates.append((p, hypo_count))
+
+        if rwn_noun_candidates:
+            # Берём с максимальным hypo_count. Если ничья — первый в списке
+            # (parses уже отсортированы pymorphy по score).
+            rwn_noun_candidates.sort(key=lambda x: -x[1])
+            return rwn_noun_candidates[0][0]
+
+    # Fallback: top content parse
+    return content_parses[0]
+
 
 def _extract_seed_structure(seed: str) -> Dict[str, Any]:
     """
     Возвращает:
       content_lemmas: List[str] — все content-леммы seed
-      action_anchor:  Optional[str] — первая VERB/INFN или первое content NOUN
-      object_anchor:  Optional[str] — последнее content NOUN (отличное от action)
+      action_anchor:  Optional[str] — VERB/INFN или action-noun (отглагольный)
+      object_anchor:  Optional[str] — предметный NOUN
       qualifier:      Optional[str] — число из seed (если есть)
+
+    Выбор anchor'ов:
+    - action = первый VERB/INFN. Если нет — NOUN с verb-derivation в RWN
+      (доставка → доставлять, ремонт → ремонтировать). Это устойчиво к
+      порядку слов: "доставка цветов" и "цветов доставка" дадут одно.
+    - object = NOUN ≠ action, без verb-derivation если возможно.
+    - Fallback (если RWN недоступен) — позиционный: первый NOUN=action,
+      последний NOUN=object.
     """
     tokens = _tokenize(seed)
     content_parses = []
     for tok in tokens:
-        p = _parse_top(tok)
+        p = _pick_token_parse(tok)
         if p is None:
             continue
         if _is_content_word(p):
@@ -243,21 +397,46 @@ def _extract_seed_structure(seed: str) -> Dict[str, Any]:
 
     content_lemmas = [p.normal_form for p in content_parses]
 
-    # Action: первый VERB/INFN, иначе первый NOUN-кандидат
-    action_anchor = None
+    action_anchor: Optional[str] = None
+    object_anchor: Optional[str] = None
+
+    # 1. Явный VERB/INFN → action
     for p in content_parses:
         if p.tag.POS in {'VERB', 'INFN'}:
             action_anchor = p.normal_form
             break
-    if action_anchor is None and content_parses:
-        action_anchor = content_parses[0].normal_form
 
-    # Object: последний NOUN ≠ action
-    object_anchor = None
-    for p in reversed(content_parses):
-        if p.tag.POS == 'NOUN' and p.normal_form != action_anchor:
-            object_anchor = p.normal_form
-            break
+    # Только NOUN среди content-парсов
+    noun_parses = [p for p in content_parses if p.tag.POS == 'NOUN']
+
+    if action_anchor is None and noun_parses:
+        # 2. Action = NOUN с verb-derivation (отглагольный), если RWN доступен.
+        # Если несколько кандидатов с derivation — берём первый по позиции.
+        if _rwn is not None:
+            for p in noun_parses:
+                if _has_verb_derivation(p.normal_form):
+                    action_anchor = p.normal_form
+                    break
+
+        # 3. Fallback: первый NOUN
+        if action_anchor is None:
+            action_anchor = noun_parses[0].normal_form
+
+    # Object = NOUN ≠ action. Предпочитаем NOUN без verb-derivation
+    # (это "предметные" существительные: цветок, квартира). Если все NOUN
+    # отглагольные — берём последний ≠ action.
+    object_candidates = [p for p in noun_parses if p.normal_form != action_anchor]
+    if object_candidates:
+        non_action_noun = None
+        if _rwn is not None:
+            for p in object_candidates:
+                if not _has_verb_derivation(p.normal_form):
+                    non_action_noun = p
+                    break
+        if non_action_noun is not None:
+            object_anchor = non_action_noun.normal_form
+        else:
+            object_anchor = object_candidates[-1].normal_form
 
     # Single-content seed: единственная лемма = object, action=None
     if object_anchor is None and len(content_parses) == 1:
@@ -290,6 +469,11 @@ def _build_object_neighbors(
 
     excluded_lemmas — содержательные леммы seed (action_anchor, others),
     их исключаем из neighbors, чтобы action не пролезал как object_hyponym.
+
+    Match anchor → token идёт через ВСЕ возможные леммы токена (омонимия):
+    'цветов' → {цвет, цветок}, anchor='цветок' матчится. Substring-match
+    убран — он давал false positives на коротких anchor (для 'цвет'
+    срабатывал на 'соцветие', 'разноцветный', 'цветовой').
     """
     if _morph is None or not object_anchor:
         return set()
@@ -299,30 +483,33 @@ def _build_object_neighbors(
         tokens = _tokenize(kw)
         if not tokens:
             continue
-        parses = [_parse_top(t) for t in tokens]
-        lemmas = [p.normal_form if p else None for p in parses]
+        # Все леммы каждого токена (омонимия: цветов → {цвет, цветок}).
+        token_lemma_sets: List[Set[str]] = [_token_lemmas(t) for t in tokens]
+        # NOUN-леммы отдельно для соседей (фильтруем по POS).
+        token_noun_lemmas: List[Set[str]] = [
+            _token_lemmas(t, pos_filter={'NOUN'}) for t in tokens
+        ]
 
-        # позиции anchor (substring или лемма)
+        # позиции anchor: токен у которого среди возможных лемм есть anchor
         anchor_positions = [
-            i for i, (tok, lem) in enumerate(zip(tokens, lemmas))
-            if (object_anchor in tok) or (lem == object_anchor)
+            i for i, lem_set in enumerate(token_lemma_sets)
+            if object_anchor in lem_set
         ]
         if not anchor_positions:
             continue
 
-        # уникальные леммы NOUN в окне для этого kw (избегаем двойного счёта)
+        # уникальные леммы NOUN в окне для этого kw (избегаем двойного счёта).
+        # Для каждого токена-соседа берём ВСЕ его NOUN-леммы (омонимия даёт
+        # больше шансов матча в дальнейшем prove_object).
         seen_in_kw: Set[str] = set()
         for pos in anchor_positions:
             for j in range(max(0, pos - window), min(len(tokens), pos + window + 1)):
                 if j == pos:
                     continue
-                p = parses[j]
-                if p is None or p.tag.POS != 'NOUN':
-                    continue
-                lem = p.normal_form
-                if not lem or lem == object_anchor or lem in excluded_lemmas:
-                    continue
-                seen_in_kw.add(lem)
+                for lem in token_noun_lemmas[j]:
+                    if lem == object_anchor or lem in excluded_lemmas:
+                        continue
+                    seen_in_kw.add(lem)
         for lem in seen_in_kw:
             counter[lem] += 1
 
@@ -379,43 +566,49 @@ def _prove_object(
         diag['reason'] = f'substring:{object_anchor}'
         return True, diag
 
-    # 2. прямая лемма
-    for lem in kw_lemmas:
-        if lem == object_anchor:
+    # 2. прямая лемма (через ВСЕ парсы токена — омонимы).
+    #    'цветов' → {цвет, цветок}, anchor='цветок' → match.
+    for tok in kw_tokens:
+        if object_anchor in _token_lemmas(tok):
             diag['method'] = 'lemma'
             diag['matched_lemma'] = object_anchor
             diag['reason'] = f'lemma:{object_anchor}'
             return True, diag
 
-    # 3. RuWordNet synonym
-    for lem in kw_lemmas:
-        if lem and lem in object_synonyms:
-            diag['method'] = 'ruwordnet'
-            diag['matched_lemma'] = lem
-            diag['reason'] = f'ruwordnet:{lem}'
-            return True, diag
+    # 3. RuWordNet synonym/hyponym (через все леммы токена)
+    for tok in kw_tokens:
+        for lem in _token_lemmas(tok):
+            if lem in object_synonyms:
+                diag['method'] = 'ruwordnet'
+                diag['matched_lemma'] = lem
+                diag['reason'] = f'ruwordnet:{lem}'
+                return True, diag
 
-    # 4. E5 hyponym с GAP-тестом.
-    # Для каждого NOUN-кандидата считаем cos и к object_anchor и к action_anchor.
-    # Гипоним object имеет ВЫСОКИЙ cos_obj и НИЗКИЙ cos_act → большой gap.
-    # Атрибут процесса (цена, отзыв, оплата) имеет высокий cos к обоим → маленький gap → skip.
-    # BYPASS: если лемма из seed_content_lemmas — принимаем сразу (не атрибут seed-юзера).
+    # 4. E5 hyponym.
+    # GAP-тест откатан (правка 8): для гипонимов на коротких фразах
+    # cos_obj и cos_act близки (роза gap=0.029, букет gap=0.038) — gap не
+    # разделяет гипонимы от шума. Фильтр шума переносим на in_neighbors +
+    # cos_obj порог. Атрибуты процесса (цена, отзыв) обычно не попадают
+    # в neighbors object_anchor, что и должно их отсекать.
+    # BYPASS: лемма из seed_content_lemmas — принимаем без neighbors.
     anchor_emb = get_e5_word_embedding(object_anchor)
     action_emb = get_e5_word_embedding(action_anchor) if action_anchor else None
 
     if anchor_emb is not None:
-        best_score = -1.0  # ранжируем по gap
+        best_cos_obj = -1.0
         best_lem_overall = None
-        best_cos_obj = 0.0
-        best_cos_act = 0.0
+        best_cos_act_overall = 0.0
 
-        for p, lem in zip(kw_parses, kw_lemmas):
-            if p is None or lem is None:
-                continue
-            if p.tag.POS != 'NOUN':
-                continue
-            if lem == object_anchor or lem in excluded_lemmas:
-                continue
+        # Уникальные NOUN-леммы среди ВСЕХ парсов всех токенов keyword
+        # (омонимия: цветов → роза/цвет/цветок может оба парса дать).
+        cand_lemmas: Set[str] = set()
+        for tok in kw_tokens:
+            for lem in _token_lemmas(tok, pos_filter={'NOUN'}):
+                if lem == object_anchor or lem in excluded_lemmas:
+                    continue
+                cand_lemmas.add(lem)
+
+        for lem in cand_lemmas:
             cand_emb = get_e5_word_embedding(lem)
             if cand_emb is None:
                 continue
@@ -434,67 +627,50 @@ def _prove_object(
                 'in_seed': in_seed,
             })
 
-            # BYPASS для лемм из seed: принимаем независимо от gap
+            # BYPASS для лемм из seed (для 3+ word seeds где content_lemmas
+            # содержит "прочие" non-anchor слова).
             if in_seed and cos_obj >= COS_OBJECT_HIGH:
-                if cos_obj > best_score:
-                    best_score = cos_obj
-                    best_lem_overall = lem
+                if cos_obj > best_cos_obj:
                     best_cos_obj = cos_obj
-                    best_cos_act = cos_act
+                    best_lem_overall = lem
+                    best_cos_act_overall = cos_act
                 continue
 
-            # Обычная проверка: cos≥порог, в neighbors, gap≥COS_GAP_MIN
+            # Базовая проверка: cos выше порога + в L0_VALID neighbors.
             if not in_n:
                 continue
             if cos_obj < COS_OBJECT_HIGH:
                 continue
-            if gap < COS_GAP_MIN:
-                continue
 
-            if gap > best_score:
-                best_score = gap
-                best_lem_overall = lem
+            if cos_obj > best_cos_obj:
                 best_cos_obj = cos_obj
-                best_cos_act = cos_act
+                best_lem_overall = lem
+                best_cos_act_overall = cos_act
 
         if best_lem_overall:
             diag['best_cos'] = round(best_cos_obj, 3)
-            diag['best_cos_act'] = round(best_cos_act, 3)
-            diag['best_gap'] = round(best_cos_obj - best_cos_act, 3)
+            diag['best_cos_act'] = round(best_cos_act_overall, 3)
+            diag['best_gap'] = round(best_cos_obj - best_cos_act_overall, 3)
             diag['method'] = 'hyponym'
             diag['matched_lemma'] = best_lem_overall
             diag['reason'] = (
                 f'hyponym:{best_lem_overall}'
-                f'(obj={best_cos_obj:.2f},act={best_cos_act:.2f},gap={best_cos_obj-best_cos_act:+.2f})'
+                f'(obj={best_cos_obj:.2f},act={best_cos_act_overall:.2f})'
             )
             return True, diag
 
-    # 5. abbrev_pos0 — короткое NOUN на pos 0 + в neighbors + gap-тест против action
-    # (без gap может пропустить атрибуты типа "цена" в ключе "цены доставки").
+    # 5. abbrev_pos0 — короткое NOUN на pos 0 + в neighbors.
+    # GAP-тест откатан (см. метод 4). Защита от шума — neighbors-фильтр.
     if kw_parses and kw_parses[0] is not None:
         p0 = kw_parses[0]
-        lem0 = kw_lemmas[0]
-        if p0.tag.POS == 'NOUN' and lem0 and len(kw_tokens[0]) <= 4:
-            if lem0 in object_neighbors and lem0 not in excluded_lemmas:
-                # gap-тест: проверяем что лемма ближе к object чем к action
-                cand_emb0 = get_e5_word_embedding(lem0)
-                if cand_emb0 is not None and anchor_emb is not None:
-                    cos_obj0 = e5_cosine_sim(anchor_emb, cand_emb0)
-                    cos_act0 = (e5_cosine_sim(action_emb, cand_emb0)
-                                if action_emb is not None else 0.0)
-                    if (cos_obj0 - cos_act0) >= COS_GAP_MIN or lem0 in seed_content_lemmas:
-                        diag['method'] = 'abbrev_pos0'
-                        diag['matched_lemma'] = lem0
-                        diag['reason'] = (
-                            f'abbrev_pos0:{lem0}'
-                            f'(obj={cos_obj0:.2f},act={cos_act0:.2f})'
-                        )
-                        return True, diag
-                else:
-                    # без E5 — старая логика (но это редко: E5 должен работать)
+        # Берём все возможные NOUN-леммы первого токена (омонимы)
+        first_noun_lemmas = _token_lemmas(kw_tokens[0], pos_filter={'NOUN'})
+        if first_noun_lemmas and len(kw_tokens[0]) <= 4:
+            for lem0 in first_noun_lemmas:
+                if lem0 in object_neighbors and lem0 not in excluded_lemmas:
                     diag['method'] = 'abbrev_pos0'
                     diag['matched_lemma'] = lem0
-                    diag['reason'] = f'abbrev_pos0:{lem0}(no_e5)'
+                    diag['reason'] = f'abbrev_pos0:{lem0}'
                     return True, diag
 
     diag['reason'] = 'no_object_proof'
@@ -531,34 +707,36 @@ def _prove_action(
         diag['reason'] = f'substring:{action_anchor}'
         return True, diag
 
-    # 2. прямая лемма
-    for lem in kw_lemmas:
-        if lem == action_anchor:
+    # 2. прямая лемма (через ВСЕ парсы токена)
+    for tok in kw_tokens:
+        if action_anchor in _token_lemmas(tok):
             diag['method'] = 'lemma'
             diag['matched_lemma'] = action_anchor
             diag['reason'] = f'lemma:{action_anchor}'
             return True, diag
 
-    # 3. RuWordNet synonym
-    for lem in kw_lemmas:
-        if lem and lem in action_synonyms:
-            diag['method'] = 'ruwordnet'
-            diag['matched_lemma'] = lem
-            diag['reason'] = f'ruwordnet:{lem}'
-            return True, diag
+    # 3. RuWordNet synonym (через все парсы)
+    for tok in kw_tokens:
+        for lem in _token_lemmas(tok):
+            if lem in action_synonyms:
+                diag['method'] = 'ruwordnet'
+                diag['matched_lemma'] = lem
+                diag['reason'] = f'ruwordnet:{lem}'
+                return True, diag
 
     # 4. E5 synonym (cos≥COS_ACTION_HIGH, без neighbors)
     anchor_emb = get_e5_word_embedding(action_anchor)
     if anchor_emb is not None:
         best_cos = 0.0
         best_lem = None
-        for p, lem in zip(kw_parses, kw_lemmas):
-            if p is None or lem is None:
-                continue
-            if p.tag.POS not in {'NOUN', 'VERB', 'INFN'}:
-                continue
-            if lem == action_anchor:
-                continue
+        # Кандидаты — все леммы NOUN/VERB/INFN среди парсов токенов
+        cand_lemmas: Set[str] = set()
+        for tok in kw_tokens:
+            for lem in _token_lemmas(tok, pos_filter={'NOUN', 'VERB', 'INFN'}):
+                if lem != action_anchor:
+                    cand_lemmas.add(lem)
+
+        for lem in cand_lemmas:
             cand_emb = get_e5_word_embedding(lem)
             if cand_emb is None:
                 continue
@@ -591,12 +769,13 @@ def _prove_other_lemma(
     kw_low = ' '.join(kw_tokens)
     if lemma in kw_low:
         return True, f'substring:{lemma}'
-    for lem in kw_lemmas:
-        if lem == lemma:
+    for tok in kw_tokens:
+        token_lems = _token_lemmas(tok)
+        if lemma in token_lems:
             return True, f'lemma:{lemma}'
-    for lem in kw_lemmas:
-        if lem and lem in synonyms:
-            return True, f'ruwordnet:{lem}'
+        if token_lems & synonyms:
+            matched = next(iter(token_lems & synonyms))
+            return True, f'ruwordnet:{matched}'
     return False, f'no_proof:{lemma}'
 
 
