@@ -123,16 +123,19 @@ _E5_IMPORT_OK = False
 get_e5_word_embedding = None
 e5_cosine_sim = None
 get_e5_model = None
+warm_e5_word_cache = None
 
 try:
     from .e5_model import (
         get_e5_word_embedding as _gee,
         e5_cosine_sim as _ecs,
         get_e5_model as _gem,
+        warm_e5_word_cache as _wwc,
     )
     get_e5_word_embedding = _gee
     e5_cosine_sim = _ecs
     get_e5_model = _gem
+    warm_e5_word_cache = _wwc
     _E5_IMPORT_OK = True
     logger.info("[L1.5/v3] E5 module imported via relative path")
 except Exception as e_rel:
@@ -142,10 +145,12 @@ except Exception as e_rel:
             get_e5_word_embedding as _gee,
             e5_cosine_sim as _ecs,
             get_e5_model as _gem,
+            warm_e5_word_cache as _wwc,
         )
         get_e5_word_embedding = _gee
         e5_cosine_sim = _ecs
         get_e5_model = _gem
+        warm_e5_word_cache = _wwc
         _E5_IMPORT_OK = True
         logger.info("[L1.5/v3] E5 module imported via absolute path")
     except Exception as e_abs:
@@ -160,6 +165,9 @@ except Exception as e_rel:
 
         def get_e5_model():
             return None
+
+        def warm_e5_word_cache(words, batch_size=64):
+            return 0
 
 # ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
 COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
@@ -872,6 +880,33 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         f"[L1.5/v3] neighbors({object_anchor})={len(object_neighbors)} "
         f"obj_syn={len(object_synonyms)} act_syn={len(action_synonyms)}"
     )
+
+    # ── Batch warm E5 cache ─────────────────────────────────────────────
+    # КРИТИЧНО для скорости: индивидуальные get_e5_word_embedding вызывают
+    # ONNX runtime на каждое слово (~50ms на E5-large CPU). Собираем все
+    # уникальные леммы которые понадобятся в проверках, считаем один батч.
+    # Дальше get_e5_word_embedding() в _prove_* мгновенно возвращает из кеша.
+    if _E5_IMPORT_OK and warm_e5_word_cache is not None:
+        import time as _t
+        _t0 = _t.time()
+        words_to_warm: Set[str] = set()
+        # anchors
+        if object_anchor:
+            words_to_warm.add(object_anchor)
+        if action_anchor:
+            words_to_warm.add(action_anchor)
+        # все NOUN/VERB/INFN-леммы из всех keywords (через омонимы)
+        for kw in grey_keywords:
+            for tok in _tokenize(kw):
+                # для object-кандидатов нужны NOUN, для action — NOUN+VERB+INFN
+                for lem in _token_lemmas(tok, pos_filter={'NOUN', 'VERB', 'INFN'}):
+                    if len(lem) >= MIN_OBJECT_LEMMA_LEN:
+                        words_to_warm.add(lem)
+        n_warmed = warm_e5_word_cache(words_to_warm)
+        logger.info(
+            f"[L1.5/v3] E5 batch warm: {n_warmed} new embeddings "
+            f"(total {len(words_to_warm)} unique words) in {_t.time()-_t0:.1f}s"
+        )
 
     # ── Прогон GREY.
     # _l1_5_trace — только TRASH (для UI, чтобы GREY не показывались как заблокированные).
