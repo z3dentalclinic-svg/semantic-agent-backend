@@ -163,8 +163,18 @@ except Exception as e_rel:
 
 # ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
 COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
-COS_ACTION_HIGH = 0.85    # порог cos для синонимов action (без neighbors, выше)
-COS_GAP_MIN = 0.15        # минимальная разница (cos_obj - cos_act) — отсекает атрибуты процесса
+COS_ACTION_HIGH = 0.90    # порог cos для синонимов action (без neighbors, выше).
+                          # Был 0.85 — пропускал "купить", "вокзал", "фото"
+                          # как синонимы "доставка" в группе D FP.
+COS_GAP_MIN = 0.05        # мин разница (cos_obj - cos_act) для метода 4 object.
+                          # Был 0.15 — убивал все валидные гипонимы (роза gap=0.029,
+                          # букет gap=0.091, тюльпан gap=0.035). Сейчас розы/тюльпаны
+                          # ловятся через RuWordNet (метод 3), а в методе 4 0.05
+                          # отсекает коммерческие FP (цена -0.029, отзыв -0.014,
+                          # одесса -0.028, дом -0.030, заказ -0.060).
+MIN_OBJECT_LEMMA_LEN = 3  # минимальная длина леммы object-кандидата в методе 4.
+                          # Защита от предлогов-омонимов: pymorphy парсит 'в'/'с'
+                          # как буквы алфавита NOUN → попадали в кандидаты.
 NEIGHBOR_WINDOW = 2
 NEIGHBOR_MIN_FREQ = 2
 
@@ -585,12 +595,14 @@ def _prove_object(
                 return True, diag
 
     # 4. E5 hyponym.
-    # GAP-тест откатан (правка 8): для гипонимов на коротких фразах
-    # cos_obj и cos_act близки (роза gap=0.029, букет gap=0.038) — gap не
-    # разделяет гипонимы от шума. Фильтр шума переносим на in_neighbors +
-    # cos_obj порог. Атрибуты процесса (цена, отзыв) обычно не попадают
-    # в neighbors object_anchor, что и должно их отсекать.
-    # BYPASS: лемма из seed_content_lemmas — принимаем без neighbors.
+    # cos_obj порог + neighbors + gap >= COS_GAP_MIN отсекают коммерческие
+    # атрибуты процесса (цена -0.029, отзыв -0.014, заказ -0.060) и гео
+    # (одесса -0.028, днепр -0.019). Гипонимы цвета (роза, тюльпан) уже
+    # ловятся методом 3 через RuWordNet hyponyms — gap не убьёт их даже при
+    # значениях 0.02-0.04, потому что метод 4 для них не достигается.
+    # MIN_OBJECT_LEMMA_LEN отсекает предлоги-омонимы 'в'/'с' (pymorphy
+    # парсит букву как NOUN — побочный парс).
+    # BYPASS: лемма из seed_content_lemmas — принимаем без neighbors/gap.
     anchor_emb = get_e5_word_embedding(object_anchor)
     action_emb = get_e5_word_embedding(action_anchor) if action_anchor else None
 
@@ -600,11 +612,13 @@ def _prove_object(
         best_cos_act_overall = 0.0
 
         # Уникальные NOUN-леммы среди ВСЕХ парсов всех токенов keyword
-        # (омонимия: цветов → роза/цвет/цветок может оба парса дать).
+        # (омонимия: цветов → цвет/цветок). Фильтруем короткие леммы (предлоги).
         cand_lemmas: Set[str] = set()
         for tok in kw_tokens:
             for lem in _token_lemmas(tok, pos_filter={'NOUN'}):
                 if lem == object_anchor or lem in excluded_lemmas:
+                    continue
+                if len(lem) < MIN_OBJECT_LEMMA_LEN:
                     continue
                 cand_lemmas.add(lem)
 
@@ -628,7 +642,7 @@ def _prove_object(
             })
 
             # BYPASS для лемм из seed (для 3+ word seeds где content_lemmas
-            # содержит "прочие" non-anchor слова).
+            # содержит "прочие" non-anchor слова). Без gap/neighbors.
             if in_seed and cos_obj >= COS_OBJECT_HIGH:
                 if cos_obj > best_cos_obj:
                     best_cos_obj = cos_obj
@@ -636,10 +650,12 @@ def _prove_object(
                     best_cos_act_overall = cos_act
                 continue
 
-            # Базовая проверка: cos выше порога + в L0_VALID neighbors.
+            # Базовая проверка: cos выше порога + neighbors + gap.
             if not in_n:
                 continue
             if cos_obj < COS_OBJECT_HIGH:
+                continue
+            if gap < COS_GAP_MIN:
                 continue
 
             if cos_obj > best_cos_obj:
