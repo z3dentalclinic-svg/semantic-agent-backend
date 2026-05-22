@@ -18,7 +18,7 @@ E5-large Model для L1.5 — отдельный singleton.
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, List, Iterable
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,74 @@ def get_e5_word_embedding(word: str) -> Optional[np.ndarray]:
     except Exception as e:
         logger.warning(f"[E5/L1.5] Embedding failed for '{word}': {e}")
         return None
+
+
+def warm_e5_word_cache(words: Iterable[str], batch_size: int = 64) -> int:
+    """Предкомпьютит embeddings для слов одним батчем и сохраняет в кеш.
+
+    Это критично для скорости L1.5: индивидуальные вызовы get_e5_word_embedding
+    запускают ONNX runtime на каждое слово (overhead ~50ms на E5-large CPU).
+    Батч-вызов работает в 10-30x быстрее на CPU.
+
+    После этой функции get_e5_word_embedding(w) для всех `words` мгновенно
+    возвращает значение из кеша.
+
+    Возвращает кол-во новых embeddings которые были посчитаны (без учёта тех
+    что уже были в кеше или пустых слов).
+    """
+    if not words:
+        return 0
+
+    # Нормализация + дедупликация + отбор тех что НЕТ в кеше
+    to_embed: List[str] = []
+    seen: set = set()
+    for w in words:
+        if not w or not isinstance(w, str):
+            continue
+        norm = w.strip().lower()
+        if not norm or norm in seen or norm in _word_emb_cache:
+            continue
+        seen.add(norm)
+        to_embed.append(norm)
+
+    if not to_embed:
+        return 0
+
+    model = get_e5_model()
+    if model is None:
+        return 0
+
+    # Уважаем лимит кеша
+    free_slots = _CACHE_MAX - len(_word_emb_cache)
+    if free_slots <= 0:
+        return 0
+    if len(to_embed) > free_slots:
+        to_embed = to_embed[:free_slots]
+
+    computed = 0
+    # Батчим: одной model.embed([...]) call. fastembed внутри сам разобьёт
+    # по сублимиту onnx если надо. Поэтому отдаём batch_size за раз — это
+    # компромисс между latency и memory peak.
+    try:
+        for start in range(0, len(to_embed), batch_size):
+            batch = to_embed[start:start + batch_size]
+            prefixed = [f"query: {w}" for w in batch]
+            embeddings = list(model.embed(prefixed))
+            for word, emb in zip(batch, embeddings):
+                if emb is None:
+                    continue
+                if isinstance(emb, list):
+                    emb = np.array(emb, dtype=np.float32)
+                # E5 уже нормализован, проверим
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+                _word_emb_cache[word] = emb
+                computed += 1
+    except Exception as e:
+        logger.warning(f"[E5/L1.5] Batch warm failed: {e}")
+
+    return computed
 
 
 def e5_cosine_sim(emb1: Optional[np.ndarray], emb2: Optional[np.ndarray]) -> float:
