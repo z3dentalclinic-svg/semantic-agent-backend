@@ -820,8 +820,14 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         logger.info("[L1.5/v3] empty GREY input — nothing to do")
         return prev_result
 
+    # ── Профилирование (стиль L0): фиксируем время каждого этапа.
+    import time as _pf_time
+    _t_stage: Dict[str, float] = {}
+    _t_total = _pf_time.perf_counter()
+
     # ── E5 warmup + диагностика. Грузим модель один раз ДО прогона.
     # Без warmup — chicken-egg, модель не загрузится никогда.
+    _t = _pf_time.perf_counter()
     e5_status = "DISABLED (import failed)"
     if _E5_IMPORT_OK:
         try:
@@ -837,11 +843,14 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
                 e5_status = "FAILED (get_e5_model returned None)"
         except Exception as e:
             e5_status = f"ERROR: {e}"
+    _t_stage['e5_warmup'] = _pf_time.perf_counter() - _t
     logger.info(f"[L1.5/v3] E5 status: {e5_status}")
     logger.info(f"[L1.5/v3] RuWordNet status: {'OK' if _rwn is not None else 'DISABLED'}")
 
     # ── Парсинг seed
+    _t = _pf_time.perf_counter()
     seed_struct = _extract_seed_structure(seed)
+    _t_stage['extract_seed'] = _pf_time.perf_counter() - _t
     content_lemmas = seed_struct['content_lemmas']
     action_anchor = seed_struct['action_anchor']
     object_anchor = seed_struct['object_anchor']
@@ -867,14 +876,25 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     )
 
     # ── Подготовка ресурсов
+    _t = _pf_time.perf_counter()
     l0_valid = prev_result.get('keywords', []) or []
     object_neighbors = (
         _build_object_neighbors(l0_valid, object_anchor, excluded_lemmas)
         if object_anchor else set()
     )
+    _t_stage['build_neighbors'] = _pf_time.perf_counter() - _t
+
+    _t = _pf_time.perf_counter()
     object_synonyms = _get_synonyms(object_anchor) if object_anchor else set()
+    _t_stage['rwn_obj_syn'] = _pf_time.perf_counter() - _t
+
+    _t = _pf_time.perf_counter()
     action_synonyms = _get_synonyms(action_anchor) if action_anchor else set()
+    _t_stage['rwn_act_syn'] = _pf_time.perf_counter() - _t
+
+    _t = _pf_time.perf_counter()
     other_synonyms = {lem: _get_synonyms(lem) for lem in other_lemmas}
+    _t_stage['rwn_other_syn'] = _pf_time.perf_counter() - _t
 
     logger.info(
         f"[L1.5/v3] neighbors({object_anchor})={len(object_neighbors)} "
@@ -886,9 +906,12 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     # ONNX runtime на каждое слово (~50ms на E5-large CPU). Собираем все
     # уникальные леммы которые понадобятся в проверках, считаем один батч.
     # Дальше get_e5_word_embedding() в _prove_* мгновенно возвращает из кеша.
+    _t = _pf_time.perf_counter()
+    _t_warm_collect = 0.0
+    n_warmed = 0
+    n_total = 0
     if _E5_IMPORT_OK and warm_e5_word_cache is not None:
-        import time as _t
-        _t0 = _t.time()
+        _tc = _pf_time.perf_counter()
         words_to_warm: Set[str] = set()
         # anchors
         if object_anchor:
@@ -902,11 +925,18 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
                 for lem in _token_lemmas(tok, pos_filter={'NOUN', 'VERB', 'INFN'}):
                     if len(lem) >= MIN_OBJECT_LEMMA_LEN:
                         words_to_warm.add(lem)
+        _t_warm_collect = _pf_time.perf_counter() - _tc
+        n_total = len(words_to_warm)
         n_warmed = warm_e5_word_cache(words_to_warm)
-        logger.info(
-            f"[L1.5/v3] E5 batch warm: {n_warmed} new embeddings "
-            f"(total {len(words_to_warm)} unique words) in {_t.time()-_t0:.1f}s"
-        )
+    _t_stage['e5_warm_collect'] = _t_warm_collect
+    _t_stage['e5_warm_total'] = _pf_time.perf_counter() - _t
+    _t_stage['_e5_warm_new'] = n_warmed
+    _t_stage['_e5_warm_unique'] = n_total
+    logger.info(
+        f"[L1.5/v3] E5 batch warm: {n_warmed} new embeddings "
+        f"(total {n_total} unique words) in {_t_stage['e5_warm_total']:.2f}s "
+        f"(collect={_t_warm_collect:.2f}s)"
+    )
 
     # ── Прогон GREY.
     # _l1_5_trace — только TRASH (для UI, чтобы GREY не показывались как заблокированные).
@@ -915,8 +945,22 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     trash_traces: List[dict] = []
     full_diag: List[dict] = []
 
+    # Аккумуляторы времени внутри основного цикла
+    _t_loop_start = _pf_time.perf_counter()
+    _t_tokenize_total = 0.0
+    _t_parse_total = 0.0
+    _t_prove_obj_total = 0.0
+    _t_prove_act_total = 0.0
+    _t_prove_other_total = 0.0
+    _slow_kw: List[Tuple[float, str]] = []  # top-N самых медленных ключей
+
     for kw in grey_keywords:
+        _kw_t0 = _pf_time.perf_counter()
+
+        _t = _pf_time.perf_counter()
         tokens = _tokenize(kw)
+        _t_tokenize_total += _pf_time.perf_counter() - _t
+
         if not tokens:
             trash_traces.append({
                 'keyword': kw, 'label': 'TRASH', 'decided_by': 'l1_5_v3',
@@ -941,25 +985,34 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
             })
             continue
 
+        _t = _pf_time.perf_counter()
         parses = [_parse_top(t) for t in tokens]
         lemmas = [p.normal_form if p else None for p in parses]
+        _t_parse_total += _pf_time.perf_counter() - _t
 
         # ОСИ
+        _t = _pf_time.perf_counter()
         obj_ok, obj_diag = _prove_object(
             tokens, lemmas, parses, object_anchor, object_neighbors, object_synonyms,
             excluded_lemmas, action_anchor, set(content_lemmas)
         )
+        _t_prove_obj_total += _pf_time.perf_counter() - _t
+
+        _t = _pf_time.perf_counter()
         act_ok, act_diag = _prove_action(
             tokens, lemmas, parses, action_anchor, action_synonyms
         )
+        _t_prove_act_total += _pf_time.perf_counter() - _t
 
         # OTHER (для 3+ word seeds) — без cos, просто substring/lemma/synonym
+        _t = _pf_time.perf_counter()
         other_results: List[Tuple[bool, str]] = []
         for lem in other_lemmas:
             ok, reason = _prove_other_lemma(lem, tokens, lemmas, other_synonyms.get(lem, set()))
             other_results.append((ok, reason))
         all_other_ok = all(ok for ok, _ in other_results)
         other_reasons = [r for _, r in other_results]
+        _t_prove_other_total += _pf_time.perf_counter() - _t
 
         if obj_ok and act_ok and all_other_ok:
             new_grey.append(kw)
@@ -995,6 +1048,20 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
             'other': other_reasons,
         })
 
+        _kw_dt = _pf_time.perf_counter() - _kw_t0
+        # Сохраняем top-5 самых медленных ключей
+        if len(_slow_kw) < 5 or _kw_dt > min(t for t, _ in _slow_kw):
+            _slow_kw.append((_kw_dt, kw))
+            _slow_kw.sort(key=lambda x: -x[0])
+            _slow_kw = _slow_kw[:5]
+
+    _t_stage['grey_loop_total'] = _pf_time.perf_counter() - _t_loop_start
+    _t_stage['_in_loop_tokenize'] = _t_tokenize_total
+    _t_stage['_in_loop_parse_top'] = _t_parse_total
+    _t_stage['_in_loop_prove_obj'] = _t_prove_obj_total
+    _t_stage['_in_loop_prove_act'] = _t_prove_act_total
+    _t_stage['_in_loop_prove_other'] = _t_prove_other_total
+
     # ── Обновление prev_result
     prev_result['keywords_grey'] = new_grey
     prev_result['keywords_grey_count'] = len(new_grey)
@@ -1006,5 +1073,27 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     logger.info(
         f"[L1.5/v3] {len(grey_keywords)} → GREY={grey_n}, TRASH={trash_n}"
     )
+
+    # ── Финальный профиль ──────────────────────────────────────────────
+    _t_stage['_total'] = _pf_time.perf_counter() - _t_total
+    # Сортируем по убыванию (только positive stages, без счётчиков)
+    _stage_items = [(k, v) for k, v in _t_stage.items() if not k.startswith('_') and isinstance(v, (int, float))]
+    _stage_items.sort(key=lambda x: -x[1])
+    _stage_str = " | ".join(f"{k}={v:.2f}s" for k, v in _stage_items)
+    logger.info(f"[L1.5/stage] {_stage_str}")
+    logger.info(
+        f"[L1.5/stage] in_loop: tokenize={_t_tokenize_total:.2f}s "
+        f"parse_top={_t_parse_total:.2f}s prove_obj={_t_prove_obj_total:.2f}s "
+        f"prove_act={_t_prove_act_total:.2f}s prove_other={_t_prove_other_total:.2f}s"
+    )
+    if _slow_kw:
+        _slow_str = " | ".join(f"{t:.2f}s:{kw!r}" for t, kw in _slow_kw)
+        logger.info(f"[L1.5/slowest] {_slow_str}")
+
+    # Сохраняем в result для UI/JSON ответа (как L0 делает с _filter_timings)
+    prev_result.setdefault('_l1_5_stage_timings', {}).update({
+        k: round(v, 4) for k, v in _t_stage.items()
+        if not k.startswith('_') and isinstance(v, (int, float))
+    })
 
     return prev_result
