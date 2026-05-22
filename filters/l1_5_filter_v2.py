@@ -171,12 +171,16 @@ except Exception as e_rel:
 
 # ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
 COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
-COS_ACTION_HIGH = 0.88    # порог cos для синонимов action (без neighbors, выше).
+COS_ACTION_HIGH = 0.87    # порог cos для синонимов action (без neighbors, выше).
                           # Был 0.85 — пропускал "купить", "вокзал", "фото"
                           # как синонимы "доставка" в группе D FP.
                           # 0.90 был слишком строгим (терял "посылка"=0.882,
                           # "заказ"=0.899). 0.88 возвращает их, сохраняя
                           # отсечение "купить"=0.861, "вокзал"=0.850, "дом"=0.868.
+                          # 0.87 дополнительно спасает acronyms типа 'акб'=0.876
+                          # для action='аккумулятор'. Безопасно для baseline
+                          # 'доставка цветов': в зоне [0.87, 0.88) нет ключей
+                          # с прошедшим object → 0 регрессий, 0 возвратов FP.
 COS_GAP_MIN = 0.05        # мин разница (cos_obj - cos_act) для метода 4 object.
                           # Был 0.15 — убивал все валидные гипонимы (роза gap=0.029,
                           # букет gap=0.091, тюльпан gap=0.035). Сейчас розы/тюльпаны
@@ -328,6 +332,97 @@ def _has_verb_derivation(lemma: str) -> bool:
         return False
     except Exception:
         return False
+
+
+# Лимит размера cohyponym-набора. Если у object_anchor через ближайший
+# hypernym с 2 уровнями вниз набирается БОЛЬШЕ COHYPONYM_MAX_SIZE лемм —
+# таксономия слишком общая и расширение опасно (для 'цветок' → 'растение'
+# попадают деревья/кустарники/травы, 566 лемм). Защита baseline.
+# Узкие таксономии типа 'скутер' (36 лемм через 'мототранспортное средство')
+# проходят и спасают семантически родственные термины (мопед, байк, мотоцикл).
+COHYPONYM_MAX_SIZE = 50
+
+
+def _get_cohyponyms(lemma: str) -> Set[str]:
+    """Co-hyponyms (семантические братья) леммы в RuWordNet.
+
+    Берём ближайший hypernym леммы и опускаемся на 2 уровня вниз. Это ловит
+    как прямых братьев (на 1 уровне), так и племянников (на 2 уровне).
+
+    Зачем 2 уровня: в RWN многие пары родственников разнесены на разные
+    подкатегории. Например 'скутер' прямой ребёнок МОТОТРАНСПОРТНОЕ СРЕДСТВО,
+    а 'мопед' — внук того же synset через промежуточный МОТОЦИКЛ.
+    На 1 уровне они не видны как братья, на 2 — видны.
+
+    Возвращает ПУСТОЙ set если результат превышает COHYPONYM_MAX_SIZE —
+    защита от слишком общих hypernym'ов (цветок→растение даёт 566 лемм с
+    overshoot в деревья/кустарники).
+    """
+    if _rwn is None or not lemma:
+        return set()
+    try:
+        senses = _rwn.get_senses(lemma)
+        if not senses:
+            return set()
+
+        # Стартовые synsets леммы — те с которых поднимаемся
+        seen_synsets: Set[str] = set()
+        starting: Set[str] = set()
+        for sense in senses:
+            ss = sense.synset
+            seen_synsets.add(ss.id)
+            starting.add(ss.id)
+
+        # Поднимаемся на 1 уровень — собираем ближайших hypernym'ов
+        hypernym_synsets = []
+        for sense in senses:
+            for h in sense.synset.hypernyms:
+                if h.id not in seen_synsets:
+                    seen_synsets.add(h.id)
+                    hypernym_synsets.append(h)
+
+        if not hypernym_synsets:
+            return set()
+
+        # Спускаемся от hypernym'ов на 2 уровня вниз
+        descendants_synsets = list(hypernym_synsets)  # сам уровень hypernym тоже даёт лемм
+        current = list(hypernym_synsets)
+        for _ in range(2):
+            next_level = []
+            for s in current:
+                for hypo in s.hyponyms:
+                    if hypo.id in seen_synsets:
+                        continue
+                    seen_synsets.add(hypo.id)
+                    next_level.append(hypo)
+                    descendants_synsets.append(hypo)
+            if not next_level:
+                break
+            current = next_level
+
+        # Собираем все леммы (исключая саму lemma)
+        cohyp: Set[str] = set()
+        lemma_lower = lemma.lower()
+        for ss in descendants_synsets:
+            for s in ss.senses:
+                if s.lemma:
+                    sl = s.lemma.lower()
+                    if sl != lemma_lower:
+                        cohyp.add(sl)
+
+        # Защита baseline: если набор слишком широкий — отказываемся.
+        # Лучше пропустить cohyponym-метод для широкой таксономии чем дать FP.
+        if len(cohyp) > COHYPONYM_MAX_SIZE:
+            logger.info(
+                f"[L1.5/v3] _get_cohyponyms({lemma!r}): {len(cohyp)} лемм "
+                f"> {COHYPONYM_MAX_SIZE} лимит → отклонено (широкая таксономия)"
+            )
+            return set()
+
+        return cohyp
+    except Exception as e:
+        logger.warning(f"[L1.5/v3] _get_cohyponyms({lemma!r}) failed: {e}")
+        return set()
 
 
 # ─── Разбор seed ─────────────────────────────────────────────────────────
@@ -549,11 +644,12 @@ def _prove_object(
     excluded_lemmas: Set[str],
     action_anchor: Optional[str],
     seed_content_lemmas: Set[str],
+    object_cohyponyms: Optional[Set[str]] = None,
 ) -> Tuple[bool, dict]:
     """
     Возвращает (proven, diag).
     diag = {
-        'method': 'substring|lemma|ruwordnet|hyponym|abbrev_pos0|none',
+        'method': 'substring|lemma|ruwordnet|ruwordnet_cohyponym|hyponym|abbrev_pos0|none',
         'matched_lemma': str | None,
         'best_cos': float,           # cos к object_anchor у лучшего кандидата
         'best_cos_act': float,       # cos к action_anchor у того же кандидата
@@ -604,6 +700,22 @@ def _prove_object(
                 diag['matched_lemma'] = lem
                 diag['reason'] = f'ruwordnet:{lem}'
                 return True, diag
+
+    # 3.5. RuWordNet co-hyponym (sibling через ближайший hypernym + 2 уровня
+    # вниз). Ловит семантически родственные термины которые НЕ являются
+    # гипонимом друг друга, но имеют общего предка таксономии.
+    # Пример: 'скутер' и 'мопед' — оба ребёнки/внуки МОТОТРАНСПОРТНОЕ СРЕДСТВО.
+    # Метод 3 (hyponyms скутера) такого не ловит — мопед не ребёнок скутера.
+    # _get_cohyponyms возвращает пустой set для широких таксономий
+    # (>COHYPONYM_MAX_SIZE лемм) — защита baseline 'доставка цветов'.
+    if object_cohyponyms:
+        for tok in kw_tokens:
+            for lem in _token_lemmas(tok):
+                if lem in object_cohyponyms:
+                    diag['method'] = 'ruwordnet_cohyponym'
+                    diag['matched_lemma'] = lem
+                    diag['reason'] = f'ruwordnet_cohyponym:{lem}'
+                    return True, diag
 
     # 4. E5 hyponym.
     # cos_obj порог + neighbors + gap >= COS_GAP_MIN отсекают коммерческие
@@ -889,6 +1001,10 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     _t_stage['rwn_obj_syn'] = _pf_time.perf_counter() - _t
 
     _t = _pf_time.perf_counter()
+    object_cohyponyms = _get_cohyponyms(object_anchor) if object_anchor else set()
+    _t_stage['rwn_obj_cohyp'] = _pf_time.perf_counter() - _t
+
+    _t = _pf_time.perf_counter()
     action_synonyms = _get_synonyms(action_anchor) if action_anchor else set()
     _t_stage['rwn_act_syn'] = _pf_time.perf_counter() - _t
 
@@ -898,7 +1014,8 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
 
     logger.info(
         f"[L1.5/v3] neighbors({object_anchor})={len(object_neighbors)} "
-        f"obj_syn={len(object_synonyms)} act_syn={len(action_synonyms)}"
+        f"obj_syn={len(object_synonyms)} obj_cohyp={len(object_cohyponyms)} "
+        f"act_syn={len(action_synonyms)}"
     )
 
     # ── Batch warm E5 cache ─────────────────────────────────────────────
@@ -994,7 +1111,8 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         _t = _pf_time.perf_counter()
         obj_ok, obj_diag = _prove_object(
             tokens, lemmas, parses, object_anchor, object_neighbors, object_synonyms,
-            excluded_lemmas, action_anchor, set(content_lemmas)
+            excluded_lemmas, action_anchor, set(content_lemmas),
+            object_cohyponyms=object_cohyponyms,
         )
         _t_prove_obj_total += _pf_time.perf_counter() - _t
 
