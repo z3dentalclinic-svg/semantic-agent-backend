@@ -720,19 +720,44 @@ def _build_action_neighbors(
     min_freq: int = NEIGHBOR_MIN_FREQ,
 ) -> Set[str]:
     """
-    Леммы (NOUN/VERB/INFN/ADVB) встречающиеся в окне ±window от action_anchor
-    минимум в min_freq L0_VALID ключах.
+    ОТКЛЮЧЕНО (но оставлено в коде на будущее).
 
-    Симметричная функция к _build_object_neighbors, но включает ADVB —
-    вопросительные наречия 'сколько'/'почём' валидны для коммерческих
-    seeds где L0 пропустил info-intent ключи (например для 'купить айфон 16'
-    L0 пропустил 'сколько стоит купить айфон 16' — значит 'сколько' — это
-    валидный action-сигнал для этого seed).
+    Логика co-occurrence в окне ±window от action_anchor — на сидах вида
+    "доставка X" даёт object-domain леммы (цвет/букет/роза...) которые
+    не являются синонимами action. См. историю фиксов: попытка V5 привела
+    к 24 FP в 'доставка цветов'.
 
-    Защита от FP: если action_anchor нет в L0 VALID, neighbors пустые.
-    Это автоматически работает для seeds где info-questions не релевантны:
-    например 'доставка цветов' — L0 не пропускает 'где доставка', поэтому
-    'где' не появится в action_neighbors.
+    Вместо этого используется _build_advb_question_whitelist — узкое
+    правило только для ADVB-лемм встречающихся в начале L0 VALID с
+    action_anchor (info-intent позиция).
+    """
+    return set()
+
+
+def _build_action_question_anchors(
+    l0_valid_keywords: List[str],
+    action_anchor: str,
+    min_freq: int = 2,
+) -> Set[str]:
+    """
+    Набор ADVB-лемм встречающихся на позиции 0 в L0 VALID-keyword'ах
+    содержащих action_anchor. Минимум min_freq повторений.
+
+    Построен per-seed из данных L0 — не хардкод-список.
+
+    Зачем: L0 пропускает info-вопросы которые валидны для конкретного
+    seed-намерения. Например для 'купить айфон 16' L0 пропускает
+    'сколько стоит купить айфон 16', 'где купить айфон 16', 'как выгодно
+    купить айфон 16'. Это значит 'сколько'/'где'/'как' — релевантные
+    action-сигналы для коммерческого intent этого seed.
+
+    Узкое правило (только ADVB, только pos 0, min_freq=2) защищает
+    baseline 'доставка цветов': L0 НЕ пропускает 'где доставка цветов'
+    (info про другие магазины, не про доставку), поэтому 'где' не
+    попадает в набор. Не задеёт 'где купить цветы в днепре' (TRASH).
+
+    Симметрично object_neighbors: оба используют co-occurrence в L0 VALID
+    для построения per-seed набора релевантных слов.
     """
     if _morph is None or not action_anchor:
         return set()
@@ -742,33 +767,18 @@ def _build_action_neighbors(
         tokens = _tokenize(kw)
         if not tokens:
             continue
-        # Все леммы каждого токена для матча anchor
-        token_lemma_sets: List[Set[str]] = [_token_lemmas(t) for t in tokens]
-        # Action-кандидаты: NOUN/VERB/INFN/ADVB
-        token_act_lemmas: List[Set[str]] = [
-            _token_lemmas(t, pos_filter={'NOUN', 'VERB', 'INFN', 'ADVB'}) for t in tokens
-        ]
-
-        anchor_positions = [
-            i for i, lem_set in enumerate(token_lemma_sets)
-            if action_anchor in lem_set
-        ]
-        if not anchor_positions:
+        # Проверяем что keyword содержит action_anchor среди лемм токенов
+        # (через _token_lemmas чтобы учесть омонимы)
+        has_anchor = any(action_anchor in _token_lemmas(t) for t in tokens)
+        if not has_anchor:
             continue
-
-        seen_in_kw: Set[str] = set()
-        for pos in anchor_positions:
-            for j in range(max(0, pos - window), min(len(tokens), pos + window + 1)):
-                if j == pos:
-                    continue
-                for lem in token_act_lemmas[j]:
-                    if lem == action_anchor or lem in excluded_lemmas:
-                        continue
-                    if len(lem) < MIN_OBJECT_LEMMA_LEN:
-                        continue
-                    seen_in_kw.add(lem)
-        for lem in seen_in_kw:
-            counter[lem] += 1
+        # Берём pos 0 — info-intent позиция
+        first_tok = tokens[0]
+        for p in _parse_all(first_tok):
+            if 'ADVB' in p.tag.grammemes:
+                if p.normal_form:
+                    counter[p.normal_form] += 1
+                break  # один ADVB-парс достаточно
 
     return {lem for lem, freq in counter.items() if freq >= min_freq}
 
@@ -963,15 +973,14 @@ def _prove_action(
     kw_parses: List[Any],
     action_anchor: Optional[str],
     action_synonyms: Set[str],
-    action_neighbors: Optional[Set[str]] = None,
+    action_question_anchors: Optional[Set[str]] = None,
 ) -> Tuple[bool, dict]:
     """Возвращает (proven, diag). Структура diag — как у _prove_object.
 
-    action_neighbors — леммы (NOUN/VERB/INFN/ADVB) co-occur с action_anchor в L0
-    VALID. Если кандидат в keyword — neighbor → доказательство action.
-    Это симметрично object_neighbors в _prove_object и переиспользует
-    решение L0 о валидности (например L0 пропускает 'сколько стоит купить
-    айфон' значит 'сколько' — валидный action-сигнал для этого seed).
+    action_question_anchors — набор ADVB-лемм встречающихся в pos 0 L0 VALID
+    с action_anchor (минимум 2 раза). Построено per-seed из данных L0 — не
+    хардкод. Используется методом 3.5 для info-intent keyword'ов
+    ('сколько стоит ...', 'как заказать ...').
     """
     diag = {
         'method': 'none',
@@ -1012,20 +1021,30 @@ def _prove_action(
                 diag['reason'] = f'ruwordnet:{lem}'
                 return True, diag
 
-    # 3.5. action_neighbors — co-occurrence в L0 VALID.
-    # Если лемма встречалась рядом с action_anchor в ключах прошедших L0,
-    # значит для этого seed она — валидный action-сигнал. L0 уже сделал
-    # отбор по типу intent для этого конкретного seed; мы переиспользуем
-    # его решение вместо повторного семантического анализа.
-    # Это симметрично методу abbrev_pos0 в _prove_object.
-    if action_neighbors:
+    # 3.5. ADVB-question anchor. Для info-intent keyword'ов: проверяем
+    # есть ли в keyword токен-наречие с леммой из per-seed набора
+    # action_question_anchors (построен из pos 0 L0 VALID c action_anchor).
+    #
+    # Спасает: 'сколько стоит купить айфон 16', 'где лучше купить айфон',
+    # 'как выгодно купить ...'. Это валидные info-вопросы для коммерческого
+    # seed-намерения которые L0 пропускает.
+    #
+    # Не задевает baseline 'доставка цветов': L0 не пропускает 'где
+    # доставка...', поэтому 'где' не в action_question_anchors → keyword
+    # 'где купить цветы днепр' остаётся TRASH (action не доказан, 'купить'
+    # не наречие, 'где' не в наборе).
+    if action_question_anchors:
         for tok in kw_tokens:
-            for lem in _token_lemmas(tok):
-                if lem in action_neighbors:
-                    diag['method'] = 'action_neighbor'
+            for p in _parse_all(tok):
+                if 'ADVB' not in p.tag.grammemes:
+                    continue
+                lem = p.normal_form
+                if lem and lem in action_question_anchors:
+                    diag['method'] = 'advb_question'
                     diag['matched_lemma'] = lem
-                    diag['reason'] = f'action_neighbor:{lem}'
+                    diag['reason'] = f'advb_question:{lem}'
                     return True, diag
+                break  # для токена нашли ADVB парс — выходим из inner loop
 
     # 4. E5 synonym (cos≥COS_ACTION_HIGH, без neighbors).
     # Кандидаты: NOUN/VERB/INFN — содержательные слова, ADVB — вопросительные
@@ -1168,18 +1187,13 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     _t_stage['build_neighbors'] = _pf_time.perf_counter() - _t
 
     _t = _pf_time.perf_counter()
-    # action_neighbors — для доказательства action через co-occurrence в L0 VALID.
-    # excluded из action_neighbors = object_anchor + other_lemmas (т.к. action
-    # сам по себе встречается с object, не считаем object как action-neighbor).
-    action_excluded: Set[str] = set()
-    if object_anchor:
-        action_excluded.add(object_anchor)
-    action_excluded.update(other_lemmas)
-    action_neighbors = (
-        _build_action_neighbors(l0_valid, action_anchor, action_excluded)
+    # action_question_anchors: набор ADVB-лемм в pos 0 L0 VALID c action_anchor.
+    # Per-seed построение для info-intent keywords (см. _build_action_question_anchors).
+    action_question_anchors = (
+        _build_action_question_anchors(l0_valid, action_anchor)
         if action_anchor else set()
     )
-    _t_stage['build_action_neighbors'] = _pf_time.perf_counter() - _t
+    _t_stage['build_action_q_anchors'] = _pf_time.perf_counter() - _t
 
     _t = _pf_time.perf_counter()
     object_synonyms = _get_synonyms(object_anchor) if object_anchor else set()
@@ -1199,7 +1213,7 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
 
     logger.info(
         f"[L1.5/v3] neighbors({object_anchor})={len(object_neighbors)} "
-        f"act_neighbors({action_anchor})={len(action_neighbors)} "
+        f"act_q_anchors({action_anchor})={sorted(action_question_anchors)} "
         f"obj_syn={len(object_synonyms)} obj_cohyp={len(object_cohyponyms)} "
         f"act_syn={len(action_synonyms)}"
     )
@@ -1323,7 +1337,7 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
         _t = _pf_time.perf_counter()
         act_ok, act_diag = _prove_action(
             tokens, lemmas, parses, action_anchor, action_synonyms,
-            action_neighbors=action_neighbors,
+            action_question_anchors=action_question_anchors,
         )
         _t_prove_act_total += _pf_time.perf_counter() - _t
 
