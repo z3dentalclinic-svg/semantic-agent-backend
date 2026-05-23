@@ -712,6 +712,67 @@ def _build_object_neighbors(
     return {lem for lem, freq in counter.items() if freq >= min_freq}
 
 
+def _build_action_neighbors(
+    l0_valid_keywords: List[str],
+    action_anchor: str,
+    excluded_lemmas: Set[str],
+    window: int = NEIGHBOR_WINDOW,
+    min_freq: int = NEIGHBOR_MIN_FREQ,
+) -> Set[str]:
+    """
+    Леммы (NOUN/VERB/INFN/ADVB) встречающиеся в окне ±window от action_anchor
+    минимум в min_freq L0_VALID ключах.
+
+    Симметричная функция к _build_object_neighbors, но включает ADVB —
+    вопросительные наречия 'сколько'/'почём' валидны для коммерческих
+    seeds где L0 пропустил info-intent ключи (например для 'купить айфон 16'
+    L0 пропустил 'сколько стоит купить айфон 16' — значит 'сколько' — это
+    валидный action-сигнал для этого seed).
+
+    Защита от FP: если action_anchor нет в L0 VALID, neighbors пустые.
+    Это автоматически работает для seeds где info-questions не релевантны:
+    например 'доставка цветов' — L0 не пропускает 'где доставка', поэтому
+    'где' не появится в action_neighbors.
+    """
+    if _morph is None or not action_anchor:
+        return set()
+
+    counter: Counter = Counter()
+    for kw in l0_valid_keywords:
+        tokens = _tokenize(kw)
+        if not tokens:
+            continue
+        # Все леммы каждого токена для матча anchor
+        token_lemma_sets: List[Set[str]] = [_token_lemmas(t) for t in tokens]
+        # Action-кандидаты: NOUN/VERB/INFN/ADVB
+        token_act_lemmas: List[Set[str]] = [
+            _token_lemmas(t, pos_filter={'NOUN', 'VERB', 'INFN', 'ADVB'}) for t in tokens
+        ]
+
+        anchor_positions = [
+            i for i, lem_set in enumerate(token_lemma_sets)
+            if action_anchor in lem_set
+        ]
+        if not anchor_positions:
+            continue
+
+        seen_in_kw: Set[str] = set()
+        for pos in anchor_positions:
+            for j in range(max(0, pos - window), min(len(tokens), pos + window + 1)):
+                if j == pos:
+                    continue
+                for lem in token_act_lemmas[j]:
+                    if lem == action_anchor or lem in excluded_lemmas:
+                        continue
+                    if len(lem) < MIN_OBJECT_LEMMA_LEN:
+                        continue
+                    seen_in_kw.add(lem)
+        for lem in seen_in_kw:
+            counter[lem] += 1
+
+    return {lem for lem, freq in counter.items() if freq >= min_freq}
+
+
 # ─── Доказательство осей ─────────────────────────────────────────────────
 
 def _prove_object(
@@ -902,8 +963,16 @@ def _prove_action(
     kw_parses: List[Any],
     action_anchor: Optional[str],
     action_synonyms: Set[str],
+    action_neighbors: Optional[Set[str]] = None,
 ) -> Tuple[bool, dict]:
-    """Возвращает (proven, diag). Структура diag — как у _prove_object."""
+    """Возвращает (proven, diag). Структура diag — как у _prove_object.
+
+    action_neighbors — леммы (NOUN/VERB/INFN/ADVB) co-occur с action_anchor в L0
+    VALID. Если кандидат в keyword — neighbor → доказательство action.
+    Это симметрично object_neighbors в _prove_object и переиспользует
+    решение L0 о валидности (например L0 пропускает 'сколько стоит купить
+    айфон' значит 'сколько' — валидный action-сигнал для этого seed).
+    """
     diag = {
         'method': 'none',
         'matched_lemma': None,
@@ -942,6 +1011,21 @@ def _prove_action(
                 diag['matched_lemma'] = lem
                 diag['reason'] = f'ruwordnet:{lem}'
                 return True, diag
+
+    # 3.5. action_neighbors — co-occurrence в L0 VALID.
+    # Если лемма встречалась рядом с action_anchor в ключах прошедших L0,
+    # значит для этого seed она — валидный action-сигнал. L0 уже сделал
+    # отбор по типу intent для этого конкретного seed; мы переиспользуем
+    # его решение вместо повторного семантического анализа.
+    # Это симметрично методу abbrev_pos0 в _prove_object.
+    if action_neighbors:
+        for tok in kw_tokens:
+            for lem in _token_lemmas(tok):
+                if lem in action_neighbors:
+                    diag['method'] = 'action_neighbor'
+                    diag['matched_lemma'] = lem
+                    diag['reason'] = f'action_neighbor:{lem}'
+                    return True, diag
 
     # 4. E5 synonym (cos≥COS_ACTION_HIGH, без neighbors).
     # Кандидаты: NOUN/VERB/INFN — содержательные слова, ADVB — вопросительные
@@ -1084,6 +1168,20 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     _t_stage['build_neighbors'] = _pf_time.perf_counter() - _t
 
     _t = _pf_time.perf_counter()
+    # action_neighbors — для доказательства action через co-occurrence в L0 VALID.
+    # excluded из action_neighbors = object_anchor + other_lemmas (т.к. action
+    # сам по себе встречается с object, не считаем object как action-neighbor).
+    action_excluded: Set[str] = set()
+    if object_anchor:
+        action_excluded.add(object_anchor)
+    action_excluded.update(other_lemmas)
+    action_neighbors = (
+        _build_action_neighbors(l0_valid, action_anchor, action_excluded)
+        if action_anchor else set()
+    )
+    _t_stage['build_action_neighbors'] = _pf_time.perf_counter() - _t
+
+    _t = _pf_time.perf_counter()
     object_synonyms = _get_synonyms(object_anchor) if object_anchor else set()
     _t_stage['rwn_obj_syn'] = _pf_time.perf_counter() - _t
 
@@ -1101,6 +1199,7 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
 
     logger.info(
         f"[L1.5/v3] neighbors({object_anchor})={len(object_neighbors)} "
+        f"act_neighbors({action_anchor})={len(action_neighbors)} "
         f"obj_syn={len(object_synonyms)} obj_cohyp={len(object_cohyponyms)} "
         f"act_syn={len(action_synonyms)}"
     )
@@ -1223,7 +1322,8 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
 
         _t = _pf_time.perf_counter()
         act_ok, act_diag = _prove_action(
-            tokens, lemmas, parses, action_anchor, action_synonyms
+            tokens, lemmas, parses, action_anchor, action_synonyms,
+            action_neighbors=action_neighbors,
         )
         _t_prove_act_total += _pf_time.perf_counter() - _t
 
