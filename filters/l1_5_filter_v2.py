@@ -1355,6 +1355,19 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
             new_grey.append(kw)
             label = 'GREY'
             reason = 'all_axes_proven'
+        elif obj_ok and act_ok and not all_other_ok:
+            # GREY_SOFT: основные оси (obj+act) доказаны, но other-лемма
+            # (3-я+ content-слово seed, например 'цена' для seed
+            # "установка кондиционера цена") не найдена в keyword.
+            # Семантически это keyword с тем же intent но без явного маркера
+            # дополнительной леммы. Не TRASH — пользователь решит включать
+            # или нет через UI-группировку по label.
+            # Не задеёт seeds с ≤2 content-словами (там other_lemmas пустой
+            # → all_other_ok=True всегда).
+            new_grey.append(kw)
+            label = 'GREY_SOFT'
+            missing = [r for ok, r in other_results if not ok]
+            reason = 'main_axes_proven_other_missing:' + ','.join(missing)
         else:
             label = 'TRASH'
             failed: List[str] = []
@@ -1406,9 +1419,10 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     prev_result.setdefault('_l1_5_diag', []).extend(full_diag)
 
     grey_n = sum(1 for t in full_diag if t['label'] == 'GREY')
+    grey_soft_n = sum(1 for t in full_diag if t['label'] == 'GREY_SOFT')
     trash_n = sum(1 for t in full_diag if t['label'] == 'TRASH')
     logger.info(
-        f"[L1.5/v3] {len(grey_keywords)} → GREY={grey_n}, TRASH={trash_n}"
+        f"[L1.5/v3] {len(grey_keywords)} → GREY={grey_n}, GREY_SOFT={grey_soft_n}, TRASH={trash_n}"
     )
 
     # ── Финальный профиль ──────────────────────────────────────────────
