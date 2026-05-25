@@ -21,6 +21,7 @@ LONG SEEDS (3+ content_lemmas):
 "прочие" content_lemmas (например, geo `буковель`) — только substring/lemma/synonym.
 """
 
+import functools
 import logging
 import re
 from typing import List, Dict, Set, Tuple, Optional, Any
@@ -268,6 +269,7 @@ def _token_lemmas(word: str, pos_filter: Optional[Set[str]] = None) -> Set[str]:
     return out
 
 
+@functools.lru_cache(maxsize=1024)
 def _get_synonyms(lemma: str) -> Set[str]:
     """Лексика близкая к лемме из RuWordNet (если доступен).
 
@@ -312,6 +314,7 @@ def _get_synonyms(lemma: str) -> Set[str]:
         return set()
 
 
+@functools.lru_cache(maxsize=2048)
 def _has_verb_derivation(lemma: str) -> bool:
     """Есть ли у леммы VERB/INFN-производное в RuWordNet?
 
@@ -352,6 +355,7 @@ def _has_verb_derivation(lemma: str) -> bool:
 COHYPONYM_MAX_SIZE = 50
 
 
+@functools.lru_cache(maxsize=1024)
 def _get_cohyponyms(lemma: str) -> Set[str]:
     """Co-hyponyms (семантические братья) леммы в RuWordNet.
 
