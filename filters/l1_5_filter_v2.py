@@ -393,10 +393,37 @@ def _get_cohyponyms(lemma: str) -> Set[str]:
         if not hypernym_synsets:
             return set()
 
-        # Спускаемся от hypernym'ов на 2 уровня вниз
-        descendants_synsets = list(hypernym_synsets)  # сам уровень hypernym тоже даёт лемм
+        # Спускаемся от hypernym'ов на 2 уровня вниз, собирая леммы по ходу.
+        # Early-exit как только в наборе превышен COHYPONYM_MAX_SIZE — раньше
+        # обходили весь граф (тысячи SQLite-запросов через ORM lazy-loading)
+        # и в конце выкидывали результат. Теперь прерываемся на ~50-м SQL.
+        # Семантика для |cohyp| <= лимит идентична: обход тот же, леммы те же.
+        lemma_lower = lemma.lower()
+        cohyp: Set[str] = set()
+
+        def _collect_and_check(ss) -> bool:
+            """Добавить леммы synset в cohyp. Вернуть True если лимит превышен."""
+            for s in ss.senses:
+                if s.lemma:
+                    sl = s.lemma.lower()
+                    if sl != lemma_lower:
+                        cohyp.add(sl)
+                        if len(cohyp) > COHYPONYM_MAX_SIZE:
+                            return True
+            return False
+
+        # Уровень H1 — сами hypernym'ы (раньше входили в descendants_synsets первым шагом)
+        for ss in hypernym_synsets:
+            if _collect_and_check(ss):
+                logger.info(
+                    f"[L1.5/v3] _get_cohyponyms({lemma!r}): early-exit на H1, "
+                    f"> {COHYPONYM_MAX_SIZE} лимит → отклонено (широкая таксономия)"
+                )
+                return set()
+
+        # H2-H3: дети и внуки hypernym'ов
         current = list(hypernym_synsets)
-        for _ in range(2):
+        for depth in range(2):
             next_level = []
             for s in current:
                 for hypo in s.hyponyms:
@@ -404,29 +431,16 @@ def _get_cohyponyms(lemma: str) -> Set[str]:
                         continue
                     seen_synsets.add(hypo.id)
                     next_level.append(hypo)
-                    descendants_synsets.append(hypo)
+                    if _collect_and_check(hypo):
+                        logger.info(
+                            f"[L1.5/v3] _get_cohyponyms({lemma!r}): early-exit "
+                            f"на H{depth+2}, > {COHYPONYM_MAX_SIZE} лимит → "
+                            f"отклонено (широкая таксономия)"
+                        )
+                        return set()
             if not next_level:
                 break
             current = next_level
-
-        # Собираем все леммы (исключая саму lemma)
-        cohyp: Set[str] = set()
-        lemma_lower = lemma.lower()
-        for ss in descendants_synsets:
-            for s in ss.senses:
-                if s.lemma:
-                    sl = s.lemma.lower()
-                    if sl != lemma_lower:
-                        cohyp.add(sl)
-
-        # Защита baseline: если набор слишком широкий — отказываемся.
-        # Лучше пропустить cohyponym-метод для широкой таксономии чем дать FP.
-        if len(cohyp) > COHYPONYM_MAX_SIZE:
-            logger.info(
-                f"[L1.5/v3] _get_cohyponyms({lemma!r}): {len(cohyp)} лемм "
-                f"> {COHYPONYM_MAX_SIZE} лимит → отклонено (широкая таксономия)"
-            )
-            return set()
 
         return cohyp
     except Exception as e:
