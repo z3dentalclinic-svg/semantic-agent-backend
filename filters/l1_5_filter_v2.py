@@ -454,6 +454,44 @@ def _get_cohyponyms(lemma: str) -> Set[str]:
 
 # ─── Разбор seed ─────────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=1024)
+def _count_hyponyms(lemma: str) -> int:
+    """Суммарное число лемм-hyponyms у леммы (через все её senses).
+
+    Возвращаемые значения:
+        -1: леммы нет в RWN (или RWN недоступен)
+         0: лемма есть в RWN, но hyponyms нет (лист дерева)
+         N: лемма есть, у неё N hyponyms-лемм суммарно по всем sense'ам
+
+    Используется в `_pick_token_parse` для эвристики выбора 'предметного'
+    NOUN при омонимии: цветок → много hyponyms (роза, тюльпан, ...),
+    цвет-окраска → 0 или меньше.
+
+    Вынесено в отдельную функцию с lru_cache потому что в `_pick_token_parse`
+    был inline-walk по RWN-графу: для каждого NOUN-парса каждого токена
+    seed делалось `get_senses` + обход `synset.hyponyms` + `hypo.senses`
+    (десятки-сотни SQL через ORM lazy-loading). Для широких таксономий
+    типа 'лицо'/'пластика' это давало 8-10s даже после lru_cache на
+    `_get_synonyms`/`_get_cohyponyms` (потому что hypo_count считался отдельно).
+    """
+    if _rwn is None or not lemma:
+        return -1
+    try:
+        senses = _rwn.get_senses(lemma)
+    except Exception:
+        return -1
+    if not senses:
+        return -1
+    count = 0
+    try:
+        for sense in senses:
+            for hypo in sense.synset.hyponyms:
+                count += len(hypo.senses)
+    except Exception:
+        pass
+    return count
+
+
 def _pick_token_parse(token: str) -> Optional[Any]:
     """Выбор parse для одного токена seed с учётом RuWordNet.
 
@@ -487,20 +525,10 @@ def _pick_token_parse(token: str) -> Optional[Any]:
             if p.normal_form in seen_lemmas:
                 continue
             seen_lemmas.add(p.normal_form)
-            try:
-                senses = _rwn.get_senses(p.normal_form)
-            except Exception:
+            hypo_count = _count_hyponyms(p.normal_form)
+            if hypo_count < 0:
+                # Леммы нет в RWN — пропускаем кандидата (поведение как раньше)
                 continue
-            if not senses:
-                continue
-            # Считаем суммарное число hyponyms по всем sense'ам
-            hypo_count = 0
-            try:
-                for sense in senses:
-                    for hypo in sense.synset.hyponyms:
-                        hypo_count += len(hypo.senses)
-            except Exception:
-                pass
             rwn_noun_candidates.append((p, hypo_count))
 
         if rwn_noun_candidates:
