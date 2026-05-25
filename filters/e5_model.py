@@ -68,6 +68,23 @@ def get_e5_model():
         else:
             _e5_model = TextEmbedding(_E5_MODEL_NAME)
         logger.info("[E5/L1.5] Loaded successfully (1024-dim embeddings)")
+
+        # ── ONNX warmup ──────────────────────────────────────────────────
+        # Первый embed после загрузки модели прогревает ONNX-runtime (JIT-
+        # компиляция графа, выделение тензоров). Без прогрева первый запрос
+        # пользователя ловит ~10s overhead. Делаем один dummy-embed здесь
+        # внутри singleton'а — будет вызвано один раз при инициализации
+        # модуля. Кеш warmup-эмбеддинга НЕ сохраняем (это служебное слово).
+        try:
+            import time as _t
+            _t0 = _t.perf_counter()
+            _ = list(_e5_model.embed(["query: warmup"]))
+            logger.info(
+                f"[E5/L1.5] ONNX warmup embed: "
+                f"{_t.perf_counter() - _t0:.2f}s (one-shot, amortized over all requests)"
+            )
+        except Exception as _w_err:
+            logger.warning(f"[E5/L1.5] Warmup embed failed: {_w_err}")
     except Exception as e:
         logger.error(f"[E5/L1.5] Failed to load E5-large: {e}")
         logger.error(f"[E5/L1.5] L1.5 will fall back to no-semantic mode")
