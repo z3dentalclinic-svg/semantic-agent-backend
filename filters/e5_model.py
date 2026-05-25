@@ -234,3 +234,19 @@ def clear_e5_cache():
 
 def get_e5_cache_size() -> int:
     return len(_word_emb_cache)
+
+
+# ─── Auto-load при импорте модуля ────────────────────────────────────────
+# Переносит загрузку модели (~5-10s с диска) и ONNX warmup (~10s) в момент
+# импорта e5_model.py — то есть в startup сервера. Это значит:
+#   - Сервер стартует на ~15-20s дольше (но это однократно).
+#   - Первый пользовательский запрос НЕ ловит эти 15-20s overhead.
+# Без auto-load первый запрос платит за всё.
+#
+# Если загрузка падает (нет сети / нет диска) — get_e5_model() сохранит
+# _e5_model = None и сервис продолжит работать в no-semantic-mode
+# (substring/lemma/RWN-методы продолжат работать без E5).
+try:
+    get_e5_model()
+except Exception as _import_err:
+    logger.warning(f"[E5/L1.5] Auto-load at import raised: {_import_err}")
