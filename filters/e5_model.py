@@ -1,19 +1,20 @@
 """
-E5-large Model для L1.5 — отдельный singleton.
+Embedding Model для L1.5 — singleton с переключателем backend.
 
 ВАЖНО: Этот модуль ДОБАВЛЯЕТСЯ, не заменяет shared_model.py.
 Остальные фильтры (L0, L2, CategoryMismatch) продолжают использовать MiniLM 
 через shared_model.py.
 
-Только L1.5 использует E5-large для улучшенной семантики на русском.
+L1.5 использует свою E5-модель для улучшенной семантики на русском.
 
-Модель: intfloat/multilingual-e5-large
-- 1024-dim embeddings
-- SOTA для multilingual (2024+)
-- Размер на диске: ~2.2GB
-- RAM при загрузке: ~1.0-1.2GB
-- ВАЖНО: требует префиксы 'query: ' / 'passage: '
-  Для symmetric similarity (наш случай — сравнение слов) используем 'query: '
+Поддерживаемые backend'ы:
+- e5_large (intfloat/multilingual-e5-large) — 1024-dim, ~2.2GB, ~85ms/embed CPU
+- e5_small (intfloat/multilingual-e5-small) — 384-dim, ~470MB, ~10-15ms/embed CPU
+
+Откат назад: меняем EMBEDDING_BACKEND + рестарт сервера. Без изменений кода.
+Пороги в l1_5_filter_v2.py привязаны к backend через _THRESHOLDS_BY_BACKEND.
+
+Префикс 'query: ' одинаков для обеих моделей (это семейство E5).
 """
 
 import logging
@@ -23,12 +24,41 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ─── Backend конфигурация ────────────────────────────────────────────────
+# Переключатель backend. Меняется значение → рестарт сервера → переход
+# на новую модель. Пороги в фильтре переключаются автоматически.
+EMBEDDING_BACKEND = "e5_small"  # "e5_large" | "e5_small"
+
+_BACKEND_CONFIG = {
+    "e5_large": {
+        "model_name": "intfloat/multilingual-e5-large",
+        "dim": 1024,
+        "prefix": "query: ",
+        "native_in_fastembed": True,  # fastembed знает эту модель из коробки
+    },
+    "e5_small": {
+        "model_name": "intfloat/multilingual-e5-small",
+        "dim": 384,
+        "prefix": "query: ",
+        "native_in_fastembed": False,  # требует add_custom_model
+    },
+}
+
+if EMBEDDING_BACKEND not in _BACKEND_CONFIG:
+    raise ValueError(
+        f"EMBEDDING_BACKEND={EMBEDDING_BACKEND!r} not in {list(_BACKEND_CONFIG)}"
+    )
+
+_CFG = _BACKEND_CONFIG[EMBEDDING_BACKEND]
+_E5_MODEL_NAME = _CFG["model_name"]
+_E5_PREFIX = _CFG["prefix"]
+
 _e5_model = None
 _e5_loading = False
-_E5_MODEL_NAME = "intfloat/multilingual-e5-large"
 
 # Persistent disk для модели (по умолчанию fastembed качает в /tmp, лимит 2GB
-# на Render → eviction. E5-large ~2.2GB не помещается).
+# на Render → eviction. E5-large ~2.2GB не помещается, e5-small ~470MB
+# тоже хочется держать persistent чтобы не качать каждый рестарт).
 _E5_CACHE_DIR = "/var/data/models"
 try:
     os.makedirs(_E5_CACHE_DIR, exist_ok=True)
@@ -36,13 +66,54 @@ except Exception as _e:
     logger.error(f"[E5/L1.5] Cannot create {_E5_CACHE_DIR}: {_e}. Falling back to default cache.")
     _E5_CACHE_DIR = None
 
-# Кеш эмбеддингов слов
+# Кеш эмбеддингов слов. Лимит выставлен под e5-large (4KB на запись → 40MB).
+# Для e5-small запись 1.5KB → можно поднять лимит при необходимости.
 _word_emb_cache: dict = {}
 _CACHE_MAX = 10000
 
 
+def _register_custom_models():
+    """Регистрирует модели не входящие в нативный список fastembed.
+
+    Безопасно: если модель уже зарегистрирована (новые версии fastembed
+    могут добавить нативную поддержку) — ловим exception и пропускаем.
+    Если fastembed недоступен — тоже не падаем (get_e5_model вернёт None).
+    """
+    if _CFG["native_in_fastembed"]:
+        return  # ничего регистрировать не нужно
+
+    try:
+        from fastembed import TextEmbedding
+        from fastembed.common.model_description import PoolingType, ModelSource
+    except Exception as e:
+        logger.warning(f"[E5/L1.5] fastembed not available, skipping custom model registration: {e}")
+        return
+
+    # Проверяем — может модель уже в нативном списке (новая версия fastembed)
+    try:
+        supported = {m.get("model") for m in TextEmbedding.list_supported_models()}
+        if _E5_MODEL_NAME in supported:
+            logger.info(f"[E5/L1.5] {_E5_MODEL_NAME} already in native fastembed list, skipping registration")
+            return
+    except Exception:
+        pass  # не критично, пробуем зарегистрировать
+
+    try:
+        TextEmbedding.add_custom_model(
+            model=_E5_MODEL_NAME,
+            pooling=PoolingType.MEAN,
+            normalization=True,
+            sources=ModelSource(hf=_E5_MODEL_NAME),
+            dim=_CFG["dim"],
+            model_file="onnx/model.onnx",
+        )
+        logger.info(f"[E5/L1.5] Registered custom model: {_E5_MODEL_NAME} (dim={_CFG['dim']})")
+    except Exception as e:
+        logger.warning(f"[E5/L1.5] add_custom_model({_E5_MODEL_NAME!r}) failed: {e}")
+
+
 def get_e5_model():
-    """Singleton E5-large для L1.5."""
+    """Singleton модели для L1.5 (E5-large или E5-small в зависимости от EMBEDDING_BACKEND)."""
     global _e5_model, _e5_loading
 
     if _e5_model is not None:
@@ -59,15 +130,21 @@ def get_e5_model():
     _e5_loading = True
 
     try:
+        # Регистрируем не-нативные модели в fastembed (e5-small требует add_custom_model)
+        _register_custom_models()
+
         from fastembed import TextEmbedding
+        logger.info(f"[E5/L1.5] Backend: {EMBEDDING_BACKEND}")
         logger.info(f"[E5/L1.5] Loading {_E5_MODEL_NAME}...")
         logger.info(f"[E5/L1.5] cache_dir={_E5_CACHE_DIR or 'default(/tmp)'}")
-        logger.info("[E5/L1.5] First-time download ~2.2GB, may take 1-2 minutes")
+        logger.info(
+            f"[E5/L1.5] First-time download may take 30-120s (size varies by model)"
+        )
         if _E5_CACHE_DIR:
             _e5_model = TextEmbedding(_E5_MODEL_NAME, cache_dir=_E5_CACHE_DIR)
         else:
             _e5_model = TextEmbedding(_E5_MODEL_NAME)
-        logger.info("[E5/L1.5] Loaded successfully (1024-dim embeddings)")
+        logger.info(f"[E5/L1.5] Loaded successfully ({_CFG['dim']}-dim embeddings)")
 
         # ── ONNX warmup ──────────────────────────────────────────────────
         # Первый embed после загрузки модели прогревает ONNX-runtime (JIT-
@@ -78,7 +155,7 @@ def get_e5_model():
         try:
             import time as _t
             _t0 = _t.perf_counter()
-            _ = list(_e5_model.embed(["query: warmup"]))
+            _ = list(_e5_model.embed([f"{_E5_PREFIX}warmup"]))
             logger.info(
                 f"[E5/L1.5] ONNX warmup embed: "
                 f"{_t.perf_counter() - _t0:.2f}s (one-shot, amortized over all requests)"
@@ -86,7 +163,7 @@ def get_e5_model():
         except Exception as _w_err:
             logger.warning(f"[E5/L1.5] Warmup embed failed: {_w_err}")
     except Exception as e:
-        logger.error(f"[E5/L1.5] Failed to load E5-large: {e}")
+        logger.error(f"[E5/L1.5] Failed to load {_E5_MODEL_NAME}: {e}")
         logger.error(f"[E5/L1.5] L1.5 will fall back to no-semantic mode")
         _e5_model = None
     finally:
@@ -121,9 +198,9 @@ def get_e5_word_embedding(word: str) -> Optional[np.ndarray]:
         return None
     
     try:
-        # E5 prefix: 'query: ' для symmetric similarity 
+        # E5 prefix: 'query: ' для symmetric similarity
         # (sentence-to-sentence, classification, clustering)
-        prefixed = f"query: {word}"
+        prefixed = f"{_E5_PREFIX}{word}"
         embeddings = list(model.embed([prefixed]))
         if not embeddings:
             return None
@@ -196,7 +273,7 @@ def warm_e5_word_cache(words: Iterable[str], batch_size: int = 64) -> int:
     try:
         for start in range(0, len(to_embed), batch_size):
             batch = to_embed[start:start + batch_size]
-            prefixed = [f"query: {w}" for w in batch]
+            prefixed = [f"{_E5_PREFIX}{w}" for w in batch]
             embeddings = list(model.embed(prefixed))
             for word, emb in zip(batch, embeddings):
                 if emb is None:
