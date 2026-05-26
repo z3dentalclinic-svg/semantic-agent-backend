@@ -120,12 +120,21 @@ def _init_ruwordnet():
 _rwn = _init_ruwordnet()
 
 # ─── E5 model — НЕ молча глотаем ошибки импорта ─────────────────────────
+import sys as _sys
+
+def _filter_diag(msg: str) -> None:
+    """Диагностический print для startup-логов (logger.info на module-level
+    может уходить в никуда т.к. uvicorn ещё не настроил logging)."""
+    print(f"[L1.5/DIAG] {msg}", file=_sys.stderr, flush=True)
+
+
 _E5_IMPORT_OK = False
 get_e5_word_embedding = None
 e5_cosine_sim = None
 get_e5_model = None
 warm_e5_word_cache = None
 
+_filter_diag("starting e5_model import")
 try:
     from .e5_model import (
         get_e5_word_embedding as _gee,
@@ -133,14 +142,21 @@ try:
         get_e5_model as _gem,
         warm_e5_word_cache as _wwc,
     )
+    _filter_diag(f"relative import: _gee={_gee}, _gem={_gem}, _ecs={_ecs}, _wwc={_wwc}")
+    # SANITY: все 4 имени должны быть вызываемыми. Если хоть одно None —
+    # импорт частично сломан, fallback не сработал, raise чтобы явно увидеть.
+    assert callable(_gee), f"get_e5_word_embedding is not callable: {_gee!r}"
+    assert callable(_ecs), f"e5_cosine_sim is not callable: {_ecs!r}"
+    assert callable(_gem), f"get_e5_model is not callable: {_gem!r}"
+    assert callable(_wwc), f"warm_e5_word_cache is not callable: {_wwc!r}"
     get_e5_word_embedding = _gee
     e5_cosine_sim = _ecs
     get_e5_model = _gem
     warm_e5_word_cache = _wwc
     _E5_IMPORT_OK = True
-    logger.info("[L1.5/v3] E5 module imported via relative path")
+    _filter_diag("E5 module imported via relative path, all callables OK")
 except Exception as e_rel:
-    logger.warning(f"[L1.5/v3] relative import of e5_model failed: {e_rel}")
+    _filter_diag(f"relative import failed: {type(e_rel).__name__}: {e_rel}")
     try:
         from e5_model import (
             get_e5_word_embedding as _gee,
@@ -148,15 +164,20 @@ except Exception as e_rel:
             get_e5_model as _gem,
             warm_e5_word_cache as _wwc,
         )
+        _filter_diag(f"absolute import: _gee={_gee}, _gem={_gem}, _ecs={_ecs}, _wwc={_wwc}")
+        assert callable(_gee), f"get_e5_word_embedding is not callable: {_gee!r}"
+        assert callable(_ecs), f"e5_cosine_sim is not callable: {_ecs!r}"
+        assert callable(_gem), f"get_e5_model is not callable: {_gem!r}"
+        assert callable(_wwc), f"warm_e5_word_cache is not callable: {_wwc!r}"
         get_e5_word_embedding = _gee
         e5_cosine_sim = _ecs
         get_e5_model = _gem
         warm_e5_word_cache = _wwc
         _E5_IMPORT_OK = True
-        logger.info("[L1.5/v3] E5 module imported via absolute path")
+        _filter_diag("E5 module imported via absolute path, all callables OK")
     except Exception as e_abs:
-        logger.error(f"[L1.5/v3] absolute import of e5_model also failed: {e_abs}")
-        logger.error("[L1.5/v3] E5 unavailable — semantic axes will use only substring/lemma/ruwordnet/neighbors")
+        _filter_diag(f"absolute import also failed: {type(e_abs).__name__}: {e_abs}")
+        _filter_diag("E5 unavailable — fallback to no-semantic mode (substring/lemma/RWN only)")
 
         def get_e5_word_embedding(w):
             return None
@@ -170,36 +191,75 @@ except Exception as e_rel:
         def warm_e5_word_cache(words, batch_size=64):
             return 0
 
-# ─── Тюнинг (откалибровать после первого прогона) ────────────────────────
-COS_OBJECT_HIGH = 0.78    # порог cos для гипонимов object (с двойным фильтром neighbors)
-COS_ACTION_HIGH = 0.87    # порог cos для синонимов action (без neighbors, выше).
-                          # Был 0.85 — пропускал "купить", "вокзал", "фото"
-                          # как синонимы "доставка" в группе D FP.
-                          # 0.90 был слишком строгим (терял "посылка"=0.882,
-                          # "заказ"=0.899). 0.88 возвращает их, сохраняя
-                          # отсечение "купить"=0.861, "вокзал"=0.850, "дом"=0.868.
-                          # 0.87 дополнительно спасает acronyms типа 'акб'=0.876
-                          # для action='аккумулятор'. Безопасно для baseline
-                          # 'доставка цветов': в зоне [0.87, 0.88) нет ключей
-                          # с прошедшим object → 0 регрессий, 0 возвратов FP.
-COS_GAP_MIN = 0.05        # мин разница (cos_obj - cos_act) для метода 4 object.
-                          # Был 0.15 — убивал все валидные гипонимы (роза gap=0.029,
-                          # букет gap=0.091, тюльпан gap=0.035). Сейчас розы/тюльпаны
-                          # ловятся через RuWordNet (метод 3), а в методе 4 0.05
-                          # отсекает коммерческие FP (цена -0.029, отзыв -0.014,
-                          # одесса -0.028, дом -0.030, заказ -0.060).
+# Финальный assert после всего: даже после fallback функции должны быть вызываемыми
+assert callable(get_e5_word_embedding), \
+    f"FATAL: get_e5_word_embedding is None after import block. _E5_IMPORT_OK={_E5_IMPORT_OK}"
+assert callable(get_e5_model), \
+    f"FATAL: get_e5_model is None after import block. _E5_IMPORT_OK={_E5_IMPORT_OK}"
+_filter_diag(f"final state: _E5_IMPORT_OK={_E5_IMPORT_OK}, all E5 callables OK")
+
+# ─── Тюнинг — пороги привязаны к backend модели ──────────────────────────
+# Распределение cos зависит от модели → пороги тоже зависят. При смене
+# EMBEDDING_BACKEND в e5_model.py пороги переключаются автоматически.
+#
+# MIN_OBJECT_LEMMA_LEN от backend НЕ зависит (это длина строки).
+#
+# При миграции на новый backend:
+#   1. Стартуем с тех же значений что у предыдущего backend
+#   2. Прогон → смотрим distribution cos и регрессии в counts
+#   3. Калибруем пороги по контрольным парам (см. MIGRATION_TO_MINILM.md §4)
+
+_THRESHOLDS_BY_BACKEND = {
+    "e5_large": {
+        # Откалибровано на baseline 'доставка цветов' / 'купить айфон 16'
+        "COS_OBJECT_HIGH":             0.78,
+        "COS_ACTION_HIGH":             0.87,
+        "COS_GAP_MIN":                 0.05,
+        "COS_QUALIFIER_NUMERIC_HIGH":  0.82,
+    },
+    "e5_small": {
+        # СТАРТ: те же значения для прогона baseline на новой модели.
+        # После прогона на 'доставка цветов' / 'купить айфон 16' калибруем
+        # под фактическое распределение cos в e5-small. Ожидаемое смещение
+        # ~0.02-0.05 от значений e5-large (то же семейство, но меньше параметров).
+        "COS_OBJECT_HIGH":             0.78,
+        "COS_ACTION_HIGH":             0.87,
+        "COS_GAP_MIN":                 0.05,
+        "COS_QUALIFIER_NUMERIC_HIGH":  0.82,
+    },
+}
+
+# Импортируем активный backend из e5_model (одна точка истины)
+try:
+    from .e5_model import EMBEDDING_BACKEND as _ACTIVE_BACKEND
+except Exception:
+    try:
+        from e5_model import EMBEDDING_BACKEND as _ACTIVE_BACKEND
+    except Exception:
+        _ACTIVE_BACKEND = "e5_large"  # fallback на дефолт
+        logger.warning(
+            "[L1.5/v3] Could not import EMBEDDING_BACKEND from e5_model, "
+            "falling back to e5_large thresholds"
+        )
+
+if _ACTIVE_BACKEND not in _THRESHOLDS_BY_BACKEND:
+    logger.warning(
+        f"[L1.5/v3] Unknown backend {_ACTIVE_BACKEND!r}, falling back to e5_large thresholds"
+    )
+    _ACTIVE_BACKEND = "e5_large"
+
+_T = _THRESHOLDS_BY_BACKEND[_ACTIVE_BACKEND]
+logger.info(f"[L1.5/v3] Active embedding backend: {_ACTIVE_BACKEND}, thresholds: {_T}")
+
+COS_OBJECT_HIGH            = _T["COS_OBJECT_HIGH"]    # порог cos для гипонимов object (метод 4, с neighbors+gap)
+COS_ACTION_HIGH            = _T["COS_ACTION_HIGH"]    # порог cos для синонимов action (метод 4, без neighbors)
+COS_GAP_MIN                = _T["COS_GAP_MIN"]        # мин разница (cos_obj - cos_act) в методе 4 object
+COS_QUALIFIER_NUMERIC_HIGH = _T["COS_QUALIFIER_NUMERIC_HIGH"]  # порог cos '16' ↔ 'шестнадцатый'
+
 MIN_OBJECT_LEMMA_LEN = 3  # минимальная длина леммы object-кандидата в методе 4.
                           # Защита от предлогов-омонимов: pymorphy парсит 'в'/'с'
                           # как буквы алфавита NOUN → попадали в кандидаты.
-COS_QUALIFIER_NUMERIC_HIGH = 0.82  # порог cos для эквивалентности словесной
-                          # и цифровой формы числа ('шестнадцатый' ↔ '16').
-                          # Консервативный: cos между числами обычно высокий
-                          # (E5 видит их вместе в текстах), а cos с object
-                          # типа cos('16','айфон')≈0.5 далеко ниже.
-                          # 0.82 — компромисс: пропускает 'шестнадцатый',
-                          # отсекает явный шум. Если в реальных прогонах
-                          # возникнут регрессии — снижать до 0.80 или повышать
-                          # до 0.85 точечно.
+                          # От backend НЕ зависит.
 NEIGHBOR_WINDOW = 2
 NEIGHBOR_MIN_FREQ = 2
 
