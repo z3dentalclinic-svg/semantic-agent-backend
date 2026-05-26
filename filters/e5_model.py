@@ -24,6 +24,24 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ─── Логируем версию fastembed для диагностики ───────────────────────────
+try:
+    import fastembed as _fe
+    _fe_version = getattr(_fe, "__version__", "unknown")
+    logger.info(f"[E5/L1.5] fastembed version: {_fe_version}")
+    # Проверка наличия add_custom_model
+    from fastembed import TextEmbedding as _TE_check
+    _has_add_custom = hasattr(_TE_check, "add_custom_model")
+    logger.info(f"[E5/L1.5] fastembed.TextEmbedding.add_custom_model available: {_has_add_custom}")
+    # Проверка наличия model_description модуля
+    try:
+        from fastembed.common.model_description import PoolingType as _pt_check, ModelSource as _ms_check
+        logger.info(f"[E5/L1.5] fastembed.common.model_description: OK (PoolingType={_pt_check}, ModelSource={_ms_check})")
+    except Exception as _md_err:
+        logger.info(f"[E5/L1.5] fastembed.common.model_description: NOT AVAILABLE ({_md_err})")
+except Exception as _diag_err:
+    logger.warning(f"[E5/L1.5] Version diagnostic failed: {_diag_err}")
+
 # ─── Backend конфигурация ────────────────────────────────────────────────
 # Переключатель backend. Меняется значение → рестарт сервера → переход
 # на новую модель. Пороги в фильтре переключаются автоматически.
