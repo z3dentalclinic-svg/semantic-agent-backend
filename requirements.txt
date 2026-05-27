@@ -26,7 +26,7 @@ geonamescache>=3.0.0
 # Multilingual country names для Geo-Garbage Filter
 babel
 
-# L2 Embeddings (MiniLM)
+# L2 Embeddings (MiniLM) + L1.5 Embeddings (E5-small через add_custom_model)
 fastembed>=0.7.0
 onnxruntime>=1.17.0
 
@@ -36,5 +36,8 @@ psutil>=5.9.0
 # Streaming
 anthropic
 
-# RuWordNet — taxonomy для L1.5 (synonyms/hyponyms)
-ruwordnet>=0.0.4
+# RuWordNet — УДАЛЕНО.
+# L1.5 теперь использует prebuilt index'ы (rwn_synonyms.json.gz, rwn_cohyponyms.json.gz,
+# rwn_meta.json.gz), которые лежат в корне проекта.
+# Эти файлы собраны локально скриптом build_rwn_index.py, который использует
+# ruwordnet ОДИН РАЗ при сборке. В проде ruwordnet не нужен.
