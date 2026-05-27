@@ -43,6 +43,13 @@ class BatchPostFilter:
             # "новый"→Novyy/RU/p=6k. Без этих записей foreign-блок отсеивает валидные ключи
             # типа "доставка 24 часа", "новые санжары", "новый телефон".
             "час", "новый",
+            # FIX (priority restructure, batch 2): омонимы тематических/частотных слов.
+            # "роз"/"роза"→lemma "роза"→Roza/RU/p=14k (посёлок Челябинской обл) — флористический
+            # термин, ловится в "13 роз доставка", "101 роза", "5 роз ціна" и т.д.
+            # "белая"→Gudermes/RU/p=32k alt-name (мусорная запись geonames). Юниграмма "белая"
+            # обрабатывается раньше биграммы "белая церковь"(UA/207k) и блокирует ключ
+            # "белая церковь доставка цветов" до того как биграмма получит шанс пройти как target.
+            "роза", "белая",
         }
 
         # Кэш на уровень одного filter_batch: (word, country) → bool
@@ -783,12 +790,30 @@ class BatchPostFilter:
                 if item in our_city_lemmas or item_normalized in our_city_lemmas:
                     continue
                 
-                # FIX (priority restructure): ignored_words guard — омонимы частотных слов,
-                # случайно сидящие в БД как мелкие города. "час" / "новый" / "дом" / "мир" /
-                # "бор" / "нива" и т.д. — обычные русские слова, лемма ключа может совпасть
-                # с ними и привести к ложной блокировке валидного ключа.
+                # FIX (priority restructure, batch 3): двойной guard для disambiguation
+                # мелких городов в БД от alt-names обычных слов.
+                # 
+                # GUARD 1: явный ignored_words (известные омонимы — час, новый, роза, белая)
                 if item_normalized in self.ignored_words or item in self.ignored_words:
                     continue
+                
+                # GUARD 2: алгоритмическое disambiguation для мелких городов.
+                # Логика: 
+                #   - крупный город (pop >= 50k) → доверяем БД безусловно, блокируем
+                #   - мелкий город (pop < 50k) + слово 100% уверенное обычное слово
+                #     (top score=1.0, известно, без Geox/Name тегов в любом parse)
+                #     → это omonim, доверяем pymorphy, не блокируем
+                #   - мелкий город + пограничный сигнал (score<1.0 или есть Geox в alt parse)
+                #     → доверяем БД, блокируем
+                # Применяется только для unigrams (биграммы редко омонимичны обычным словам).
+                if ' ' not in item and '-' not in item:
+                    _city_pop = max(
+                        self.population_cache.get(item, 0) or 0,
+                        self.population_cache.get(item_normalized, 0) or 0,
+                    )
+                    if _city_pop < 50000:
+                        if self._is_omonym_common(item, language):
+                            continue
                 
                 # FIX (priority restructure): _is_common_noun guard УБРАН в блоке foreign.
                 # Сюда попадаем только когда found_country != None — то есть item уже в БД
@@ -929,14 +954,14 @@ class BatchPostFilter:
     def _get_word_features(self, word: str, language: str) -> dict:
         """
         Единый морфоразбор слова: один вызов morph.parse вместо 2-3 отдельных.
-        Возвращает dict с lemma, skip_geo, is_common_noun.
+        Возвращает dict с lemma, skip_geo, is_common_noun, is_omonym_common.
         Кэшируется в _word_features_cache (персистентный между запросами).
         """
         cache_key = (word, language)
         if cache_key in self._word_features_cache:
             return self._word_features_cache[cache_key]
 
-        features = {'skip_geo': False, 'is_common_noun': False}
+        features = {'skip_geo': False, 'is_common_noun': False, 'is_omonym_common': False}
 
         if not self._has_morph or language not in ['ru', 'uk']:
             self._word_features_cache[cache_key] = features
@@ -969,6 +994,20 @@ class BatchPostFilter:
                                 features['is_common_noun'] = True
                         elif 'NOUN' in tag_str:
                             features['is_common_noun'] = 'inan' in tag_str and best.score >= 0.5
+
+                # is_omonym_common: disambiguation для мелких городов в БД vs alt-names обычных слов.
+                # Сигнал: pymorphy НЕ помечает слово тегом Geox ни в одном parse →
+                # это не топоним. Name/Surn/Patr/Orgn — НЕ Geox (они для имён людей вроде "Роза",
+                # "Яссы" как имена; для нас это omonim-сигнал, а не гео).
+                # Условие срабатывания: word_is_known + no Geox в любом parse.
+                # Покрывает: час, новый, роза, белая, салон, виды, дом, дача, ... — всё что
+                # pymorphy уверенно не считает топонимом. Защита от FP геонеймс-alt-names.
+                # FN для мелких городов без Geox-маркера в pymorphy (лазаревское, целина, щучин,
+                # яровое) — компромисс: лучше потерять 4 редких кейса чем ловить FP в каждой нише.
+                if word.islower() and morph.word_is_known(word):
+                    has_geox = any('Geox' in str(p.tag) for p in parses)
+                    if not has_geox:
+                        features['is_omonym_common'] = True
         except:
             pass
 
@@ -980,6 +1019,9 @@ class BatchPostFilter:
 
     def _should_skip_geo_check(self, word: str, language: str) -> bool:
         return self._get_word_features(word, language)['skip_geo']
+
+    def _is_omonym_common(self, word: str, language: str) -> bool:
+        return self._get_word_features(word, language)['is_omonym_common']
 
     def _extract_cities_from_seed(self, seed: str, country: str, language: str) -> Set[str]:
         """🔥 FIX: Извлекает города из seed БЕЗ фильтра по стране.
