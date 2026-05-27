@@ -1,6 +1,6 @@
 {
-  "_comment": "Curated list of retailers and online marketplaces. Covers UA/RU/BY/KZ/EU/global. Names in lowercase. Multi-word names stored as single strings (detector handles bigram matching). Last updated: 2026-04 (v1.1 — added hotline/яблука/shop.by/rustore).",
-  "_version": "1.1",
+  "_comment": "Curated list of retailers and online marketplaces. Covers UA/RU/BY/KZ/EU/global. Names in lowercase. Multi-word names stored as single strings (detector handles bigram matching). Last updated: 2026-05 (v1.2 — added яндекс/yandex (root, covers all Яндекс services), глово/glovo).",
+  "_version": "1.2",
   "retailers": [
     "розетка",
     "rozetka",
@@ -60,6 +60,8 @@
     "ozon",
     "вайлдберриз",
     "wildberries",
+    "яндекс",
+    "yandex",
     "яндекс маркет",
     "yandex market",
     "мвидео",
@@ -207,6 +209,8 @@
     "шоп бай",
     "shop.by",
     "рустор",
-    "rustore"
+    "rustore",
+    "глово",
+    "glovo"
   ]
 }
