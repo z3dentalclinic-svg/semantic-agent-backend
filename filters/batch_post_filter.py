@@ -864,35 +864,69 @@ class BatchPostFilter:
         # Биграмы: оба компонента кандидаты ИЛИ биграмма целиком в geo-индексе.
         # "нижний новгород" → в city_multi_index → OK даже если компоненты не кандидаты.
         # "ремонт харьков" → харьков=кандидат, ремонт=нет → НЕ строим биграмму.
+        # Space↔dash: города типа "южно-курильск", "ростов-на-дону" лежат в индексе
+        # с дефисом. Юзер пишет с пробелом — биграмма "южно курильск" должна
+        # резолвиться через "южно-курильск".
         for i in range(len(words) - 1):
             w1, w2 = words[i], words[i + 1]
             l1 = lemmas_map.get(w1, w1)
             l2 = lemmas_map.get(w2, w2)
             bg = f"{w1} {w2}"
             bg_lemma = f"{l1} {l2}"
+            bg_dash = bg.replace(' ', '-')
+            bg_lemma_dash = bg_lemma.replace(' ', '-')
 
             in_multi = (
                 bg in self.city_multi_index or
                 bg_lemma in self.city_multi_index or
+                bg_dash in self.city_multi_index or
+                bg_lemma_dash in self.city_multi_index or
                 bg in self.explicit_geo_index or
-                bg_lemma in self.explicit_geo_index
+                bg_lemma in self.explicit_geo_index or
+                bg_dash in self.explicit_geo_index or
+                bg_lemma_dash in self.explicit_geo_index
             )
             both_candidates = unigram_flags[i] and unigram_flags[i + 1]
 
             if in_multi or both_candidates:
                 candidates.append(bg)
                 if '-' not in bg:
-                    candidates.append(bg.replace(' ', '-'))
+                    candidates.append(bg_dash)
                 if bg_lemma != bg:
                     candidates.append(bg_lemma)
                     if '-' not in bg_lemma:
-                        candidates.append(bg_lemma.replace(' ', '-'))
+                        candidates.append(bg_lemma_dash)
 
-        # Триграмы: только если биграмма уже кандидат (крайне редко нужны)
+        # Триграмы: проверяем space-форму, dash-форму и lemma-варианты.
+        # "комсомольск на амуре" → "комсомольск-на-амуре" в multi_index → BLOCK.
         for i in range(len(words) - 2):
-            tg = f"{words[i]} {words[i+1]} {words[i+2]}"
-            if tg in self.city_multi_index or tg in self.explicit_geo_index:
+            w1, w2, w3 = words[i], words[i+1], words[i+2]
+            l1 = lemmas_map.get(w1, w1)
+            l2 = lemmas_map.get(w2, w2)
+            l3 = lemmas_map.get(w3, w3)
+            tg = f"{w1} {w2} {w3}"
+            tg_lemma = f"{l1} {l2} {l3}"
+            tg_dash = tg.replace(' ', '-')
+            tg_lemma_dash = tg_lemma.replace(' ', '-')
+
+            in_idx = (
+                tg in self.city_multi_index or
+                tg_lemma in self.city_multi_index or
+                tg_dash in self.city_multi_index or
+                tg_lemma_dash in self.city_multi_index or
+                tg in self.explicit_geo_index or
+                tg_lemma in self.explicit_geo_index or
+                tg_dash in self.explicit_geo_index or
+                tg_lemma_dash in self.explicit_geo_index
+            )
+            if in_idx:
                 candidates.append(tg)
+                if '-' not in tg:
+                    candidates.append(tg_dash)
+                if tg_lemma != tg:
+                    candidates.append(tg_lemma)
+                    if '-' not in tg_lemma:
+                        candidates.append(tg_lemma_dash)
 
         return list(dict.fromkeys(candidates))
 
