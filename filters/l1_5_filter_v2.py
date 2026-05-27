@@ -37,87 +37,20 @@ except Exception as e:
     _morph = None
     logger.error(f"[L1.5/v3] pymorphy3 not available: {e}")
 
-# ─── RuWordNet (optional) ────────────────────────────────────────────────
-# Пакет ruwordnet>=0.0.4 НЕ содержит БД в комплекте. БД нужно скачивать
-# отдельно командой `python -m ruwordnet download`, которая качает файл в
-# `<package>/static/ruwordnet-2021.db`. Эта папка пересоздаётся при каждом
-# деплое Render → download пришлось бы повторять. Поэтому качаем БД сами в
-# persistent disk `/var/data/models/`, при первом старте сервиса.
-
-_RWN_DB_DIR = "/var/data/models"
-_RWN_DB_PATH = f"{_RWN_DB_DIR}/ruwordnet-2021.db"
-_RWN_DB_URL = (
-    "https://github.com/avidale/python-ruwordnet/releases/download/"
-    "0.0.4/ruwordnet-2021.db"
-)
-
-
-def _ensure_ruwordnet_db() -> bool:
-    """
-    Гарантирует наличие БД RuWordNet на persistent disk.
-    Возвращает True если файл готов к использованию.
-    """
-    import os
-    import urllib.request
-
-    if os.path.exists(_RWN_DB_PATH):
-        try:
-            size_mb = os.path.getsize(_RWN_DB_PATH) / 1e6
-            logger.info(f"[L1.5/v3] RuWordNet DB found at {_RWN_DB_PATH} ({size_mb:.1f} MB)")
-        except Exception:
-            pass
-        return True
-
-    try:
-        os.makedirs(_RWN_DB_DIR, exist_ok=True)
-    except Exception as e:
-        logger.error(f"[L1.5/v3] Cannot create dir {_RWN_DB_DIR}: {e}")
-        return False
-
-    tmp_path = _RWN_DB_PATH + ".tmp"
-    try:
-        logger.info(f"[L1.5/v3] RuWordNet DB not found, downloading from {_RWN_DB_URL}")
-        # Тот же подход что и в `python -m ruwordnet download` (urlretrieve).
-        # Сохраняем во временный файл и атомарно переименовываем — если
-        # download прерван, повреждённый файл не останется как валидный.
-        urllib.request.urlretrieve(_RWN_DB_URL, tmp_path)
-        size_mb = os.path.getsize(tmp_path) / 1e6
-        os.rename(tmp_path, _RWN_DB_PATH)
-        logger.info(f"[L1.5/v3] RuWordNet DB downloaded: {_RWN_DB_PATH} ({size_mb:.1f} MB)")
-        return True
-    except Exception as e:
-        logger.error(f"[L1.5/v3] Failed to download RuWordNet DB: {e}")
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
-
-
-def _init_ruwordnet():
-    """Возвращает экземпляр RuWordNet или None (если БД не доступна)."""
-    try:
-        from ruwordnet import RuWordNet
-    except ImportError as e:
-        logger.warning(f"[L1.5/v3] RuWordNet package not installed: {e}")
-        return None
-
-    if not _ensure_ruwordnet_db():
-        return None
-
-    try:
-        rwn = RuWordNet(filename_or_session=_RWN_DB_PATH)
-        # Sanity-check: пробуем простой запрос. Если БД повреждена — здесь упадёт.
-        _ = rwn.get_senses("тест")
-        logger.info(f"[L1.5/v3] RuWordNet loaded from {_RWN_DB_PATH}")
-        return rwn
-    except Exception as e:
-        logger.error(f"[L1.5/v3] RuWordNet init failed: {e}")
-        return None
-
-
-_rwn = _init_ruwordnet()
+# ─── RuWordNet (REMOVED) ─────────────────────────────────────────────────
+# Раньше здесь был download БД RuWordNet с GitHub + инициализация ORM.
+# Удалено: теперь все 4 RWN-функции (_get_synonyms, _get_cohyponyms,
+# _has_verb_derivation, _count_hyponyms) читают данные из prebuilt index'ов
+# `rwn_*.json.gz` (см. блок PREBUILT RWN INDEX ниже).
+#
+# Преимущества удаления:
+#   - -100-200 MB RAM (нет sqlite ORM в памяти)
+#   - -1-2s startup (нет download/init/sanity-check)
+#   - -1 зависимость в requirements.txt (ruwordnet больше не нужен)
+#   - Чище код (нет fallback-веток `if _rwn is None`)
+#
+# Файлы индексов собираются скриптом `build_rwn_index.py` локально — он
+# использует ruwordnet ОДИН РАЗ при сборке. В проде ruwordnet не нужен.
 
 
 # ─── PREBUILT RWN INDEX — мгновенный dict-lookup вместо RWN walks ────────
@@ -409,91 +342,38 @@ def _token_lemmas(word: str, pos_filter: Optional[Set[str]] = None) -> Set[str]:
 
 @functools.lru_cache(maxsize=1024)
 def _get_synonyms(lemma: str) -> Set[str]:
-    """Лексика близкая к лемме из RuWordNet (если доступен).
+    """Лексика близкая к лемме из RuWordNet (через prebuilt index).
 
-    Берём:
+    Включает (через build_rwn_index.py):
     1. Synonyms — леммы того же synset (доставка ↔ привоз)
     2. Hyponyms — дочерние synset (цветок → роза, тюльпан, букет, эустома)
     3. POS-synonyms — мост между частями речи (доставка ↔ доставлять)
     4. Derivations — словообразовательные пары на уровне sense
        (доставлять → доставка, доставщик)
 
-    Расширение synset.senses одного синсета само по себе бесполезно для нашей
-    задачи (для 'цветок' оно даёт {цвет} — близкий smysl, но не гипонимы).
-    Главную ценность дают hyponyms.
+    Если prebuilt index не загружен — возвращает пустой set (фильтр работает
+    без RWN-методов через E5+substring+lemma).
     """
-    # Fast path: prebuilt index → instant dict lookup.
-    # Семантика идентична — индекс собран той же логикой (build_rwn_index.py).
-    if _USE_PREBUILT_INDEX:
-        return set(_SYNONYMS_INDEX.get(lemma.lower() if lemma else "", []))
-
-    if _rwn is None or not lemma:
+    if not _USE_PREBUILT_INDEX or not lemma:
         return set()
-    try:
-        syns: Set[str] = set()
-        senses = _rwn.get_senses(lemma)
-        for sense in senses:
-            # 1. Synonyms (одного synset)
-            for s in sense.synset.senses:
-                if s.lemma and s.lemma.lower() != lemma:
-                    syns.add(s.lemma.lower())
-            # 2. Hyponyms (дочерние synset — роза для цветок)
-            for hypo_synset in sense.synset.hyponyms:
-                for s in hypo_synset.senses:
-                    if s.lemma:
-                        syns.add(s.lemma.lower())
-            # 3. POS-synonyms (мост между частями речи)
-            for ps_synset in sense.synset.pos_synonyms:
-                for s in ps_synset.senses:
-                    if s.lemma and s.lemma.lower() != lemma:
-                        syns.add(s.lemma.lower())
-            # 4. Derivations (sense-level словообразование)
-            for deriv in sense.derivations:
-                if deriv.lemma and deriv.lemma.lower() != lemma:
-                    syns.add(deriv.lemma.lower())
-        return syns
-    except Exception as e:
-        logger.warning(f"[L1.5/v3] _get_synonyms({lemma!r}) failed: {e}")
-        return set()
+    return set(_SYNONYMS_INDEX.get(lemma.lower(), []))
 
 
 @functools.lru_cache(maxsize=2048)
 def _has_verb_derivation(lemma: str) -> bool:
-    """Есть ли у леммы VERB/INFN-производное в RuWordNet?
+    """Есть ли у леммы VERB/INFN-производное в RuWordNet (через prebuilt index)?
 
     Используется для определения action-noun: отглагольные существительные
     (доставка, ремонт, продажа) имеют verb-counterpart, природные предметы
     (цветок, квартира) — нет.
 
-    Возвращает False если RuWordNet недоступен → caller использует fallback.
+    Если prebuilt index не загружен — возвращает False (caller использует
+    fallback в логике определения action-anchor).
     """
-    # Fast path: prebuilt index
-    if _USE_PREBUILT_INDEX:
-        if not lemma:
-            return False
-        meta = _META_INDEX.get(lemma.lower(), {})
-        return bool(meta.get("has_verb_derivation", False))
-
-    if _rwn is None or not lemma:
+    if not _USE_PREBUILT_INDEX or not lemma:
         return False
-    try:
-        senses = _rwn.get_senses(lemma)
-        for sense in senses:
-            # Проверяем POS-synonyms (synset мостит части речи)
-            for ps_synset in sense.synset.pos_synonyms:
-                pos = (ps_synset.part_of_speech or '').upper()
-                if pos.startswith('V'):  # V / VERB
-                    return True
-            # Проверяем sense-level derivations
-            for deriv in sense.derivations:
-                if deriv.synset is None:
-                    continue
-                pos = (deriv.synset.part_of_speech or '').upper()
-                if pos.startswith('V'):
-                    return True
-        return False
-    except Exception:
-        return False
+    meta = _META_INDEX.get(lemma.lower())
+    return bool(meta and meta.get("has_verb_derivation", False))
 
 
 # Лимит размера cohyponym-набора. Если у object_anchor через ближайший
@@ -507,152 +387,42 @@ COHYPONYM_MAX_SIZE = 50
 
 @functools.lru_cache(maxsize=1024)
 def _get_cohyponyms(lemma: str) -> Set[str]:
-    """Co-hyponyms (семантические братья) леммы в RuWordNet.
+    """Co-hyponyms (семантические братья) леммы из prebuilt RWN index.
 
-    Берём ближайший hypernym леммы и опускаемся на 2 уровня вниз. Это ловит
-    как прямых братьев (на 1 уровне), так и племянников (на 2 уровне).
+    Через build_rwn_index.py:
+      - Поднимаемся на 1 уровень к hypernym'у
+      - Опускаемся на 2 уровня вниз
+      - Если набор > COHYPONYM_MAX_SIZE — пустой (защита от широких таксономий)
 
-    Зачем 2 уровня: в RWN многие пары родственников разнесены на разные
-    подкатегории. Например 'скутер' прямой ребёнок МОТОТРАНСПОРТНОЕ СРЕДСТВО,
-    а 'мопед' — внук того же synset через промежуточный МОТОЦИКЛ.
-    На 1 уровне они не видны как братья, на 2 — видны.
-
-    Возвращает ПУСТОЙ set если результат превышает COHYPONYM_MAX_SIZE —
-    защита от слишком общих hypernym'ов (цветок→растение даёт 566 лемм с
-    overshoot в деревья/кустарники).
+    Если prebuilt index не загружен — пустой set (cohyponym-метод выключен,
+    остаются substring/lemma/synonym/E5 как fallback).
     """
-    # Fast path: prebuilt index
-    if _USE_PREBUILT_INDEX:
-        return set(_COHYPONYMS_INDEX.get(lemma.lower() if lemma else "", []))
-
-    if _rwn is None or not lemma:
+    if not _USE_PREBUILT_INDEX or not lemma:
         return set()
-    try:
-        senses = _rwn.get_senses(lemma)
-        if not senses:
-            return set()
-
-        # Стартовые synsets леммы — те с которых поднимаемся
-        seen_synsets: Set[str] = set()
-        starting: Set[str] = set()
-        for sense in senses:
-            ss = sense.synset
-            seen_synsets.add(ss.id)
-            starting.add(ss.id)
-
-        # Поднимаемся на 1 уровень — собираем ближайших hypernym'ов
-        hypernym_synsets = []
-        for sense in senses:
-            for h in sense.synset.hypernyms:
-                if h.id not in seen_synsets:
-                    seen_synsets.add(h.id)
-                    hypernym_synsets.append(h)
-
-        if not hypernym_synsets:
-            return set()
-
-        # Спускаемся от hypernym'ов на 2 уровня вниз, собирая леммы по ходу.
-        # Early-exit как только в наборе превышен COHYPONYM_MAX_SIZE — раньше
-        # обходили весь граф (тысячи SQLite-запросов через ORM lazy-loading)
-        # и в конце выкидывали результат. Теперь прерываемся на ~50-м SQL.
-        # Семантика для |cohyp| <= лимит идентична: обход тот же, леммы те же.
-        lemma_lower = lemma.lower()
-        cohyp: Set[str] = set()
-
-        def _collect_and_check(ss) -> bool:
-            """Добавить леммы synset в cohyp. Вернуть True если лимит превышен."""
-            for s in ss.senses:
-                if s.lemma:
-                    sl = s.lemma.lower()
-                    if sl != lemma_lower:
-                        cohyp.add(sl)
-                        if len(cohyp) > COHYPONYM_MAX_SIZE:
-                            return True
-            return False
-
-        # Уровень H1 — сами hypernym'ы (раньше входили в descendants_synsets первым шагом)
-        for ss in hypernym_synsets:
-            if _collect_and_check(ss):
-                logger.info(
-                    f"[L1.5/v3] _get_cohyponyms({lemma!r}): early-exit на H1, "
-                    f"> {COHYPONYM_MAX_SIZE} лимит → отклонено (широкая таксономия)"
-                )
-                return set()
-
-        # H2-H3: дети и внуки hypernym'ов
-        current = list(hypernym_synsets)
-        for depth in range(2):
-            next_level = []
-            for s in current:
-                for hypo in s.hyponyms:
-                    if hypo.id in seen_synsets:
-                        continue
-                    seen_synsets.add(hypo.id)
-                    next_level.append(hypo)
-                    if _collect_and_check(hypo):
-                        logger.info(
-                            f"[L1.5/v3] _get_cohyponyms({lemma!r}): early-exit "
-                            f"на H{depth+2}, > {COHYPONYM_MAX_SIZE} лимит → "
-                            f"отклонено (широкая таксономия)"
-                        )
-                        return set()
-            if not next_level:
-                break
-            current = next_level
-
-        return cohyp
-    except Exception as e:
-        logger.warning(f"[L1.5/v3] _get_cohyponyms({lemma!r}) failed: {e}")
-        return set()
+    return set(_COHYPONYMS_INDEX.get(lemma.lower(), []))
 
 
 # ─── Разбор seed ─────────────────────────────────────────────────────────
 
 @functools.lru_cache(maxsize=1024)
 def _count_hyponyms(lemma: str) -> int:
-    """Суммарное число лемм-hyponyms у леммы (через все её senses).
+    """Суммарное число лемм-hyponyms у леммы (через prebuilt index).
 
     Возвращаемые значения:
-        -1: леммы нет в RWN (или RWN недоступен)
+        -1: леммы нет в RWN, либо prebuilt index не загружен
          0: лемма есть в RWN, но hyponyms нет (лист дерева)
          N: лемма есть, у неё N hyponyms-лемм суммарно по всем sense'ам
 
     Используется в `_pick_token_parse` для эвристики выбора 'предметного'
     NOUN при омонимии: цветок → много hyponyms (роза, тюльпан, ...),
     цвет-окраска → 0 или меньше.
-
-    Вынесено в отдельную функцию с lru_cache потому что в `_pick_token_parse`
-    был inline-walk по RWN-графу: для каждого NOUN-парса каждого токена
-    seed делалось `get_senses` + обход `synset.hyponyms` + `hypo.senses`
-    (десятки-сотни SQL через ORM lazy-loading). Для широких таксономий
-    типа 'лицо'/'пластика' это давало 8-10s даже после lru_cache на
-    `_get_synonyms`/`_get_cohyponyms` (потому что hypo_count считался отдельно).
     """
-    # Fast path: prebuilt index
-    if _USE_PREBUILT_INDEX:
-        if not lemma:
-            return -1
-        meta = _META_INDEX.get(lemma.lower())
-        if meta is None:
-            return -1
-        return int(meta.get("hypo_count", -1))
-
-    if _rwn is None or not lemma:
+    if not _USE_PREBUILT_INDEX or not lemma:
         return -1
-    try:
-        senses = _rwn.get_senses(lemma)
-    except Exception:
+    meta = _META_INDEX.get(lemma.lower())
+    if meta is None:
         return -1
-    if not senses:
-        return -1
-    count = 0
-    try:
-        for sense in senses:
-            for hypo in sense.synset.hyponyms:
-                count += len(hypo.senses)
-    except Exception:
-        pass
-    return count
+    return int(meta.get("hypo_count", -1))
 
 
 def _pick_token_parse(token: str) -> Optional[Any]:
@@ -678,7 +448,7 @@ def _pick_token_parse(token: str) -> Optional[Any]:
     if not content_parses:
         return parses[0]
 
-    if _rwn is not None:
+    if _USE_PREBUILT_INDEX:
         # Собираем NOUN-парсы найденные в RWN с числом их hyponyms
         rwn_noun_candidates: List[Tuple[Any, int]] = []
         seen_lemmas: Set[str] = set()
@@ -744,9 +514,9 @@ def _extract_seed_structure(seed: str) -> Dict[str, Any]:
     noun_parses = [p for p in content_parses if p.tag.POS == 'NOUN']
 
     if action_anchor is None and noun_parses:
-        # 2. Action = NOUN с verb-derivation (отглагольный), если RWN доступен.
+        # 2. Action = NOUN с verb-derivation (отглагольный), если prebuilt index доступен.
         # Если несколько кандидатов с derivation — берём первый по позиции.
-        if _rwn is not None:
+        if _USE_PREBUILT_INDEX:
             for p in noun_parses:
                 if _has_verb_derivation(p.normal_form):
                     action_anchor = p.normal_form
@@ -762,7 +532,7 @@ def _extract_seed_structure(seed: str) -> Dict[str, Any]:
     object_candidates = [p for p in noun_parses if p.normal_form != action_anchor]
     if object_candidates:
         non_action_noun = None
-        if _rwn is not None:
+        if _USE_PREBUILT_INDEX:
             for p in object_candidates:
                 if not _has_verb_derivation(p.normal_form):
                     non_action_noun = p
@@ -1356,7 +1126,10 @@ def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
             e5_status = f"ERROR: {e}"
     _t_stage['e5_warmup'] = _pf_time.perf_counter() - _t
     logger.info(f"[L1.5/v3] E5 status: {e5_status}")
-    logger.info(f"[L1.5/v3] RuWordNet status: {'OK' if _rwn is not None else 'DISABLED'}")
+    logger.info(
+        f"[L1.5/v3] RWN index status: "
+        f"{'OK (' + str(len(_SYNONYMS_INDEX)) + ' lemmas)' if _USE_PREBUILT_INDEX else 'DISABLED'}"
+    )
 
     # ── Парсинг seed
     _t = _pf_time.perf_counter()
