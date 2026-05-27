@@ -38,6 +38,11 @@ class BatchPostFilter:
         
         self.ignored_words = {
             "дом", "мир", "бор", "нива", "балка", "луч", "спутник", "работа", "цена", "выезд",
+            # FIX (priority restructure): омонимы частотных слов, случайно совпавшие с мелкими
+            # городами в alt-names БД. "часа"→lemma "час"→Chas/IN/p=141k; "новые"→lemma
+            # "новый"→Novyy/RU/p=6k. Без этих записей foreign-блок отсеивает валидные ключи
+            # типа "доставка 24 часа", "новые санжары", "новый телефон".
+            "час", "новый",
         }
 
         # Кэш на уровень одного filter_batch: (word, country) → bool
@@ -731,16 +736,25 @@ class BatchPostFilter:
         self._last_search_stats['total'] = self._last_search_stats.get('total', 0) + _cnt_total
 
         for item in search_items:
-            # Geox guard — только для unigrams
-            if ' ' not in item and '-' not in item:
+            item_normalized = self._get_lemma(item, language)
+
+            # FIX (priority restructure): ранний лукап в all_cities_global ПЕРЕД pymorphy-эвристиками.
+            # Если слово/лемма уже в БД с известной страной — это город по определению базы,
+            # и pymorphy-эвристики skip_geo / is_common_noun не должны его отпускать.
+            # Раньше слова: щербинка/RU, дачное/RU, целина/RU, лазаревское/RU, заречный/RU,
+            # яровое/RU, октябрьский/RU, железнодорожный/RU, яссы/RO, щучин/BY, горки/BY и др.
+            # терялись на skip_geo (ADJF/NOUN inan без Geox в top-parse) ещё до блока проверки.
+            _in_db = (self.all_cities_global.get(item) is not None or
+                      (item_normalized != item and self.all_cities_global.get(item_normalized) is not None))
+
+            # Geox guard — только для unigrams И только если слово НЕ в БД как известный город
+            if not _in_db and ' ' not in item and '-' not in item:
                 _tsg = time.perf_counter()
                 _skip = self._should_skip_geo_check(item, language)
                 _t_skip_geo_total += time.perf_counter() - _tsg
                 if _skip:
                     _cnt_skip_geo += 1
                     continue
-            
-            item_normalized = self._get_lemma(item, language)
 
             # G4/G6: если item — часть улицы/района в seed_city или имя ЖК → не блокируем
             if ' ' not in item and '-' not in item:
@@ -769,12 +783,19 @@ class BatchPostFilter:
                 if item in our_city_lemmas or item_normalized in our_city_lemmas:
                     continue
                 
-                # Обычное слово языка? "дом", "белая", "гора"
-                _tcn = time.perf_counter()
-                _cn = self._is_common_noun(item, language)
-                _t_common_noun_total += time.perf_counter() - _tcn
-                if _cn:
+                # FIX (priority restructure): ignored_words guard — омонимы частотных слов,
+                # случайно сидящие в БД как мелкие города. "час" / "новый" / "дом" / "мир" /
+                # "бор" / "нива" и т.д. — обычные русские слова, лемма ключа может совпасть
+                # с ними и привести к ложной блокировке валидного ключа.
+                if item_normalized in self.ignored_words or item in self.ignored_words:
                     continue
+                
+                # FIX (priority restructure): _is_common_noun guard УБРАН в блоке foreign.
+                # Сюда попадаем только когда found_country != None — то есть item уже в БД
+                # как город. pymorphy-эвристика "это обычное слово" против факта в БД —
+                # ложное срабатывание. Прежде так терялись щербинка/RU (NOUN inan score=0.5)
+                # и горки/BY (NOUN inan score=0.58). Защита от FP для слов вроде "дом", "белая",
+                # "гора" сохраняется тем, что таких слов в all_cities_global нет.
                 
                 # Город из сида — всегда разрешён
                 if item_normalized in seed_cities or item in seed_cities:
