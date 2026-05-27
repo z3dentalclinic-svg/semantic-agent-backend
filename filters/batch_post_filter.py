@@ -839,11 +839,17 @@ class BatchPostFilter:
 
         for w in words:
             lemma = lemmas_map.get(w, w)
+            # Token-with-dash check: re.findall(r'[а-яёa-z0-9-]+') не разделяет
+            # "комсомольск-на-амуре" — это один token, который лежит в city_multi_index,
+            # а не в city_unigram_index. Без проверки multi-index такой token теряется
+            # как candidate. Те же кейсы: "йошкар-ола", "ростов-на-дону" и т.п.
             is_candidate = (
                 w in self.explicit_geo_index or
                 lemma in self.explicit_geo_index or
                 w in self.city_unigram_index or
                 lemma in self.city_unigram_index or
+                w in self.city_multi_index or
+                lemma in self.city_multi_index or
                 w in seed_cities or
                 lemma in seed_cities or
                 w in self._geo_hit_cache or
@@ -922,8 +928,11 @@ class BatchPostFilter:
                     if not has_geox:
                         features['skip_geo'] = True
 
-                # is_common_noun: обычное нарицательное слово языка
-                if not features['skip_geo'] and word.islower():
+                # is_common_noun: обычное нарицательное слово языка.
+                # Требуем word_is_known: pymorphy3 даёт NOUN-разбор любому слову
+                # через эвристики ("калач-на-дону" → NOUN inan score=1.0), и без
+                # этого guard составные топонимы ошибочно классифицируются как нарицательные.
+                if not features['skip_geo'] and word.islower() and morph.word_is_known(word):
                     if not any(m in tag_str for m in ('Geox', 'Name', 'Surn', 'Patr', 'Orgn')):
                         if 'ADJF' in tag_str:
                             if ('Qual' in tag_str and best.score >= 0.4) or best.score >= 0.6:
