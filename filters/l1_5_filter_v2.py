@@ -119,6 +119,84 @@ def _init_ruwordnet():
 
 _rwn = _init_ruwordnet()
 
+
+# ─── PREBUILT RWN INDEX — мгновенный dict-lookup вместо RWN walks ────────
+# Если рядом с проектом лежат .json.gz файлы со предкомпьюченными индексами
+# (созданными скриптом build_rwn_index.py), грузим их в RAM и используем
+# для всех RWN-запросов вместо ORM-обхода SQLite.
+#
+# Цель: убить ~18s RWN-нагрузки с холодного прогона.
+# Старая RWN-логика остаётся как fallback если файлов нет / битые / отключено.
+#
+# Файлы (~12 MB суммарно):
+#   rwn_synonyms.json.gz     — {лемма: [синонимы]}
+#   rwn_cohyponyms.json.gz   — {лемма: [cohyponyms]}  (с лимитом 50)
+#   rwn_meta.json.gz         — {лемма: {hypo_count: N, has_verb_derivation: bool}}
+
+import gzip as _gzip
+import json as _json
+import os as _os
+
+_USE_PREBUILT_INDEX = False
+_SYNONYMS_INDEX: Dict[str, List[str]] = {}
+_COHYPONYMS_INDEX: Dict[str, List[str]] = {}
+_META_INDEX: Dict[str, Dict[str, Any]] = {}
+
+
+def _find_index_dir() -> Optional[str]:
+    """Ищет папку с rwn_*.json.gz файлами по нескольким стандартным местам."""
+    # __file__ = .../filters/l1_5_filter_v2.py → родительская папка = корень проекта
+    _filter_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _project_root = _os.path.dirname(_filter_dir)
+    candidates = [
+        _project_root,                                # /opt/render/project/src
+        _filter_dir,                                  # /opt/render/project/src/filters
+        _os.getcwd(),                                 # текущая директория процесса
+        _os.path.join(_project_root, "data"),         # на случай если положишь в /data
+    ]
+    for d in candidates:
+        path = _os.path.join(d, "rwn_synonyms.json.gz")
+        if _os.path.exists(path):
+            return d
+    return None
+
+
+def _load_prebuilt_indexes() -> bool:
+    """Грузит 3 .json.gz файла в глобальные dict'ы. True если всё ок."""
+    global _SYNONYMS_INDEX, _COHYPONYMS_INDEX, _META_INDEX
+    index_dir = _find_index_dir()
+    if not index_dir:
+        logger.info("[L1.5/v3] Prebuilt RWN index files NOT FOUND → fallback to RWN-walk mode")
+        return False
+
+    import time as _time
+    t0 = _time.perf_counter()
+    try:
+        with _gzip.open(_os.path.join(index_dir, "rwn_synonyms.json.gz"), "rt", encoding="utf-8") as f:
+            _SYNONYMS_INDEX = _json.load(f)
+        with _gzip.open(_os.path.join(index_dir, "rwn_cohyponyms.json.gz"), "rt", encoding="utf-8") as f:
+            _COHYPONYMS_INDEX = _json.load(f)
+        with _gzip.open(_os.path.join(index_dir, "rwn_meta.json.gz"), "rt", encoding="utf-8") as f:
+            _META_INDEX = _json.load(f)
+    except Exception as e:
+        logger.warning(f"[L1.5/v3] Prebuilt index load FAILED: {e} → fallback to RWN-walk mode")
+        _SYNONYMS_INDEX = {}
+        _COHYPONYMS_INDEX = {}
+        _META_INDEX = {}
+        return False
+
+    dt = _time.perf_counter() - t0
+    logger.info(
+        f"[L1.5/v3] Prebuilt RWN index loaded from {index_dir} in {dt:.2f}s "
+        f"(synonyms={len(_SYNONYMS_INDEX)}, cohyponyms={len(_COHYPONYMS_INDEX)}, "
+        f"meta={len(_META_INDEX)})"
+    )
+    return True
+
+
+_USE_PREBUILT_INDEX = _load_prebuilt_indexes()
+
+
 # ─── E5 model — НЕ молча глотаем ошибки импорта ─────────────────────────
 import sys as _sys
 
@@ -344,6 +422,11 @@ def _get_synonyms(lemma: str) -> Set[str]:
     задачи (для 'цветок' оно даёт {цвет} — близкий smysl, но не гипонимы).
     Главную ценность дают hyponyms.
     """
+    # Fast path: prebuilt index → instant dict lookup.
+    # Семантика идентична — индекс собран той же логикой (build_rwn_index.py).
+    if _USE_PREBUILT_INDEX:
+        return set(_SYNONYMS_INDEX.get(lemma.lower() if lemma else "", []))
+
     if _rwn is None or not lemma:
         return set()
     try:
@@ -384,6 +467,13 @@ def _has_verb_derivation(lemma: str) -> bool:
 
     Возвращает False если RuWordNet недоступен → caller использует fallback.
     """
+    # Fast path: prebuilt index
+    if _USE_PREBUILT_INDEX:
+        if not lemma:
+            return False
+        meta = _META_INDEX.get(lemma.lower(), {})
+        return bool(meta.get("has_verb_derivation", False))
+
     if _rwn is None or not lemma:
         return False
     try:
@@ -431,6 +521,10 @@ def _get_cohyponyms(lemma: str) -> Set[str]:
     защита от слишком общих hypernym'ов (цветок→растение даёт 566 лемм с
     overshoot в деревья/кустарники).
     """
+    # Fast path: prebuilt index
+    if _USE_PREBUILT_INDEX:
+        return set(_COHYPONYMS_INDEX.get(lemma.lower() if lemma else "", []))
+
     if _rwn is None or not lemma:
         return set()
     try:
@@ -534,6 +628,15 @@ def _count_hyponyms(lemma: str) -> int:
     типа 'лицо'/'пластика' это давало 8-10s даже после lru_cache на
     `_get_synonyms`/`_get_cohyponyms` (потому что hypo_count считался отдельно).
     """
+    # Fast path: prebuilt index
+    if _USE_PREBUILT_INDEX:
+        if not lemma:
+            return -1
+        meta = _META_INDEX.get(lemma.lower())
+        if meta is None:
+            return -1
+        return int(meta.get("hypo_count", -1))
+
     if _rwn is None or not lemma:
         return -1
     try:
