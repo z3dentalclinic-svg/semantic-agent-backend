@@ -536,40 +536,9 @@ class BatchPostFilter:
             lemmas = [lemmas_map.get(w, w) for w in words]
             found_own = False
 
-            # ── FOREIGN DISTRICT guard (зеркально detect_geo, задача "южное бутово") ──
-            # Если в ключе есть биграмма ИЛИ слово из districts с FOREIGN страной —
-            # это чужой район. Нельзя ставить own_geo от одиночного слова внутри него
-            # (например 'южное' само по себе — UA-город Одесской обл, p=32k, но в
-            # биграмме 'южное бутово' это район Москвы). Пропускаем весь ключ.
-            _foreign_district = False
-            # Биграммы из districts
-            for i in range(len(words) - 1):
-                bg_variants = {
-                    f"{words[i]} {words[i+1]}",
-                    f"{lemmas[i]} {lemmas[i+1]}",
-                }
-                for bg in list(bg_variants):
-                    bg_variants.add(bg.replace(' ', '-'))
-                for bg in bg_variants:
-                    dc = self.districts.get(bg)
-                    if dc is not None and dc != country_l:
-                        _foreign_district = True
-                        break
-                if _foreign_district:
-                    break
-            # Одиночные слова из districts (foreign)
-            if not _foreign_district:
-                for w, lem in zip(words, lemmas):
-                    dc = self.districts.get(w)
-                    if dc is None and len(w) >= 5 and lem != w:
-                        dc = self.districts.get(lem)
-                    if dc is not None and dc != country_l:
-                        _foreign_district = True
-                        break
-            if _foreign_district:
-                continue  # чужой район в ключе → own_geo НЕ ставим
-
             # ── Триграммы (longest-first) ──
+            # Составное имя города (триграмма) проверяется первым — оно перевешивает
+            # любой district-guard (комплексное имя надёжнее одиночного district-слова).
             for i in range(len(words) - 2):
                 variants = set()
                 raw3 = ' '.join(words[i:i+3])
@@ -588,8 +557,12 @@ class BatchPostFilter:
                 if matched:
                     break
             # ── Биграммы ──
+            # Биграмма-город ('новые санжары'/'нові санжари' → UA) перехватывает раньше
+            # одиночных. Это КРИТИЧНО: 'новые' → лемма 'новый' может быть в districts как
+            # foreign-мусор, но биграмма 'новые санжары' — валидный UA-город. Приоритет
+            # биграммы-города над district-словом зеркалит detect_geo.
+            _bigram_city_matched = False
             if not found_own:
-                _bigram_matched = False
                 for i in range(len(words) - 1):
                     variants = set()
                     raw2 = ' '.join(words[i:i+2])
@@ -600,21 +573,56 @@ class BatchPostFilter:
                     for v in variants:
                         mc = _multi_country(v)
                         if mc is not None:
-                            _bigram_matched = True
+                            _bigram_city_matched = True
                             if mc == country_l:
                                 found_own = True
                             break
-                    if _bigram_matched:
+                    if _bigram_city_matched:
                         break
-                # ── Одиночные токены (только если биграмма не перехватила) ──
-                if not found_own and not _bigram_matched:
-                    for w, lem in zip(words, lemmas):
-                        if _city_country_match(w):
-                            found_own = True
+
+            # ── FOREIGN DISTRICT guard для биграмм (задача "южное бутово") ──
+            # Применяется ТОЛЬКО если биграмма-город НЕ нашлась выше. Если в ключе есть
+            # биграмма из districts с foreign-страной — это чужой район ('южное бутово'
+            # = район Москвы), и одиночное слово внутри ('южное' = UA-город) НЕ должно
+            # давать own_geo. Но own-city-биграмма уже перехвачена выше, поэтому здесь
+            # режем только настоящие foreign-районы.
+            _foreign_district = False
+            if not found_own and not _bigram_city_matched:
+                for i in range(len(words) - 1):
+                    bg_variants = {
+                        f"{words[i]} {words[i+1]}",
+                        f"{lemmas[i]} {lemmas[i+1]}",
+                    }
+                    for bg in list(bg_variants):
+                        bg_variants.add(bg.replace(' ', '-'))
+                    for bg in bg_variants:
+                        dc = self.districts.get(bg)
+                        if dc is not None and dc != country_l:
+                            _foreign_district = True
                             break
-                        if len(w) >= 5 and lem != w and _city_country_match(lem):
-                            found_own = True
-                            break
+                    if _foreign_district:
+                        break
+
+            # ── Одиночные токены (только если биграмма/триграмма не перехватила) ──
+            # При foreign-district в ключе одиночные НЕ проверяем (часть чужого района).
+            if not found_own and not _bigram_city_matched and not _foreign_district:
+                for w, lem in zip(words, lemmas):
+                    # Приоритет: слово — город target-страны? (перевешивает foreign-district
+                    # по тому же слову — 'южное' само по себе UA-city при target=UA).
+                    if _city_country_match(w):
+                        found_own = True
+                        break
+                    if len(w) >= 5 and lem != w and _city_country_match(lem):
+                        found_own = True
+                        break
+                    # Слово — foreign district (и НЕ target-city) → это чужой район,
+                    # прерываем для всего ключа (не ставим own_geo).
+                    _dc = self.districts.get(w)
+                    if _dc is None and len(w) >= 5 and lem != w:
+                        _dc = self.districts.get(lem)
+                    if _dc is not None and _dc != country_l:
+                        found_own = False
+                        break
 
             if found_own:
                 own_geo.add(kw)
