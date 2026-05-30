@@ -482,6 +482,112 @@ class BatchPostFilter:
         keyword_lower = keyword.lower()
         return any(root in keyword_lower for root in seed_roots)
 
+    def _detect_own_geo_keywords(self, keywords: List[str], country: str,
+                                  lemmas_map: Dict[str, str], language: str) -> set:
+        """
+        Для списка УЖЕ ПРОПУЩЕННЫХ ключей определяет, какие содержат город
+        ЦЕЛЕВОЙ страны (свой гео из расширенной базы all_cities_global /
+        city_multi_index / districts).
+
+        Используется чтобы передать L0 метку own_geo: L0-база (geo_db,
+        cities15000=32k) не знает мелких UA-сёл (таирово/хотов/тячев/...),
+        которые знает BPF-база (cities1000=661k форм). Без метки L0 гоняет
+        такие хвосты через category_mismatch → chargram=0 → ложный GREY.
+
+        Логика зеркальна detect_geo: longest-first (триграмма → биграмма →
+        одиночное), сравнение страны с target. Возвращает set ключей где
+        найден город target-страны.
+
+        Важно: проверяем ТОЛЬКО target-страну (country). Foreign сюда не
+        попадают (они уже заблокированы и не в keywords). Если в ключе город
+        нашёлся, но он foreign — это значит BPF его пропустил по guard'у
+        (omonym / pop<50k FN), метку НЕ ставим (L0 разберётся сам).
+        """
+        country_l = country.lower()
+        own_geo: set = set()
+
+        def _city_country_match(token: str) -> bool:
+            """True если token — город target-страны (в любой из гео-баз)."""
+            # all_cities_global: token → 'ua'/'ru'/...
+            cc = self.all_cities_global.get(token)
+            if cc is not None:
+                return cc == country_l
+            # districts: token → 'ua'/...
+            dc = self.districts.get(token)
+            if dc is not None:
+                return dc == country_l
+            # regions
+            rc = self.regions.get(token)
+            if rc is not None:
+                return rc == country_l
+            return False
+
+        def _multi_country(phrase: str):
+            """Для биграмм/триграмм: страна из all_cities_global, либо None.
+            city_multi_index — это set составных имён; страна в all_cities_global."""
+            if phrase in self.city_multi_index:
+                return self.all_cities_global.get(phrase)
+            return None
+
+        for kw in keywords:
+            words = re.findall(r'[а-яёa-z0-9-]+', kw)
+            if not words:
+                continue
+            lemmas = [lemmas_map.get(w, w) for w in words]
+            found_own = False
+
+            # ── Триграммы (longest-first) ──
+            for i in range(len(words) - 2):
+                variants = set()
+                raw3 = ' '.join(words[i:i+3])
+                lem3 = ' '.join(lemmas[i:i+3])
+                for b in (raw3, lem3):
+                    variants.add(b)
+                    variants.add(b.replace(' ', '-'))
+                matched = False
+                for v in variants:
+                    mc = _multi_country(v)
+                    if mc is not None:
+                        matched = True
+                        if mc == country_l:
+                            found_own = True
+                        break  # составное имя найдено — не спускаемся ниже
+                if matched:
+                    break
+            # ── Биграммы ──
+            if not found_own:
+                _bigram_matched = False
+                for i in range(len(words) - 1):
+                    variants = set()
+                    raw2 = ' '.join(words[i:i+2])
+                    lem2 = ' '.join(lemmas[i:i+2])
+                    for b in (raw2, lem2):
+                        variants.add(b)
+                        variants.add(b.replace(' ', '-'))
+                    for v in variants:
+                        mc = _multi_country(v)
+                        if mc is not None:
+                            _bigram_matched = True
+                            if mc == country_l:
+                                found_own = True
+                            break
+                    if _bigram_matched:
+                        break
+                # ── Одиночные токены (только если биграмма не перехватила) ──
+                if not found_own and not _bigram_matched:
+                    for w, lem in zip(words, lemmas):
+                        if _city_country_match(w):
+                            found_own = True
+                            break
+                        if len(w) >= 5 and lem != w and _city_country_match(lem):
+                            found_own = True
+                            break
+
+            if found_own:
+                own_geo.add(kw)
+
+        return own_geo
+
     def filter_batch(self, keywords: List[str], seed: str, country: str, 
                      language: str = 'ru') -> Dict:
         start_time = time.time()
@@ -545,6 +651,21 @@ class BatchPostFilter:
                 stats['reasons'][category] += 1
                 logger.warning("BPF block: '%s' → %s (%s)", kw, reason, category)
 
+        # ═══════════════════════════════════════════════════════════════
+        # FIX (task: own_geo label): для ПРОПУЩЕННЫХ ключей определяем,
+        # содержат ли они город ЦЕЛЕВОЙ страны (свой гео).
+        # BPF использует расширенную базу (cities1000 + ё→е + Lat→Cyr +
+        # pop-aware), которая знает UA-сёла (таирово, хотов, тячев, ...),
+        # которых нет в L0-базе (geo_db, cities15000=32k).
+        # Эта метка передаётся в L0, чтобы L0 не гонял такие хвосты через
+        # category_mismatch (chargram=0 → ложный GREY). L0 перепроверяет
+        # своим detect_geo, и только если своя база молчит — доверяет метке.
+        # Foreign-города сюда не попадают — они уже в final_anchors.
+        # ═══════════════════════════════════════════════════════════════
+        own_geo_keywords = self._detect_own_geo_keywords(
+            final_keywords, country, lemmas_map, language
+        )
+
         elapsed = time.time() - start_time
         logger.info("[BPF] FINISH %.2fs | allowed=%d | anchors=%d | reasons=%s",
                     elapsed, len(final_keywords), len(final_anchors), dict(stats['reasons']))
@@ -567,6 +688,7 @@ class BatchPostFilter:
             'keywords': final_keywords,
             'anchors': final_anchors,
             'blocked_reasons': blocked_reasons,
+            'own_geo_keywords': own_geo_keywords,
             'stats': {
                 'total': stats['total'],
                 'allowed': stats['allowed'],
