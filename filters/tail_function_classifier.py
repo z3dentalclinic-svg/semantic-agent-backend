@@ -188,7 +188,7 @@ class TailFunctionClassifier:
         from .function_detectors import _build_truncated_geo_index
         self._truncated_geo_index = _build_truncated_geo_index(geo_db) if geo_db else {}
     
-    def classify(self, tail: str, tail_parses: dict = None, kw: str = "") -> Dict:
+    def classify(self, tail: str, tail_parses: dict = None, kw: str = "", own_geo: bool = False) -> Dict:
         """
         Классифицирует хвост запроса.
 
@@ -200,6 +200,14 @@ class TailFunctionClassifier:
         Нужен для позиционных детекторов (premod/postmod), которые определяют
         позицию tail относительно seed. Если kw не передан — позиционные
         детекторы просто не срабатывают, остальные работают как обычно.
+
+        own_geo: BPF определил что в ключе есть город ЦЕЛЕВОЙ страны (по своей
+        расширенной базе cities1000=661k форм). Своя L0-база (geo_db,
+        cities15000=32k) такие мелкие UA-сёла (таирово/хотов/тячев) не знает,
+        поэтому detect_geo молчит → хвост ушёл бы в category_mismatch
+        (chargram=0 → ложный GREY). При own_geo=True L0 считает geo-сигнал
+        подтверждённым (если своя база молчит) и подавляет truncated_geo/
+        foreign_geo (их вердикт по таким хвостам ошибочен — это свой город).
 
         Returns:
             {
@@ -266,6 +274,16 @@ class TailFunctionClassifier:
             if detected:
                 positive_signals.append(signal_name)
                 reasons.append(f"✅ {reason}")
+
+        # FIX (task: own_geo label): BPF подтвердил город target-страны по
+        # расширенной базе (cities1000), которой нет в L0 geo_db (cities15000).
+        # Если своя база город не нашла (geo не в positive_signals) — доверяем
+        # метке BPF и проставляем geo. Это автоматически активирует Stage 0
+        # short-circuit для category_mismatch (geo ∈ _STRONG_POSITIVES_SKIP_MISMATCH),
+        # и хвост-город (таирово/хотов/тячев) не теряется в chargram=0.
+        if own_geo and 'geo' not in positive_signals:
+            positive_signals.append('geo')
+            reasons.append("✅ Город target-страны (подтверждён BPF, расширенная база)")
 
         self.classify_stages['positive_loop'] = self.classify_stages.get('positive_loop', 0.0) + (time.perf_counter() - _stage_t0)
         _stage_t0 = time.perf_counter()
@@ -346,6 +364,13 @@ class TailFunctionClassifier:
             if signal_name == 'category_mismatch':
                 if set(positive_signals) & _STRONG_POSITIVES_SKIP_MISMATCH:
                     continue
+            # FIX (task: own_geo label): при own_geo подавляем geo-негативы.
+            # BPF подтвердил что это город target-страны по расширенной базе.
+            # truncated_geo даёт ложный обрезок ('хотов' → 'хот-спрингс'),
+            # foreign_geo может сработать на коллизии — оба вердикта ошибочны
+            # для подтверждённого своего города.
+            if own_geo and signal_name in ('truncated_geo', 'foreign_geo'):
+                continue
             _t0 = time.perf_counter()
             detected, reason = detector()
             self.detector_timings[signal_name] = self.detector_timings.get(signal_name, 0.0) + (time.perf_counter() - _t0)
