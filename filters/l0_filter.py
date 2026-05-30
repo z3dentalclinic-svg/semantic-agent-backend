@@ -457,6 +457,7 @@ def apply_l0_filter(
     geo_db: Dict[str, Set[str]] = None,
     brand_db: Set[str] = None,
     retailer_db: Set[str] = None,
+    own_geo_keywords: Set[str] = None,
 ) -> Dict[str, Any]:
     """
     Применяет L0 классификатор к списку ключевых слов.
@@ -469,6 +470,14 @@ def apply_l0_filter(
         brand_db: база брендов (set). Если None — пустой set
         retailer_db: база ритейлеров/маркетплейсов (set). Если None — пустой set.
                      Должен загружаться вызывающим кодом через databases.load_retailers_db().
+        own_geo_keywords: set ключей (lowercase), для которых BPF определил наличие
+                     города ЦЕЛЕВОЙ страны по расширенной базе (cities1000=661k форм).
+                     L0-база (geo_db, cities15000=32k) не знает мелких UA-сёл
+                     (таирово/хотов/тячев/...), поэтому detect_geo на них молчит, и
+                     хвост уходит в category_mismatch → chargram=0 → ложный GREY.
+                     Метка передаётся в classify(): если своя база город не нашла,
+                     но ключ в own_geo_keywords — geo-сигнал считается подтверждённым.
+                     Если None — обычное поведение (только своя база).
 
     Returns:
         result с обновлёнными keywords, keywords_grey, anchors, _l0_trace, _filter_timings
@@ -476,6 +485,9 @@ def apply_l0_filter(
     t_l0_start = time.perf_counter()
     # Детальные тайминги этапов L0 для диагностики узких мест
     _t_stage = {}
+
+    if own_geo_keywords is None:
+        own_geo_keywords = set()
 
     keywords = result.get("keywords", [])
     if not keywords:
@@ -818,8 +830,11 @@ def apply_l0_filter(
             continue
 
         # ── classify с глобальным tail_parses ───────────────────────────────
+        # own_geo: BPF подтвердил наличие города target-страны по расширенной базе.
+        # Передаём как флаг — classify() использует его если своя geo_db молчит.
+        _kw_own_geo = (kw.lower().strip() in own_geo_keywords) if own_geo_keywords else False
         t0 = time.perf_counter()
-        r = clf.classify(tail, tail_parses=tail_parses, kw=kw)
+        r = clf.classify(tail, tail_parses=tail_parses, kw=kw, own_geo=_kw_own_geo)
         _classify_dt = time.perf_counter() - t0
         t_classify_total += _classify_dt
         _classify_count += 1
