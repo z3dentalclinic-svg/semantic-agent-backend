@@ -212,27 +212,87 @@ class BatchPostFilter:
         }
     
     def _build_filtered_geo_index(self) -> Dict[str, str]:
+        """
+        Строит индекс городов из geonamescache.
+        
+        FIX v8.0 (task 2): расширение покрытия для мелких НП и orthographic normalisations.
+          - Порог снижен 5000 → 1000 (cities1000.json, ~161k городов вместо 65k).
+            Закрывает: цахкадзор/AM/1k, хотов/UA/5k, рогань/UA/3k, таирово/UA/4k,
+            янино-1/RU/4k, близнюки/UA/3k и др.
+          - Population-aware индексация: при коллизии имён в разных странах побеждает
+            запись с большей population. Закрывает: Знаменка (Znamyanka/UA/22k vs
+            Znamenka/RU/12k — UA выигрывает). Раньше победителем была случайная первая
+            запись из geonames (порядок alt-names произвольный).
+          - Нормализация ё → е при индексации. Закрывает: "желтые воды" находит
+            "жёлтые воды" → Zhovti Vody/UA/42k. Без нормализации лукап по "желтые воды"
+            проваливался.
+          - Нормализация Lat → Cyr визуально-идентичных букв в смешанных строках.
+            Закрывает: "тячев" находит alt-name "Тячeв" (с латинской e U+0065) → Tyachiv/UA/9k.
+            Применяется ТОЛЬКО когда строка mixed (есть и кириллица и латиница), и только
+            для безопасных пар (a/а, e/е, o/о, p/р, c/с, x/х, y/у, k/к). Опасные
+            (t/т, m/м, h/н, b/в — visual mismatch в lowercase) не включены.
+          - Параллельно обновляется self.population_cache для всех новых записей —
+                чтобы guard'ы pop>=50k в других местах кода работали корректно.
+        """
+        # Lat → Cyr lookalike normalization map (для смешанных строк)
+        LAT_CYR_LOOKALIKES = {
+            'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р',
+            'c': 'с', 'x': 'х', 'y': 'у', 'k': 'к',
+        }
+        
+        def _normalize_mixed_lat_cyr(s: str) -> str:
+            """Если строка смешанная (Lat+Cyr) — заменяем латинские визуально-идентичные
+            на кириллические. Чистые строки (только Cyr или только Lat) возвращаем как есть."""
+            has_cyr = any('\u0400' <= ch <= '\u04FF' for ch in s)
+            has_lat = any('a' <= ch <= 'z' for ch in s)
+            if not (has_cyr and has_lat):
+                return s
+            return ''.join(LAT_CYR_LOOKALIKES.get(ch, ch) for ch in s)
+        
         try:
             import geonamescache
             gc = geonamescache.GeonamesCache()
             
-            # КРИТИЧНО: Устанавливаем порог 5000 для загрузки cities5000.json (65k городов)
-            # По умолчанию загружается cities15000.json (32k городов)
-            gc.min_city_population = self.population_threshold  # 5000
-            
+            # FIX v8.0: cities1000.json (161k городов) вместо cities5000.json (65k).
+            # Раньше брали self.population_threshold (5000); теперь грузим максимум,
+            # фильтр по threshold применяется отдельно ниже (если threshold > 1000).
+            INDEX_MIN_POPULATION = 1000
+            gc.min_city_population = INDEX_MIN_POPULATION
             cities = gc.get_cities()
             
-            filtered_index = {}
+            filtered_index: Dict[str, str] = {}
+            index_pop: Dict[str, int] = {}  # для population-aware коллизий
+            
+            def _put(key: str, country: str, pop: int):
+                """Записывает в индекс с учётом population: побеждает большая pop.
+                Также обновляет self.population_cache (если ещё нет или меньше)."""
+                if not key:
+                    return
+                existing_pop = index_pop.get(key, 0)
+                if key not in filtered_index or existing_pop < pop:
+                    filtered_index[key] = country
+                    index_pop[key] = pop
+                # Обновляем общий population_cache (additive, не перезаписываем больший)
+                if pop > (self.population_cache.get(key, 0) or 0):
+                    self.population_cache[key] = pop
             
             for city_id, city_data in cities.items():
                 country = city_data['countrycode'].lower()
-                population = city_data.get('population', 0)
+                population = city_data.get('population', 0) or 0
                 
-                if population < self.population_threshold:
+                if population < INDEX_MIN_POPULATION:
                     continue
                 
                 name = city_data['name'].lower().strip()
-                filtered_index[name] = country
+                # Основное имя — индексируем с pop-aware put + ё→е вариант
+                _put(name, country, population)
+                name_no_yo = name.replace('ё', 'е')
+                if name_no_yo != name:
+                    _put(name_no_yo, country, population)
+                # Lat-Cyr normalisation основного имени (на случай если уже смешанное)
+                name_normalised = _normalize_mixed_lat_cyr(name)
+                if name_normalised != name:
+                    _put(name_normalised, country, population)
                 
                 for alt in city_data.get('alternatenames', []):
                     alt = alt.strip()
@@ -252,19 +312,29 @@ class BatchPostFilter:
                     
                     alt_lower = alt.lower()
                     
-                    has_cyr = any('\u0400' <= c <= '\u04FF' for c in alt_lower)
-                    has_lat = any('a' <= c <= 'z' for c in alt_lower)
+                    # 1. Прямая запись
+                    _put(alt_lower, country, population)
                     
-                    if has_cyr and not has_lat:
-                        if alt_lower not in filtered_index:
-                            filtered_index[alt_lower] = country
-                    
-                    if alt_lower not in filtered_index:
-                        filtered_index[alt_lower] = country
-                    
+                    # 2. Dash-вариант (space ↔ dash)
                     alt_dash = alt_lower.replace(' ', '-')
-                    if alt_dash != alt_lower and alt_dash not in filtered_index:
-                        filtered_index[alt_dash] = country
+                    if alt_dash != alt_lower:
+                        _put(alt_dash, country, population)
+                    
+                    # 3. ё → е нормализация
+                    alt_no_yo = alt_lower.replace('ё', 'е')
+                    if alt_no_yo != alt_lower:
+                        _put(alt_no_yo, country, population)
+                        alt_no_yo_dash = alt_no_yo.replace(' ', '-')
+                        if alt_no_yo_dash != alt_no_yo:
+                            _put(alt_no_yo_dash, country, population)
+                    
+                    # 4. Lat → Cyr lookalike нормализация (только для смешанных строк)
+                    alt_normalised = _normalize_mixed_lat_cyr(alt_lower)
+                    if alt_normalised != alt_lower:
+                        _put(alt_normalised, country, population)
+                        alt_normalised_dash = alt_normalised.replace(' ', '-')
+                        if alt_normalised_dash != alt_normalised:
+                            _put(alt_normalised_dash, country, population)
             
             return filtered_index
             
