@@ -536,6 +536,39 @@ class BatchPostFilter:
             lemmas = [lemmas_map.get(w, w) for w in words]
             found_own = False
 
+            # ── FOREIGN DISTRICT guard (зеркально detect_geo, задача "южное бутово") ──
+            # Если в ключе есть биграмма ИЛИ слово из districts с FOREIGN страной —
+            # это чужой район. Нельзя ставить own_geo от одиночного слова внутри него
+            # (например 'южное' само по себе — UA-город Одесской обл, p=32k, но в
+            # биграмме 'южное бутово' это район Москвы). Пропускаем весь ключ.
+            _foreign_district = False
+            # Биграммы из districts
+            for i in range(len(words) - 1):
+                bg_variants = {
+                    f"{words[i]} {words[i+1]}",
+                    f"{lemmas[i]} {lemmas[i+1]}",
+                }
+                for bg in list(bg_variants):
+                    bg_variants.add(bg.replace(' ', '-'))
+                for bg in bg_variants:
+                    dc = self.districts.get(bg)
+                    if dc is not None and dc != country_l:
+                        _foreign_district = True
+                        break
+                if _foreign_district:
+                    break
+            # Одиночные слова из districts (foreign)
+            if not _foreign_district:
+                for w, lem in zip(words, lemmas):
+                    dc = self.districts.get(w)
+                    if dc is None and len(w) >= 5 and lem != w:
+                        dc = self.districts.get(lem)
+                    if dc is not None and dc != country_l:
+                        _foreign_district = True
+                        break
+            if _foreign_district:
+                continue  # чужой район в ключе → own_geo НЕ ставим
+
             # ── Триграммы (longest-first) ──
             for i in range(len(words) - 2):
                 variants = set()
