@@ -1148,6 +1148,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         before_set = after_set
     
     # BATCH POST-FILTER
+    _bpf_own_geo = set()  # метка own_geo от BPF → передаётся в L0
     if run_bpf:
         parser.tracer.before_filter("batch_post_filter", result.get("keywords", []))
         _t0 = time.time()
@@ -1158,6 +1159,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             language=language
         )
         result["keywords"] = bpf_result["keywords"]
+        _bpf_own_geo = bpf_result.get("own_geo_keywords", set()) or set()
         _timings["batch_post_filter"] = round(time.time() - _t0, 4)
         _bpf_reasons = bpf_result.get("blocked_reasons", {})
         parser.tracer.after_filter("batch_post_filter", result.get("keywords", []), reasons=_bpf_reasons)
@@ -1185,6 +1187,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             geo_db=GEO_DB,
             brand_db=BRAND_DB,
             retailer_db=RETAILER_DB,
+            own_geo_keywords=_bpf_own_geo,
         )
         _timings["l0_filter"] = round(time.time() - _t0, 4)
         
