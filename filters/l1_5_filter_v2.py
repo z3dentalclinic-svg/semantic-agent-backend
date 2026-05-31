@@ -1100,67 +1100,11 @@ def _prove_other_lemma(
 
 # ─── Main entry ──────────────────────────────────────────────────────────
 
-# ── РАЗОВЫЙ замерный режим threads (активируется спец-seed из UI) ────────
-# Фронт шлёт seed вида "__bench_threads__:доставка цветов". Обычные сиды
-# работают как раньше. Возвращает result с _bench_threads (таблица), без
-# обычной фильтрации. Выпилить после калибровки threads.
-_BENCH_THREADS_PREFIX = "__bench_threads__:"
-
-
-def _run_threads_bench(prev_result: dict, real_seed: str, thread_values=(16, 8, 4, 2)) -> dict:
-    """Собирает представительный набор слов из prev_result и замеряет embed
-    при заданных intra-op threads. Точный состав слов для замера СКОРОСТИ не
-    критичен — важно число (~сотни) и одинаковость набора между значениями."""
-    kws = (prev_result.get('keywords', []) or []) + (prev_result.get('keywords_grey', []) or [])
-    words: Set[str] = set()
-    for k in kws:
-        s = k if isinstance(k, str) else (k.get('keyword') or '')
-        for tok in re.findall(r'\w+', s.lower()):
-            if len(tok) >= 2:
-                words.add(tok)
-    word_list = sorted(words)
-
-    table = []
-    bench_err = None
-    if _E5_IMPORT_OK:
-        try:
-            try:
-                from .e5_model import bench_embed_threads as _bench
-            except ImportError:
-                from e5_model import bench_embed_threads as _bench
-            table = _bench(word_list, thread_values=thread_values)
-        except Exception as e:
-            bench_err = f"{type(e).__name__}: {e}"
-            logger.error(f"[L1.5/bench] failed: {bench_err}")
-    else:
-        bench_err = "E5 import not OK"
-
-    logger.info(f"[L1.5/bench] seed={real_seed!r} threads={thread_values} words={len(word_list)} result={table}")
-    return {
-        **prev_result,
-        '_bench_threads': table,
-        '_bench_n_words': len(word_list),
-        '_bench_seed': real_seed,
-        '_bench_error': bench_err,
-    }
-
-
 def apply_l1_5_filter_v2(prev_result: dict, seed: str) -> dict:
     """
     TRASH-filter. Прибирает GREY-список из prev_result.
     Никогда не модифицирует keywords (L0 VALID) и не добавляет туда новых.
     """
-    # Замерный режим (разовый): спец-seed из UI-кнопки «Замер threads».
-    # Формат: "__bench_threads__:<N>:<seed>" — N intra-op потоков (одно
-    # значение за запрос, чтобы не ловить таймаут/OOM на 4 моделях разом).
-    # Если N не указан/нечисловой — замеряется дефолтный набор (для CLI).
-    if isinstance(seed, str) and seed.startswith(_BENCH_THREADS_PREFIX):
-        rest = seed[len(_BENCH_THREADS_PREFIX):]
-        parts = rest.split(":", 1)
-        if len(parts) == 2 and parts[0].strip().lstrip('-').isdigit():
-            return _run_threads_bench(prev_result, parts[1].strip(), (int(parts[0].strip()),))
-        return _run_threads_bench(prev_result, rest.strip(), (16, 8, 4, 2))
-
     grey_keywords: List[str] = prev_result.get('keywords_grey', []) or []
     prev_result.setdefault('_l1_5_trace', [])
 
