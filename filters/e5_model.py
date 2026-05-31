@@ -8,13 +8,16 @@ Embedding Model для L1.5 — singleton с переключателем backen
 L1.5 использует свою E5-модель для улучшенной семантики на русском.
 
 Поддерживаемые backend'ы:
-- e5_large (intfloat/multilingual-e5-large) — 1024-dim, ~2.2GB, ~85ms/embed CPU
-- e5_small (intfloat/multilingual-e5-small) — 384-dim, ~470MB, ~10-15ms/embed CPU
+- e5_large   (intfloat/multilingual-e5-large) — 1024-dim, ~2.2GB, ~85ms/embed CPU, native
+- e5_large_q (квантованный int8 e5-large)     — 1024-dim, ~550MB, embed ~3-4x быстрее large
+- e5_small   (intfloat/multilingual-e5-small) — 384-dim, ~470MB, ~10-15ms/embed CPU
 
 Откат назад: меняем EMBEDDING_BACKEND + рестарт сервера. Без изменений кода.
 Пороги в l1_5_filter_v2.py привязаны к backend через _THRESHOLDS_BY_BACKEND.
+Если backend неизвестен фильтру — он дефолтит на пороги e5_large (с warning).
 
-Префикс 'query: ' одинаков для обеих моделей (это семейство E5).
+Логи загрузки модели грепаются по '[E5/L1.5/DIAG]'; сводка — 'LOAD BREAKDOWN'.
+Префикс 'query: ' одинаков для всех (это семейство E5).
 """
 
 import logging
@@ -56,20 +59,43 @@ except Exception as _diag_err:
 # ─── Backend конфигурация ────────────────────────────────────────────────
 # Переключатель backend. Меняется значение → рестарт сервера → переход
 # на новую модель. Пороги в фильтре переключаются автоматически.
-EMBEDDING_BACKEND = "e5_small"  # "e5_large" | "e5_small"
+EMBEDDING_BACKEND = "e5_large_q"  # "e5_large" | "e5_large_q" | "e5_small"
 
 _BACKEND_CONFIG = {
     "e5_large": {
         "model_name": "intfloat/multilingual-e5-large",
         "dim": 1024,
         "prefix": "query: ",
-        "native_in_fastembed": True,  # fastembed знает эту модель из коробки
+        "native_in_fastembed": True,   # fastembed знает эту модель из коробки
+        "hf_source": None,             # native — не нужен
+        "model_file": None,
+    },
+    "e5_large_q": {
+        # Квантованный (int8) e5-large. Качество ≈ e5-large, embed-инференс
+        # быстрее в ~3-4x (квантизация ускоряет ТОЛЬКО embed, не загрузку модели).
+        #
+        # ВНИМАНИЕ: имя onnx-файла "onnx/model_quantized.onnx" — это дефолтное
+        # имя transformers.js quantize (которым собран репозиторий), но я НЕ
+        # подтвердил его листингом репо. Если instantiate упадёт с
+        # "file not found / no such file" — посмотри точное имя командой:
+        #   python -c "from huggingface_hub import list_repo_files; \
+        #     print([f for f in list_repo_files('morgendigital/multilingual-e5-large-quantized') if f.endswith('.onnx')])"
+        # и впиши его в model_file ниже. При падении сработает auto-fallback
+        # на e5_large (fp32) — сервис не ляжет, но скорость будет как у fp32.
+        "model_name": "morgendigital/multilingual-e5-large-quantized",
+        "dim": 1024,
+        "prefix": "query: ",
+        "native_in_fastembed": False,
+        "hf_source": "morgendigital/multilingual-e5-large-quantized",
+        "model_file": "onnx/model_quantized.onnx",
     },
     "e5_small": {
         "model_name": "intfloat/multilingual-e5-small",
         "dim": 384,
         "prefix": "query: ",
         "native_in_fastembed": False,  # требует add_custom_model
+        "hf_source": "intfloat/multilingual-e5-small",
+        "model_file": "onnx/model.onnx",
     },
 }
 
@@ -101,6 +127,22 @@ _word_emb_cache: dict = {}
 _CACHE_MAX = 10000
 
 
+def _dir_size_mb(path: Optional[str]) -> float:
+    """Суммарный размер файлов в каталоге (МБ). Читает только метаданные
+    (stat), не содержимое — быстро даже для многогигабайтных моделей.
+    Используется для диагностики: был ли download при instantiate."""
+    if not path or not os.path.isdir(path):
+        return 0.0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total / (1024.0 * 1024.0)
+
+
 def _register_custom_models():
     """Регистрирует модели не входящие в нативный список fastembed.
 
@@ -130,16 +172,24 @@ def _register_custom_models():
     except Exception as e:
         _diag(f"custom model: list_supported_models check failed: {e} (continuing to add_custom_model)")
 
+    # Источник и имя onnx-файла берём из конфига backend (с дефолтами для
+    # старого формата без этих ключей).
+    hf_source = _CFG.get("hf_source") or _E5_MODEL_NAME
+    model_file = _CFG.get("model_file") or "onnx/model.onnx"
+
     try:
         TextEmbedding.add_custom_model(
             model=_E5_MODEL_NAME,
             pooling=PoolingType.MEAN,
             normalization=True,
-            sources=ModelSource(hf=_E5_MODEL_NAME),
+            sources=ModelSource(hf=hf_source),
             dim=_CFG["dim"],
-            model_file="onnx/model.onnx",
+            model_file=model_file,
         )
-        _diag(f"custom model: add_custom_model({_E5_MODEL_NAME!r}, dim={_CFG['dim']}) OK")
+        _diag(
+            f"custom model: add_custom_model({_E5_MODEL_NAME!r}, dim={_CFG['dim']}, "
+            f"hf={hf_source!r}, file={model_file!r}) OK"
+        )
         return True
     except Exception as e:
         _diag(f"custom model: add_custom_model FAILED: {type(e).__name__}: {e}")
@@ -167,30 +217,60 @@ def get_e5_model():
         return None
 
     _e5_loading = True
+    import time as _t
+    _t_load0 = _t.perf_counter()
     _diag(f"get_e5_model: starting load, backend={EMBEDDING_BACKEND}, model={_E5_MODEL_NAME}")
 
+    dt_reg = dt_inst = dt_warm = 0.0
+    downloaded_mb = 0.0
     try:
-        # Регистрируем не-нативные модели в fastembed (e5-small требует add_custom_model)
+        # ── Фаза 1: регистрация не-нативных моделей (add_custom_model) ──
+        _t_reg = _t.perf_counter()
         registered = _register_custom_models()
+        dt_reg = _t.perf_counter() - _t_reg
         if not registered:
             _diag(f"get_e5_model: registration failed for {_E5_MODEL_NAME}, will try anyway")
+        _diag(f"get_e5_model: [phase] register = {dt_reg:.2f}s")
 
+        # ── Фаза 2: instantiate TextEmbedding (= download если нет на диске
+        #    + инициализация ONNX session). disk-snapshot до/после разделяет
+        #    "скачали с HF" (разово) от "прочитали с диска" (каждый рестарт). ──
         from fastembed import TextEmbedding
-        _diag(f"get_e5_model: instantiating TextEmbedding({_E5_MODEL_NAME!r}, cache_dir={_E5_CACHE_DIR!r})")
+        disk_before = _dir_size_mb(_E5_CACHE_DIR)
+        _diag(
+            f"get_e5_model: instantiating TextEmbedding({_E5_MODEL_NAME!r}, "
+            f"cache_dir={_E5_CACHE_DIR!r}); cache before = {disk_before:.0f} MB"
+        )
+        _t_inst = _t.perf_counter()
         if _E5_CACHE_DIR:
             _e5_model = TextEmbedding(_E5_MODEL_NAME, cache_dir=_E5_CACHE_DIR)
         else:
             _e5_model = TextEmbedding(_E5_MODEL_NAME)
-        _diag(f"get_e5_model: TextEmbedding OK, dim={_CFG['dim']}")
+        dt_inst = _t.perf_counter() - _t_inst
+        downloaded_mb = max(0.0, _dir_size_mb(_E5_CACHE_DIR) - disk_before)
+        _diag(
+            f"get_e5_model: [phase] instantiate = {dt_inst:.2f}s "
+            f"(downloaded ~{downloaded_mb:.0f} MB → "
+            f"{'DOWNLOAD from HF (one-time)' if downloaded_mb > 5 else 'read from disk/cache'}), "
+            f"dim={_CFG['dim']}"
+        )
 
-        # ── ONNX warmup ──
+        # ── Фаза 3: ONNX warmup (первый прогон графа) ──
         try:
-            import time as _t
-            _t0 = _t.perf_counter()
+            _t_warm = _t.perf_counter()
             _ = list(_e5_model.embed([f"{_E5_PREFIX}warmup"]))
-            _diag(f"get_e5_model: ONNX warmup OK ({_t.perf_counter() - _t0:.2f}s)")
+            dt_warm = _t.perf_counter() - _t_warm
+            _diag(f"get_e5_model: [phase] warmup = {dt_warm:.2f}s")
         except Exception as _w_err:
             _diag(f"get_e5_model: warmup failed (non-fatal): {_w_err}")
+
+        # ── Сводка: одной строкой, грепается как 'LOAD BREAKDOWN' ──
+        _diag(
+            f"get_e5_model: LOAD BREAKDOWN backend={EMBEDDING_BACKEND} "
+            f"register={dt_reg:.2f}s instantiate={dt_inst:.2f}s "
+            f"(download~{downloaded_mb:.0f}MB) warmup={dt_warm:.2f}s "
+            f"TOTAL={_t.perf_counter() - _t_load0:.2f}s"
+        )
     except Exception as e:
         _diag(f"get_e5_model: FAILED to load {_E5_MODEL_NAME}: {type(e).__name__}: {e}")
         import traceback
@@ -213,9 +293,11 @@ def get_e5_model():
                 _E5_MODEL_NAME = fallback_name
                 _E5_PREFIX = fallback_cfg["prefix"]
                 _diag(
-                    f"get_e5_model: FALLBACK to {fallback_name} OK "
+                    f"get_e5_model: FALLBACK to {fallback_name} (fp32) OK "
                     f"(dim={fallback_cfg['dim']}). "
-                    f"NOTE: пороги фильтра остаются для {EMBEDDING_BACKEND}, могут быть несовместимы — рестарт с правильным EMBEDDING_BACKEND рекомендуется."
+                    f"WARNING: backend {EMBEDDING_BACKEND!r} НЕ загрузился — сейчас работает "
+                    f"fp32 e5-large, НЕ квантованная. Скорость embed будет как у fp32. "
+                    f"Проверь причину выше (вероятно неверное model_file в _BACKEND_CONFIG)."
                 )
             except Exception as fe:
                 _diag(f"get_e5_model: fallback to e5_large also FAILED: {type(fe).__name__}: {fe}")
