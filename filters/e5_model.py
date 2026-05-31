@@ -475,11 +475,15 @@ def bench_embed_threads(words, thread_values=(16, 8, 4, 2)):
     """РАЗОВЫЙ замер: скорость embed одного набора слов при разных
     intra-op потоках onnxruntime.
 
-    Для каждого значения threads создаётся ВРЕМЕННАЯ модель → прогрев →
-    замер embed всего набора → выгрузка (del + gc). Пик памяти = основная
-    модель сервиса + одна временная (~2.7GB на int8-large при 4GB RAM).
-    НЕ трогает _word_emb_cache сервиса — считает напрямую через model.embed,
-    поэтому каждое значение меряется «вхолодную» и кэш живого сервиса цел.
+    Сначала ВЫГРУЖАЕТ основную singleton-модель (чтобы на 4GB RAM не держать
+    две модели разом → OOM). Затем для каждого threads создаёт ВРЕМЕННУЮ
+    модель → прогрев → замер embed набора → выгрузка (del+gc). Пик памяти =
+    одна временная модель + geo_db + MiniLM (~2.7GB, влезает в 4GB).
+    НЕ трогает _word_emb_cache сервиса. После замера основная = None,
+    перезагрузится при следующем реальном запросе (~5s с диска).
+
+    На 4GB лучше звать с ОДНИМ значением threads за HTTP-запрос (UI так и
+    делает) — тогда временная модель освобождается по завершении запроса.
 
     Возвращает list записей: {threads, seconds, ms_per_word, n_words, init_s}
     или {threads, error}.
@@ -504,12 +508,22 @@ def bench_embed_threads(words, thread_values=(16, 8, 4, 2)):
     if n == 0:
         return [{"threads": None, "error": "no words to embed"}]
 
-    # Гарантируем что модель зарегистрирована в fastembed (для e5_large_q/e5_small
-    # это already-done если сервис прогрет, но вызов безопасен/идемпотентен).
+    # КРИТИЧНО для 4GB RAM: выгружаем основную singleton-модель, чтобы в
+    # памяти НЕ было двух моделей разом (основная 1.1GB + временная 1.1GB +
+    # geo_db ~1GB + MiniLM 0.5GB → OOM-kill). Сервис перезагрузит основную
+    # при следующем реальном запросе (~5s с диска, разово).
+    global _e5_model
+    if _e5_model is not None:
+        _e5_model = None
+        _gc.collect()
+        _diag("[BENCH] unloaded main singleton to free RAM (will reload on next real request)")
+
+    # Регистрируем имя модели в fastembed БЕЗ её загрузки (дёшево, только
+    # add_custom_model — не создаёт TextEmbedding, не ест RAM).
     try:
-        get_e5_model()
+        _register_custom_models()
     except Exception as e:
-        _diag(f"[BENCH] get_e5_model warmup failed (continuing): {e}")
+        _diag(f"[BENCH] register warn: {e}")
 
     try:
         from fastembed import TextEmbedding
