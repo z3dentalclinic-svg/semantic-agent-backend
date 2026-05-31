@@ -146,22 +146,28 @@ def load_brands_db() -> Set[str]:
     return brands
 
 
-def load_retailers_db() -> Set[str]:
+def load_retailers_db() -> Dict[str, list]:
     """
-    Загружает базу ритейлеров / маркетплейсов.
+    Загружает базу ритейлеров / маркетплейсов с привязкой к странам.
 
     В отличие от brands.json (производители), retailers.json содержит
     торговые сети и онлайн-маркетплейсы: Rozetka, Amazon, OLX, Wildberries
     и т.д. Separate file — разная семантика и разные правила обновления.
 
+    ФОРМАТ v2.0: Dict[str, list] — {название: [коды_стран]}, '*' = global.
+    Это позволяет detect_retailer_foreign резать ритейлер если target_country
+    не входит в список его стран (Ozon на UA-target → мусор, на RU → валид).
+
+    Обратная совместимость: если файл в старом плоском формате (list), все
+    ритейлеры получают ['*'] (работают везде — старое поведение detect_retailer).
+
     Приоритет:
-    1. retailers.json — кураторский список для UA/RU/BY/KZ/EU/global
-    2. Встроенный fallback — топ-30 наиболее частых
+    1. retailers.json — кураторский список с гео-привязкой
+    2. Встроенный fallback — топ-30 наиболее частых (все ['*'])
 
     Returns:
-        Множество названий ритейлеров в нижнем регистре. Многословные
-        имена ("нова пошта", "медиа маркт") хранятся как строки и
-        детектором проверяются в обе стороны: одним токеном или биграммой.
+        Dict[str, list]: название (lowercase) → список ISO-кодов стран или ['*'].
+        Многословные имена ("нова пошта") хранятся как ключи-строки.
     """
     import os
     import json
@@ -175,23 +181,29 @@ def load_retailers_db() -> Set[str]:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                retailers = set(data.get("retailers", []))
+                raw = data.get("retailers", {})
+                if isinstance(raw, dict):
+                    # v2.0 формат: {name: [countries]}
+                    retailers = {k.lower(): [c.lower() for c in v] for k, v in raw.items()}
+                else:
+                    # legacy плоский список → все global
+                    retailers = {name.lower(): ['*'] for name in raw}
                 print(f"✅ retailers.json loaded: {len(retailers)} retailers from {path}")
                 return retailers
             except Exception as e:
                 print(f"⚠️ Error loading retailers.json: {e}")
 
-    # Fallback: топ-30 для UA/RU/глобальных (если файл не найден)
+    # Fallback: топ-30 для UA/RU/глобальных (если файл не найден). Все ['*'].
     print("⚠️ retailers.json not found, using built-in fallback (limited)")
-    retailers = {
+    fallback = [
         'розетка', 'rozetka', 'алло', 'allo', 'comfy', 'эпицентр', 'epicentr',
         'цитрус', 'citrus', 'фокстрот', 'foxtrot', 'олх', 'olx',
         'озон', 'ozon', 'вайлдберриз', 'wildberries',
         'амазон', 'amazon', 'ebay', 'aliexpress', 'алиэкспресс',
         'авито', 'avito', 'мвидео', 'm-video', 'эльдорадо', 'eldorado',
         'каспи', 'kaspi', 'куфар', 'kufar', 'онлайнер', 'onliner',
-    }
-    return retailers
+    ]
+    return {name: ['*'] for name in fallback}
 
 
 def get_lemma(word: str) -> str:
