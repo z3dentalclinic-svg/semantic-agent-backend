@@ -52,6 +52,17 @@ class BatchPostFilter:
             "роза", "белая",
         }
 
+        # FIX (task: FN cities): реальные города, которые pymorphy НЕ помечает Geox
+        # и ошибочно классифицирует как нарицательные (is_omonym_common=True),
+        # из-за чего foreign-блок их пропускает. Это НЕ хардкод-блокировка:
+        # страна по-прежнему сравнивается с target (целина/RU блокируется при
+        # target=UA, но проходит при target=RU). Список лишь отключает omonym-guard
+        # для конкретных слов — корректирует пробел в словаре pymorphy.
+        # целина/RU/11k, лазаревское/RU/30k, яровое/RU/21k, щучин/BY/15k.
+        self._known_cities_not_omonym = {
+            "целина", "лазаревское", "яровое", "щучин",
+        }
+
         # Кэш на уровень одного filter_batch: (word, country) → bool
         # Сбрасывается при каждом вызове filter_batch.
         # Ключевая экономия: слово "купить" в 500 ключах → 1 вызов _find_in_country вместо 500.
@@ -1039,14 +1050,20 @@ class BatchPostFilter:
                 #   - мелкий город + пограничный сигнал (score<1.0 или есть Geox в alt parse)
                 #     → доверяем БД, блокируем
                 # Применяется только для unigrams (биграммы редко омонимичны обычным словам).
+                # ИСКЛЮЧЕНИЕ: слова из _known_cities_not_omonym — реальные города, которые
+                # pymorphy ошибочно считает нарицательными (целина/лазаревское/щучин/яровое).
+                # Для них omonym-guard пропускаем → foreign-блок отрабатывает по стране.
                 if ' ' not in item and '-' not in item:
-                    _city_pop = max(
-                        self.population_cache.get(item, 0) or 0,
-                        self.population_cache.get(item_normalized, 0) or 0,
-                    )
-                    if _city_pop < 50000:
-                        if self._is_omonym_common(item, language):
-                            continue
+                    _is_known_city = (item in self._known_cities_not_omonym or
+                                      item_normalized in self._known_cities_not_omonym)
+                    if not _is_known_city:
+                        _city_pop = max(
+                            self.population_cache.get(item, 0) or 0,
+                            self.population_cache.get(item_normalized, 0) or 0,
+                        )
+                        if _city_pop < 50000:
+                            if self._is_omonym_common(item, language):
+                                continue
                 
                 # FIX (priority restructure): _is_common_noun guard УБРАН в блоке foreign.
                 # Сюда попадаем только когда found_country != None — то есть item уже в БД
