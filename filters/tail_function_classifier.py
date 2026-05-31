@@ -24,7 +24,7 @@ from .function_detectors import (
     detect_verb_modifier, detect_conjunctive_extension,
     detect_prepositional_modifier,
     # Новые мягкие детекторы
-    detect_truncated_geo, detect_truncated_geo_fast, detect_orphan_genitive, detect_single_infinitive,
+    detect_truncated_geo, detect_truncated_geo_fast, detect_truncated_geo_foreign, detect_orphan_genitive, detect_single_infinitive,
     detect_foreign_geo,
     # Info-intent detector — информационные/research/how-to запросы как positive
     detect_info_intent,
@@ -94,6 +94,7 @@ SIGNAL_WEIGHTS = {
     'standalone_num':  0.7,    # голое число — может ошибиться (модели)
     'category_mismatch': 0.5,  # мягкий — embeddings ненадёжно классифицируют категории
     'truncated_geo':     0.85,  # обрезанный составной город — довольно надёжно
+    'truncated_geo_foreign': 0.95,  # обрезок ИНОСТРАННОГО составного города — hard (foreign-гео)
     'foreign_geo':       0.95,  # город/страна из чужого региона — очень надёжно (geo_db)
     'orphan_genitive':   0.5,   # мягкий — может быть валидным ("фильтров")
     'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
@@ -346,6 +347,7 @@ class TailFunctionClassifier:
             ('standalone_num',  lambda: detect_standalone_number(tail, self.seed, tp=tp)),
             ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
             ('truncated_geo',   lambda: detect_truncated_geo_fast(tail, self.geo_db, self._truncated_geo_index, tp=tp)),
+            ('truncated_geo_foreign', lambda: detect_truncated_geo_foreign(tail, self.geo_db, self._truncated_geo_index, self.target_country, tp=tp)),
             ('foreign_geo',     lambda: detect_foreign_geo(tail, self.geo_db, self.target_country, tp=tp)),
             ('orphan_genitive', lambda: detect_orphan_genitive(tail, self.seed, tp=tp)),
             ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp, seed_is_service=self._seed_is_service)),
@@ -369,7 +371,7 @@ class TailFunctionClassifier:
             # truncated_geo даёт ложный обрезок ('хотов' → 'хот-спрингс'),
             # foreign_geo может сработать на коллизии — оба вердикта ошибочны
             # для подтверждённого своего города.
-            if own_geo and signal_name in ('truncated_geo', 'foreign_geo'):
+            if own_geo and signal_name in ('truncated_geo', 'truncated_geo_foreign', 'foreign_geo'):
                 continue
             _t0 = time.perf_counter()
             detected, reason = detector()
