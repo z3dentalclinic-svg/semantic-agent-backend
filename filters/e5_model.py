@@ -108,6 +108,23 @@ _CFG = _BACKEND_CONFIG[EMBEDDING_BACKEND]
 _E5_MODEL_NAME = _CFG["model_name"]
 _E5_PREFIX = _CFG["prefix"]
 
+# ─── Замер параллелизма (intra-op потоки onnxruntime) ────────────────────
+# По дефолту ORT берёт потоки по числу ВИДИМЫХ ядер (на Render это 32), но
+# контейнер CPU-ограничен через cgroup → 32 потока дерутся за реальные ядра
+# и тормозят. Явное ограничение часто УСКОРЯЕТ embed.
+#
+# ЗАМЕР: меняй env E5_ONNX_THREADS (в Render dashboard, без коммита) + рестарт,
+# прогоняй один и тот же сид, сравнивай 'e5_warm_total' в логах.
+# Пробовать: пусто(дефолт ORT) → 16 → 8 → 4 → 2 → 1.
+# Пусто или 0 = дефолт onnxruntime (по видимым ядрам).
+# Это intra-op (один процесс, БЕЗ копий модели) — не путать с parallel=
+# (мультипроцесс, который для large-модели = OOM, по копии на процесс).
+try:
+    _E5_ONNX_THREADS = int(os.getenv("E5_ONNX_THREADS", "0")) or None
+except (TypeError, ValueError):
+    _E5_ONNX_THREADS = None
+_diag(f"E5_ONNX_THREADS = {_E5_ONNX_THREADS} (None = onnxruntime default by visible cores)")
+
 _e5_model = None
 _e5_loading = False
 
@@ -242,10 +259,12 @@ def get_e5_model():
             f"cache_dir={_E5_CACHE_DIR!r}); cache before = {disk_before:.0f} MB"
         )
         _t_inst = _t.perf_counter()
+        _te_kwargs = {}
         if _E5_CACHE_DIR:
-            _e5_model = TextEmbedding(_E5_MODEL_NAME, cache_dir=_E5_CACHE_DIR)
-        else:
-            _e5_model = TextEmbedding(_E5_MODEL_NAME)
+            _te_kwargs["cache_dir"] = _E5_CACHE_DIR
+        if _E5_ONNX_THREADS is not None:
+            _te_kwargs["threads"] = _E5_ONNX_THREADS
+        _e5_model = TextEmbedding(_E5_MODEL_NAME, **_te_kwargs)
         dt_inst = _t.perf_counter() - _t_inst
         downloaded_mb = max(0.0, _dir_size_mb(_E5_CACHE_DIR) - disk_before)
         _diag(
@@ -267,6 +286,7 @@ def get_e5_model():
         # ── Сводка: одной строкой, грепается как 'LOAD BREAKDOWN' ──
         _diag(
             f"get_e5_model: LOAD BREAKDOWN backend={EMBEDDING_BACKEND} "
+            f"threads={_E5_ONNX_THREADS} "
             f"register={dt_reg:.2f}s instantiate={dt_inst:.2f}s "
             f"(download~{downloaded_mb:.0f}MB) warmup={dt_warm:.2f}s "
             f"TOTAL={_t.perf_counter() - _t_load0:.2f}s"
@@ -284,10 +304,12 @@ def get_e5_model():
                 from fastembed import TextEmbedding
                 fallback_cfg = _BACKEND_CONFIG["e5_large"]
                 fallback_name = fallback_cfg["model_name"]
+                _fb_kwargs = {}
                 if _E5_CACHE_DIR:
-                    _e5_model = TextEmbedding(fallback_name, cache_dir=_E5_CACHE_DIR)
-                else:
-                    _e5_model = TextEmbedding(fallback_name)
+                    _fb_kwargs["cache_dir"] = _E5_CACHE_DIR
+                if _E5_ONNX_THREADS is not None:
+                    _fb_kwargs["threads"] = _E5_ONNX_THREADS
+                _e5_model = TextEmbedding(fallback_name, **_fb_kwargs)
                 # Обновляем активные переменные на e5_large
                 _CFG = fallback_cfg
                 _E5_MODEL_NAME = fallback_name
@@ -447,6 +469,89 @@ def clear_e5_cache():
 
 def get_e5_cache_size() -> int:
     return len(_word_emb_cache)
+
+
+def bench_embed_threads(words, thread_values=(16, 8, 4, 2)):
+    """РАЗОВЫЙ замер: скорость embed одного набора слов при разных
+    intra-op потоках onnxruntime.
+
+    Для каждого значения threads создаётся ВРЕМЕННАЯ модель → прогрев →
+    замер embed всего набора → выгрузка (del + gc). Пик памяти = основная
+    модель сервиса + одна временная (~2.7GB на int8-large при 4GB RAM).
+    НЕ трогает _word_emb_cache сервиса — считает напрямую через model.embed,
+    поэтому каждое значение меряется «вхолодную» и кэш живого сервиса цел.
+
+    Возвращает list записей: {threads, seconds, ms_per_word, n_words, init_s}
+    или {threads, error}.
+    """
+    import time as _t
+    import gc as _gc
+
+    # Нормализация + дедуп слов, префикс E5 один раз
+    norm, seen = [], set()
+    for w in words:
+        if not w or not isinstance(w, str):
+            continue
+        x = w.strip().lower()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        norm.append(x)
+    prefixed = [f"{_E5_PREFIX}{w}" for w in norm]
+    n = len(prefixed)
+    _diag(f"[BENCH] start: {n} unique words, thread_values={list(thread_values)}, model={_E5_MODEL_NAME}")
+
+    if n == 0:
+        return [{"threads": None, "error": "no words to embed"}]
+
+    # Гарантируем что модель зарегистрирована в fastembed (для e5_large_q/e5_small
+    # это already-done если сервис прогрет, но вызов безопасен/идемпотентен).
+    try:
+        get_e5_model()
+    except Exception as e:
+        _diag(f"[BENCH] get_e5_model warmup failed (continuing): {e}")
+
+    try:
+        from fastembed import TextEmbedding
+    except Exception as e:
+        return [{"threads": None, "error": f"fastembed import failed: {e}"}]
+
+    out = []
+    for tv in thread_values:
+        m = None
+        try:
+            kw = {}
+            if _E5_CACHE_DIR:
+                kw["cache_dir"] = _E5_CACHE_DIR
+            if tv is not None:
+                kw["threads"] = tv
+            t_make = _t.perf_counter()
+            m = TextEmbedding(_E5_MODEL_NAME, **kw)
+            init_s = _t.perf_counter() - t_make
+            # прогрев (не учитываем в замере)
+            list(m.embed([f"{_E5_PREFIX}warmup"]))
+            # сам замер: embed всего набора
+            t0 = _t.perf_counter()
+            _ = list(m.embed(prefixed))
+            dt = _t.perf_counter() - t0
+            rec = {
+                "threads": tv,
+                "seconds": round(dt, 3),
+                "ms_per_word": round(dt * 1000.0 / n, 1),
+                "n_words": n,
+                "init_s": round(init_s, 2),
+            }
+            out.append(rec)
+            _diag(f"[BENCH] threads={tv}: embed {n} words in {dt:.2f}s ({rec['ms_per_word']} ms/word)")
+        except Exception as e:
+            out.append({"threads": tv, "error": f"{type(e).__name__}: {e}"})
+            _diag(f"[BENCH] threads={tv}: ERROR {type(e).__name__}: {e}")
+        finally:
+            del m
+            _gc.collect()
+
+    _diag(f"[BENCH] done: {out}")
+    return out
 
 
 # ─── НЕТ auto-load при импорте ────────────────────────────────────────────
