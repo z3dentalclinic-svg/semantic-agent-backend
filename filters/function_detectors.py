@@ -3663,6 +3663,77 @@ def detect_retailer(tail: str, retailers_db: Set[str], tp: dict = None) -> Tuple
     return False, ""
 
 
+def _retailer_match(words, retailers_db):
+    """Находит ритейлер в списке слов. Возвращает (name, matched_text) или (None, None).
+    Та же логика поиска что в detect_retailer: биграммы → одиночные → префикс-падеж.
+    retailers_db может быть Set[str] (старое) или Dict[str, list] (v2.0) — membership
+    по ключам работает одинаково."""
+    # Биграммы
+    for i in range(len(words) - 1):
+        bigram = f"{words[i]} {words[i+1]}"
+        bigram_dash = f"{words[i]}-{words[i+1]}"
+        if bigram in retailers_db:
+            return bigram, bigram
+        if bigram_dash in retailers_db:
+            return bigram_dash, bigram_dash
+    # Одиночные
+    for word in words:
+        if word in retailers_db:
+            return word, word
+    # Префикс-падеж
+    for word in words:
+        if len(word) < 5:
+            continue
+        for retailer in retailers_db:
+            if len(retailer) < 4 or ' ' in retailer or '-' in retailer:
+                continue
+            if word.startswith(retailer) and len(word) - len(retailer) <= 3:
+                return retailer, word
+    return None, None
+
+
+def detect_retailer_foreign(tail: str, retailers_db, target_country: str = "ua",
+                            tp: dict = None) -> Tuple[bool, str]:
+    """
+    Негативный HARD-детектор: ритейлер/маркетплейс из ЧУЖОГО региона.
+
+    Динамически по target_country: ритейлер режется, если target НЕ входит в
+    список его стран (и список не содержит '*' = global). Озон/Wildberries/Яндекс
+    на UA-target → мусор; на RU/BY-target → валид (detect_retailer пропустит).
+
+    Требует retailers_db в формате Dict[str, list] (название → [страны]). Для
+    Set[str] (старый формат без гео) детектор всегда возвращает False — резать
+    нечем, страны неизвестны (обратная совместимость: поведение как раньше).
+
+    'озон' (target=ua) → ['ru','by','kz'], ua не входит → HARD TRASH.
+    'озон' (target=ru) → ru входит → не срабатывает (detect_retailer даст +retailer).
+    'rozetka' (target=ua) → ['ua'] → ok, не срабатывает.
+    'amazon' (любой target) → ['*'] → global, не срабатывает.
+    """
+    if not tail or not retailers_db:
+        return False, ""
+    # Только для dict-формата (со странами). Set → нечего проверять.
+    if not isinstance(retailers_db, dict):
+        return False, ""
+
+    words = tail.lower().split()
+    if not words:
+        return False, ""
+
+    name, matched = _retailer_match(words, retailers_db)
+    if not name:
+        return False, ""
+
+    regions = retailers_db.get(name, [])
+    if '*' in regions:
+        return False, ""  # глобальный — валиден везде
+    target = target_country.lower()
+    if target not in regions:
+        rg = ','.join(regions) if regions else '?'
+        return True, f"Ритейлер чужого региона: '{matched}' ({rg}), target={target}"
+    return False, ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # detect_model_variant — короткие латинские токены после seed как вариант
 # модели товара или единица измерения.
