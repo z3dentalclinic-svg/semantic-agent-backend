@@ -69,25 +69,19 @@ _BACKEND_CONFIG = {
         "native_in_fastembed": True,   # fastembed знает эту модель из коробки
         "hf_source": None,             # native — не нужен
         "model_file": None,
+        "threads": 2,                  # intra-op onnxruntime = числу реальных ядер (Render: 2 CPU)
     },
     "e5_large_q": {
-        # Квантованный (int8) e5-large. Качество ≈ e5-large, embed-инференс
-        # быстрее в ~3-4x (квантизация ускоряет ТОЛЬКО embed, не загрузку модели).
-        #
-        # ВНИМАНИЕ: имя onnx-файла "onnx/model_quantized.onnx" — это дефолтное
-        # имя transformers.js quantize (которым собран репозиторий), но я НЕ
-        # подтвердил его листингом репо. Если instantiate упадёт с
-        # "file not found / no such file" — посмотри точное имя командой:
-        #   python -c "from huggingface_hub import list_repo_files; \
-        #     print([f for f in list_repo_files('morgendigital/multilingual-e5-large-quantized') if f.endswith('.onnx')])"
-        # и впиши его в model_file ниже. При падении сработает auto-fallback
-        # на e5_large (fp32) — сервис не ляжет, но скорость будет как у fp32.
+        # Квантованный (int8) e5-large. Качество ≈ e5-large, размер вдвое меньше.
+        # На 2-CPU инстансе int8 НЕ ускоряет инференс (нужен AVX-VNNI, его нет),
+        # но даёт качество large при меньшей загрузке модели.
         "model_name": "morgendigital/multilingual-e5-large-quantized",
         "dim": 1024,
         "prefix": "query: ",
         "native_in_fastembed": False,
         "hf_source": "morgendigital/multilingual-e5-large-quantized",
         "model_file": "onnx/model_quantized.onnx",
+        "threads": 2,                  # оптимум на 2 CPU (замер: 2→9.2s, 4→10.7s, дефолт→26s)
     },
     "e5_small": {
         "model_name": "intfloat/multilingual-e5-small",
@@ -96,6 +90,7 @@ _BACKEND_CONFIG = {
         "native_in_fastembed": False,  # требует add_custom_model
         "hf_source": "intfloat/multilingual-e5-small",
         "model_file": "onnx/model.onnx",
+        "threads": 2,                  # на 2 CPU оптимум = 2 потока
     },
 }
 
@@ -108,22 +103,11 @@ _CFG = _BACKEND_CONFIG[EMBEDDING_BACKEND]
 _E5_MODEL_NAME = _CFG["model_name"]
 _E5_PREFIX = _CFG["prefix"]
 
-# ─── Замер параллелизма (intra-op потоки onnxruntime) ────────────────────
-# По дефолту ORT берёт потоки по числу ВИДИМЫХ ядер (на Render это 32), но
-# контейнер CPU-ограничен через cgroup → 32 потока дерутся за реальные ядра
-# и тормозят. Явное ограничение часто УСКОРЯЕТ embed.
-#
-# ЗАМЕР: меняй env E5_ONNX_THREADS (в Render dashboard, без коммита) + рестарт,
-# прогоняй один и тот же сид, сравнивай 'e5_warm_total' в логах.
-# Пробовать: пусто(дефолт ORT) → 16 → 8 → 4 → 2 → 1.
-# Пусто или 0 = дефолт onnxruntime (по видимым ядрам).
-# Это intra-op (один процесс, БЕЗ копий модели) — не путать с parallel=
-# (мультипроцесс, который для large-модели = OOM, по копии на процесс).
-try:
-    _E5_ONNX_THREADS = int(os.getenv("E5_ONNX_THREADS", "0")) or None
-except (TypeError, ValueError):
-    _E5_ONNX_THREADS = None
-_diag(f"E5_ONNX_THREADS = {_E5_ONNX_THREADS} (None = onnxruntime default by visible cores)")
+# intra-op потоки onnxruntime. Берём из конфига backend (хардкод).
+# На Render-инстансе 2 физических CPU → оптимум = 2 (замер: 1→17.6s, 2→9.2s,
+# 4→10.7s, дефолт-oversubscribe→26s). Меняется вместе с планом инстанса.
+_E5_ONNX_THREADS = _CFG.get("threads")
+_diag(f"E5_ONNX_THREADS = {_E5_ONNX_THREADS} (intra-op threads, from backend config)")
 
 _e5_model = None
 _e5_loading = False
@@ -469,103 +453,6 @@ def clear_e5_cache():
 
 def get_e5_cache_size() -> int:
     return len(_word_emb_cache)
-
-
-def bench_embed_threads(words, thread_values=(16, 8, 4, 2)):
-    """РАЗОВЫЙ замер: скорость embed одного набора слов при разных
-    intra-op потоках onnxruntime.
-
-    Сначала ВЫГРУЖАЕТ основную singleton-модель (чтобы на 4GB RAM не держать
-    две модели разом → OOM). Затем для каждого threads создаёт ВРЕМЕННУЮ
-    модель → прогрев → замер embed набора → выгрузка (del+gc). Пик памяти =
-    одна временная модель + geo_db + MiniLM (~2.7GB, влезает в 4GB).
-    НЕ трогает _word_emb_cache сервиса. После замера основная = None,
-    перезагрузится при следующем реальном запросе (~5s с диска).
-
-    На 4GB лучше звать с ОДНИМ значением threads за HTTP-запрос (UI так и
-    делает) — тогда временная модель освобождается по завершении запроса.
-
-    Возвращает list записей: {threads, seconds, ms_per_word, n_words, init_s}
-    или {threads, error}.
-    """
-    import time as _t
-    import gc as _gc
-
-    # Нормализация + дедуп слов, префикс E5 один раз
-    norm, seen = [], set()
-    for w in words:
-        if not w or not isinstance(w, str):
-            continue
-        x = w.strip().lower()
-        if not x or x in seen:
-            continue
-        seen.add(x)
-        norm.append(x)
-    prefixed = [f"{_E5_PREFIX}{w}" for w in norm]
-    n = len(prefixed)
-    _diag(f"[BENCH] start: {n} unique words, thread_values={list(thread_values)}, model={_E5_MODEL_NAME}")
-
-    if n == 0:
-        return [{"threads": None, "error": "no words to embed"}]
-
-    # КРИТИЧНО для 4GB RAM: выгружаем основную singleton-модель, чтобы в
-    # памяти НЕ было двух моделей разом (основная 1.1GB + временная 1.1GB +
-    # geo_db ~1GB + MiniLM 0.5GB → OOM-kill). Сервис перезагрузит основную
-    # при следующем реальном запросе (~5s с диска, разово).
-    global _e5_model
-    if _e5_model is not None:
-        _e5_model = None
-        _gc.collect()
-        _diag("[BENCH] unloaded main singleton to free RAM (will reload on next real request)")
-
-    # Регистрируем имя модели в fastembed БЕЗ её загрузки (дёшево, только
-    # add_custom_model — не создаёт TextEmbedding, не ест RAM).
-    try:
-        _register_custom_models()
-    except Exception as e:
-        _diag(f"[BENCH] register warn: {e}")
-
-    try:
-        from fastembed import TextEmbedding
-    except Exception as e:
-        return [{"threads": None, "error": f"fastembed import failed: {e}"}]
-
-    out = []
-    for tv in thread_values:
-        m = None
-        try:
-            kw = {}
-            if _E5_CACHE_DIR:
-                kw["cache_dir"] = _E5_CACHE_DIR
-            if tv is not None:
-                kw["threads"] = tv
-            t_make = _t.perf_counter()
-            m = TextEmbedding(_E5_MODEL_NAME, **kw)
-            init_s = _t.perf_counter() - t_make
-            # прогрев (не учитываем в замере)
-            list(m.embed([f"{_E5_PREFIX}warmup"]))
-            # сам замер: embed всего набора
-            t0 = _t.perf_counter()
-            _ = list(m.embed(prefixed))
-            dt = _t.perf_counter() - t0
-            rec = {
-                "threads": tv,
-                "seconds": round(dt, 3),
-                "ms_per_word": round(dt * 1000.0 / n, 1),
-                "n_words": n,
-                "init_s": round(init_s, 2),
-            }
-            out.append(rec)
-            _diag(f"[BENCH] threads={tv}: embed {n} words in {dt:.2f}s ({rec['ms_per_word']} ms/word)")
-        except Exception as e:
-            out.append({"threads": tv, "error": f"{type(e).__name__}: {e}"})
-            _diag(f"[BENCH] threads={tv}: ERROR {type(e).__name__}: {e}")
-        finally:
-            del m
-            _gc.collect()
-
-    _diag(f"[BENCH] done: {out}")
-    return out
 
 
 # ─── НЕТ auto-load при импорте ────────────────────────────────────────────
