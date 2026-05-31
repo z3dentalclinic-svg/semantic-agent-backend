@@ -261,21 +261,37 @@ _truncated_geo_index_for: int = -1  # id последнего geo_db
 
 
 def _build_truncated_geo_index(geo_db: dict) -> Dict[str, str]:
-    """Строит индекс первых частей составных городов."""
+    """Строит индекс частей составных городов → полное имя.
+
+    Индексирует ПЕРВУЮ часть всегда. ПОСЛЕДНЮЮ часть — только если составное
+    имя НЕ содержит соединителя (на/при/над/по/из-за и т.п.). Это нужно для
+    городов вида 'набережные челны' (обе части значимы → 'челны' индексируется),
+    но НЕ для 'ростов-на-дону' / 'комсомольск-на-амуре' (часть после соединителя
+    'дону'/'амуре' — служебная, индексировать её → FP на любом хвосте 'дону').
+    Последняя часть индексируется только при длине ≥4 (отсев 'оск','ола' и пр.
+    коротких хвостов, дающих ложные матчи).
+    """
     global _truncated_geo_index, _truncated_geo_index_for
     db_id = id(geo_db)
     if db_id == _truncated_geo_index_for:
         return _truncated_geo_index
+    # Соединители в составных топонимах — часть после них не самостоятельна
+    _CONNECTORS = {'на', 'при', 'над', 'по', 'под', 'за', 'из', 'у', 'во', 'в'}
     index = {}
     for city_name in geo_db:
-        if '-' in city_name:
-            first_part = city_name.split('-')[0]
-            if first_part and first_part not in index:
-                index[first_part] = city_name
-        elif ' ' in city_name:
-            first_part = city_name.split(' ')[0]
-            if first_part and first_part not in index:
-                index[first_part] = city_name
+        sep = '-' if '-' in city_name else (' ' if ' ' in city_name else None)
+        if not sep:
+            continue
+        parts = city_name.split(sep)
+        # Первая часть — всегда (как было)
+        first_part = parts[0]
+        if first_part and first_part not in index:
+            index[first_part] = city_name
+        # Последняя часть — только если нет соединителя в имени и часть значима
+        if len(parts) >= 2 and not (set(parts) & _CONNECTORS):
+            last_part = parts[-1]
+            if len(last_part) >= 4 and last_part not in index:
+                index[last_part] = city_name
     _truncated_geo_index = index
     _truncated_geo_index_for = db_id
     return index
@@ -2300,6 +2316,68 @@ def detect_standalone_number(tail: str, seed: str = "", tp: dict = None) -> Tupl
 # ============================================================
 # НОВЫЕ НЕГАТИВНЫЕ ДЕТЕКТОРЫ (мягкие — понижают вес, не убивают)
 # ============================================================
+
+def detect_truncated_geo_foreign(tail: str, geo_db: dict, geo_index: dict,
+                                  target_country: str = "ua", tp: dict = None) -> Tuple[bool, str]:
+    """
+    Негативный HARD-детектор: обрезок составного ИНОСТРАННОГО города.
+
+    Отличается от detect_truncated_geo_fast (soft) тем, что срабатывает ТОЛЬКО
+    когда восстановленный полный город принадлежит НЕ target-стране. Такой
+    сигнал надёжен (foreign-гео), поэтому в classifier ему даётся hard-вес и он
+    НЕ в _SOFT_NEGATIVES — то есть в одиночку даёт TRASH/anchor, а не GREY.
+
+    'йошкар' (target=UA) → 'йошкар-ола'/RU → foreign → HARD TRASH.
+    'челны'  (target=UA) → 'набережные челны'/RU → foreign → HARD TRASH.
+    'южно'   (target=RU) → 'южно-сахалинск'/RU → СВОЙ → не срабатывает (soft словит как обычно).
+
+    Свои/неоднозначные обрезки остаются на soft-детекторе detect_truncated_geo_fast.
+    """
+    if not tail or not geo_db:
+        return False, ""
+
+    words = tail.lower().split()
+    if len(words) != 1:
+        return False, ""
+    word = words[0]
+    if word.isdigit() or len(word) < 3:
+        return False, ""
+    if word in geo_db:
+        return False, ""
+
+    word_parsed = _get_parses(word, tp)[0]
+    lemma = word_parsed.normal_form
+    if lemma in geo_db:
+        return False, ""
+    if word_parsed.tag.POS in ('ADJF', 'ADJS', 'NUMR'):
+        return False, ""
+
+    city = geo_index.get(word) or geo_index.get(lemma)
+    if not city:
+        return False, ""
+
+    # OMONYM guard: если обрезок — известное нарицательное слово без Geox-тега,
+    # это омоним, а не обрезок города. Отсекает FP вида 'корпус'→'корпус кристи',
+    # 'белые'→'белые воды', 'дон'→'дон торкуато'. Тот же критерий что в BPF
+    # (_is_omonym_common): word_is_known + ни один parse не помечен Geox.
+    # Реальные обрезки (йошкар/челны/ханты) pymorphy НЕ знает как слова → проходят.
+    parses_all = _get_parses(word, tp)
+    if morph.word_is_known(word):
+        has_geox = any('Geox' in str(p.tag) for p in parses_all)
+        if not has_geox:
+            return False, ""
+
+    # Страна восстановленного города. geo_db: Dict[str, Set[str]] (название → {ISO}).
+    countries = geo_db.get(city)
+    if not countries:
+        return False, ""
+    target = target_country.upper()
+    # foreign только если target НЕ среди стран города
+    if target not in countries:
+        cc = next(iter(countries))
+        return True, f"Обрезанный иностранный город: '{word}' → '{city}' ({cc})"
+    return False, ""
+
 
 def detect_truncated_geo_fast(tail: str, geo_db: dict, geo_index: dict, tp: dict = None) -> Tuple[bool, str]:
     """
