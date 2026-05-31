@@ -36,6 +36,7 @@ from .function_detectors import (
     detect_product_spec,
     # Retailer — онлайн-магазины и маркетплейсы (Rozetka, Amazon, OLX)
     detect_retailer,
+    detect_retailer_foreign,
     # Model variant — короткие латинские модификаторы модели/единиц (pro, ultra, gb, hz)
     detect_model_variant,
     # Helpers
@@ -103,6 +104,7 @@ SIGNAL_WEIGHTS = {
     'unknown_district':  0.4,   # мягкий — район, которого нет в базе, но структура валидна
     'product_spec':      0.85,  # технические параметры товара (12 в, 4т, 220 ом) — надёжный сигнал
     'retailer':          0.85,  # упоминание ритейлера/маркетплейса — сильный коммерческий интент
+    'retailer_foreign':  0.95,  # ритейлер чужого региона — hard (foreign-маркетплейс, мусор для target)
     'model_variant':     0.75,  # короткий латинский модификатор (pro/ultra/gb/hz) — структурный сигнал для англ. моделей и ед. измерения
 }
 
@@ -348,6 +350,7 @@ class TailFunctionClassifier:
             ('category_mismatch', lambda: detect_category_mismatch(self.seed, tail)),
             ('truncated_geo',   lambda: detect_truncated_geo_fast(tail, self.geo_db, self._truncated_geo_index, tp=tp)),
             ('truncated_geo_foreign', lambda: detect_truncated_geo_foreign(tail, self.geo_db, self._truncated_geo_index, self.target_country, tp=tp)),
+            ('retailer_foreign', lambda: detect_retailer_foreign(tail, self.retailer_db, self.target_country, tp=tp)),
             ('foreign_geo',     lambda: detect_foreign_geo(tail, self.geo_db, self.target_country, tp=tp)),
             ('orphan_genitive', lambda: detect_orphan_genitive(tail, self.seed, tp=tp)),
             ('single_infinitive', lambda: detect_single_infinitive(tail, self.seed, tp=tp, seed_is_service=self._seed_is_service)),
@@ -518,7 +521,11 @@ class TailFunctionClassifier:
             # сигналами. Это вердикт о неприменимости, не об интенте.
             # wrong_district: в хвосте известный район чужого города при
             # городском seed — аналогичная неприменимость таргетинга.
-            absolute_blockers = {'foreign_geo', 'wrong_district'}
+            # retailer_foreign: маркетплейс чужого региона (озон/яндекс на UA) —
+            # неприменимость по площадке; даже +retailer/+commerce не спасает.
+            # truncated_geo_foreign: обрезок иностранного города (йошкар→йошкар-ола/RU).
+            absolute_blockers = {'foreign_geo', 'wrong_district',
+                                 'retailer_foreign', 'truncated_geo_foreign'}
             if set(negative) & absolute_blockers:
                 return 'TRASH', 0.9, pos_score, neg_score
             
