@@ -1,18 +1,18 @@
 """
-l3_filter.py — Слой 3: Google Gemini 3.1 Flash-Lite классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Google Gemini 3.1 Pro классификатор для GREY-зоны.
 
-Версия: БИНАРНАЯ (0 или 1), 2 корзины, thinking_level=high.
+Версия: БИНАРНАЯ (0 или 1), 2 корзины, thinking_level=medium.
 
 Архитектура:
-- Модель: gemini-3.1-flash-lite (Google, самая дешёвая 3.x, есть free-tier)
-- thinking_level="high" (максимальное мышление; у Lite нет уровня выше high)
+- Модель: gemini-3.1-pro-preview (Google, топовое рассуждение; дороже, без free-tier)
+- thinking_level="medium" (среднее; у Pro уровни low/medium/high, medium ≈ прежний high у 3 Pro)
 - batch_size=20, max_parallel=7
 - Бинарная классификация: 1 → VALID, 0 → TRASH
 - exponential backoff (2->4->8->16с) на 5 попытках
 - Параметры region/language передаются в user-prompt
 
 ВАЖНО про API:
-- Нативный Gemini API: POST /v1beta/models/gemini-3.1-flash-lite:generateContent
+- Нативный Gemini API: POST /v1beta/models/gemini-3.1-pro-preview:generateContent
 - Ключ: заголовок x-goog-api-key (env GEMINI_API_KEY)
 - Мышление: generationConfig.thinkingConfig.thinkingLevel (minimal|low|medium|high)
 - temperature/top_p/top_k НЕ задаём — на 3.5 Flash не рекомендуются, игнорируются
@@ -27,7 +27,8 @@ l3_filter.py — Слой 3: Google Gemini 3.1 Flash-Lite классификат
 - Claude Sonnet 4.6 (no thinking) — пропускает мусор, режет review
 - GPT-5.5 — тест на бренд-насыщенных коммерческих сидах
 - Gemini 3.5 Flash (thinking=medium) — пропускал мусор/доп-гео непоследовательно
-- Gemini 3.1 Flash-Lite (thinking=high) — текущая модель
+- Gemini 3.1 Flash-Lite (thinking=high) — пробовали на мусоре/чуши
+- Gemini 3.1 Pro (thinking=medium) — текущая модель
 
 Ключ: env OPENAI_API_KEY
 """
@@ -42,7 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gemini-3.1-flash-lite"
+MODEL = "gemini-3.1-pro-preview"
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 
@@ -55,7 +56,7 @@ class L3Config:
     max_parallel: int = 7
     region: str = "Украина"
     language: str = "русский"
-    thinking_level: str = "high"  # minimal | low | medium | high (3.1 Flash-Lite; high = потолок/«макс»)
+    thinking_level: str = "medium"  # low | medium | high (3.1 Pro; без minimal; medium ≈ прежний high у 3 Pro)
 
 
 # =============================================================================
