@@ -34,8 +34,8 @@ from .function_detectors import (
     detect_wrong_district, detect_unknown_district,
     # Wrong geo token — голый одиночный токен ОТДЕЛЬНОГО города ≠ seed
     detect_wrong_geo_token,
-    # Хелпер: район при городском seed → снять ложный +geo (→ GREY→L3)
-    has_seed_city_and_district_tail,
+    # Хелпер: доп-гео после seed-города → снять структурные позитивы (→ GREY→L3)
+    content_after_seed_city,
     # Множество городов seed — для гейта own_geo (городской seed vs нет)
     _extract_seed_cities,
     # Product spec — технические спецификации товара (12в, 4т, 220 ом)
@@ -301,19 +301,27 @@ class TailFunctionClassifier:
             positive_signals.append('geo')
             reasons.append("✅ Город target-страны (подтверждён BPF, расширенная база)")
 
-        # ===== РАЙОН ПРИ ГОРОДСКОМ SEED → снять ложный +geo, отдать в L3 =====
-        # detect_geo (и own_geo) ставят +geo районным токенам: districts слиты в
-        # GEO_DB как города. Но имя района к городу однозначно не привязывается
-        # (Позняки=Киев; Победа/Перемога — в т.ч. Днепр; одного parent в
-        # districts.json недостаточно, кратность не восстановима). Поэтому при
-        # городском seed снимаем geo с района — ключ уходит в GREY→L3, где LLM
-        # решает по городу. ОТДЕЛЬНЫЙ город ≠ seed (южное/харьков) ловит
-        # detect_wrong_geo_token (hard). Без города в seed — не трогаем.
-        if 'geo' in positive_signals and has_seed_city_and_district_tail(tail, self.seed, tp=tp):
-            positive_signals.remove('geo')
-            reasons.append(
-                "⚠ geo снят: район при городском seed — имя района неоднозначно → GREY→L3"
-            )
+        # ===== ДОП-ГЕО ПОСЛЕ SEED-ГОРОДА → снять структурные позитивы → GREY→L3 =====
+        # Правило: доп-гео (улица/район/локалитет) идёт ПОСЛЕ seed-города. Такой
+        # хвост к городу по имени не привязать → не VALID, отдаём в L3. Снимаем
+        # только СТРУКТУРНЫЕ/гео позитивы (geo/postmod_adj/premod_adj/type_spec/
+        # model_variant) — на топонимах и согласованных прилагательных они ложны
+        # (южный/юбилейный/жуковского цепляют postmod_adj за 'ремонт'; позняки/
+        # победа — +geo как район из GEO_DB). Реальный интент после города
+        # (отзывы/цена/на дому/срочно → reputation/commerce/location/time) НЕ
+        # трогаем — он легитимен, ключ остаётся VALID. Отдельный город ≠ seed
+        # (южное/харьков) ловит detect_wrong_geo_token (hard) → TRASH.
+        # Редкий товарный модификатор после города (днепр аккумуляторных) тоже
+        # уйдёт в GREY→L3 — таких мало, L3 разрулит (согласовано).
+        # Без города в seed (ремонт пылесосов) флаг False → ничего не трогаем.
+        if positive_signals and content_after_seed_city(kw, self.seed, tp=tp):
+            _geo_struct = {'geo', 'postmod_adj', 'premod_adj', 'type_spec', 'model_variant'}
+            _removed = [s for s in positive_signals if s in _geo_struct]
+            if _removed:
+                positive_signals[:] = [s for s in positive_signals if s not in _geo_struct]
+                reasons.append(
+                    f"⚠ снят структурный позитив после seed-города (доп-гео → GREY→L3): {_removed}"
+                )
 
         self.classify_stages['positive_loop'] = self.classify_stages.get('positive_loop', 0.0) + (time.perf_counter() - _stage_t0)
         _stage_t0 = time.perf_counter()
