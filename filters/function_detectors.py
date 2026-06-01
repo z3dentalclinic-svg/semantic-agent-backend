@@ -3520,7 +3520,7 @@ def detect_wrong_geo_token(
     к городу однозначно не привязывается (Позняки=Киев, но Победа — в т.ч.
     Днепр; одного parent в districts.json недостаточно). Районы уходят в
     GREY→L3 — geo-сигнал с них снимается в классификаторе
-    (has_seed_city_and_district_tail), а не здесь.
+    (content_after_seed_city), а не здесь.
 
     Примеры (seed='ремонт пылесосов днепр', seed_cities={'dnipro'}):
       'южное'   → отдельный UA-город ≠ 'dnipro' → TRASH
@@ -3585,28 +3585,49 @@ def detect_wrong_geo_token(
     return False, ""
 
 
-def has_seed_city_and_district_tail(tail: str, seed: str = "", tp: dict = None) -> bool:
-    """True, если в seed есть город И в хвосте есть токен-РАЙОН target-страны
-    (∈ _DISTRICT_TO_CANONICAL с country == seed-страны... ну, target).
+_CONTENT_SKIP_POS = {'PREP', 'CONJ', 'PRCL', 'INTJ'}
 
-    Используется классификатором, чтобы снять ложный +geo с района: detect_geo
-    ставит +geo районам (districts слиты в GEO_DB как города), но по имени
-    района город не определить → ключ должен уйти в GREY→L3, а не в VALID.
 
-    Скоупится городским seed: при seed без города (ремонт пылесосов) районы не
-    трогаются — own_geo-спасение мелких локаций (таирово/хотов) сохраняется.
-    Чужие районы (country != target) не считаем — их detect_geo молчит,
-    а foreign_geo решает сам.
+def content_after_seed_city(kw: str, seed: str = "", tp: dict = None) -> bool:
+    """True, если в seed есть город И в kw ПОСЛЕ токена seed-города идёт
+    содержательный токен (не предлог/союз/частица).
+
+    Признак доп-гео (правило: доп-гео идёт после гео). Семантика: при городском
+    seed легитимный товарный модификатор сидит внутри фразы (до города:
+    'ремонт АККУМУЛЯТОРНЫХ пылесосов днепр'), а топоним-хвост (улица/район/
+    локалитет: 'днепр южный/жуковского/ярослава мудрого') идёт ПОСЛЕ города.
+
+    Классификатор по этому флагу снимает СТРУКТУРНЫЕ позитивы (geo/postmod_adj/
+    premod_adj/...) → ключ уходит в GREY→L3. Реальный интент (отзывы/цена/на дому)
+    при этом не трогается. Город ≠ seed (южное/харьков) ловит detect_wrong_geo_token.
+
+    Берём ПОСЛЕДНЕЕ вхождение seed-города в kw — содержательное после него = доп.
+    Без города в seed → False (бессородный seed не трогаем).
     """
-    if not seed or not _DISTRICT_TO_CANONICAL or not _CITY_NORMALIZE:
+    if not kw or not seed or not _CITY_NORMALIZE:
         return False
-    if not _extract_seed_cities(seed, tp=tp):
+    seed_cities = _extract_seed_cities(seed, tp=tp)
+    if not seed_cities:
         return False
-    for w in tail.lower().split():
-        # Только сырой токен: лемма даёт коллизии (южное→южный=RU-район).
-        # Имена районов в districts.json хранятся в номинативной поверхностной форме.
-        if w in _DISTRICT_TO_CANONICAL:
-            return True
+
+    words = kw.lower().split()
+    city_idx = -1
+    for i, w in enumerate(words):
+        norm = _CITY_NORMALIZE.get(w)
+        if norm is None:
+            p = _get_parses(w, tp)
+            if p:
+                norm = _CITY_NORMALIZE.get(p[0].normal_form)
+        if norm in seed_cities:
+            city_idx = i  # последнее вхождение
+    if city_idx < 0:
+        return False
+
+    for w in words[city_idx + 1:]:
+        p = _get_parses(w, tp)[0]
+        if str(p.tag.POS) in _CONTENT_SKIP_POS:
+            continue
+        return True
     return False
 
 
