@@ -32,6 +32,12 @@ from .function_detectors import (
     detect_premod_adjective, detect_postmod_adjective,
     # District guard — районы чужих городов при городском seed
     detect_wrong_district, detect_unknown_district,
+    # Wrong geo token — голый одиночный токен ОТДЕЛЬНОГО города ≠ seed
+    detect_wrong_geo_token,
+    # Хелпер: район при городском seed → снять ложный +geo (→ GREY→L3)
+    has_seed_city_and_district_tail,
+    # Множество городов seed — для гейта own_geo (городской seed vs нет)
+    _extract_seed_cities,
     # Product spec — технические спецификации товара (12в, 4т, 220 ом)
     detect_product_spec,
     # Retailer — онлайн-магазины и маркетплейсы (Rozetka, Amazon, OLX)
@@ -101,6 +107,7 @@ SIGNAL_WEIGHTS = {
     'single_infinitive': 0.5,   # мягкий — может быть валидным интентом
     'intent_mismatch':   0.9,   # информационный seed + коммерческий tail — надёжный конфликт
     'wrong_district':    0.95,  # известный район ЧУЖОГО города при городском seed — hard block
+    'wrong_geo_token':   0.95,  # голый гео-токен чужого города/района при городском seed — hard block
     'unknown_district':  0.4,   # мягкий — район, которого нет в базе, но структура валидна
     'product_spec':      0.85,  # технические параметры товара (12 в, 4т, 220 ом) — надёжный сигнал
     'retailer':          0.85,  # упоминание ритейлера/маркетплейса — сильный коммерческий интент
@@ -284,9 +291,29 @@ class TailFunctionClassifier:
         # метке BPF и проставляем geo. Это автоматически активирует Stage 0
         # short-circuit для category_mismatch (geo ∈ _STRONG_POSITIVES_SKIP_MISMATCH),
         # и хвост-город (таирово/хотов/тячев) не теряется в chargram=0.
-        if own_geo and 'geo' not in positive_signals:
+        # own_geo от BPF доверяем ВСЛЕПУЮ только когда в seed НЕТ города:
+        # тогда +geo спасает мелкую UA-локацию в хвосте (таирово/хотов/тячев),
+        # которой нет в L0 geo_db. При ГОРОДСКОМ seed слепое доверие неверно —
+        # UA-гео ≠ seed-город требует проверки вложенности, которой по имени нет;
+        # пусть detect_geo / detect_wrong_geo_token / L3 решают (иначе село-омоним
+        # вроде 'ёжик' из расширенной базы BPF стал бы VALID при seed='…днепр').
+        if own_geo and 'geo' not in positive_signals and not _extract_seed_cities(self.seed, tp=tp):
             positive_signals.append('geo')
             reasons.append("✅ Город target-страны (подтверждён BPF, расширенная база)")
+
+        # ===== РАЙОН ПРИ ГОРОДСКОМ SEED → снять ложный +geo, отдать в L3 =====
+        # detect_geo (и own_geo) ставят +geo районным токенам: districts слиты в
+        # GEO_DB как города. Но имя района к городу однозначно не привязывается
+        # (Позняки=Киев; Победа/Перемога — в т.ч. Днепр; одного parent в
+        # districts.json недостаточно, кратность не восстановима). Поэтому при
+        # городском seed снимаем geo с района — ключ уходит в GREY→L3, где LLM
+        # решает по городу. ОТДЕЛЬНЫЙ город ≠ seed (южное/харьков) ловит
+        # detect_wrong_geo_token (hard). Без города в seed — не трогаем.
+        if 'geo' in positive_signals and has_seed_city_and_district_tail(tail, self.seed, tp=tp):
+            positive_signals.remove('geo')
+            reasons.append(
+                "⚠ geo снят: район при городском seed — имя района неоднозначно → GREY→L3"
+            )
 
         self.classify_stages['positive_loop'] = self.classify_stages.get('positive_loop', 0.0) + (time.perf_counter() - _stage_t0)
         _stage_t0 = time.perf_counter()
@@ -359,6 +386,10 @@ class TailFunctionClassifier:
             # unknown_district = SOFT: биграмма валидна структурно, но не в базе → GREY.
             ('wrong_district',   lambda: detect_wrong_district(tail, self.seed, tp=tp)),
             ('unknown_district', lambda: detect_unknown_district(tail, self.seed, tp=tp)),
+            # Голый одиночный гео-токен чужого города/района (без маркера 'район').
+            # HARD: detect_geo ставит +geo любому target-токену из geo_db, не сверяя
+            # с seed-городом ('днепр позняки/победа/южное'). Сверяет true_city ↔ seed_cities.
+            ('wrong_geo_token',  lambda: detect_wrong_geo_token(tail, self.seed, self.geo_db, self.target_country, tp=tp)),
         ]
         
         for signal_name, detector in detectors_negative:
@@ -525,7 +556,8 @@ class TailFunctionClassifier:
             # неприменимость по площадке; даже +retailer/+commerce не спасает.
             # truncated_geo_foreign: обрезок иностранного города (йошкар→йошкар-ола/RU).
             absolute_blockers = {'foreign_geo', 'wrong_district',
-                                 'retailer_foreign', 'truncated_geo_foreign'}
+                                 'retailer_foreign', 'truncated_geo_foreign',
+                                 'wrong_geo_token'}
             if set(negative) & absolute_blockers:
                 return 'TRASH', 0.9, pos_score, neg_score
             
