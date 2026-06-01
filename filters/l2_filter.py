@@ -46,6 +46,9 @@ import numpy as np
 import pymorphy3
 
 from .shared_model import get_embedding_model
+# Позиционный гейт доп-гео (тот же, что в L0): прилагательное после seed-города =
+# топоним, а не модификатор → морф не должен промоутить его в VALID.
+from .function_detectors import content_after_seed_city
 
 # Singleton morph analyzer (0 MB extra — pymorphy3 already in L0)
 _morph_analyzer = None
@@ -693,8 +696,21 @@ class L2Classifier:
             # KNN guard НЕ работает: "литий ионный" = morph 1.0, KNN 0.378 (валидный, но KNN низкий)
             # "женский" = morph 1.0, KNN 0.752 (FP, но KNN высокий). Диапазоны пересекаются.
             elif morph >= 0.7 and not pure_neg:
-                label = "VALID"
-                reason = f"Morph {morph:.1f} ({morph_detail})"
+                # Доп-гео после seed-города: согласованное прилагательное здесь —
+                # это топоним (улица/район: "днепр южный/юбилейный/ярослава
+                # мудрого"), а не товарный модификатор. Тот же позиционный гейт,
+                # что в L0 (postmod_adj): морф НЕ промоутит → остаётся GREY → L3.
+                # Для бессородного seed (нет города) гейт = False → морф работает
+                # как раньше (гелевый/литиевый/аккумуляторный → VALID).
+                if content_after_seed_city(keyword, seed):
+                    label = "GREY"
+                    reason = (
+                        f"Morph {morph:.1f} ({morph_detail}) снят: "
+                        f"доп-гео после seed-города → GREY→L3"
+                    )
+                else:
+                    label = "VALID"
+                    reason = f"Morph {morph:.1f} ({morph_detail})"
             
             # R2.8: Digit-letter spec token → VALID
             # "12v", "7ah", "ytz7s", "50кубов" — спецификация = коммерческий запрос
