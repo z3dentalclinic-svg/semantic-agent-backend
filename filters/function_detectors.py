@@ -3291,6 +3291,43 @@ def _extract_seed_city(seed: str, tp: dict = None) -> str:
     return result
 
 
+# Кэш множества seed-городов (multi-city seed). Ключ: tuple(seed_words_lower).
+_seed_cities_cache: Dict[tuple, frozenset] = {}
+
+
+def _extract_seed_cities(seed: str, tp: dict = None) -> frozenset:
+    """Все канонические города из seed (множество).
+
+    Аналог _extract_seed_city, но собирает ВСЕ города, а не только первый.
+    Нужно для multi-city seed ('билеты харьков варшава' → {'kharkiv', 'warsaw'}):
+    новый гео-токен валиден, если вложен/равен ЛЮБОМУ из них (правило N-seed).
+
+    Возвращает frozenset канонических english-имён или пустой frozenset, если
+    в seed нет городов (тогда детектор-потребитель делает no-op).
+    """
+    if not seed or not _CITY_NORMALIZE:
+        return frozenset()
+
+    seed_words = tuple(seed.lower().split())
+    if seed_words in _seed_cities_cache:
+        return _seed_cities_cache[seed_words]
+
+    found = set()
+    for w in seed_words:
+        if w in _CITY_NORMALIZE:
+            found.add(_CITY_NORMALIZE[w])
+            continue
+        parsed = _get_parses(w, tp)
+        if parsed:
+            lemma = parsed[0].normal_form
+            if lemma in _CITY_NORMALIZE:
+                found.add(_CITY_NORMALIZE[lemma])
+
+    result = frozenset(found)
+    _seed_cities_cache[seed_words] = result
+    return result
+
+
 def _find_district_bigram(tail: str, tp: dict = None):
     """Ищет биграмму 'X район/микрорайон/квартал' в tail.
 
@@ -3468,6 +3505,109 @@ def detect_unknown_district(
         f"Неизвестный район: '{display_bigram}' отсутствует в базе "
         f"districts.json, а seed указывает '{seed_city}'"
     )
+
+
+def detect_wrong_geo_token(
+    tail: str, seed: str = "",
+    geo_db: Dict[str, Set[str]] = None,
+    target_country: str = "ua",
+    tp: dict = None,
+) -> Tuple[bool, str]:
+    """HARD NEGATIVE: одиночный токен — самостоятельный ГОРОД target-страны,
+    отличный от города из seed.
+
+    Только города (geonames). РАЙОНЫ (place=suburb) сюда НЕ входят: имя района
+    к городу однозначно не привязывается (Позняки=Киев, но Победа — в т.ч.
+    Днепр; одного parent в districts.json недостаточно). Районы уходят в
+    GREY→L3 — geo-сигнал с них снимается в классификаторе
+    (has_seed_city_and_district_tail), а не здесь.
+
+    Примеры (seed='ремонт пылесосов днепр', seed_cities={'dnipro'}):
+      'южное'   → отдельный UA-город ≠ 'dnipro' → TRASH
+      'харьков' → отдельный UA-город ≠ 'dnipro' → TRASH
+      'позняки' → район (∈ districts) → пропуск (geo снимется в классификаторе)
+      'южный'   → RU-район, не target → пропуск (foreign_geo решает)
+      'ёжик'    → нет в geo_db → пропуск
+
+    No-op когда geo_db / _CITY_NORMALIZE пусты, либо в seed нет distinct city.
+    """
+    if not seed or not geo_db or not _CITY_NORMALIZE:
+        return False, ""
+
+    seed_cities = _extract_seed_cities(seed, tp=tp)
+    if not seed_cities:
+        return False, ""
+
+    target = target_country.upper()
+    words = tail.lower().split()
+    if not words:
+        return False, ""
+
+    _word_positions = {}
+    for _wi, _ww in enumerate(words):
+        if _ww not in _word_positions:
+            _word_positions[_ww] = _wi
+
+    skip_pos = {'CONJ', 'PREP', 'PRCL', 'INTJ'}
+
+    for word in words:
+        # Район — не наша зона (geo снимается в классификаторе → GREY→L3).
+        if word in _DISTRICT_TO_CANONICAL:
+            continue
+        parsed = _get_parses(word, tp)[0]
+        if parsed.tag.POS in skip_pos:
+            continue
+        lem = parsed.normal_form
+
+        # G4: adj-форма + street_marker справа → имя улицы, не город
+        if _g_is_street(word, lem, _word_positions, words):
+            continue
+        # G6: жк/мкр перед словом → имя ЖК, не город
+        if _g_is_complex(word, _word_positions, words):
+            continue
+
+        # Самостоятельный город target-страны? raw, затем лемма (len>=5).
+        key = None
+        if word in geo_db and target in geo_db[word]:
+            key = word
+        elif len(word) >= 5 and lem != word and lem in geo_db and target in geo_db[lem]:
+            key = lem
+        if key is None:
+            continue
+
+        true_city = _normalize_city(key)
+        if true_city and true_city not in seed_cities:
+            return True, (
+                f"Другой город target-страны: '{word}' → '{true_city}', "
+                f"seed указывает {sorted(seed_cities)}"
+            )
+
+    return False, ""
+
+
+def has_seed_city_and_district_tail(tail: str, seed: str = "", tp: dict = None) -> bool:
+    """True, если в seed есть город И в хвосте есть токен-РАЙОН target-страны
+    (∈ _DISTRICT_TO_CANONICAL с country == seed-страны... ну, target).
+
+    Используется классификатором, чтобы снять ложный +geo с района: detect_geo
+    ставит +geo районам (districts слиты в GEO_DB как города), но по имени
+    района город не определить → ключ должен уйти в GREY→L3, а не в VALID.
+
+    Скоупится городским seed: при seed без города (ремонт пылесосов) районы не
+    трогаются — own_geo-спасение мелких локаций (таирово/хотов) сохраняется.
+    Чужие районы (country != target) не считаем — их detect_geo молчит,
+    а foreign_geo решает сам.
+    """
+    if not seed or not _DISTRICT_TO_CANONICAL or not _CITY_NORMALIZE:
+        return False
+    if not _extract_seed_cities(seed, tp=tp):
+        return False
+    for w in tail.lower().split():
+        # Только сырой токен: лемма даёт коллизии (южное→южный=RU-район).
+        # Имена районов в districts.json хранятся в номинативной поверхностной форме.
+        if w in _DISTRICT_TO_CANONICAL:
+            return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
