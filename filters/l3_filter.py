@@ -1,21 +1,22 @@
 """
-l3_filter.py — Слой 3: OpenAI GPT-5.5 классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Google Gemini 3.5 Flash классификатор для GREY-зоны.
 
-Версия: БИНАРНАЯ (0 или 1), 2 корзины, reasoning=low.
+Версия: БИНАРНАЯ (0 или 1), 2 корзины, thinking_level=medium.
 
 Архитектура:
-- Модель: gpt-5.5 (OpenAI flagship, релиз апрель 2026, $5/$30 за 1M токенов)
-- reasoning_effort="none" (минимум размышлений для быстрой классификации)
+- Модель: gemini-3.5-flash (Google, GA с 19.05.2026, $1.50/$9.00 за 1M токенов)
+- thinking_level="medium" (среднее мышление; дефолт у 3.5 Flash)
 - batch_size=20, max_parallel=7
 - Бинарная классификация: 1 → VALID, 0 → TRASH
 - exponential backoff (2->4->8->16с) на 5 попытках
 - Параметры region/language передаются в user-prompt
 
 ВАЖНО про API:
-- Endpoint: /v1/chat/completions
-- max_completion_tokens (НЕ max_tokens) — обязательно для reasoning-моделей
-- temperature НЕ поддерживается у reasoning-моделей, убрана
-- reasoning_effort: none | low | medium | high | xhigh
+- Нативный Gemini API: POST /v1beta/models/gemini-3.5-flash:generateContent
+- Ключ: заголовок x-goog-api-key (env GEMINI_API_KEY)
+- Мышление: generationConfig.thinkingConfig.thinkingLevel (minimal|low|medium|high)
+- temperature/top_p/top_k НЕ задаём — на 3.5 Flash не рекомендуются, игнорируются
+- Ответ: candidates[0].content.parts[].text; токены мышления — usageMetadata.thoughtsTokenCount
 
 ИСТОРИЯ моделей в этом проекте:
 - Gemini 2.5 Flash-Lite preview — старт, отбросили (плохо UA)
@@ -24,7 +25,8 @@ l3_filter.py — Слой 3: OpenAI GPT-5.5 классификатор для GR
 - GPT-5.4 Mini (low) — 92% совпадение, $33/мес — финал на много дней
 - Claude Haiku 4.5 (no thinking) — слабая интент-фильтрация
 - Claude Sonnet 4.6 (no thinking) — пропускает мусор, режет review
-- GPT-5.5 — текущий тест на бренд-насыщенных коммерческих сидах
+- GPT-5.5 — тест на бренд-насыщенных коммерческих сидах
+- Gemini 3.5 Flash (thinking=medium) — текущая модель
 
 Ключ: env OPENAI_API_KEY
 """
@@ -39,8 +41,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gpt-5.5"
-API_URL = "https://api.openai.com/v1/chat/completions"
+MODEL = "gemini-3.5-flash"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 
 @dataclass
@@ -52,7 +54,7 @@ class L3Config:
     max_parallel: int = 7
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "none"  # none | low | medium | high | xhigh (GPT-5.5 поддерживает все)
+    thinking_level: str = "medium"  # minimal | low | medium | high (Gemini 3.5; medium = дефолт)
 
 
 # =============================================================================
@@ -220,13 +222,14 @@ SYSTEM_PROMPT_DRAFT_17 = """Классифицируй каждый запрос
 
 
 # -----------------------------------------------------------------------------
-# АКТИВНЫЙ ПРОМПТ — драфт 17 (тест на GPT-5.5 + reasoning=none).
+# АКТИВНЫЙ ПРОМПТ — драфт 17 (на Gemini 3.5 Flash + thinking=medium).
+# Промпт не менялся при смене модели — поменялся только провайдер/мышление.
 # История:
 #   На Mini драфт 17 ломал UA-кейсы (модель не знала украинские бренды).
-#   На GPT-5.5 ожидаем что:
+#   На сильной модели (GPT-5.5 / Gemini 3.5 Flash) ожидаем что:
 #     ✅ модель знает Фокстрот=УА, Жарден=РФ → правило сработает корректно
 #     ✅ расширенный список маркеров поможет ловить .ru домены, юр-формы
-#     ⚠️ возможные потери на пограничных кейсах (если GPT-5.5 не уверена)
+#     ⚠️ возможные потери на пограничных кейсах (если модель не уверена)
 # -----------------------------------------------------------------------------
 SYSTEM_PROMPT = """Классифицируй каждый запрос по связи с темой сида: 1 (связано) или 0 (не связано).
 
@@ -274,31 +277,38 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
-def _call_openai(
+def _call_gemini(
     api_key: str,
     system_prompt: str,
     user_prompt: str,
     timeout: int,
-    reasoning_effort: str,
+    thinking_level: str,
 ) -> Tuple[str, Dict[str, Any]]:
     """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}.
-    
-    ВАЖНО про reasoning-модели OpenAI (GPT-5 family):
-    - max_completion_tokens вместо max_tokens
-    - temperature, top_p, etc. НЕ поддерживаются
-    - reasoning_effort: low | medium | high | xhigh (для gpt-5.4-mini)
+
+    Нативный Gemini API (generateContent), модель gemini-3.5-flash (GA).
+    Уровень мышления — generationConfig.thinkingConfig.thinkingLevel:
+    minimal | low | medium | high (по умолчанию medium). thinkingLevel и
+    thinkingBudget вместе нельзя. temperature/top_p/top_k не задаём — на 3.5
+    Flash они не рекомендуются и игнорируются. Системный промпт идёт в
+    systemInstruction, ответ — в candidates[0].content.parts[].text,
+    токены мышления — в usageMetadata.thoughtsTokenCount.
     """
     import requests
 
+    level = (thinking_level or "medium").strip().upper()
+    if level not in ("MINIMAL", "LOW", "MEDIUM", "HIGH"):
+        level = "MEDIUM"
+
     payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": user_prompt}]},
         ],
-        "max_completion_tokens": 8192,
-        "stream": False,
-        "reasoning_effort": reasoning_effort,
+        "generationConfig": {
+            "thinkingConfig": {"thinkingLevel": level},
+            "maxOutputTokens": 8192,
+        },
     }
 
     try:
@@ -306,42 +316,50 @@ def _call_openai(
             API_URL,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
+                "x-goog-api-key": api_key,
             },
             json=payload,
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"OpenAI network error: {type(e).__name__}: {e}")
+        raise Exception(f"Gemini network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"OpenAI API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"Gemini API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"OpenAI JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"Gemini JSON parse error: {e}. Raw: {response.text[:300]}")
 
-    try:
-        choice = data['choices'][0]
-        message = choice['message']
-        content = (message.get('content') or '').strip()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        # Блокировка промптом/безопасностью или иной отказ → отдаём в retry.
+        feedback = data.get("promptFeedback") or {}
+        raise Exception(f"Gemini no candidates (promptFeedback={feedback}): {str(data)[:300]}")
 
-        usage = data.get('usage', {}) or {}
-        completion_details = usage.get('completion_tokens_details', {}) or {}
-        diag = {
-            "prompt_tokens": usage.get('prompt_tokens'),
-            "completion_tokens": usage.get('completion_tokens'),
-            "reasoning_tokens": completion_details.get('reasoning_tokens'),
-            "finish_reason": choice.get('finish_reason'),
-        }
-        return content, diag
-    except (KeyError, IndexError, TypeError):
-        if 'choices' not in data:
-            raise Exception(f"OpenAI no choices: {str(data)[:400]}")
-        choice = data['choices'][0] if data.get('choices') else {}
-        finish = choice.get('finish_reason', 'UNKNOWN')
-        raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
+    cand = candidates[0]
+    finish = cand.get("finishReason")
+    parts = ((cand.get("content") or {}).get("parts")) or []
+    # Только видимый текст: исключаем thought-части, если вернулись.
+    content = "".join(
+        p.get("text", "") for p in parts
+        if isinstance(p, dict) and "text" in p and not p.get("thought")
+    ).strip()
+
+    usage = data.get("usageMetadata", {}) or {}
+    diag = {
+        "prompt_tokens": usage.get("promptTokenCount"),
+        "completion_tokens": usage.get("candidatesTokenCount"),
+        "reasoning_tokens": usage.get("thoughtsTokenCount"),
+        "finish_reason": finish,
+    }
+
+    if not content:
+        # Пустой ответ (часто finishReason=MAX_TOKENS / STOP без текста) → retry.
+        raise Exception(f"Gemini empty content (finish_reason={finish}): {str(data)[:300]}")
+
+    return content, diag
 
 
 def _parse_labels(response: str, expected_count: int) -> List[Optional[int]]:
@@ -402,9 +420,9 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response, diag = _call_openai(
+            response, diag = _call_gemini(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
-                config.timeout, config.reasoning_effort
+                config.timeout, config.thinking_level
             )
             elapsed = time.time() - t0
 
@@ -459,12 +477,12 @@ def apply_l3_filter(
         config = L3Config()
 
     # Всегда берём свежий ключ из env
-    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if env_key:
         config.api_key = env_key
 
     if not config.api_key:
-        logger.warning("[L3] No OPENAI_API_KEY — skipping")
+        logger.warning("[L3] No GEMINI_API_KEY — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
@@ -485,7 +503,7 @@ def apply_l3_filter(
     logger.info(
         f"[L3] Processing {len(kw_strings)} GREY keywords via {MODEL} "
         f"({total_batches} batches of {config.batch_size}, {workers} parallel) "
-        f"region={config.region} language={config.language} reasoning={config.reasoning_effort} "
+        f"region={config.region} language={config.language} thinking={config.thinking_level} "
         f"binary classification: 1=VALID, 0=TRASH"
     )
 
@@ -575,7 +593,7 @@ def apply_l3_filter(
         "model": MODEL,
         "region": config.region,
         "language": config.language,
-        "reasoning_effort": config.reasoning_effort,
+        "thinking_level": config.thinking_level,
         "classification": "binary_1_0",
     }
     out["_l3_trace"] = l3_trace
