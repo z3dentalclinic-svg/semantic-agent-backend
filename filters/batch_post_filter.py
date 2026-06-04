@@ -941,6 +941,11 @@ class BatchPostFilter:
                 # Баг B: известное слово без Geox → нарицательное, не район
                 if self._get_word_features(w, language)['skip_geo']:
                     continue
+                # Бытовое существительное-омоним (боль/сок/ёж/ёлка) — не район,
+                # даже при pop>=50k (alt-name наследует население города-хоста).
+                # Реальные районы — имена собственные/прилагательные → POS!=NOUN.
+                if self._is_everyday_noun(w, language):
+                    continue
                 if w in our_city_bigrams:
                     continue
                 if self._find_in_country(w, country):
@@ -1056,14 +1061,22 @@ class BatchPostFilter:
                 if ' ' not in item and '-' not in item:
                     _is_known_city = (item in self._known_cities_not_omonym or
                                       item_normalized in self._known_cities_not_omonym)
-                    if not _is_known_city:
+                    if not _is_known_city and self._is_omonym_common(item, language):
+                        # Различитель «бытовое слово vs топоним без Geox-маркера»:
+                        #  • топонимы-омонимы pymorphy — субстантивированные
+                        #    ПРИЛАГАТЕЛЬНЫЕ (Дачное/Заречный/Октябрьский/
+                        #    Железнодорожный) → держим в блоке порогом pop>=50k;
+                        #  • бытовые слова (боль/сок/ёж/ёлка) — обычные
+                        #    СУЩЕСТВИТЕЛЬНЫЕ → скипаем независимо от pop, т.к. pop
+                        #    у alt-name наследуется от далёкого города-хоста
+                        #    (боли→Boli/CN/95k, сок→JP/250k).
+                        _pos = self._get_word_features(item, language).get('pos')
                         _city_pop = max(
                             self.population_cache.get(item, 0) or 0,
                             self.population_cache.get(item_normalized, 0) or 0,
                         )
-                        if _city_pop < 50000:
-                            if self._is_omonym_common(item, language):
-                                continue
+                        if _pos == 'NOUN' or _city_pop < 50000:
+                            continue
                 
                 # FIX (priority restructure): _is_common_noun guard УБРАН в блоке foreign.
                 # Сюда попадаем только когда found_country != None — то есть item уже в БД
@@ -1211,7 +1224,7 @@ class BatchPostFilter:
         if cache_key in self._word_features_cache:
             return self._word_features_cache[cache_key]
 
-        features = {'skip_geo': False, 'is_common_noun': False, 'is_omonym_common': False}
+        features = {'skip_geo': False, 'is_common_noun': False, 'is_omonym_common': False, 'pos': None}
 
         if not self._has_morph or language not in ['ru', 'uk']:
             self._word_features_cache[cache_key] = features
@@ -1224,7 +1237,7 @@ class BatchPostFilter:
                 best = parses[0]
                 tag_str = str(best.tag)
                 pos = best.tag.POS
-
+                features['pos'] = pos
                 # skip_geo: служебные части речи или известное слово без Geox
                 if pos in ('CONJ', 'PREP', 'PRCL', 'INTJ'):
                     features['skip_geo'] = True
@@ -1272,6 +1285,21 @@ class BatchPostFilter:
 
     def _is_omonym_common(self, word: str, language: str) -> bool:
         return self._get_word_features(word, language)['is_omonym_common']
+
+    def _is_everyday_noun(self, word: str, language: str) -> bool:
+        """True если pymorphy уверенно знает слово как нарицательное СУЩЕСТВИТЕЛЬНОЕ
+        без Geox ни в одном разборе (боль/сок/ёж/ёлка). Такие слова нельзя
+        блокировать как гео: они цепляются за мусорные alt-names далёких городов
+        (боли→Boli/CN/95k, сок→JP/250k, боль→Baule/FR), причём pop наследуется от
+        города-хоста, поэтому порог 50k их не отсекает.
+        Топонимы-омонимы, которые pymorphy не метит Geox, — это субстантивированные
+        ПРИЛАГАТЕЛЬНЫЕ (Дачное/Заречный/Октябрьский/Железнодорожный) → POS!=NOUN →
+        сюда НЕ попадают и остаются под foreign-блоком по порогу pop>=50k.
+        _known_cities_not_omonym (целина/лазаревское/яровое/щучин) исключены явно."""
+        if word in self._known_cities_not_omonym:
+            return False
+        f = self._get_word_features(word, language)
+        return f.get('is_omonym_common', False) and f.get('pos') == 'NOUN'
 
     def _extract_cities_from_seed(self, seed: str, country: str, language: str) -> Set[str]:
         """🔥 FIX: Извлекает города из seed БЕЗ фильтра по стране.
