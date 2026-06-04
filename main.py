@@ -1512,6 +1512,157 @@ async def l1_5_trace_endpoint(
     return info
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  DEBUG: замер контраста action-anchor vs deal-pole (L1.5, разовый)
+# ---------------------------------------------------------------------
+#  Гипотеза "контраст полюсов": action засчитывать не по порогу
+#  cos(слово, anchor) ≥ 0.87, а по margin = cos(слово, anchor) −
+#  cos(слово, deal-pole-центроид). Этот эндпоинт ТОЛЬКО МЕРЯЕТ числа
+#  (margin/breakdown), фильтр не меняет. Эмбеддинги берутся тем же путём,
+#  что в _prove_action (get_e5_word_embedding → норм. вектор;
+#  e5_cosine_sim → dot), поэтому cos_anchor сопоставим с _l1_5_diag.
+# ─────────────────────────────────────────────────────────────────────
+def _ap_split(arg, fallback):
+    """'a,b , c' → ['a','b','c']; пусто/None → fallback."""
+    if not arg:
+        return list(fallback)
+    parts = [p.strip().lower() for p in arg.split(",")]
+    parts = [p for p in parts if p]
+    return parts or list(fallback)
+
+
+def _ap_centroid(words, embed_fn):
+    """Нормированный центроид эмбеддингов слов. → (vec|None, used_words).
+    Слова, которые не удалось встроить, пропускаются (не ломают центроид)."""
+    import numpy as np
+    vecs, used = [], []
+    for w in words:
+        e = embed_fn(w)
+        if e is not None:
+            vecs.append(np.asarray(e, dtype=np.float32))
+            used.append(w)
+    if not vecs:
+        return None, []
+    c = np.mean(np.stack(vecs, axis=0), axis=0)
+    n = float(np.linalg.norm(c))
+    if n > 0:
+        c = c / n
+    return c.astype(np.float32), used
+
+
+def _ap_compute(anchor, pole_words, probe_words, embed_fn, cos_fn):
+    """ЧИСТАЯ логика замера (тестируется на моке отдельно).
+
+    Для каждого probe-слова:
+      cos_anchor     = cos(probe, anchor_lemma)          ← воспроизводит diag
+      cos_pole       = cos(probe, deal-pole centroid)
+      margin         = cos_anchor − cos_pole             ← кандидат-критерий
+      pole_breakdown = cos(probe, каждое слово полюса)   ← чем именно тянет
+    Плюс служебное: anchor_vs_pole_centroid (близок ли сам якорь к сделке),
+    pole_cohesion (плотен ли полюс)."""
+    anchor_emb = embed_fn(anchor)
+    centroid, pole_used = _ap_centroid(pole_words, embed_fn)
+
+    results = []
+    for w in probe_words:
+        we = embed_fn(w)
+        if we is None:
+            results.append({"word": w, "error": "embedding_failed"})
+            continue
+        cos_anchor = round(cos_fn(we, anchor_emb), 3) if anchor_emb is not None else None
+        cos_pole = round(cos_fn(we, centroid), 3) if centroid is not None else None
+        margin = (round(cos_anchor - cos_pole, 3)
+                  if (cos_anchor is not None and cos_pole is not None) else None)
+        breakdown = {p: round(cos_fn(we, embed_fn(p)), 3) for p in pole_words}
+        results.append({
+            "word": w,
+            "cos_anchor": cos_anchor,
+            "cos_pole": cos_pole,
+            "margin": margin,
+            "pole_breakdown": breakdown,
+        })
+
+    anchor_vs_pole = (round(cos_fn(anchor_emb, centroid), 3)
+                      if (anchor_emb is not None and centroid is not None) else None)
+    pole_cohesion = ({w: round(cos_fn(embed_fn(w), centroid), 3) for w in pole_used}
+                     if centroid is not None else {})
+
+    return {
+        "anchor": anchor,
+        "anchor_embedded": anchor_emb is not None,
+        "pole_words": pole_words,
+        "pole_words_used": pole_used,
+        "anchor_vs_pole_centroid": anchor_vs_pole,
+        "pole_cohesion": pole_cohesion,
+        "results": results,
+    }
+
+
+# Дефолты = решающий кейс доставки (открыть URL без параметров).
+_AP_DEFAULT_ANCHOR = "доставка"
+_AP_DEFAULT_POLE = ["купить", "заказ", "цена", "покупка", "продажа", "стоимость"]
+_AP_DEFAULT_WORDS = ["заказ", "отправка", "купить", "доставить", "привоз", "заказать", "доставка"]
+
+
+@app.get("/debug/action-poles")
+def action_poles_endpoint(
+    anchor: str = Query("", description="action-якорь сида (дефолт 'доставка')"),
+    pole: str = Query("", description="контр-полюс через запятую (дефолт транзакц. набор)"),
+    words: str = Query("", description="пробы через запятую"),
+):
+    """РАЗОВЫЙ замер контраста action-anchor vs deal-pole (L1.5).
+
+    Sync def (не async): инференс E5 блокирующий — FastAPI выполнит его в
+    threadpool, не морозя event loop на время батча.
+
+    Примеры:
+        /debug/action-poles
+        /debug/action-poles?anchor=доставка&pole=купить,заказ,цена&words=заказ,отправка,купить
+    """
+    from filters.e5_model import (
+        get_e5_word_embedding,
+        e5_cosine_sim,
+        warm_e5_word_cache,
+        is_e5_loaded,
+        EMBEDDING_BACKEND,
+    )
+    try:
+        from filters.l1_5_filter_v2 import COS_ACTION_HIGH as _cos_action_high
+    except Exception:
+        _cos_action_high = None
+
+    a = (anchor or _AP_DEFAULT_ANCHOR).strip().lower()
+    pole_words = _ap_split(pole, _AP_DEFAULT_POLE)
+    probe_words = _ap_split(words, _AP_DEFAULT_WORDS)
+
+    # Прогреваем кеш одним батчем (как делает фильтр) — быстрее, тем же путём.
+    try:
+        warm_e5_word_cache([a] + pole_words + probe_words)
+    except Exception:
+        pass  # не критично: _ap_compute всё равно встроит по одному
+
+    # Модель грузится лениво. Если так и не поднялась — честно скажем.
+    if not is_e5_loaded() and get_e5_word_embedding(a) is None:
+        return {
+            "backend": EMBEDDING_BACKEND,
+            "error": "e5_model_not_loaded",
+            "hint": "модель грузится лениво при первом запросе; повтори через ~10-30с",
+        }
+
+    payload = _ap_compute(
+        a, pole_words, probe_words,
+        get_e5_word_embedding, e5_cosine_sim,
+    )
+    payload["backend"] = EMBEDDING_BACKEND
+    payload["COS_ACTION_HIGH_current"] = _cos_action_high
+    payload["note"] = (
+        "cos_anchor сверь с _l1_5_diag (заказ≈0.900, отправка≈0.891, "
+        "купить≈0.851). margin=cos_anchor-cos_pole — кандидат-критерий вместо "
+        "порога 0.87. Это ТОЛЬКО замер, фильтр не изменён."
+    )
+    return payload
+
+
 @app.get("/debug/l0-trace")
 async def l0_trace_endpoint(
     label: str = Query("all", description="Фильтр: all / valid / trash / grey / no_seed"),
