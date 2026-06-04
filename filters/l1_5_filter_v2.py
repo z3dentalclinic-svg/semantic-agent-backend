@@ -957,6 +957,44 @@ def _prove_object(
     return False, diag
 
 
+# ─── DEAL-POLE: измерительный контр-полюс для action (контраст полюсов) ────
+# Универсальный транзакционный центроид (НЕ список ниши — niche-agnostic).
+# Используется ТОЛЬКО для записи в diag: по каждому E5-кандидату action
+# добавляются cos_deal = cos(кандидат, центроид сделки) и
+# margin = cos_anchor - cos_deal. Решение фильтра (порог COS_ACTION_HIGH)
+# НЕ затрагивается — это данные для оценки гипотезы "контраст полюсов".
+# Центроид строится один раз на процесс (6 эмбеддингов, кешируются E5-кешем),
+# затем переиспользуется. Если модель недоступна — None, поля просто не пишутся.
+_DEAL_POLE_WORDS = ("купить", "заказ", "цена", "покупка", "продажа", "стоимость")
+_deal_pole_centroid = None
+_deal_pole_built = False
+
+
+def _get_deal_pole_centroid():
+    """Нормированный центроид эмбеддингов _DEAL_POLE_WORDS (lazy, cached).
+    Возвращает np.ndarray|None. Только для diag-измерения, не для решений."""
+    global _deal_pole_centroid, _deal_pole_built
+    if _deal_pole_built:
+        return _deal_pole_centroid
+    _deal_pole_built = True
+    if get_e5_word_embedding is None:
+        return None
+    import numpy as np
+    vecs = []
+    for w in _DEAL_POLE_WORDS:
+        e = get_e5_word_embedding(w)
+        if e is not None:
+            vecs.append(np.asarray(e, dtype=np.float32))
+    if not vecs:
+        return None
+    c = np.mean(np.stack(vecs, axis=0), axis=0)
+    n = float(np.linalg.norm(c))
+    if n > 0:
+        c = c / n
+    _deal_pole_centroid = c.astype(np.float32)
+    return _deal_pole_centroid
+
+
 def _prove_action(
     kw_tokens: List[str],
     kw_lemmas: List[Optional[str]],
@@ -1055,12 +1093,18 @@ def _prove_action(
                     continue
                 cand_lemmas.add(lem)
 
+        deal_centroid = _get_deal_pole_centroid()  # измерение, на решение НЕ влияет
         for lem in cand_lemmas:
             cand_emb = get_e5_word_embedding(lem)
             if cand_emb is None:
                 continue
             cos = e5_cosine_sim(anchor_emb, cand_emb)
-            diag['all_cos'].append({'lemma': lem, 'cos': round(cos, 3)})
+            entry = {'lemma': lem, 'cos': round(cos, 3)}
+            if deal_centroid is not None:
+                cos_deal = e5_cosine_sim(deal_centroid, cand_emb)
+                entry['cos_deal'] = round(cos_deal, 3)
+                entry['margin'] = round(cos - cos_deal, 3)
+            diag['all_cos'].append(entry)
             if cos > best_cos:
                 best_cos = cos
                 best_lem = lem
