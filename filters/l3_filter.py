@@ -56,7 +56,7 @@ class L3Config:
     max_parallel: int = 7
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "medium"  # none | low | medium | high | xhigh (GPT-5.5)
+    reasoning_effort: str = "low"  # none | low | medium | high | xhigh (GPT-5.5)
 
 
 # =============================================================================
