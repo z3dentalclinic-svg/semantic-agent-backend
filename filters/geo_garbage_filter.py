@@ -686,6 +686,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         allowed_districts = allowed_districts | CITY_DISTRICTS.get(seed_city, set())
         logger.info(f"[GEO_WHITE_LIST] seed_city='{seed_city}' → canonical='{seed_canonical}' → "
                     f"{len(allowed_districts)} allowed districts")
+
+    # ФИКС 1: нормализованный seed_city и его страна — для проверки «ключ обязан
+    # содержать гео сида» (см. ПРОВЕРКА 7 ниже). Считаем один раз на батч.
+    seed_city_norm = _normalize_token(seed_city) if seed_city else None
+    _seed_country_code = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
     
     # ═══════════════════════════════════════════════════════════════
     # Шаг 3: WHITE-LIST фильтрация (с нормализацией!)
@@ -703,6 +708,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         'blocked_wrong_district': 0,
         'blocked_wrong_oblast': 0,
         'blocked_geox_region': 0,
+        'blocked_no_geo': 0,
         'allowed': 0,
     }
     
@@ -1136,6 +1142,49 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 blocked_reasons[query_lower.strip()] = f"Geox-регион: '{_geox_word}'"
                 continue
         
+        # ═══════════════════════════════════════════════════════════
+        # ПРОВЕРКА 7 (ФИКС 1): гео-сид → ключ ОБЯЗАН содержать гео сида
+        # На гео-сиде (seed_city определён) ключ без гео сида = "совсем
+        # другой ключ" → TRASH. Разрешено одно из:
+        #   1) сам seed_city в любом падеже ("лондоне"→"лондон")
+        #   2) составной seed_city как биграма ("нью йорк")
+        #   3) разрешённый район seed_city из districts.json
+        #   4) страна seed_city (англия/великобритания при лондон=GB)
+        # Конфликтующее гео ("сша", чужой город/район) уже отсеяно
+        # ПРОВЕРКАМИ 2-6, поэтому сюда доходит либо "гео сида есть",
+        # либо "гео нет вовсе" — режем второе.
+        # На НЕ-гео сиде (seed_city is None) блок НЕ выполняется →
+        # GREY_SOFT для "батарея/акб на скутер" не затрагивается.
+        # ═══════════════════════════════════════════════════════════
+
+        if seed_city:
+            _has_seed_geo = False
+            # 1) сам seed_city (raw или нормализованный падеж)
+            if (seed_city in clean_words or seed_city in clean_words_normalized
+                    or (seed_city_norm and (seed_city_norm in clean_words
+                                            or seed_city_norm in clean_words_normalized))):
+                _has_seed_geo = True
+            # 2) составной seed_city как биграма ("нью йорк")
+            elif seed_city in query_bigrams:
+                _has_seed_geo = True
+            # 3) разрешённый район seed_city
+            elif allowed_districts and (
+                    any(w in allowed_districts for w in clean_words)
+                    or any(w in allowed_districts for w in clean_words_normalized)):
+                _has_seed_geo = True
+            # 4) страна seed_city (англия при лондон=GB) — raw и normalized форма
+            elif _seed_country_code:
+                for _rw, _wn in zip(clean_words, clean_words_normalized):
+                    _ent = all_geo_entities.get(_rw) or all_geo_entities.get(_wn)
+                    if _ent and _ent[1] == 'country' and _ent[0].upper() == _seed_country_code:
+                        _has_seed_geo = True
+                        break
+
+            if not _has_seed_geo:
+                stats['blocked_no_geo'] += 1
+                blocked_reasons[query_lower.strip()] = "гео-сид: в ключе нет гео сида"
+                continue
+
         # ═══════════════════════════════════════════════════════════
         # Запрос прошел - разрешаем
         # ═══════════════════════════════════════════════════════════
