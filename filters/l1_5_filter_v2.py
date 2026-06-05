@@ -459,6 +459,22 @@ def _pick_token_parse(token: str) -> Optional[Any]:
     if not content_parses:
         return parses[0]
 
+    # Неизвестные слова (бренды/модели через guesser): top-парс pymorphy
+    # ненадёжен. 'нимесил' -> top=VERB(нимесить), 'ибупрофен' -> top=ADJS,
+    # хотя NOUN-чтение есть вторичным парсом. Без этого NOUN-чтение терялось:
+    # токен не попадал в noun_parses -> object_anchor=None -> объектная ось
+    # выключалась (баг класса top-парс-не-NOUN, см. LESSONS_object_extraction).
+    # В контексте seed неизвестный content-токен почти всегда предметный
+    # объект, а не второй глагол, поэтому берём NOUN-парс с максимальным
+    # score (parses уже отсортированы pymorphy). Для ИЗВЕСТНЫХ слов top-порядок
+    # надёжен -> ветку пропускаем (омонимы вроде 'цветов' решаются ниже через
+    # RWN; известные VERB-омонимы 'жгут'/'три'/'дали' остаются VERB).
+    # От backend (RWN/E5) НЕ зависит — чистый pymorphy.
+    if _morph is not None and not _morph.word_is_known(token):
+        for p in content_parses:
+            if p.tag.POS == 'NOUN':
+                return p
+
     if _USE_PREBUILT_INDEX:
         # Собираем NOUN-парсы найденные в RWN с числом их hyponyms
         rwn_noun_candidates: List[Tuple[Any, int]] = []
