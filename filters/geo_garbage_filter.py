@@ -633,10 +633,13 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
     # Guard обязателен: без него случайные слова ("дом", "цветов") совпадают с городами
     # ═══════════════════════════════════════════════════════════════
 
-    seed_city = None
     seed_words = re.findall(r'[а-яёіїєґa-z]+', seed_lower)
     seed_words_normalized = [_normalize_token(w) for w in seed_words]
 
+    # БАГ 1 (составной сид): собираем ВСЕ города сида, а не первый.
+    # "билеты варшава львов" → seed_cities=[варшава, львов]; иначе львов
+    # считался бы чужим городом и резал даже сам сид ("2+ города").
+    seed_cities: List[str] = []
     for word, word_norm in zip(seed_words, seed_words_normalized):
         # Geox guard: пропускаем только явно нарицательные слова
         # Разрешаем: Geox (топоним), Surn (фамилия=может быть город: Львов, Киров),
@@ -666,29 +669,46 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         for check in [word, word_norm]:
             entity = _GEO_ENTITIES_CACHE.get(check)
             if entity and entity[1] == 'city':
-                seed_city = check
-                logger.info(f"[GEO_WHITE_LIST] seed_city: '{seed_city}' ({entity[0]})")
+                if check not in seed_cities:
+                    seed_cities.append(check)
+                    logger.info(f"[GEO_WHITE_LIST] seed_city: '{check}' ({entity[0]})")
                 break
-        if seed_city:
-            break
+
+    # Составные города в сиде ("нью йорк", "сан франциско") — биграмы
+    for _i in range(len(seed_words) - 1):
+        _bg = f"{seed_words[_i]} {seed_words[_i + 1]}"
+        _ent = _GEO_ENTITIES_CACHE.get(_bg)
+        if _ent and _ent[1] == 'city' and _bg not in seed_cities:
+            seed_cities.append(_bg)
+            logger.info(f"[GEO_WHITE_LIST] seed_city (bigram): '{_bg}' ({_ent[0]})")
+
+    # Основной город — для логов и гейтов `if seed_city:` (= это гео-сид)
+    seed_city = seed_cities[0] if seed_cities else None
 
     if not seed_city:
         logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city in seed: '{seed}'. All queries pass.")
-    
-    # Разрешенные районы — динамически из districts.json + geonamescache
-    # seed_city "днепр" → canonical "dnipro" → 126 районов из districts.json
-    seed_canonical = CITY_CANONICAL_MAP.get(seed_city, seed_city) if seed_city else None
-    allowed_districts = set()
-    if seed_canonical:
-        # Динамические районы из districts.json
-        allowed_districts = CANONICAL_CITY_DISTRICTS.get(seed_canonical, set())
-        # Плюс хардкодные (fallback, если districts.json неполный)
-        allowed_districts = allowed_districts | CITY_DISTRICTS.get(seed_city, set())
-        logger.info(f"[GEO_WHITE_LIST] seed_city='{seed_city}' → canonical='{seed_canonical}' → "
-                    f"{len(allowed_districts)} allowed districts")
 
-    # ФИКС 1: нормализованный seed_city и его страна — для проверки «ключ обязан
-    # содержать гео сида» (см. ПРОВЕРКА 7 ниже). Считаем один раз на батч.
+    # ═══════════════════════════════════════════════════════════════
+    # Производные МНОЖЕСТВА по ВСЕМ городам сида (БАГ 1).
+    # Разрешённые районы — объединение районов всех seed_cities.
+    # ═══════════════════════════════════════════════════════════════
+    seed_cities_norm = {_normalize_token(c) for c in seed_cities}
+    seed_canonicals = {CITY_CANONICAL_MAP.get(c, c) for c in seed_cities}
+    seed_country_codes: Set[str] = set()
+    allowed_districts: Set[str] = set()
+    for c in seed_cities:
+        _canon = CITY_CANONICAL_MAP.get(c, c)
+        allowed_districts |= CANONICAL_CITY_DISTRICTS.get(_canon, set())
+        allowed_districts |= CITY_DISTRICTS.get(c, set())
+        _cc = all_geo_entities.get(c, ('', ''))[0].upper()
+        if _cc:
+            seed_country_codes.add(_cc)
+    if seed_city:
+        logger.info(f"[GEO_WHITE_LIST] seed_cities={seed_cities} canonicals={seed_canonicals} "
+                    f"countries={sorted(seed_country_codes)} → {len(allowed_districts)} allowed districts")
+
+    # Совместимость со старыми ветками (основной = первый город)
+    seed_canonical = CITY_CANONICAL_MAP.get(seed_city, seed_city) if seed_city else None
     seed_city_norm = _normalize_token(seed_city) if seed_city else None
     _seed_country_code = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
     
@@ -899,15 +919,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
             
             # П4: логика зависит от наличия города в seed
             if len(cities_in_query) > 0:
-                # Нормализация: seed_city может быть в nomn ('одесса'), а в query
-                # может быть в падеже ('одессе' → loct). Сравниваем по нормальной
-                # форме чтобы не считать разные падежи одного города двумя городами.
-                # _normalize_token обрезает падежные окончания: 'одессе'→'одесс',
-                # 'одесса'→'одесс' → равны.
-                seed_city_norm = _normalize_token(seed_city)
+                # Нормализация: город в query может быть в падеже ('одессе'),
+                # а в сиде в nomn ('одесса') — сравниваем по нормальной форме.
+                # БАГ 1: исключаем ВСЕ города сида (seed_cities_norm), не первый.
                 other_cities = {
                     c for c in cities_in_query
-                    if _normalize_token(c) != seed_city_norm
+                    if _normalize_token(c) not in seed_cities_norm
                 }
                 if other_cities:
                     if seed_city:
@@ -965,9 +982,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     # П3: целевая страна → разрешить
                     if entity_country.upper() == target_country.upper():
                         continue
-                    # G3: страна seed_city → разрешить (англия при лондон)
-                    _seed_city_country = all_geo_entities.get(seed_city, ('', ''))[0].upper() if seed_city else ''
-                    if entity_country.upper() == _seed_city_country:
+                    # G3: страна ЛЮБОГО города сида → разрешить (англия при лондон;
+                    # БАГ 1: при составном сиде — страны всех seed_cities)
+                    if entity_country.upper() in seed_country_codes:
                         continue
                     # Предлог перед страной → контекст доставки/покупки → разрешить
                     # "из польши", "в германии", "до франции"
@@ -1028,7 +1045,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                     DISTRICT_TO_CANONICAL.get(raw_word) or 
                     DISTRICT_TO_CANONICAL.get(word_norm)
                 )
-                if district_canonical_city and district_canonical_city != seed_canonical:
+                if district_canonical_city and district_canonical_city not in seed_canonicals:
                     # Блокируем только если район принадлежит иностранному городу.
                     # UA район другого UA пригорода (жуляны→вишневе, нивки→коцюбинське) — пропускаем.
                     _dist_country = (
@@ -1066,11 +1083,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 # Стандартная нормализация ("одесская"→"одес") не находит город,
                 # но suffix expansion находит
                 resolved = _resolve_oblast_adjective(raw_word, all_geo_entities)
-                if resolved and resolved != seed_city:
+                if resolved and _normalize_token(resolved) not in seed_cities_norm:
                     cities_in_query_oblast.add(resolved)
             
-            # П4: логика зависит от наличия города в seed
-            other_cities_oblast = {c for c in cities_in_query_oblast if c != seed_city}
+            # БАГ 1: чужой город области = город НЕ из набора сида
+            other_cities_oblast = {
+                c for c in cities_in_query_oblast
+                if _normalize_token(c) not in seed_cities_norm
+            }
             if other_cities_oblast:
                 if seed_city:
                     stats['blocked_wrong_oblast'] += 1
@@ -1129,9 +1149,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if dist_country == 'unknown':
                     continue  # неизвестная страна → не блокируем
 
-                # G3: страна seed_city → разрешаем (англия=gb при лондон=gb)
-                _seed_city_country = _DISTRICT_TO_COUNTRY.get(seed_city, '')
-                if dist_country == _seed_city_country:
+                # G3: страна ЛЮБОГО города сида → разрешаем (англия=gb при лондон=gb;
+                # БАГ 1: при составном сиде — страны всех seed_cities)
+                if dist_country.upper() in seed_country_codes:
                     continue
 
                 has_foreign_geox = True
@@ -1159,24 +1179,25 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
 
         if seed_city:
             _has_seed_geo = False
-            # 1) сам seed_city (raw или нормализованный падеж)
-            if (seed_city in clean_words or seed_city in clean_words_normalized
-                    or (seed_city_norm and (seed_city_norm in clean_words
-                                            or seed_city_norm in clean_words_normalized))):
+            _cw_set = set(clean_words) | set(clean_words_normalized)
+            # 1) ЛЮБОЙ город сида в любом падеже (raw или нормализованный)
+            #    БАГ 1: проверяем весь seed_cities, не первый
+            if (any(sc in _cw_set for sc in seed_cities)
+                    or any(scn in _cw_set for scn in seed_cities_norm)):
                 _has_seed_geo = True
-            # 2) составной seed_city как биграма ("нью йорк")
-            elif seed_city in query_bigrams:
+            # 2) составной город сида как биграма ("нью йорк")
+            elif any(sc in query_bigrams for sc in seed_cities):
                 _has_seed_geo = True
-            # 3) разрешённый район seed_city
+            # 3) разрешённый район любого города сида (allowed_districts — объединение)
             elif allowed_districts and (
                     any(w in allowed_districts for w in clean_words)
                     or any(w in allowed_districts for w in clean_words_normalized)):
                 _has_seed_geo = True
-            # 4) страна seed_city (англия при лондон=GB) — raw и normalized форма
-            elif _seed_country_code:
+            # 4) страна любого города сида (англия при лондон=GB) — raw и normalized
+            elif seed_country_codes:
                 for _rw, _wn in zip(clean_words, clean_words_normalized):
                     _ent = all_geo_entities.get(_rw) or all_geo_entities.get(_wn)
-                    if _ent and _ent[1] == 'country' and _ent[0].upper() == _seed_country_code:
+                    if _ent and _ent[1] == 'country' and _ent[0].upper() in seed_country_codes:
                         _has_seed_geo = True
                         break
 
