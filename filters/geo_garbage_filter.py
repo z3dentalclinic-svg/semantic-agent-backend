@@ -182,19 +182,44 @@ _OBLAST_CITY_SUFFIXES = ['', 'а', 'я', 'ск', 'к', 'ь', 'ье', 'е', 'о',
                          'ів', 'ва', 'сса', 'са', 'ы', 'і', 'и']
 
 
-def _sqlite_batch_geo_lookup(tokens: set):
+def _has_geo_parse(word: str) -> bool:
+    """Кириллическое слово имеет Geox/Surn-разбор? (кэшируется)"""
+    if word in _GEO_PARSE_CACHE:
+        return _GEO_PARSE_CACHE[word]
+    res = False
+    if _morph_geox:
+        try:
+            res = any(('Geox' in str(p.tag)) or ('Surn' in str(p.tag))
+                      for p in _morph_geox.parse(word))
+        except Exception:
+            res = False
+    _GEO_PARSE_CACHE[word] = res
+    return res
+
+
+_GEO_PARSE_CACHE: Dict[str, bool] = {}
+_CYR_RE = re.compile(r'[а-яёіїєґ]')
+
+
+def _sqlite_batch_geo_lookup(tokens: set, target_country: str = ''):
     """
     ОДИН батч-запрос к geo.sqlite на весь пул.
     Возвращает (entities, pops) в формате старого кэша:
-        entities: {имя: (COUNTRY, 'city')}   pops: {имя: population}
+        entities: {имя: (COUNTRY, 'city'|'country')}   pops: {имя: population}
     или (None, None) если база недоступна (деградация на legacy-кэш).
 
-    Детали:
-      - ё→е на стороне запроса (в базе имена с е); алиас обратно на ё-форму
-      - омонимы (киев в 8 странах) → победитель по MAX population
-      - имена стран (PCLI, class A) исключаются — страны приходят из
-        COUNTRY_NAMES_MULTILINGUAL с типом 'country' (логика П3/G3)
-      - len < 3 отсекается (паритет со старым len(alt) > 2)
+    Маппинг классов:
+      P/T  → 'city' (нас. пункты, горы-курорты)
+      A    → 'city', НО только для target-страны (области сида работают,
+             чужие регионы-омонимы — Hatay/'хата' — невидимы)
+      C    → 'country' (PCL* из пересобранной базы) с гейтом включения:
+             babel-имя ИЛИ ascii ИЛИ кириллица-с-гео-разбором.
+             Отсекает 'япон' (бренд-слово, без Geox), пропускает
+             'украина/украине/польши/сша' (все с Geox / в babel).
+    Страховка для старой базы (без класса C): имя из babel-списка стран →
+    'country' при любом классе.
+    Детали: ё→е на стороне запроса с обратным алиасом; омонимы → MAX pop;
+    len < 3 отсекается.
     """
     global _GEO_SQLITE_WARNED
     if not os.path.exists(GEO_SQLITE_PATH):
@@ -202,12 +227,16 @@ def _sqlite_batch_geo_lookup(tokens: set):
             logger.warning("[GEO_SQLITE] база не найдена: %s — деградация на geonamescache",
                            GEO_SQLITE_PATH)
             _GEO_SQLITE_WARNED = True
-        return None, None
+        return None, None, None, None
 
     entities: Dict[str, tuple] = {}
     pops: Dict[str, int] = {}
+    admin1s: Dict[str, str] = {}
+    fclasses: Dict[str, str] = {}
     if not tokens:
-        return entities, pops
+        return entities, pops, admin1s, fclasses
+
+    target_cc = (target_country or '').upper()
 
     # ё→е ключи + обратный алиас (запрос "ёлка" должен матчить базовое "елка")
     key2orig: Dict[str, set] = {}
@@ -221,8 +250,10 @@ def _sqlite_batch_geo_lookup(tokens: set):
         try:
             con.execute("PRAGMA mmap_size=1073741824")  # 1GB mmap — кэш ядра, не heap
             cur = con.cursor()
-            best: Dict[str, tuple] = {}   # key → (pop, country, fclass)
-            CHUNK = 700                    # лимит параметров SQLite ~999
+            # лучший кандидат на имя ОТДЕЛЬНО для каждой роли:
+            best_city: Dict[str, tuple] = {}     # key → (pop, country, admin1, fclass)
+            best_country: Dict[str, tuple] = {}  # key → (pop, country)  из C
+            CHUNK = 700                           # лимит параметров SQLite ~999
             for i in range(0, len(keys), CHUNK):
                 chunk = keys[i:i + CHUNK]
                 ph = ",".join("?" * len(chunk))
@@ -230,28 +261,61 @@ def _sqlite_batch_geo_lookup(tokens: set):
                         f"SELECT name, country, pop, admin1, fclass "
                         f"FROM geo WHERE name IN ({ph})", chunk):
                     p = pop or 0
-                    if name not in best or p > best[name][0]:
-                        best[name] = (p, country or '', fclass or '')
+                    cc = (country or '').upper()
+                    a1 = admin1 or ''
+                    if fclass == 'C':
+                        if name not in best_country or p > best_country[name][0]:
+                            best_country[name] = (p, cc)
+                    elif fclass == 'A':
+                        # области/регионы: только страна таргета
+                        if cc == target_cc:
+                            if name not in best_city or p > best_city[name][0]:
+                                best_city[name] = (p, cc, a1, 'A')
+                    else:  # P, T
+                        if name not in best_city or p > best_city[name][0]:
+                            best_city[name] = (p, cc, a1, fclass)
         finally:
             con.close()
     except Exception as e:
         if not _GEO_SQLITE_WARNED:
             logger.warning("[GEO_SQLITE] ошибка чтения %s: %s — деградация", GEO_SQLITE_PATH, e)
             _GEO_SQLITE_WARNED = True
-        return None, None
+        return None, None, None, None
 
-    for k, (p, c, fc) in best.items():
-        if len(k) < 3:
-            continue
-        if k in COUNTRY_NAMES_MULTILINGUAL:
-            continue  # страны → тип 'country' через setdefault в Шаге 1
-        ent = (c.upper(), 'city')   # P/T/A → 'city' (область как биграма = гео-конфликт)
+    def _emit(k, ent, p, a1='', fc=''):
         for orig in key2orig.get(k, ()):
             entities[orig] = ent
             pops[orig] = p
+            if fc:
+                admin1s[orig] = a1
+                fclasses[orig] = fc
         entities.setdefault(k, ent)
         pops.setdefault(k, p)
-    return entities, pops
+        if fc:
+            admin1s.setdefault(k, a1)
+            fclasses.setdefault(k, fc)
+
+    # 1) страны (класс C) — с гейтом включения
+    for k, (p, cc) in best_country.items():
+        if len(k) < 3:
+            continue
+        ok = (k in COUNTRY_NAMES_MULTILINGUAL
+              or not _CYR_RE.search(k)
+              or _has_geo_parse(k))
+        if ok:
+            _emit(k, (cc, 'country'), p)
+
+    # 2) города/области — страховка: babel-имя страны не может быть «городом»
+    for k, (p, cc, a1, fc) in best_city.items():
+        if len(k) < 3:
+            continue
+        if k in entities:           # страна уже заняла имя
+            continue
+        if k in COUNTRY_NAMES_MULTILINGUAL:
+            _emit(k, COUNTRY_NAMES_MULTILINGUAL[k], p)   # старая база без C
+            continue
+        _emit(k, (cc, 'city'), p, a1, fc)
+    return entities, pops, admin1s, fclasses
 
 
 def _collect_pool_tokens(seed: str, keywords) -> set:
@@ -759,12 +823,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
     # биграмы, кандидаты oblast-резолвера). RAM приложения не растёт:
     # мини-словарь только по токенам ТЕКУЩЕГО пула.
     _pool_tokens = _collect_pool_tokens(seed, data["keywords"])
-    _batch_geo, _batch_pop = _sqlite_batch_geo_lookup(_pool_tokens)
+    _batch_geo, _batch_pop, _batch_admin1, _batch_fclass = \
+        _sqlite_batch_geo_lookup(_pool_tokens, target_country)
     if _batch_geo is None:
         # Деградация: базы нет → старый geonamescache-кэш (лениво)
         _ensure_legacy_geonames_cache()
         _batch_geo = _GEO_ENTITIES_CACHE
         _batch_pop = _GEO_POPULATION_CACHE
+        _batch_admin1, _batch_fclass = {}, {}   # admin-разрешения неактивны
     has_geonames = bool(_batch_geo)
     logger.info(f"[GEO_SQLITE] pool tokens={len(_pool_tokens)}, geo matched={len(_batch_geo)}")
 
@@ -848,6 +914,16 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
     # ь-усечённый вариант, чтобы падежи СВОЕГО города не считались чужим.
     seed_cities_norm |= {n[:-1] for n in set(seed_cities_norm) if n.endswith('ь') and len(n) > 3}
     seed_canonicals = {CITY_CANONICAL_MAP.get(c, c) for c in seed_cities}
+    # Правило «своя область — не треш»: пары (страна, admin1) городов сида.
+    # admin1 берётся из geo.sqlite (та же строка-победитель). Для буковеля
+    # это ('UA','06') = Ивано-Франковская обл. → её A-сущности разрешены,
+    # чужие области (львовская='13') остаются конфликтом.
+    seed_region_pairs: Set[tuple] = set()
+    for c in seed_cities:
+        _a1 = _batch_admin1.get(c, '')
+        _cc0 = (all_geo_entities.get(c, ('', ''))[0] or '').upper()
+        if _a1 and _cc0:
+            seed_region_pairs.add((_cc0, _a1))
     seed_country_codes: Set[str] = set()
     allowed_districts: Set[str] = set()
     for c in seed_cities:
@@ -1035,10 +1111,30 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                             # Бренд не является городом даже если совпадает с топонимом
                             if check_word in _brand_set or raw_word in _brand_set:
                                 continue
+
+                            # МОРФ-ГАРД (полная база): кириллический NOUN
+                            # обязан иметь Geox/Surn-разбор, иначе это
+                            # товар/бренд-омоним места: кальян (Kalyan IN
+                            # 1.2M), роли (Raleigh US), сало (Salo FI).
+                            # Морфология — по RAW-слову (матч мог быть и
+                            # нормализованной формой: «кальяна»→«кальян»).
+                            # Реальные города проходят (киев/одесса/измаил/
+                            # варшава/сталинграда — Geox и в косв. падежах).
+                            # ADJF-города (Хмельницкий) не задеты: гард
+                            # только для POS == NOUN. Цена: NOUN-города без
+                            # Geox в словаре pymorphy (напр. «буча») уходят
+                            # на L3 вместо жёсткого блока — мягкая утечка.
+                            if _morph_geox and not raw_word.isascii():
+                                _p0 = _morph_geox.parse(raw_word)
+                                if (_p0 and _p0[0].tag.POS == 'NOUN'
+                                        and not _has_geo_parse(raw_word)):
+                                    continue
                             
-                            # Compound genitive: "героев днепра" → составное имя (метро/улица), не город
-                            # Признак: город найден через нормализацию И raw в genitive И prev слово тоже NOUN,gent
-                            if check_word == word_norm and check_word != raw_word and _morph_geox:
+                            # Compound genitive: "героев днепра/сталинграда" → составное
+                            # имя (улица/метро), не город. С запечёнными падежами город
+                            # матчится и СЫРОЙ формой — гард по сути: raw в gent +
+                            # предыдущее слово gent-NOUN, независимо от формы матча.
+                            if _morph_geox:
                                 _rp = _morph_geox.parse(raw_word)
                                 if _rp and _rp[0].tag.case == 'gent':
                                     try:
@@ -1050,6 +1146,13 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                                     except ValueError:
                                         pass
                             
+                            # СВОЯ ОБЛАСТЬ (A-класс, admin1 == сид) → не конфликт.
+                            # Город той же области (P) остаётся конфликтом.
+                            if (_batch_fclass.get(check_word) == 'A'
+                                    and (entity_country.upper(),
+                                         _batch_admin1.get(check_word, '')) in seed_region_pairs):
+                                continue
+
                             # Population + literal geo trigger:
                             # Мелкий иностранный город (< 50k) без гео-предлога → не блокируем.
                             # "паркленд" (Tønder DK 16k, Parkland US 34k) без предлога → пропускаем.
@@ -1064,11 +1167,18 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                             cities_in_query.add(check_word)
                             break
             
-            # Проверяем биграмы: "сан франциско", "нью йорк", "лос анджелес"
+            # Проверяем биграмы: "сан франциско", "нью йорк", "львовская область"
+            # Pop-гейт и здесь: биграм-омонимы мест ("новая почта"-деревня)
+            # не должны считаться городом; нью йорк (8M) и области (2.5M) проходят.
             for bigram in query_bigrams:
                 if bigram in all_geo_entities:
                     entity_country, entity_type = all_geo_entities[bigram]
-                    if entity_type == 'city':
+                    if entity_type == 'city' and _batch_pop.get(bigram, 0) > 50000:
+                        # своя область (A, admin1 сида) → не конфликт
+                        if (_batch_fclass.get(bigram) == 'A'
+                                and (entity_country.upper(),
+                                     _batch_admin1.get(bigram, '')) in seed_region_pairs):
+                            continue
                         cities_in_query.add(bigram)
             
             # П4: логика зависит от наличия города в seed
@@ -1238,6 +1348,11 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 # но suffix expansion находит
                 resolved = _resolve_oblast_adjective(raw_word, all_geo_entities)
                 if resolved and _normalize_token(resolved) not in seed_cities_norm:
+                    # adj СВОЕЙ области ("ивано-франковская" при буковеле):
+                    # резолвнутый город в admin1 сида → не конфликт
+                    _rcc = (all_geo_entities.get(resolved, ('', ''))[0] or '').upper()
+                    if (_rcc, _batch_admin1.get(resolved, '')) in seed_region_pairs:
+                        continue
                     cities_in_query_oblast.add(resolved)
             
             # БАГ 1: чужой город области = город НЕ из набора сида
