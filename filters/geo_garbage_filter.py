@@ -199,6 +199,27 @@ def _has_geo_parse(word: str) -> bool:
 
 _GEO_PARSE_CACHE: Dict[str, bool] = {}
 _CYR_RE = re.compile(r'[а-яёіїєґ]')
+_ADJ_STYLE_CACHE: Dict[str, bool] = {}
+
+
+def _is_region_style(text: str) -> bool:
+    """«Региональное» написание = есть ADJF-токен («львовскАЯ»,
+    «ивано-франковскАЯ область»). NOUN-стиль («ивано франковск»,
+    «черновцы») — городское упоминание, льготы своей области не даёт."""
+    if text in _ADJ_STYLE_CACHE:
+        return _ADJ_STYLE_CACHE[text]
+    res = False
+    if _morph_geox:
+        for tok in text.replace('-', ' ').split():
+            try:
+                p = _morph_geox.parse(tok)
+                if p and p[0].tag.POS == 'ADJF':
+                    res = True
+                    break
+            except Exception:
+                pass
+    _ADJ_STYLE_CACHE[text] = res
+    return res
 
 
 def _sqlite_batch_geo_lookup(tokens: set, target_country: str = ''):
@@ -1146,11 +1167,16 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                                     except ValueError:
                                         pass
                             
-                            # СВОЯ ОБЛАСТЬ (A-класс, admin1 == сид) → не конфликт.
-                            # Город той же области (P) остаётся конфликтом.
+                            # СВОЯ ОБЛАСТЬ (A-класс, admin1 == сид) → не конфликт,
+                            # НО только в «региональном» написании (ADJF:
+                            # «ивано-франковскАЯ»). NOUN-стиль («ивано
+                            # франковск») — городское упоминание; в данных он
+                            # может висеть altname'ом на области (у города нет
+                            # ru-имени) → льгота не даётся, конфликт остаётся.
                             if (_batch_fclass.get(check_word) == 'A'
                                     and (entity_country.upper(),
-                                         _batch_admin1.get(check_word, '')) in seed_region_pairs):
+                                         _batch_admin1.get(check_word, '')) in seed_region_pairs
+                                    and _is_region_style(raw_word)):
                                 continue
 
                             # Population + literal geo trigger:
@@ -1174,10 +1200,12 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if bigram in all_geo_entities:
                     entity_country, entity_type = all_geo_entities[bigram]
                     if entity_type == 'city' and _batch_pop.get(bigram, 0) > 50000:
-                        # своя область (A, admin1 сида) → не конфликт
+                        # своя область (A, admin1 сида) → не конфликт,
+                        # только в ADJF-стиле (см. комментарий выше)
                         if (_batch_fclass.get(bigram) == 'A'
                                 and (entity_country.upper(),
-                                     _batch_admin1.get(bigram, '')) in seed_region_pairs):
+                                     _batch_admin1.get(bigram, '')) in seed_region_pairs
+                                and _is_region_style(bigram)):
                             continue
                         cities_in_query.add(bigram)
             
