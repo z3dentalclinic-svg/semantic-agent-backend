@@ -555,6 +555,8 @@ class L2Classifier:
         """
         Обработать результат L0, классифицировать GREY через три сигнала.
         """
+        cfg = self.config  # определяем СРАЗУ: используется в диагностике (try/except),
+                           # которая исполняется даже при раннем выходе/исключении
         grey_keywords = l0_result.get("keywords_grey", [])
         l0_valid_keywords = l0_result.get("keywords", [])
         
@@ -653,7 +655,13 @@ class L2Classifier:
         # Число пишется в debug['knn_score'] → l2_trace/l2_diagnostic для
         # калибровки порогов под e5 (щорса/ёжик vs аптека/суши). После
         # калибровки вторым шагом включим KNN в правила.
-        knn_scores = self._compute_knn_scores_e5(grey_tails, valid_tails, k=self.config.knn_k)
+        # Страховка: инструментация KNN НЕ должна ронять L2 ни при каких
+        # условиях (e5 не загрузился, OOM, любой сбой) → knn=0, фильтр работает.
+        try:
+            knn_scores = self._compute_knn_scores_e5(grey_tails, valid_tails, k=cfg.knn_k)
+        except Exception as _knn_err:
+            logger.warning(f"L2/KNN-e5 instrumentation failed (non-fatal): {_knn_err}")
+            knn_scores = {tail: 0.0 for tail in grey_tails}
         
         # --- CENTROID (закомментировано) ---
         # centroid_scores = {}
@@ -681,7 +689,6 @@ class L2Classifier:
         logger.info(f"L2: Reference words ({len(ref_words)}): {sorted(ref_words)[:20]}...")
         
         # === MULTI-SIGNAL DECISION ===
-        cfg = self.config
         classified = {"valid": [], "grey": [], "trash": []}
         
         for tail in grey_tails:
