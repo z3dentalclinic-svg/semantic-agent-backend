@@ -870,8 +870,15 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
     # Guard обязателен: без него случайные слова ("дом", "цветов") совпадают с городами
     # ═══════════════════════════════════════════════════════════════
 
-    seed_words = re.findall(r'[а-яёіїєґa-z]+', seed_lower)
+    # Буквенно-цифровые токены: s21, 128gb, 5g, a04s — иначе модели техники
+    # (samsung galaxy s21) теряют s21 из seed_words и оно ложно ловится как
+    # «город» по коду места в полной базе. Тот же класс символов, что в
+    # _collect_pool_tokens (консистентность сид ↔ лукап).
+    seed_words = re.findall(r'[а-яёіїєґa-z0-9]+', seed_lower)
     seed_words_normalized = [_normalize_token(w) for w in seed_words]
+    # Биграмы сида (для защиты составных сид-топонимов от ложного «2+ города»)
+    _seed_bigrams = {f"{seed_words[_i]} {seed_words[_i + 1]}"
+                     for _i in range(len(seed_words) - 1)}
 
     # БАГ 1 (составной сид): собираем ВСЕ города сида, а не первый.
     # "билеты варшава львов" → seed_cities=[варшава, львов]; иначе львов
@@ -1050,6 +1057,14 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
 
+                # СЛОВО ИЗ СИДА не сверяем с гео-базой: это якорь запроса, а не
+                # второй город. Без этого токены модели техники (samsung galaxy
+                # s21 → "s21") ловятся как код места в полной базе → ложный
+                # «2+ города». Работает для любого сида/языка. seed_words
+                # включает буквенно-цифровые токены (s21, 128gb).
+                if raw_word in seed_words or word_norm in seed_words_normalized:
+                    continue
+
                 # ═══════════════════════════════════════════════════════════
                 # DISTRICT_TO_CANONICAL guard — слово является районом/улицей
                 # ═══════════════════════════════════════════════════════════
@@ -1214,6 +1229,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
             # не должны считаться городом; нью йорк (8M) и области (2.5M) проходят.
             for bigram in query_bigrams:
                 if bigram in all_geo_entities:
+                    # биграма из сида — якорь, не второй город
+                    if bigram in _seed_bigrams:
+                        continue
                     entity_country, entity_type = all_geo_entities[bigram]
                     if entity_type == 'city' and _batch_pop.get(bigram, 0) > 50000:
                         # своя область (A, admin1 сида) → не конфликт,
@@ -1333,6 +1351,9 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
             
             # Проверяем пары (raw, normalized) вместе
             for raw_word, word_norm in zip(clean_words, clean_words_normalized):
+                # Слово из сида — якорь, не чужой район
+                if raw_word in seed_words or word_norm in seed_words_normalized:
+                    continue
                 # Пропускаем разрешенные районы seed_city
                 if raw_word in allowed_districts or word_norm in allowed_districts:
                     continue
