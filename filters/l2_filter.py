@@ -255,8 +255,14 @@ class L2Classifier:
             logger.warning("L2/KNN-e5: модель e5 недоступна → knn=0 (инструментация неактивна)")
             return {tail: 0.0 for tail in grey_tails}
         try:
-            v_in = [f"{_E5_KNN_PREFIX}{t}" for t in valid_tails]
-            g_in = [f"{_E5_KNN_PREFIX}{t}" for t in grey_tails]
+            # ВАРИАНТ B: асимметричный режим e5 (retrieval-native).
+            # query↔query (оба 'query:') даёт «всё похоже на всё» (косинусы
+            # 0.79–0.90, нет зазора). Пробуем нативный e5-retrieval:
+            #   эталоны VALID → 'passage: '  (это «документы»)
+            #   классифицируемые GREY → 'query: '  (это «запросы»)
+            # Гипотеза: asymmetric раздвигает похожее/непохожее сильнее.
+            v_in = [f"passage: {t}" for t in valid_tails]
+            g_in = [f"query: {t}" for t in grey_tails]
             valid_embs = np.array(list(model.embed(v_in)), dtype=np.float32)
             grey_embs = np.array(list(model.embed(g_in)), dtype=np.float32)
             # e5 нормализует, но подстрахуемся (как в e5_model.get_e5_word_embedding)
