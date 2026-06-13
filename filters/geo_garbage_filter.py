@@ -1070,7 +1070,23 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
                 # → "белая" блокирует). Foreign-районы (лошица, чиланзар,
                 # юнусабад) пусть разбирает L3 семантически.
                 if raw_word in DISTRICT_TO_CANONICAL or word_norm in DISTRICT_TO_CANONICAL:
-                    continue
+                    # ИСКЛЮЧЕНИЕ (№3): district-запись проигрывает НАСТОЯЩЕМУ
+                    # крупному городу из geo.sqlite. "варшава" лежит в
+                    # districts.json районом Славянска, но в geo.sqlite это
+                    # город PL pop 1.7M → это реальный чужой город, конфликт.
+                    # Узко: только city pop>50k И НЕ своя область (P-город,
+                    # а не A). Короткие нарицательные ("рог/бор/церковь") сюда
+                    # не попадают — у них pop≤50k или они не city. ADJF-стиль
+                    # тоже не трогаем (это район/улица типа "московская").
+                    _override = False
+                    for cw in (raw_word, word_norm):
+                        if (_batch_fclass.get(cw) in ('P', 'T')
+                                and _batch_pop.get(cw, 0) > 50000
+                                and _normalize_token(cw) not in seed_cities_norm):
+                            _override = True
+                            break
+                    if not _override:
+                        continue
 
                 # G4: adj-форма города + street_marker справа → улица/район seed_city
                 if _g_is_street(raw_word, word_norm, _word_positions, words):
