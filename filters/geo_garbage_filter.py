@@ -913,6 +913,15 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
         for check in [word, word_norm]:
             entity = all_geo_entities.get(check)
             if entity and entity[1] == 'city':
+                # ЛАТИНСКОЕ слово → seed_city только если это КРУПНЫЙ город
+                # (pop>50k). Морфологии для латиницы нет, поэтому без порога
+                # 'galaxy'/'s21'/'pro' (мелкие места-омонимы) ложно становятся
+                # seed_city → весь сид считается гео → П7/П2 режут украинские
+                # города в хвосте. Крупные латинские города (lviv/paris/london)
+                # порог проходят. Кириллица — без изменений (её фильтрует
+                # морф-гард выше).
+                if check.isascii() and _batch_pop.get(check, 0) <= 50000:
+                    continue
                 if check not in seed_cities:
                     seed_cities.append(check)
                     logger.info(f"[GEO_WHITE_LIST] seed_city: '{check}' ({entity[0]})")
