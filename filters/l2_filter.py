@@ -653,7 +653,7 @@ class L2Classifier:
         # Число пишется в debug['knn_score'] → l2_trace/l2_diagnostic для
         # калибровки порогов под e5 (щорса/ёжик vs аптека/суши). После
         # калибровки вторым шагом включим KNN в правила.
-        knn_scores = self._compute_knn_scores_e5(grey_tails, valid_tails, k=cfg.knn_k)
+        knn_scores = self._compute_knn_scores_e5(grey_tails, valid_tails, k=self.config.knn_k)
         
         # --- CENTROID (закомментировано) ---
         # centroid_scores = {}
