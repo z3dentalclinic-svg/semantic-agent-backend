@@ -46,22 +46,6 @@ import numpy as np
 import pymorphy3
 
 from .shared_model import get_embedding_model
-
-# ─── E5 для KNN (ИНСТРУМЕНТАЦИЯ) ──────────────────────────────────────────
-# KNN считается на int8 e5-large (тот же синглтон, что в L1.5 — RAM не растёт),
-# т.к. на MiniLM KNN не разделял (исторически отключён). MiniLM остаётся для
-# остального (CategoryMismatch). Числа KNN пишутся в l2_trace/l2_diagnostic,
-# НА РЕШЕНИЯ ПОКА НЕ ВЛИЯЮТ — нужны для калибровки порогов под e5.
-_e5_for_knn = None
-try:
-    from .e5_model import get_e5_model as _e5_for_knn
-except Exception:
-    try:
-        from e5_model import get_e5_model as _e5_for_knn  # noqa
-    except Exception:
-        _e5_for_knn = None
-# Префикс E5 (без него similarity деградирует — требование семейства E5)
-_E5_KNN_PREFIX = "query: "
 # Позиционный гейт доп-гео (тот же, что в L0): прилагательное после seed-города =
 # топоним, а не модификатор → морф не должен промоутить его в VALID.
 from .function_detectors import content_after_seed_city
@@ -235,49 +219,10 @@ class L2Classifier:
         
         return scores
     
-    def _compute_knn_scores_e5(
-        self,
-        grey_tails: List[str],
-        valid_tails: List[str],
-        k: int = 3
-    ) -> Dict[str, float]:
-        """
-        KNN на int8 e5-large (ИНСТРУМЕНТАЦИЯ — пороги ещё не откалиброваны).
-        Та же логика top-k mean cosine, что _compute_knn_scores, но эмбеддинги
-        от e5 (с префиксом 'query: ', e5 уже L2-нормализует на выходе).
-        Считает по ЧИСТОМУ хвосту (сид отрезан выше). На решения не влияет —
-        число пишется в debug['knn_score'] для калибровки.
-        """
-        if not valid_tails or not grey_tails:
-            return {tail: 0.0 for tail in grey_tails}
-        model = _e5_for_knn() if _e5_for_knn else None
-        if model is None:
-            logger.warning("L2/KNN-e5: модель e5 недоступна → knn=0 (инструментация неактивна)")
-            return {tail: 0.0 for tail in grey_tails}
-        try:
-            # ВАРИАНТ B: асимметричный режим e5 (retrieval-native).
-            # query↔query (оба 'query:') даёт «всё похоже на всё» (косинусы
-            # 0.79–0.90, нет зазора). Пробуем нативный e5-retrieval:
-            #   эталоны VALID → 'passage: '  (это «документы»)
-            #   классифицируемые GREY → 'query: '  (это «запросы»)
-            # Гипотеза: asymmetric раздвигает похожее/непохожее сильнее.
-            v_in = [f"passage: {t}" for t in valid_tails]
-            g_in = [f"query: {t}" for t in grey_tails]
-            valid_embs = np.array(list(model.embed(v_in)), dtype=np.float32)
-            grey_embs = np.array(list(model.embed(g_in)), dtype=np.float32)
-            # e5 нормализует, но подстрахуемся (как в e5_model.get_e5_word_embedding)
-            valid_embs = np.array([self._normalize(e) for e in valid_embs])
-            grey_embs = np.array([self._normalize(e) for e in grey_embs])
-            sim_matrix = np.dot(grey_embs, valid_embs.T)
-            actual_k = min(k, len(valid_tails))
-            scores = {}
-            for i, tail in enumerate(grey_tails):
-                top_k = np.sort(sim_matrix[i])[-actual_k:]
-                scores[tail] = float(np.mean(top_k))
-            return scores
-        except Exception as e:
-            logger.warning(f"L2/KNN-e5: ошибка расчёта ({e}) → knn=0")
-            return {tail: 0.0 for tail in grey_tails}
+    # =========================================================
+    # SIGNAL 2 (LEGACY): Centroid Distance — ЗАКОММЕНТИРОВАНО
+    # Раскомментировать для сравнения с KNN.
+    # =========================================================
     
     # def _compute_centroid(self, valid_tails: List[str]) -> Optional[np.ndarray]:
     #     """Центроид = нормализованный средний вектор L0 VALID хвостов."""
@@ -561,8 +506,6 @@ class L2Classifier:
         """
         Обработать результат L0, классифицировать GREY через три сигнала.
         """
-        cfg = self.config  # определяем СРАЗУ: используется в диагностике (try/except),
-                           # которая исполняется даже при раннем выходе/исключении
         grey_keywords = l0_result.get("keywords_grey", [])
         l0_valid_keywords = l0_result.get("keywords", [])
         
@@ -654,20 +597,11 @@ class L2Classifier:
         word_df = self._compute_word_df(all_tails_for_df)
         pmi_scores = {tail: self._pmi_score(tail, word_df) for tail in grey_tails}
         
-        # === SIGNAL 2: KNN Similarity — ИНСТРУМЕНТАЦИЯ на e5 ===
-        # Историческая заглушка (knn=0 на MiniLM) заменена реальным расчётом
-        # на int8 e5-large. ВАЖНО: на решения это ПОКА НЕ влияет — ни одно
-        # decision-rule ниже не читает knn (R3/R4/R5 на KNN отключены в коде).
-        # Число пишется в debug['knn_score'] → l2_trace/l2_diagnostic для
-        # калибровки порогов под e5 (щорса/ёжик vs аптека/суши). После
-        # калибровки вторым шагом включим KNN в правила.
-        # Страховка: инструментация KNN НЕ должна ронять L2 ни при каких
-        # условиях (e5 не загрузился, OOM, любой сбой) → knn=0, фильтр работает.
-        try:
-            knn_scores = self._compute_knn_scores_e5(grey_tails, valid_tails, k=cfg.knn_k)
-        except Exception as _knn_err:
-            logger.warning(f"L2/KNN-e5 instrumentation failed (non-fatal): {_knn_err}")
-            knn_scores = {tail: 0.0 for tail in grey_tails}
+        # === SIGNAL 2: KNN Similarity — ОТКЛЮЧЕНО ===
+        # MiniLM не различает функциональную совместимость.
+        # KNN VALID (R3) отключён давно. KNN TRASH (R4/R5) ловит ~7 хвостов,
+        # L3 обработает их без потерь. Экономим compute time на embed 270+ хвостов.
+        knn_scores = {tail: 0.0 for tail in grey_tails}
         
         # --- CENTROID (закомментировано) ---
         # centroid_scores = {}
@@ -695,6 +629,7 @@ class L2Classifier:
         logger.info(f"L2: Reference words ({len(ref_words)}): {sorted(ref_words)[:20]}...")
         
         # === MULTI-SIGNAL DECISION ===
+        cfg = self.config
         classified = {"valid": [], "grey": [], "trash": []}
         
         for tail in grey_tails:
