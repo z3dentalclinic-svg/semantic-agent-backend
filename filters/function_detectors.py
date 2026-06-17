@@ -3275,6 +3275,12 @@ def _extract_seed_city(seed: str, tp: dict = None) -> str:
 
     result = ""
     for w in seed_words:
+        # МОРФ-ГАРД (см. _extract_seed_cities): нарицательное NOUN без Geox
+        # ('дом'→'dome') не город. Geox на raw (львов→лемма 'лев' теряет Geox).
+        if not w.isascii():
+            _p = _get_parses(w, tp)
+            if _p and _p[0].tag.POS == 'NOUN' and not any('Geox' in str(x.tag) for x in _p):
+                continue
         # 1. Прямой lookup
         if w in _CITY_NORMALIZE:
             result = _CITY_NORMALIZE[w]
@@ -3314,6 +3320,17 @@ def _extract_seed_cities(seed: str, tp: dict = None) -> frozenset:
 
     found = set()
     for w in seed_words:
+        # МОРФ-ГАРД: нарицательное слово (NOUN без Geox-разбора) не может быть
+        # seed-городом. Без него alt-name-омонимы из geonamescache делают
+        # обычные слова сида «городами»: 'дом' (из 'на дом') → canonical
+        # 'dome' → seed_cities={dome} → реальный 'киев' в хвосте трактуется
+        # как «другой город target-страны» → ложный TRASH. Geox проверяем на
+        # RAW-слове (лемма может потерять Geox: львов→лемма 'лев' без Geox).
+        # Реальные города (киев/днепр/одесса/харьков) имеют Geox на raw → проходят.
+        if not w.isascii():
+            _p = _get_parses(w, tp)
+            if _p and _p[0].tag.POS == 'NOUN' and not any('Geox' in str(x.tag) for x in _p):
+                continue
         if w in _CITY_NORMALIZE:
             found.add(_CITY_NORMALIZE[w])
             continue
