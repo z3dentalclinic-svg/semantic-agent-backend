@@ -29,6 +29,7 @@ from typing import Dict, List, Set, Any, Optional
 from .tail_extractor import (
     extract_tail, build_seed_ctx, _all_top_lemmas,
     _reset_extract_timings, _get_extract_timings,
+    _is_cross_script,
 )
 from .tail_function_classifier import TailFunctionClassifier
 
@@ -570,6 +571,19 @@ def apply_l0_filter(
                     if _lem in brand_db:
                         _seed_brand_tokens.add(_w)
                         break
+        # Кросс-скрипт варианты брендов сида из brand_db: если сид содержит
+        # 'samsung' (лат), добавляем 'самсунг' (кир) и наоборот — это ОДИН
+        # бренд в разных алфавитах. Без этого 'чехол на самсунг' при сиде
+        # 'samsung' ложно считался бы чужим брендом → ошибочный TRASH.
+        if _seed_brand_tokens:
+            _sb_snapshot = list(_seed_brand_tokens)
+            for _bd in brand_db:
+                if _bd in _seed_brand_tokens:
+                    continue
+                for _sb in _sb_snapshot:
+                    if _is_cross_script(_bd, _sb):
+                        _seed_brand_tokens.add(_bd)
+                        break
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
@@ -836,6 +850,10 @@ def apply_l0_filter(
                 _foreign_brands: Set[str] = set()
                 for _w in _kw_words_set:
                     if _w in _seed_brand_tokens:
+                        _seed_brand_in_kw = True
+                        break
+                    # кросс-скрипт: 'самсунг' в kw = свой бренд 'samsung'
+                    if any(_is_cross_script(_w, _sb) for _sb in _seed_brand_tokens):
                         _seed_brand_in_kw = True
                         break
                     if _w in brand_db or any(_l in brand_db for _l in _all_top_lemmas(_w)):
