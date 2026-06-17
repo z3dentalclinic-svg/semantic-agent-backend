@@ -552,38 +552,36 @@ def apply_l0_filter(
     # latn_model (строгая проверка). Это безопасная деградация.
     _sanity_ctx = _parse_seed_for_sanity(seed_ctx, brand_db) if brand_db else None
 
-    # ── Pre-compute: бренды СИДА (для wrong-brand при seed_not_found) ──────
-    # При tail=None (сид не найден в kw) проверяем: если у сида есть бренд,
-    # а в kw присутствует ДРУГОЙ известный бренд из brand_db — это чужой
-    # продукт (canon при сиде hp laserjet) → TRASH, а не GREY-fallback.
-    # Модели НЕ проверяем (грязь моделей: с21с/к35в/4103dw — риск ложных).
-    # Сид-бренды = latn_brand сида + cyr-слова сида, которые есть в brand_db.
-    # Если у сида бренда нет (доставка цветов) → set пуст → проверка no-op
-    # (cross-niche безопасно: услуговые/гео сиды не задеты).
-    _seed_brand_tokens: Set[str] = set()
-    if brand_db and _sanity_ctx:
-        _seed_brand_tokens |= set(_sanity_ctx.get('latn_brand', frozenset()))
-        for _w in seed_ctx['words']:
-            if _w in brand_db:
-                _seed_brand_tokens.add(_w)
-            else:
-                for _lem in _all_top_lemmas(_w):
-                    if _lem in brand_db:
-                        _seed_brand_tokens.add(_w)
-                        break
-        # Кросс-скрипт варианты брендов сида из brand_db: если сид содержит
-        # 'samsung' (лат), добавляем 'самсунг' (кир) и наоборот — это ОДИН
-        # бренд в разных алфавитах. Без этого 'чехол на самсунг' при сиде
-        # 'samsung' ложно считался бы чужим брендом → ошибочный TRASH.
-        if _seed_brand_tokens:
-            _sb_snapshot = list(_seed_brand_tokens)
-            for _bd in brand_db:
-                if _bd in _seed_brand_tokens:
-                    continue
-                for _sb in _sb_snapshot:
-                    if _is_cross_script(_bd, _sb):
-                        _seed_brand_tokens.add(_bd)
-                        break
+    # ── Pre-compute: двухклассовая логика бренд/модель (Условие C) ─────────
+    # При tail=None (сид не найден) проверяем соответствие бренду/модели сида.
+    # ДВА КЛАССА сидов (структурный признак, без хардкода):
+    #   Класс A — сид содержит МОДЕЛЬ-идентификатор: чистое число ('16') или
+    #     alnum-токен ('s21','a52','p2015d'). Модель строга: в kw должна быть
+    #     ТА ЖЕ модель + бренд. Другая/нет → wrong model → TRASH.
+    #     ('iphone 16' vs 'iphone 15' → TRASH; 'samsung s21' vs 'a52' → TRASH)
+    #   Класс B — сид содержит только БРЕНД/ЛИНЕЙКУ без модели ('hp laserjet',
+    #     'iphone', 'asus'). Номер любой: в kw нужен ХОТЯ БЫ ОДИН бренд/линейка
+    #     сида. Нет → TRASH. ('laserjet p2015d' ✓, 'драйвер 1018' ✗).
+    #   CYR — нет latin-токенов ('доставка цветов') → Условие C no-op.
+    # Бренд/линейка = чисто-буквенные latin-токены сида (hp, laserjet, samsung,
+    # galaxy, iphone). Модель = число или alnum. Сравнение с kw — через
+    # кросс-скрипт (самсунг↔samsung, айфон↔iphone). НЕ зависит от brand_db
+    # (спасает от неполноты базы: 'gtx 1060' без бренда сида → TRASH).
+    _ALNUM_MODEL_RE = re.compile(r'(?=[a-z0-9]*[a-z])(?=[a-z0-9]*[0-9])[a-z0-9]+$')
+    _seed_brand_line: Set[str] = set()   # чисто-буквенные latin: hp, laserjet
+    _seed_model_toks: Set[str] = set()   # модели: 16, s21, a52, p2015d
+    for _w in seed_ctx['words']:
+        if re.fullmatch(r'[a-z]+', _w):
+            _seed_brand_line.add(_w)
+        elif re.fullmatch(r'\d+', _w) or _ALNUM_MODEL_RE.fullmatch(_w):
+            _seed_model_toks.add(_w)
+    # Класс сида
+    if _seed_model_toks:
+        _seed_class = 'A'      # модель строга
+    elif _seed_brand_line:
+        _seed_class = 'B'      # бренд/линейка, номер любой
+    else:
+        _seed_class = 'CYR'    # no-op (услуги/гео/cyr-товары)
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
@@ -836,44 +834,57 @@ def apply_l0_filter(
                     })
                     continue
 
-            # Условие C — чужой БРЕНД (wrong brand). Только бренд, НЕ модель.
-            # Модели — грязь (с21с/к35в/4103dw, пробелы, опечатки) → проверять
-            # их при seed_not_found рискованно (ложный треш на той же модели).
-            # Бренд — устойчивое слово. Логика: у сида есть бренд (hp), в kw
-            # присутствует ДРУГОЙ известный бренд из brand_db (canon/пантум),
-            # и ни один бренд сида в kw не найден → другой продукт → TRASH.
-            # НЕ трогаем (→ GREY): kw со своим брендом (hp в kw есть), kw без
-            # бренда вообще ('драйвер пак про'), сиды без бренда (цветы/юрист)
-            # — у них _seed_brand_tokens пуст → no-op, 0 регрессий cross-niche.
-            if _seed_brand_tokens and brand_db:
-                _seed_brand_in_kw = False
-                _foreign_brands: Set[str] = set()
-                for _w in _kw_words_set:
-                    if _w in _seed_brand_tokens:
-                        _seed_brand_in_kw = True
-                        break
-                    # кросс-скрипт: 'самсунг' в kw = свой бренд 'samsung'
-                    if any(_is_cross_script(_w, _sb) for _sb in _seed_brand_tokens):
-                        _seed_brand_in_kw = True
-                        break
-                    if _w in brand_db or any(_l in brand_db for _l in _all_top_lemmas(_w)):
-                        if _w not in _seed_brand_tokens:
-                            _foreign_brands.add(_w)
-                if not _seed_brand_in_kw and _foreign_brands:
-                    trash_keywords.append(kw_item)
-                    trace_records.append({
-                        "keyword": kw,
-                        "tail": None,
-                        "label": "TRASH",
-                        "decided_by": "l0",
-                        "reason": (
-                            f"seed не найден + чужой бренд "
-                            f"{sorted(_foreign_brands)} ≠ бренд сида "
-                            f"{sorted(_seed_brand_tokens)} → TRASH (wrong brand)"
-                        ),
-                        "signals": ["-wrong_brand"],
-                    })
-                    continue
+            # Условие C — двухклассовая проверка бренд/модель (см. подготовку
+            # _seed_class / _seed_brand_line / _seed_model_toks выше).
+            #   B: нужен хотя бы один бренд/линейка сида в kw (номер любой).
+            #   A: нужна модель сида в kw + бренд (другая модель → wrong model).
+            #   CYR: no-op.
+            # Сравнение через кросс-скрипт (самсунг↔samsung). Не зависит от
+            # brand_db — ловит 'gtx 1060'/'драйвер 1018' (нет бренда сида).
+            if _seed_class in ('A', 'B'):
+                _brand_present = any(
+                    (_b in _kw_words_set) or any(_is_cross_script(_b, _kw) for _kw in _kw_words_set)
+                    for _b in _seed_brand_line
+                )
+
+                if _seed_class == 'B':
+                    # бренд/линейка обязательна, модель любая
+                    if not _brand_present:
+                        trash_keywords.append(kw_item)
+                        trace_records.append({
+                            "keyword": kw, "tail": None, "label": "TRASH",
+                            "decided_by": "l0",
+                            "reason": (
+                                f"seed не найден + нет бренда/линейки сида "
+                                f"{sorted(_seed_brand_line)} в kw → TRASH (wrong/no brand)"
+                            ),
+                            "signals": ["-wrong_brand"],
+                        })
+                        continue
+                else:  # класс A — модель строга
+                    _model_present = any(
+                        (_m in _kw_words_set) or any(_is_cross_script(_m, _kw) for _kw in _kw_words_set)
+                        for _m in _seed_model_toks
+                    )
+                    # бренд считается ок, если у сида его нет ИЛИ он найден в kw
+                    _brand_ok = (not _seed_brand_line) or _brand_present
+                    if not (_model_present and _brand_ok):
+                        _miss = []
+                        if not _model_present:
+                            _miss.append(f"модель {sorted(_seed_model_toks)}")
+                        if not _brand_ok:
+                            _miss.append(f"бренд {sorted(_seed_brand_line)}")
+                        trash_keywords.append(kw_item)
+                        trace_records.append({
+                            "keyword": kw, "tail": None, "label": "TRASH",
+                            "decided_by": "l0",
+                            "reason": (
+                                f"seed не найден + не совпало: {', '.join(_miss)} "
+                                f"→ TRASH (wrong model/brand)"
+                            ),
+                            "signals": ["-wrong_model"],
+                        })
+                        continue
 
             # Fallback: seed не найден, но ни A, ни B, ни C не сработали → GREY
             # Могут быть валидные синонимы, перестановки, частичные совпадения.
