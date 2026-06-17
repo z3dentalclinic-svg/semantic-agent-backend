@@ -289,6 +289,10 @@ NEIGHBOR_MIN_FREQ = 2
 _NON_CONTENT_POS = {
     'PREP', 'CONJ', 'PRCL', 'INTJ',
     'ADVB', 'COMP', 'NUMR', 'NPRO',
+    # GRND (деепричастие) и PRED: служебные слова дают «теневой» GRND-разбор
+    # ('для'→'длить'), который ложно попадает в обязательные оси как
+    # no_proof:длить. Реальные сид-анкеры — NOUN/INFN, не GRND.
+    'GRND', 'PRED',
 }
 
 # Global parses cache (uniq tokens per request)
