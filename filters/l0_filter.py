@@ -550,6 +550,26 @@ def apply_l0_filter(
     # Если brand_db пустой — latn_brand также пустой, весь LATN идёт в
     # latn_model (строгая проверка). Это безопасная деградация.
     _sanity_ctx = _parse_seed_for_sanity(seed_ctx, brand_db) if brand_db else None
+
+    # ── Pre-compute: бренды СИДА (для wrong-brand при seed_not_found) ──────
+    # При tail=None (сид не найден в kw) проверяем: если у сида есть бренд,
+    # а в kw присутствует ДРУГОЙ известный бренд из brand_db — это чужой
+    # продукт (canon при сиде hp laserjet) → TRASH, а не GREY-fallback.
+    # Модели НЕ проверяем (грязь моделей: с21с/к35в/4103dw — риск ложных).
+    # Сид-бренды = latn_brand сида + cyr-слова сида, которые есть в brand_db.
+    # Если у сида бренда нет (доставка цветов) → set пуст → проверка no-op
+    # (cross-niche безопасно: услуговые/гео сиды не задеты).
+    _seed_brand_tokens: Set[str] = set()
+    if brand_db and _sanity_ctx:
+        _seed_brand_tokens |= set(_sanity_ctx.get('latn_brand', frozenset()))
+        for _w in seed_ctx['words']:
+            if _w in brand_db:
+                _seed_brand_tokens.add(_w)
+            else:
+                for _lem in _all_top_lemmas(_w):
+                    if _lem in brand_db:
+                        _seed_brand_tokens.add(_w)
+                        break
     _t_stage['seed_ctx'] = time.perf_counter() - _t
 
     # ── Персистентный классификатор ─────────────────────────────────────────
@@ -802,7 +822,42 @@ def apply_l0_filter(
                     })
                     continue
 
-            # Fallback: seed не найден, но ни A, ни B не сработали → GREY
+            # Условие C — чужой БРЕНД (wrong brand). Только бренд, НЕ модель.
+            # Модели — грязь (с21с/к35в/4103dw, пробелы, опечатки) → проверять
+            # их при seed_not_found рискованно (ложный треш на той же модели).
+            # Бренд — устойчивое слово. Логика: у сида есть бренд (hp), в kw
+            # присутствует ДРУГОЙ известный бренд из brand_db (canon/пантум),
+            # и ни один бренд сида в kw не найден → другой продукт → TRASH.
+            # НЕ трогаем (→ GREY): kw со своим брендом (hp в kw есть), kw без
+            # бренда вообще ('драйвер пак про'), сиды без бренда (цветы/юрист)
+            # — у них _seed_brand_tokens пуст → no-op, 0 регрессий cross-niche.
+            if _seed_brand_tokens and brand_db:
+                _seed_brand_in_kw = False
+                _foreign_brands: Set[str] = set()
+                for _w in _kw_words_set:
+                    if _w in _seed_brand_tokens:
+                        _seed_brand_in_kw = True
+                        break
+                    if _w in brand_db or any(_l in brand_db for _l in _all_top_lemmas(_w)):
+                        if _w not in _seed_brand_tokens:
+                            _foreign_brands.add(_w)
+                if not _seed_brand_in_kw and _foreign_brands:
+                    trash_keywords.append(kw_item)
+                    trace_records.append({
+                        "keyword": kw,
+                        "tail": None,
+                        "label": "TRASH",
+                        "decided_by": "l0",
+                        "reason": (
+                            f"seed не найден + чужой бренд "
+                            f"{sorted(_foreign_brands)} ≠ бренд сида "
+                            f"{sorted(_seed_brand_tokens)} → TRASH (wrong brand)"
+                        ),
+                        "signals": ["-wrong_brand"],
+                    })
+                    continue
+
+            # Fallback: seed не найден, но ни A, ни B, ни C не сработали → GREY
             # Могут быть валидные синонимы, перестановки, частичные совпадения.
             grey_keywords.append(kw_item)
             trace_records.append({
