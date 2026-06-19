@@ -1,22 +1,26 @@
 """
-l3_filter.py — Слой 3: OpenAI GPT-5.5 классификатор для GREY-зоны.
+l3_filter.py — Слой 3: Claude Sonnet 4.6 классификатор для GREY-зоны.
 
-Версия: БИНАРНАЯ (0 или 1), 2 корзины, reasoning_effort=medium, lean-промпт.
+Версия: БИНАРНАЯ (0 или 1), 2 корзины, effort=medium (adaptive thinking), lean-промпт.
 
 Архитектура:
-- Модель: gpt-5.5 (OpenAI flagship, $5/$30 за 1M токенов)
-- reasoning_effort="medium" (среднее рассуждение)
+- Модель: claude-sonnet-4-6 (Anthropic, $3/$15 за 1M токенов)
+- effort="medium" + adaptive thinking (среднее мышление)
 - batch_size=20, max_parallel=7
 - Бинарная классификация: 1 → VALID, 0 → TRASH
 - exponential backoff (2->4->8->16с) на 5 попытках
 - Параметры region/language передаются в user-prompt
 - Промпт — lean (одна фраза «очисти от брака парсинга» + вывод 1/0), без правил
 
-ВАЖНО про API:
-- Endpoint: /v1/chat/completions
-- max_completion_tokens (НЕ max_tokens) — обязательно для reasoning-моделей
-- temperature НЕ поддерживается у reasoning-моделей, убрана
-- reasoning_effort: none | low | medium | high | xhigh
+ВАЖНО про API (Anthropic Messages):
+- Endpoint: /v1/messages, заголовки x-api-key + anthropic-version
+- max_tokens (лимит на ВЕСЬ output: thinking + текст)
+- system — отдельный top-level параметр
+- thinking={"type":"adaptive"} + output_config={"effort": ...}
+- ответ: content[] из блоков, текст из type=="text"
+
+ОТКАТ НА GPT: _call_openai закомментирована ниже (не удалена). Раскомментируй её,
+верни вызов _call_openai в _process_batch и GPT-константы MODEL/API_URL вверху.
 
 ИСТОРИЯ моделей в этом проекте:
 - Gemini 2.5 Flash-Lite preview — старт, отбросили (плохо UA)
@@ -28,9 +32,10 @@ l3_filter.py — Слой 3: OpenAI GPT-5.5 классификатор для GR
 - Gemini 3.5 Flash (thinking=medium) — пропускал мусор/доп-гео непоследовательно
 - Gemini 3.1 Flash-Lite (high/minimal) — слабо
 - Gemini 3.1 Pro (thinking=medium) — сыпалась так же на гео
-- GPT-5.5 (reasoning=medium) + lean-промпт — текущая
+- GPT-5.5 (reasoning=medium) + lean-промпт — предыдущая (закомментирована)
+- Claude Sonnet 4.6 (effort=medium, adaptive thinking) + lean-промпт — текущая
 
-Ключ: env OPENAI_API_KEY
+Ключ: зашит в код (ANTHROPIC_API_KEY вверху), без env.
 """
 
 import os
@@ -43,8 +48,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-MODEL = "gpt-5.5"
-API_URL = "https://api.openai.com/v1/chat/completions"
+# --- GPT (ЗАКОММЕНТИРОВАНО, для отката раскомментируй и закомментируй Anthropic ниже) ---
+# MODEL = "gpt-5.5"
+# API_URL = "https://api.openai.com/v1/chat/completions"
+
+# --- Anthropic Claude Sonnet 4.6 (АКТИВНЫЙ) ---
+MODEL = "claude-sonnet-4-6"
+API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+
+# Ключ зашит в код по твоему решению (без env). Текущий засвечен в чате —
+# вставь СЮДА свежий из console.anthropic.com.
+ANTHROPIC_API_KEY = "sk-ant-api03-ВСТАВЬ_СВЕЖИЙ_КЛЮЧ"
 
 
 @dataclass
@@ -56,7 +71,7 @@ class L3Config:
     max_parallel: int = 7
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "low"  # none | low | medium | high | xhigh (GPT-5.5)
+    reasoning_effort: str = "medium"  # Anthropic effort: low|medium|high|xhigh|max
 
 
 # =============================================================================
@@ -246,31 +261,103 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
-def _call_openai(
+# def _call_openai(
+#     api_key: str,
+#     system_prompt: str,
+#     user_prompt: str,
+#     timeout: int,
+#     reasoning_effort: str,
+# ) -> Tuple[str, Dict[str, Any]]:
+#     """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}.
+# 
+#     ВАЖНО про reasoning-модели OpenAI (GPT-5 family):
+#     - max_completion_tokens вместо max_tokens
+#     - temperature, top_p, etc. НЕ поддерживаются
+#     - reasoning_effort: none | low | medium | high | xhigh
+#     """
+#     import requests
+# 
+#     payload = {
+#         "model": MODEL,
+#         "messages": [
+#             {"role": "system", "content": system_prompt},
+#             {"role": "user", "content": user_prompt},
+#         ],
+#         "max_completion_tokens": 8192,
+#         "stream": False,
+#         "reasoning_effort": reasoning_effort,
+#     }
+# 
+#     try:
+#         response = requests.post(
+#             API_URL,
+#             headers={
+#                 "Content-Type": "application/json",
+#                 "Authorization": f"Bearer {api_key}",
+#             },
+#             json=payload,
+#             timeout=timeout,
+#         )
+#     except requests.exceptions.RequestException as e:
+#         raise Exception(f"OpenAI network error: {type(e).__name__}: {e}")
+# 
+#     if response.status_code != 200:
+#         raise Exception(f"OpenAI API error {response.status_code}: {response.text[:500]}")
+# 
+#     try:
+#         data = response.json()
+#     except Exception as e:
+#         raise Exception(f"OpenAI JSON parse error: {e}. Raw: {response.text[:300]}")
+# 
+#     try:
+#         choice = data['choices'][0]
+#         message = choice['message']
+#         content = (message.get('content') or '').strip()
+# 
+#         usage = data.get('usage', {}) or {}
+#         completion_details = usage.get('completion_tokens_details', {}) or {}
+#         diag = {
+#             "prompt_tokens": usage.get('prompt_tokens'),
+#             "completion_tokens": usage.get('completion_tokens'),
+#             "reasoning_tokens": completion_details.get('reasoning_tokens'),
+#             "finish_reason": choice.get('finish_reason'),
+#         }
+#         return content, diag
+#     except (KeyError, IndexError, TypeError):
+#         if 'choices' not in data:
+#             raise Exception(f"OpenAI no choices: {str(data)[:400]}")
+#         choice = data['choices'][0] if data.get('choices') else {}
+#         finish = choice.get('finish_reason', 'UNKNOWN')
+#         raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
+
+
+def _call_anthropic(
     api_key: str,
     system_prompt: str,
     user_prompt: str,
     timeout: int,
-    reasoning_effort: str,
+    effort: str,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Возвращает (content, diag) где diag = {usage, reasoning_tokens, finish_reason}.
+    """Anthropic Messages API, Claude Sonnet 4.6, adaptive thinking + effort.
 
-    ВАЖНО про reasoning-модели OpenAI (GPT-5 family):
-    - max_completion_tokens вместо max_tokens
-    - temperature, top_p, etc. НЕ поддерживаются
-    - reasoning_effort: none | low | medium | high | xhigh
+    Отличия от GPT:
+    - endpoint /v1/messages, заголовки x-api-key + anthropic-version
+    - system — отдельный top-level параметр (не сообщение)
+    - max_tokens (не max_completion_tokens) — лимит на ВЕСЬ output (thinking + текст)
+    - thinking={"type":"adaptive"} + output_config={"effort": ...} — глубина мышления
+    - ответ: content[] из блоков; текст берём из type=="text", thinking пропускаем
     """
     import requests
 
     payload = {
         "model": MODEL,
+        "max_tokens": 8192,
+        "system": system_prompt,
         "messages": [
-            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_completion_tokens": 8192,
-        "stream": False,
-        "reasoning_effort": reasoning_effort,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
     }
 
     try:
@@ -278,42 +365,51 @@ def _call_openai(
             API_URL,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
             },
             json=payload,
             timeout=timeout,
         )
     except requests.exceptions.RequestException as e:
-        raise Exception(f"OpenAI network error: {type(e).__name__}: {e}")
+        raise Exception(f"Anthropic network error: {type(e).__name__}: {e}")
 
     if response.status_code != 200:
-        raise Exception(f"OpenAI API error {response.status_code}: {response.text[:500]}")
+        raise Exception(f"Anthropic API error {response.status_code}: {response.text[:500]}")
 
     try:
         data = response.json()
     except Exception as e:
-        raise Exception(f"OpenAI JSON parse error: {e}. Raw: {response.text[:300]}")
+        raise Exception(f"Anthropic JSON parse error: {e}. Raw: {response.text[:300]}")
 
-    try:
-        choice = data['choices'][0]
-        message = choice['message']
-        content = (message.get('content') or '').strip()
+    blocks = data.get("content")
+    if not isinstance(blocks, list):
+        raise Exception(f"Anthropic no content blocks: {str(data)[:400]}")
 
-        usage = data.get('usage', {}) or {}
-        completion_details = usage.get('completion_tokens_details', {}) or {}
-        diag = {
-            "prompt_tokens": usage.get('prompt_tokens'),
-            "completion_tokens": usage.get('completion_tokens'),
-            "reasoning_tokens": completion_details.get('reasoning_tokens'),
-            "finish_reason": choice.get('finish_reason'),
-        }
-        return content, diag
-    except (KeyError, IndexError, TypeError):
-        if 'choices' not in data:
-            raise Exception(f"OpenAI no choices: {str(data)[:400]}")
-        choice = data['choices'][0] if data.get('choices') else {}
-        finish = choice.get('finish_reason', 'UNKNOWN')
-        raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
+    # Текст-ответ — конкатенация блоков type=="text"; thinking/redacted_thinking игнорим
+    text_parts = [
+        b.get("text", "")
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == "text"
+    ]
+    content = "".join(text_parts).strip()
+
+    usage = data.get("usage", {}) or {}
+    diag = {
+        "prompt_tokens": usage.get("input_tokens"),
+        "completion_tokens": usage.get("output_tokens"),  # thinking входит сюда же
+        "reasoning_tokens": None,                          # Anthropic отдельно не выдаёт
+        "finish_reason": data.get("stop_reason"),
+    }
+
+    if not content:
+        # частый кейс: stop_reason=="max_tokens" — thinking съел весь бюджет
+        raise Exception(
+            f"Anthropic empty text (stop_reason={data.get('stop_reason')}): {str(data)[:400]}"
+        )
+
+    return content, diag
+
 
 def _parse_labels(response: str, expected_count: int) -> List[Optional[int]]:
     """Парсит ответ в список 0/1 или None для невалидных."""
@@ -373,7 +469,7 @@ def _process_batch(
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response, diag = _call_openai(
+            response, diag = _call_anthropic(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
                 config.timeout, config.reasoning_effort
             )
@@ -429,13 +525,11 @@ def apply_l3_filter(
     if config is None:
         config = L3Config()
 
-    # Всегда берём свежий ключ из env
-    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if env_key:
-        config.api_key = env_key
+    # Ключ зашит в код (без env) — берём из константы ANTHROPIC_API_KEY
+    config.api_key = ANTHROPIC_API_KEY
 
-    if not config.api_key:
-        logger.warning("[L3] No OPENAI_API_KEY — skipping")
+    if not config.api_key or "ВСТАВЬ" in config.api_key:
+        logger.warning("[L3] ANTHROPIC_API_KEY не задан в коде — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
