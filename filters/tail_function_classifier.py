@@ -192,6 +192,20 @@ class TailFunctionClassifier:
         # Pre-computed: seed сервисный (услуга/процесс) или товарный?
         # Используется в detect_single_infinitive и как флаг для commerce-infn positive.
         self._seed_is_service = _is_service_seed(seed) if seed else True
+        # Объекты сида = контентные существительные сида (NOUN, кроме гео).
+        # Для rescue category_mismatch: если объект сида присутствует в kw
+        # ('брекеты' в 'поставить брекеты харьков'), хвост = действие над
+        # объектом сида, а не чужая категория → mismatch пропускаем.
+        # Считается один раз. Гео исключаем (харьков — не объект услуги).
+        from .shared_morph import morph as _morph_obj
+        self._seed_object_lemmas: Set[str] = set()
+        for _sw in self._seed_words_lower:
+            try:
+                _p = _morph_obj.parse(_sw)[0]
+                if _p.tag.POS == 'NOUN' and 'Geox' not in str(_p.tag):
+                    self._seed_object_lemmas.add(_p.normal_form)
+            except Exception:
+                pass
         # Тайминги детекторов — накапливаются за батч, сбрасываются из l0_filter
         self.detector_timings: Dict[str, float] = {}
         # Индекс для truncated_geo — строится один раз при создании классификатора
@@ -408,6 +422,25 @@ class TailFunctionClassifier:
             if signal_name == 'category_mismatch':
                 if set(positive_signals) & _STRONG_POSITIVES_SKIP_MISMATCH:
                     continue
+                # RESCUE: объект сида присутствует в полном kw → хвост это
+                # действие/уточнение НАД объектом сида ('поставить брекеты
+                # харьков' — есть 'брекеты'), а не чужая категория. chargram
+                # видит только вырезанный tail ('поставить') и ложно режет.
+                # Проверяем kw (не tail — там объект уже вырезан). Мусор
+                # ('купить щербет' на сиде про аккумулятор) объекта сида НЕ
+                # содержит → не спасается, mismatch отработает.
+                # Софт: только ПРОПУСКАЕМ mismatch, не штампуем VALID — финал
+                # за остальными детекторами и L1.5/L2.
+                if self._seed_object_lemmas and kw:
+                    _kw_lemmas = set()
+                    for _kwt in kw.lower().split():
+                        _pl = (tail_parses or {}).get(_kwt)
+                        if _pl:
+                            _kw_lemmas.add(_pl[0].normal_form)
+                        else:
+                            _kw_lemmas.add(_kwt)
+                    if self._seed_object_lemmas & _kw_lemmas:
+                        continue
             # FIX (task: own_geo label): при own_geo подавляем geo-негативы.
             # BPF подтвердил что это город target-страны по расширенной базе.
             # truncated_geo даёт ложный обрезок ('хотов' → 'хот-спрингс'),
