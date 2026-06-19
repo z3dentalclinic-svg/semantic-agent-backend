@@ -59,7 +59,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # Ключ зашит в код по твоему решению (без env). Текущий засвечен в чате —
 # вставь СЮДА свежий из console.anthropic.com.
-ANTHROPIC_API_KEY = "sk-ant-api03-ВСТАВЬ_СВЕЖИЙ_КЛЮЧ"
+ANTHROPIC_API_KEY = "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"
 
 
 @dataclass
