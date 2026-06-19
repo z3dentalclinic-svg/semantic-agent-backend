@@ -289,10 +289,6 @@ NEIGHBOR_MIN_FREQ = 2
 _NON_CONTENT_POS = {
     'PREP', 'CONJ', 'PRCL', 'INTJ',
     'ADVB', 'COMP', 'NUMR', 'NPRO',
-    # GRND (деепричастие) и PRED: служебные слова дают «теневой» GRND-разбор
-    # ('для'→'длить'), который ложно попадает в обязательные оси как
-    # no_proof:длить. Реальные сид-анкеры — NOUN/INFN, не GRND.
-    'GRND', 'PRED',
 }
 
 # Global parses cache (uniq tokens per request)
@@ -578,8 +574,14 @@ def _extract_seed_structure(seed: str) -> Dict[str, Any]:
         object_anchor = content_parses[0].normal_form
         action_anchor = None
 
-    nums = re.findall(r'\d+', seed)
-    qualifier = nums[0] if nums else None
+    # Qualifier = САМОСТОЯТЕЛЬНЫЙ числовой токен сида ('16' в 'iphone 16'),
+    # НЕ цифры внутри alnum-модели. Старое re.findall(r'\d+', seed) выдирало
+    # '21' из 's21' (samsung galaxy s21) → '21' становился обязательным
+    # qualifier'ом → ключи с 's21' (не голым '21') → ложный qualifier_missing.
+    # Берём только токены, целиком состоящие из цифр (по словам), — тогда
+    # 's21'/'a52'/'p2015d' не дают qualifier, а '16'/'13' дают.
+    _seed_num_tokens = [t for t in _tokenize(seed) if t.isdigit()]
+    qualifier = _seed_num_tokens[0] if _seed_num_tokens else None
 
     return {
         'content_lemmas': content_lemmas,
