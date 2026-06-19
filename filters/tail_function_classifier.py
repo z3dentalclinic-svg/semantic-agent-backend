@@ -431,13 +431,17 @@ class TailFunctionClassifier:
                 # содержит → не спасается, mismatch отработает.
                 # Софт: только ПРОПУСКАЕМ mismatch, не штампуем VALID — финал
                 # за остальными детекторами и L1.5/L2.
+                # ВАЖНО: лемматизируем слова kw через morph НАПРЯМУЮ, а НЕ через
+                # tail_parses — tail_parses содержит только слова ХВОСТОВ
+                # (слова сида в нём отсутствуют: 'брекеты' вырезано), поэтому
+                # .get('брекеты') вернул бы None → fallback на сырое слово →
+                # 'брекеты' != лемма 'брекет' → rescue ложно не срабатывал.
                 if self._seed_object_lemmas and kw:
                     _kw_lemmas = set()
                     for _kwt in kw.lower().split():
-                        _pl = (tail_parses or {}).get(_kwt)
-                        if _pl:
-                            _kw_lemmas.add(_pl[0].normal_form)
-                        else:
+                        try:
+                            _kw_lemmas.add(morph.parse(_kwt)[0].normal_form)
+                        except Exception:
                             _kw_lemmas.add(_kwt)
                     if self._seed_object_lemmas & _kw_lemmas:
                         continue
