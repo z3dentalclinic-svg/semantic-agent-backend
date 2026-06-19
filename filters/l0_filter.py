@@ -143,6 +143,27 @@ def _translit_cyr_to_lat(w: str) -> str:
     return w.translate(_TRANSLIT_CYR_TO_LAT)
 
 
+def _model_match(kw_tok: str, seed_model: str) -> bool:
+    """
+    Совпадает ли токен ключа с моделью сида (для Условия C, класс A).
+    Не точное равенство, а:
+      1. транслитерация кир→лат с обеих сторон ('с21' → 's21'),
+      2. точное совпадение ИЛИ префикс с ГРАНИЦЕЙ модели:
+         seed 's21' ⊂ 's21+','s21s','s21fe','s21ultra' (варианты линейки S21),
+         но НЕ 's210'/'s2199' (после модели идёт цифра → другой номер).
+    Примеры: s21 ↔ s21/с21/s21+/s21fe/s21s = True; s21 ↔ s7/a52/s210 = False.
+    """
+    a = _translit_cyr_to_lat(kw_tok)
+    b = _translit_cyr_to_lat(seed_model)
+    if a == b:
+        return True
+    if a.startswith(b):
+        rest = a[len(b):]
+        # граница модели: следующий символ не цифра (иначе s210 ≠ s21)
+        return bool(rest) and not rest[0].isdigit()
+    return False
+
+
 def _parse_seed_for_sanity(seed_ctx: dict, brand_db: Set[str]) -> Optional[dict]:
     """
     Разбирает seed на 3 категории content-токенов:
@@ -861,26 +882,26 @@ def apply_l0_filter(
                             "signals": ["-wrong_brand"],
                         })
                         continue
-                else:  # класс A — модель строга
+                else:  # класс A — модель строга (но бренд НЕ обязателен)
+                    # Модель сида должна присутствовать в kw через _model_match:
+                    # транслит ('с21'→'s21') + префикс-граница ('s21'⊂'s21fe',
+                    # но не 's210'). Бренд опускать МОЖНО: 'ремонт s21 ultra'
+                    # без 'samsung' — валид (s21 — уникальный идентификатор).
+                    # Другая модель ('a52','s7','m21') не пройдёт _model_match.
+                    # Интент (разборка/обзор/price) — не зона Условия C, это L1.5.
                     _model_present = any(
-                        (_m in _kw_words_set) or any(_is_cross_script(_m, _kw) for _kw in _kw_words_set)
+                        _model_match(_kw, _m)
+                        for _kw in _kw_words_set
                         for _m in _seed_model_toks
                     )
-                    # бренд считается ок, если у сида его нет ИЛИ он найден в kw
-                    _brand_ok = (not _seed_brand_line) or _brand_present
-                    if not (_model_present and _brand_ok):
-                        _miss = []
-                        if not _model_present:
-                            _miss.append(f"модель {sorted(_seed_model_toks)}")
-                        if not _brand_ok:
-                            _miss.append(f"бренд {sorted(_seed_brand_line)}")
+                    if not _model_present:
                         trash_keywords.append(kw_item)
                         trace_records.append({
                             "keyword": kw, "tail": None, "label": "TRASH",
                             "decided_by": "l0",
                             "reason": (
-                                f"seed не найден + не совпало: {', '.join(_miss)} "
-                                f"→ TRASH (wrong model/brand)"
+                                f"seed не найден + модель сида {sorted(_seed_model_toks)} "
+                                f"не найдена в kw → TRASH (wrong model)"
                             ),
                             "signals": ["-wrong_model"],
                         })
