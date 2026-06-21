@@ -35,7 +35,7 @@ l3_filter.py — Слой 3: Claude Sonnet 4.6 классификатор для
 - GPT-5.5 (reasoning=medium) + lean-промпт — предыдущая (закомментирована)
 - Claude Sonnet 4.6 (effort=medium, adaptive thinking) + lean-промпт — текущая
 
-Ключ: зашит в код (ANTHROPIC_API_KEY вверху), без env.
+Ключ: env ANTHROPIC_API_KEY (настроена в Render).
 """
 
 import os
@@ -57,9 +57,8 @@ MODEL = "claude-sonnet-4-6"
 API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
-# Ключ зашит в код по твоему решению (без env). Текущий засвечен в чате —
-# вставь СЮДА свежий из console.anthropic.com.
-ANTHROPIC_API_KEY = "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"
+# Ключ — из переменной окружения ANTHROPIC_API_KEY (настроена в Render).
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
 
 @dataclass
@@ -525,11 +524,11 @@ def apply_l3_filter(
     if config is None:
         config = L3Config()
 
-    # Ключ зашит в код (без env) — берём из константы ANTHROPIC_API_KEY
-    config.api_key = ANTHROPIC_API_KEY
+    # Ключ из env ANTHROPIC_API_KEY (Render). Берём свежий на каждый вызов.
+    config.api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip() or ANTHROPIC_API_KEY
 
-    if not config.api_key or "ВСТАВЬ" in config.api_key:
-        logger.warning("[L3] ANTHROPIC_API_KEY не задан в коде — skipping")
+    if not config.api_key:
+        logger.warning("[L3] ANTHROPIC_API_KEY не задан в окружении — skipping")
         result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
         return result
 
