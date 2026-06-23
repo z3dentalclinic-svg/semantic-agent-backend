@@ -8,6 +8,7 @@ Contains all filtering logic:
 - relevance_filter: Relevance keyword filtering
 - l0_filter: Layer 0 structural classifier (26 detectors)
 - l2_filter: Layer 2 semantic classifier (Dual Cosine embeddings)
+- l2_5_filter: Layer 2.5 Gemini Flash-Lite valid-cleaner (semantic mismatches in VALID)
 - l1_5_filter: Layer 1.5 Domain Anchor Filter (off-topic GREY → TRASH)
 - l3_filter: Layer 3 DeepSeek LLM classifier (remaining GREY)
 - keyword_grouping: Final VALID grouping by detector signals (geo/commerce/info/...)
@@ -25,6 +26,7 @@ from .l0_filter import apply_l0_filter
 from .l2_filter import L2Classifier, apply_l2_filter
 from .l1_5_filter import apply_l1_5_filter, extract_object_anchor
 from .l1_5_filter_v2 import apply_l1_5_filter_v2
+from .l2_5_filter import apply_l2_5_filter, L2_5Config
 from .l3_filter import apply_l3_filter, L3Config
 from .keyword_grouping import group_valid_keywords, get_group_label
 
@@ -63,6 +65,8 @@ __all__ = [
     'apply_l0_filter',
     'L2Classifier',
     'apply_l2_filter',
+    'apply_l2_5_filter',
+    'L2_5Config',
     'apply_l3_filter',
     'L3Config',
     'apply_l1_5_filter',
