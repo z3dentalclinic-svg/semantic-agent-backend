@@ -27,6 +27,8 @@ from filters import (
     apply_l1_5_filter, # ← L1.5 Domain Anchor Filter v1 (между L0 и L2)
     apply_l1_5_filter_v2, # ← L1.5 v2 — E5-large + invertedlogic (опционально)
     apply_l2_filter,   # ← L2 Tri-Signal классификатор (PMI + Centroid + L0 signals)
+    apply_l2_5_filter, # ← L2.5 Gemini Flash-Lite чистка валидов (между L2 и L3)
+    L2_5Config,        # ← конфигурация L2.5
     apply_l3_filter,   # ← L3 DeepSeek LLM классификатор (финальная GREY)
     L3Config,          # ← конфигурация L3
     group_valid_keywords,  # ← группировка VALID по детекторным сигналам
@@ -226,6 +228,7 @@ except Exception as _e:
 
 # DeepSeek API key для L3
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # ← L2.5 Gemini Flash-Lite
 
 
 def deduplicate_final_results(data: dict) -> dict:
@@ -1055,9 +1058,16 @@ def _build_l3_config(api_key=None):
     return config
 
 
+def _build_l2_5_config(api_key=None):
+    """Собирает L2.5 config (Gemini Flash-Lite)."""
+    config = L2_5Config()
+    config.api_key = api_key or GEMINI_API_KEY
+    return config
+
+
 def apply_filters_traced(result: dict, seed: str, country: str, 
                           method: str, language: str = "ru", deduplicate: bool = False,
-                          enabled_filters: str = "pre,geo,bpf", l2_config = None, l3_config = None) -> dict:
+                          enabled_filters: str = "pre,geo,bpf", l2_config = None, l2_5_config = None, l3_config = None) -> dict:
     """
     Применяет цепочку фильтров с трассировкой.
     Порядок: pre_filter → geo_garbage → BPF → deduplicate → L0 → L2 → L3
@@ -1087,10 +1097,11 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     run_l15_v2 = "l15v2" in parts
     run_l15 = run_l15_v1 or run_l15_v2
     run_l2 = "l2" in parts
+    run_l25 = "l25" in parts
     run_l3 = "l3" in parts
     
     l15_version = "v2" if run_l15_v2 else ("v1" if run_l15_v1 else "off")
-    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0} l1.5={l15_version} l2={run_l2} l3={run_l3}")
+    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0} l1.5={l15_version} l2={run_l2} l2.5={run_l25} l3={run_l3}")
     
     parser.tracer.start_request(seed=seed, country=country, method=method)
     
@@ -1294,6 +1305,55 @@ def apply_filters_traced(result: dict, seed: str, country: str,
             l2_trace=l2_trace,
         )
     
+    # L2.5 GEMINI FLASH-LITE — ЧИСТКА ВАЛИДОВ (между L2 и L3, по result["keywords"], НЕ по grey)
+    _l2_5_stage_data = None
+    _l2_5_blocked_map = None
+    if run_l25 and result.get("keywords"):
+        _valids_before = len(result.get("keywords", []))
+        parser.tracer.before_filter("l2_5_filter", result.get("keywords", []))
+        _t0 = time.time()
+        cfg25 = l2_5_config or _build_l2_5_config()
+        result = apply_l2_5_filter(
+            result,
+            seed=seed,
+            enable_l2_5=True,
+            config=cfg25,
+        )
+        _timings["l2_5_filter"] = round(time.time() - _t0, 4)
+        
+        l2_5_stats = result.get("l2_5_stats", {})
+        l2_5_trace = result.get("_l2_5_trace", [])
+        _valids_after = len(result.get("keywords", []))
+        _l25_removed = [t["keyword"] for t in l2_5_trace if t.get("binary") == 0]
+        
+        logger.info(
+            f"[L2.5] VALID: {l2_5_stats.get('l2_5_valid', 0)}, "
+            f"TRASH: {l2_5_stats.get('l2_5_trash', 0)}, "
+            f"ERROR: {l2_5_stats.get('l2_5_error', 0)} "
+            f"(tokens: {l2_5_stats.get('total_tokens', 0)}, wall: {l2_5_stats.get('wall_time_sec', 0)}s)"
+        )
+        
+        # reasons-карта для таблицы заблокированных в трейсере
+        _l25_reasons = {kw: "семантическое несоответствие SEED (L2.5 Gemini)" for kw in _l25_removed}
+        parser.tracer.after_filter("l2_5_filter", result.get("keywords", []), reasons=_l25_reasons)
+        
+        # Данные для инжекта в pipeline-трассу ПОСЛЕ finish_request (как L1.5).
+        # tokens/time → отрисуются в плитке стадии в HTML.
+        _l2_5_stage_data = {
+            "name": "l2_5_filter",
+            "input": _valids_before,
+            "output": _valids_after,
+            "valid": _valids_after,
+            "blocked": _valids_before - _valids_after,
+            "grey": 0,
+            "time": _timings["l2_5_filter"],
+            "tokens": l2_5_stats.get("total_tokens", 0),
+        }
+        _l2_5_blocked_map = {
+            kw: {"blocked_by": "l2_5_filter", "reason": "семантическое несоответствие SEED (L2.5 Gemini)"}
+            for kw in _l25_removed
+        }
+    
     # L3 DEEPSEEK LLM КЛАССИФИКАТОР
     if run_l3 and result.get("keywords_grey"):
         parser.tracer.before_filter("l3_filter", result.get("keywords_grey", []))
@@ -1379,8 +1439,28 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         if _l1_5_blocked_map:
             result["_trace"].setdefault("blocked_keywords", {}).update(_l1_5_blocked_map)
 
+    # Инжектим L2.5 stage в pipeline-трассу (после l2_filter, перед l3).
+    # Идемпотентно: если стадия уже есть — обновляем, иначе вставляем.
+    if _l2_5_stage_data and isinstance(result.get("_trace"), dict):
+        stages = result["_trace"].setdefault("stages", [])
+        existing_idx = next((i for i, st in enumerate(stages) if st.get("name") == "l2_5_filter"), None)
+        if existing_idx is not None:
+            stages[existing_idx] = _l2_5_stage_data
+        else:
+            insert_idx = None
+            for i, st in enumerate(stages):
+                if st.get("name") == "l2_filter":
+                    insert_idx = i + 1
+                    break
+            if insert_idx is not None:
+                stages.insert(insert_idx, _l2_5_stage_data)
+            else:
+                stages.append(_l2_5_stage_data)
+        if _l2_5_blocked_map:
+            result["_trace"].setdefault("blocked_keywords", {}).update(_l2_5_blocked_map)
+
     result["_filter_timings"] = _timings  # ← реальные замеры времени
-    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l15": run_l15, "l2": run_l2, "l3": run_l3, "rel": not parser.skip_relevance_filter}
+    result["_filters_enabled"] = {"pre": run_pre, "geo": run_geo, "bpf": run_bpf, "l0": run_l0, "l15": run_l15, "l2": run_l2, "l25": run_l25, "l3": run_l3, "rel": not parser.skip_relevance_filter}
     return result
 
 
@@ -1412,6 +1492,7 @@ async def apply_filters_endpoint(req: ApplyFiltersRequest):
     }
 
     l2_config = _build_l2_config(req.l2_pmi_valid, req.l2_centroid_valid, req.l2_centroid_trash)
+    l2_5_config = _build_l2_5_config()
     l3_config = _build_l3_config()
 
     result = apply_filters_traced(
@@ -1422,6 +1503,7 @@ async def apply_filters_endpoint(req: ApplyFiltersRequest):
         language=req.language,
         enabled_filters=req.filters,
         l2_config=l2_config,
+        l2_5_config=l2_5_config,
         l3_config=l3_config,
     )
 
