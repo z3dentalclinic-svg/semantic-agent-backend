@@ -1,5 +1,5 @@
 """
-l2_5_filter.py — Слой 2.5: Gemini 3.1 Flash-Lite, чистка ВАЛИДОВ1.
+l2_5_filter.py — Слой 2.5: Gemini 3.1 Flash-Lite, чистка ВАЛИДОВ.
 
 Позиция в пайплайне: между L2 и L3. Гоняется по VALID (result["keywords"]),
 грей-зону НЕ трогает (её обрабатывает L3). Критерий — валид/невалид.
@@ -45,7 +45,7 @@ API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # thinkingLevel: "minimal" (дешевле/быстрее), "low" (рекоменд. для классификации),
 # "medium"/"high" (точнее/дороже). Старт — "low".
-THINKING_LEVEL = "low"
+THINKING_LEVEL = "medium"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
