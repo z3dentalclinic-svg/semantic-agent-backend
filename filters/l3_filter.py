@@ -1,26 +1,31 @@
 """
-l3_filter.py — Слой 3: Claude Sonnet 4.6 классификатор для GREY-зоны.
+l3_filter.py — Слой 3: LLM-классификатор GREY-зоны с переключателем моделей.
 
-Версия: БИНАРНАЯ (0 или 1), 2 корзины, effort=medium (adaptive thinking), lean-промпт.
+Версия: БИНАРНАЯ (0 или 1), 2 корзины, MULTI-MODEL (тест июль 2026), lean-промпт.
 
 Архитектура:
-- Модель: claude-sonnet-4-6 (Anthropic, $3/$15 за 1M токенов)
-- effort="medium" + adaptive thinking (среднее мышление)
-- batch_size=20, max_parallel=7
-- Бинарная классификация: 1 → VALID, 0 → TRASH
-- exponential backoff (2->4->8->16с) на 5 попытках
-- Параметры region/language передаются в user-prompt
-- Промпт — lean (одна фраза «очисти от брака парсинга» + вывод 1/0), без правил
+- Реестр MODELS: 4 модели, 3 провайдера (OpenAI / Anthropic / Google)
+    gpt-5.6-sol      $5/$30   (OpenAI, reasoning_effort)
+    claude-fable-5   $10/$50  (Anthropic, adaptive thinking + effort) — референс качества
+    claude-opus-5    $5/$25   (Anthropic, adaptive thinking + effort)
+    gemini-3.6-flash $1.5/$7.5 (Google, thinkingLevel)
+- Модель и effort приходят из UI: config.model / config.reasoning_effort
+  (backend должен пробросить l3_model / l3_effort из тела запроса в L3Config)
+- batch_size=20, max_parallel=7 — без изменений
+- Бинарная классификация: 1 → VALID, 0 → TRASH — без изменений
+- exponential backoff (2->4->8->16с) на 5 попытках — без изменений
+- Промпт lean — БЕЗ ИЗМЕНЕНИЙ (правило теста: промпт не трогаем)
+- Стоимость прогона: считается из usage ответа API × цены реестра,
+  агрегируется в l3_stats (tokens_prompt/completion/thinking, cost_usd)
 
-ВАЖНО про API (Anthropic Messages):
-- Endpoint: /v1/messages, заголовки x-api-key + anthropic-version
-- max_tokens (лимит на ВЕСЬ output: thinking + текст)
-- system — отдельный top-level параметр
-- thinking={"type":"adaptive"} + output_config={"effort": ...}
-- ответ: content[] из блоков, текст из type=="text"
+Маппинг effort по провайдерам (в лог пишется фактически отправленное):
+- OpenAI:    reasoning_effort = low|medium|high (как задано)
+- Anthropic: thinking adaptive + output_config.effort = low|medium|high (как задано)
+- Gemini:    thinkingLevel — только low|high, поэтому medium→high (см. _GEMINI_LEVEL)
 
-ОТКАТ НА GPT: _call_openai закомментирована ниже (не удалена). Раскомментируй её,
-верни вызов _call_openai в _process_batch и GPT-константы MODEL/API_URL вверху.
+Fable 5: классификаторы Anthropic могут перекинуть запрос на Opus 4.8 —
+в ответе поле model будет отличаться от запрошенного. Ловим это через
+diag.served_model, несовпадения попадают в l3_stats.served_model_mismatch.
 
 ИСТОРИЯ моделей в этом проекте:
 - Gemini 2.5 Flash-Lite preview — старт, отбросили (плохо UA)
@@ -33,9 +38,10 @@ l3_filter.py — Слой 3: Claude Sonnet 4.6 классификатор для
 - Gemini 3.1 Flash-Lite (high/minimal) — слабо
 - Gemini 3.1 Pro (thinking=medium) — сыпалась так же на гео
 - GPT-5.5 (reasoning=medium) + lean-промпт — предыдущая (закомментирована)
-- Claude Sonnet 4.6 (effort=medium, adaptive thinking) + lean-промпт — текущая
+- Claude Sonnet 4.6 (effort=medium, adaptive thinking) — пропускала пограничный мусор
+- MULTI-MODEL тест: Sol / Fable 5 / Opus 5 / Gemini 3.6 Flash — текущая
 
-Ключ: env ANTHROPIC_API_KEY (настроена в Render).
+Ключи: env OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY (Render).
 """
 
 import os
@@ -48,17 +54,56 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 
-# --- GPT (ЗАКОММЕНТИРОВАНО, для отката раскомментируй и закомментируй Anthropic ниже) ---
+# --- ИСТОРИЯ (закомментировано, не удалять — точки отката) ---
 # MODEL = "gpt-5.5"
 # API_URL = "https://api.openai.com/v1/chat/completions"
+# MODEL = "claude-sonnet-4-6"
+# API_URL = "https://api.anthropic.com/v1/messages"
 
-# --- Anthropic Claude Sonnet 4.6 (АКТИВНЫЙ) ---
-MODEL = "claude-sonnet-4-6"
-API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
-# Ключ — из переменной окружения ANTHROPIC_API_KEY (настроена в Render).
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+# =============================================================================
+# РЕЕСТР МОДЕЛЕЙ — тест июль 2026. Цены: $ за 1M токенов (input/output).
+# Стоимость output считается по billable_output_tokens:
+#   OpenAI    — completion_tokens (reasoning уже внутри)
+#   Anthropic — output_tokens (thinking уже внутри)
+#   Gemini    — candidatesTokenCount + thoughtsTokenCount (thinking биллится как output)
+# =============================================================================
+MODELS: Dict[str, Dict[str, Any]] = {
+    "gpt-5.6-sol": {
+        "provider": "openai",
+        "api_url": "https://api.openai.com/v1/chat/completions",
+        "key_env": "OPENAI_API_KEY",
+        "price_in": 5.00, "price_out": 30.00,
+        "label": "GPT-5.6 Sol",
+    },
+    "claude-fable-5": {
+        "provider": "anthropic",
+        "api_url": "https://api.anthropic.com/v1/messages",
+        "key_env": "ANTHROPIC_API_KEY",
+        "price_in": 10.00, "price_out": 50.00,
+        "label": "Claude Fable 5",
+    },
+    "claude-opus-5": {
+        "provider": "anthropic",
+        "api_url": "https://api.anthropic.com/v1/messages",
+        "key_env": "ANTHROPIC_API_KEY",
+        "price_in": 5.00, "price_out": 25.00,
+        "label": "Claude Opus 5",
+    },
+    "gemini-3.6-flash": {
+        "provider": "gemini",
+        "api_url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+        "key_env": "GEMINI_API_KEY",
+        "price_in": 1.50, "price_out": 7.50,
+        "label": "Gemini 3.6 Flash",
+    },
+}
+
+DEFAULT_MODEL = "claude-opus-5"
+
+# Gemini 3.x: thinkingLevel принимает только low|high → medium маппим в high.
+_GEMINI_LEVEL = {"low": "low", "medium": "high", "high": "high", "xhigh": "high", "max": "high"}
 
 
 @dataclass
@@ -70,7 +115,8 @@ class L3Config:
     max_parallel: int = 7
     region: str = "Украина"
     language: str = "русский"
-    reasoning_effort: str = "medium"  # Anthropic effort: low|medium|high|xhigh|max
+    reasoning_effort: str = "medium"  # low|medium|high (общая шкала; Gemini: medium→high)
+    model: str = DEFAULT_MODEL        # ключ из MODELS; приходит из UI (l3_model)
 
 
 # =============================================================================
@@ -260,6 +306,8 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
     return "\n".join(lines)
 
 
+# ЛЕГАСИ (GPT-5.5, single-model). Заменена активной универсальной _call_openai ниже.
+# Не удалять — точка отката.
 # def _call_openai(
 #     api_key: str,
 #     system_prompt: str,
@@ -330,26 +378,109 @@ def _build_user_prompt(region: str, language: str, seed: str, keywords: List[str
 #         raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
 
 
-def _call_anthropic(
+def _call_openai(
+    spec: Dict[str, Any],
+    model_id: str,
     api_key: str,
     system_prompt: str,
     user_prompt: str,
     timeout: int,
     effort: str,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Anthropic Messages API, Claude Sonnet 4.6, adaptive thinking + effort.
+    """OpenAI Chat Completions (GPT-5.6 family).
 
-    Отличия от GPT:
-    - endpoint /v1/messages, заголовки x-api-key + anthropic-version
-    - system — отдельный top-level параметр (не сообщение)
-    - max_tokens (не max_completion_tokens) — лимит на ВЕСЬ output (thinking + текст)
-    - thinking={"type":"adaptive"} + output_config={"effort": ...} — глубина мышления
-    - ответ: content[] из блоков; текст берём из type=="text", thinking пропускаем
+    - max_completion_tokens вместо max_tokens
+    - temperature/top_p НЕ поддерживаются reasoning-моделями
+    - reasoning_effort: low|medium|high (передаём как есть)
+    - completion_tokens уже ВКЛЮЧАЕТ reasoning_tokens → биллинг по нему
     """
     import requests
 
     payload = {
-        "model": MODEL,
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_completion_tokens": 8192,
+        "stream": False,
+        "reasoning_effort": effort,
+    }
+
+    try:
+        response = requests.post(
+            spec["api_url"],
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"OpenAI network error: {type(e).__name__}: {e}")
+
+    if response.status_code != 200:
+        raise Exception(f"OpenAI API error {response.status_code}: {response.text[:500]}")
+
+    try:
+        data = response.json()
+    except Exception as e:
+        raise Exception(f"OpenAI JSON parse error: {e}. Raw: {response.text[:300]}")
+
+    try:
+        choice = data['choices'][0]
+        message = choice['message']
+        content = (message.get('content') or '').strip()
+
+        usage = data.get('usage', {}) or {}
+        completion_details = usage.get('completion_tokens_details', {}) or {}
+        diag = {
+            "prompt_tokens": usage.get('prompt_tokens'),
+            "completion_tokens": usage.get('completion_tokens'),
+            "reasoning_tokens": completion_details.get('reasoning_tokens'),
+            "billable_output_tokens": usage.get('completion_tokens'),  # reasoning внутри
+            "finish_reason": choice.get('finish_reason'),
+            "served_model": data.get('model'),
+            "effort_sent": effort,
+        }
+    except (KeyError, IndexError, TypeError):
+        if 'choices' not in data:
+            raise Exception(f"OpenAI no choices: {str(data)[:400]}")
+        choice = data['choices'][0] if data.get('choices') else {}
+        finish = choice.get('finish_reason', 'UNKNOWN')
+        raise Exception(f"OpenAI unexpected response (finish_reason={finish}): {str(data)[:400]}")
+
+    if not content:
+        raise Exception(f"OpenAI empty text (finish_reason={diag['finish_reason']}): {str(data)[:400]}")
+
+    return content, diag
+
+
+def _call_anthropic(
+    spec: Dict[str, Any],
+    model_id: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int,
+    effort: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Anthropic Messages API (Fable 5 / Opus 5), adaptive thinking + effort.
+
+    - endpoint /v1/messages, заголовки x-api-key + anthropic-version
+    - system — отдельный top-level параметр (не сообщение)
+    - max_tokens — лимит на ВЕСЬ output (thinking + текст)
+    - thinking={"type":"adaptive"} + output_config={"effort": ...}
+    - ответ: content[] из блоков; текст берём из type=="text", thinking пропускаем
+    - output_tokens уже ВКЛЮЧАЕТ thinking → биллинг по нему
+    - served_model: у Fable 5 классификаторы могут перекинуть запрос на Opus 4.8 —
+      тогда data.model != model_id, ловим в _process_batch
+    """
+    import requests
+
+    payload = {
+        "model": model_id,
         "max_tokens": 8192,
         "system": system_prompt,
         "messages": [
@@ -361,7 +492,7 @@ def _call_anthropic(
 
     try:
         response = requests.post(
-            API_URL,
+            spec["api_url"],
             headers={
                 "Content-Type": "application/json",
                 "x-api-key": api_key,
@@ -396,9 +527,12 @@ def _call_anthropic(
     usage = data.get("usage", {}) or {}
     diag = {
         "prompt_tokens": usage.get("input_tokens"),
-        "completion_tokens": usage.get("output_tokens"),  # thinking входит сюда же
-        "reasoning_tokens": None,                          # Anthropic отдельно не выдаёт
+        "completion_tokens": usage.get("output_tokens"),   # thinking входит сюда же
+        "reasoning_tokens": None,                           # Anthropic отдельно не выдаёт
+        "billable_output_tokens": usage.get("output_tokens"),
         "finish_reason": data.get("stop_reason"),
+        "served_model": data.get("model"),
+        "effort_sent": effort,
     }
 
     if not content:
@@ -407,6 +541,124 @@ def _call_anthropic(
             f"Anthropic empty text (stop_reason={data.get('stop_reason')}): {str(data)[:400]}"
         )
 
+    return content, diag
+
+
+def _call_gemini(
+    spec: Dict[str, Any],
+    model_id: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int,
+    effort: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Google Gemini generateContent (Gemini 3.6 Flash).
+
+    - endpoint .../models/{model}:generateContent, ключ в заголовке x-goog-api-key
+    - systemInstruction — отдельный top-level параметр
+    - thinkingConfig.thinkingLevel: только low|high → medium маппим в high (_GEMINI_LEVEL)
+    - ответ: candidates[0].content.parts[]; parts с thought==true пропускаем
+    - thinking биллится как output → billable = candidatesTokenCount + thoughtsTokenCount
+    """
+    import requests
+
+    level = _GEMINI_LEVEL.get(effort, "high")
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": user_prompt}]},
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 8192,
+            "thinkingConfig": {"thinkingLevel": level},
+        },
+    }
+
+    try:
+        response = requests.post(
+            spec["api_url"],
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            json=payload,
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Gemini network error: {type(e).__name__}: {e}")
+
+    if response.status_code != 200:
+        raise Exception(f"Gemini API error {response.status_code}: {response.text[:500]}")
+
+    try:
+        data = response.json()
+    except Exception as e:
+        raise Exception(f"Gemini JSON parse error: {e}. Raw: {response.text[:300]}")
+
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise Exception(f"Gemini no candidates: {str(data)[:400]}")
+
+    cand = candidates[0]
+    parts = ((cand.get("content") or {}).get("parts")) or []
+    # Текст-ответ — конкатенация parts без флага thought (thinking пропускаем)
+    text_parts = [
+        p.get("text", "")
+        for p in parts
+        if isinstance(p, dict) and not p.get("thought")
+    ]
+    content = "".join(text_parts).strip()
+
+    um = data.get("usageMetadata", {}) or {}
+    cand_tokens = um.get("candidatesTokenCount") or 0
+    thought_tokens = um.get("thoughtsTokenCount") or 0
+    diag = {
+        "prompt_tokens": um.get("promptTokenCount"),
+        "completion_tokens": cand_tokens,
+        "reasoning_tokens": thought_tokens,
+        "billable_output_tokens": cand_tokens + thought_tokens,  # thinking биллится как output
+        "finish_reason": cand.get("finishReason"),
+        "served_model": data.get("modelVersion"),
+        "effort_sent": level,
+    }
+
+    if not content:
+        raise Exception(
+            f"Gemini empty text (finishReason={cand.get('finishReason')}): {str(data)[:400]}"
+        )
+
+    return content, diag
+
+
+def _call_llm(
+    config: "L3Config",
+    system_prompt: str,
+    user_prompt: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Диспетчер: по config.model выбирает провайдера, зовёт его caller,
+    добавляет в diag стоимость батча по ценам реестра."""
+    spec = MODELS[config.model]
+    provider = spec["provider"]
+
+    if provider == "openai":
+        caller = _call_openai
+    elif provider == "anthropic":
+        caller = _call_anthropic
+    elif provider == "gemini":
+        caller = _call_gemini
+    else:
+        raise Exception(f"Unknown provider {provider!r} for model {config.model!r}")
+
+    content, diag = caller(
+        spec, config.model, config.api_key,
+        system_prompt, user_prompt,
+        config.timeout, config.reasoning_effort,
+    )
+
+    pt = diag.get("prompt_tokens") or 0
+    bo = diag.get("billable_output_tokens") or 0
+    diag["cost_usd"] = pt / 1e6 * spec["price_in"] + bo / 1e6 * spec["price_out"]
     return content, diag
 
 
@@ -461,17 +713,14 @@ def _process_batch(
     seed: str,
     config: L3Config,
     total_batches: int,
-) -> Tuple[int, List[Optional[int]], float]:
+) -> Tuple[int, List[Optional[int]], float, Dict[str, Any]]:
     batch_num = batch_idx + 1
     user_prompt = _build_user_prompt(config.region, config.language, seed, batch)
 
     for attempt in range(config.max_retries + 1):
         try:
             t0 = time.time()
-            response, diag = _call_anthropic(
-                config.api_key, SYSTEM_PROMPT, user_prompt,
-                config.timeout, config.reasoning_effort
-            )
+            response, diag = _call_llm(config, SYSTEM_PROMPT, user_prompt)
             elapsed = time.time() - t0
 
             labels = _parse_labels(response, len(batch))
@@ -483,16 +732,18 @@ def _process_batch(
             logger.info(
                 f"[L3] Batch {batch_num}/{total_batches} — "
                 f"VALID: {valid_count}, TRASH: {trash_count}, ERROR: {error_count} "
-                f"({elapsed:.1f}s)"
+                f"({elapsed:.1f}s, ${diag.get('cost_usd', 0):.6f})"
             )
             logger.info(
                 f"[L3-DIAG] Batch {batch_num}: "
                 f"prompt={diag.get('prompt_tokens')} "
                 f"completion={diag.get('completion_tokens')} "
                 f"reasoning_tokens={diag.get('reasoning_tokens')} "
-                f"finish={diag.get('finish_reason')}"
+                f"finish={diag.get('finish_reason')} "
+                f"served={diag.get('served_model')} "
+                f"effort_sent={diag.get('effort_sent')}"
             )
-            return (batch_idx, labels, elapsed)
+            return (batch_idx, labels, elapsed, diag)
 
         except Exception as e:
             if attempt < config.max_retries:
@@ -504,7 +755,7 @@ def _process_batch(
                 time.sleep(backoff)
             else:
                 logger.error(f"[L3] Batch {batch_num} FAILED after {config.max_retries+1} attempts: {e}")
-                return (batch_idx, [None] * len(batch), 0.0)
+                return (batch_idx, [None] * len(batch), 0.0, {})
 
 
 def apply_l3_filter(
@@ -524,12 +775,23 @@ def apply_l3_filter(
     if config is None:
         config = L3Config()
 
-    # Ключ из env ANTHROPIC_API_KEY (Render). Берём свежий на каждый вызов.
-    config.api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip() or ANTHROPIC_API_KEY
+    # Валидация модели: незнакомый id → дефолт (защита от опечатки в UI/backend)
+    if config.model not in MODELS:
+        logger.warning(f"[L3] Unknown model {config.model!r} — falling back to {DEFAULT_MODEL}")
+        config.model = DEFAULT_MODEL
+    spec = MODELS[config.model]
+
+    # Ключ провайдера из env (Render). Берём свежий на каждый вызов.
+    config.api_key = os.environ.get(spec["key_env"], "").strip()
 
     if not config.api_key:
-        logger.warning("[L3] ANTHROPIC_API_KEY не задан в окружении — skipping")
-        result["l3_stats"] = {"error": "no_api_key", "input_grey": len(grey_keywords)}
+        logger.warning(f"[L3] {spec['key_env']} не задан в окружении — skipping")
+        result["l3_stats"] = {
+            "error": "no_api_key",
+            "key_env": spec["key_env"],
+            "model": config.model,
+            "input_grey": len(grey_keywords),
+        }
         return result
 
     logger.info(
@@ -547,7 +809,7 @@ def apply_l3_filter(
     workers = min(config.max_parallel, total_batches)
 
     logger.info(
-        f"[L3] Processing {len(kw_strings)} GREY keywords via {MODEL} "
+        f"[L3] Processing {len(kw_strings)} GREY keywords via {config.model} "
         f"({total_batches} batches of {config.batch_size}, {workers} parallel) "
         f"region={config.region} language={config.language} reasoning={config.reasoning_effort} "
         f"binary classification: 1=VALID, 0=TRASH"
@@ -557,15 +819,37 @@ def apply_l3_filter(
     api_time = 0.0
     t_wall_start = time.time()
 
+    # Агрегация usage/стоимости по батчам
+    tok_prompt = 0
+    tok_completion = 0
+    tok_thinking = 0
+    thinking_known = False
+    cost_usd = 0.0
+    effort_sent = None
+    served_mismatch: List[Dict[str, Any]] = []
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(_process_batch, idx, batch, seed, config, total_batches): idx
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(futures):
-            batch_idx, labels, elapsed = future.result()
+            batch_idx, labels, elapsed, diag = future.result()
             batch_results[batch_idx] = labels
             api_time += elapsed
+
+            tok_prompt += diag.get("prompt_tokens") or 0
+            tok_completion += diag.get("completion_tokens") or 0
+            if diag.get("reasoning_tokens") is not None:
+                tok_thinking += diag["reasoning_tokens"]
+                thinking_known = True
+            cost_usd += diag.get("cost_usd") or 0.0
+            if diag.get("effort_sent") is not None:
+                effort_sent = diag["effort_sent"]
+            # Fable 5: несовпадение served/requested = переброс классификатором на Opus 4.8
+            served = diag.get("served_model")
+            if served and config.model not in str(served):
+                served_mismatch.append({"batch": batch_idx + 1, "served_model": served})
 
     wall_time = round(time.time() - t_wall_start, 2)
 
@@ -589,7 +873,7 @@ def apply_l3_filter(
                 trace_rec["l2_info"] = kw_obj["l2"]
         l3_trace.append(trace_rec)
 
-        l3_meta = {"label": bucket, "binary": label_int, "source": MODEL}
+        l3_meta = {"label": bucket, "binary": label_int, "source": config.model}
 
         if bucket == "VALID":
             if isinstance(kw_obj, dict):
@@ -636,17 +920,28 @@ def apply_l3_filter(
         "batches": total_batches,
         "batch_size": config.batch_size,
         "parallel": workers,
-        "model": MODEL,
+        "model": config.model,
+        "model_label": spec["label"],
+        "provider": spec["provider"],
         "region": config.region,
         "language": config.language,
         "reasoning_effort": config.reasoning_effort,
+        "effort_sent": effort_sent or config.reasoning_effort,
         "classification": "binary_1_0",
+        # Токены и стоимость прогона (для HTML-панели)
+        "tokens_prompt": tok_prompt,
+        "tokens_completion": tok_completion,
+        "tokens_thinking": tok_thinking if thinking_known else None,
+        "cost_usd": round(cost_usd, 6),
+        "price_in": spec["price_in"],
+        "price_out": spec["price_out"],
+        "served_model_mismatch": served_mismatch,  # Fable 5 → переброс на Opus 4.8
     }
     out["_l3_trace"] = l3_trace
 
     logger.info(
-        f"[L3] Done: {len(l3_valid)} VALID, {len(l3_trash)} TRASH, "
-        f"{len(l3_error)} ERROR | wall: {wall_time}s"
+        f"[L3] Done ({config.model}): {len(l3_valid)} VALID, {len(l3_trash)} TRASH, "
+        f"{len(l3_error)} ERROR | wall: {wall_time}s | cost: ${round(cost_usd, 6)}"
     )
 
     return out
