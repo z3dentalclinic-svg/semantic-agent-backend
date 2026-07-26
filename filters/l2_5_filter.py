@@ -14,7 +14,8 @@ l2_5_filter.py — Слой 2.5: Gemini 3.1 Flash-Lite, чистка ВАЛИД�
 Нераспознанное (None) ОСТАЁТСЯ в VALID — фильтр только понижает уверенно.
 
 API (Google Generative Language, Gemini):
-- POST https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key=...
+- POST https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent
+  (ключ в заголовке x-goog-api-key, НЕ в URL — иначе утекает в логи)
 - systemInstruction — отдельный top-level блок
 - thinkingConfig.thinkingLevel: minimal | low | medium | high  (Gemini 3.x; НЕ thinkingBudget)
 - ответ: candidates[0].content.parts[*].text ; usageMetadata.{promptTokenCount,
@@ -50,7 +51,8 @@ PRICE_OUT = 1.50
 
 # thinkingLevel: "minimal" (дешевле/быстрее), "low" (рекоменд. для классификации),
 # "medium"/"high" (точнее/дороже). Старт — "low".
-THINKING_LEVEL = "medium"
+# THINKING_LEVEL = "medium"  # база A/B-теста: 0 флипов medium↔medium на 256 ключах
+THINKING_LEVEL = "low"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -101,7 +103,9 @@ def _call_gemini(
     """Google Generative Language API, Gemini 3.1 Flash-Lite."""
     import requests
 
-    url = f"{API_BASE}/{MODEL}:generateContent?key={api_key}"
+    # Ключ — ТОЛЬКО в заголовке x-goog-api-key, не в URL: query-параметр ?key=
+    # попадает в логи HTTP-клиентов (httpx печатает полный URL) — так ключ и утёк.
+    url = f"{API_BASE}/{MODEL}:generateContent"
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
@@ -116,7 +120,10 @@ def _call_gemini(
     try:
         response = requests.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
             json=payload,
             timeout=timeout,
         )
