@@ -39,7 +39,8 @@ diag.served_model, несовпадения попадают в l3_stats.served_
 - Gemini 3.1 Pro (thinking=medium) — сыпалась так же на гео
 - GPT-5.5 (reasoning=medium) + lean-промпт — предыдущая (закомментирована)
 - Claude Sonnet 4.6 (effort=medium, adaptive thinking) — пропускала пограничный мусор
-- MULTI-MODEL тест: Sol / Fable 5 / Opus 5 / Gemini 3.6 Flash — текущая
+- MULTI-MODEL тест: Sol / Fable 5 / Opus 5 / Gemini 3.6 Flash
+- Итог теста: Gemini 3.6 Flash (medium) — текущая, зафиксирована как DEFAULT_MODEL
 
 Ключи: env OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY (Render).
 """
@@ -100,7 +101,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DEFAULT_MODEL = "claude-opus-5"
+# ПРОД (итог теста июль 2026): Gemini 3.6 Flash.
+# DEFAULT_MODEL = "claude-opus-5"  # дефолт на время теста — точка отката
+DEFAULT_MODEL = "gemini-3.6-flash"
 
 # Gemini 3.x: thinkingLevel принимает только low|high → medium маппим в high.
 _GEMINI_LEVEL = {"low": "low", "medium": "high", "high": "high", "xhigh": "high", "max": "high"}
