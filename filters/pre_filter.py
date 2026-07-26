@@ -89,12 +89,28 @@ def pre_filter(query: str, seed: str) -> tuple:
             return True
         return False
 
+    def _has_digit_neighbor(idx: int, words: list) -> bool:
+        """Правило цифрового соседа: одиночная буква — это характеристика
+        (ампераж/вольтаж/размер: '7 а', '12 в', '4 а'), а не шум, если
+        СМЕЖНЫЙ токен слева или справа содержит цифру. Работает для любых
+        единиц в любой нише — алгоритм, не список. Слитные формы ('12в',
+        '7ач') сюда не попадают — они и так не одиночные буквы."""
+        if idx - 1 >= 0 and any(ch.isdigit() for ch in words[idx - 1]):
+            return True
+        if idx + 1 < len(words) and any(ch.isdigit() for ch in words[idx + 1]):
+            return True
+        return False
+
     noise_letter = None
     noise_idx = None
     for i, w in enumerate(q_words):
         if w in SAFE_NOISE_LETTERS:
             # Защита для 'б у'
             if _is_b_u_abbreviation(i):
+                continue
+            # Защита цифрового соседа: '7 а', '4 а', '12 вольт 7 а' —
+            # буква = единица измерения при числе, не шум парсинга.
+            if _has_digit_neighbor(i, q_words):
                 continue
             noise_letter = w
             noise_idx = i
@@ -172,7 +188,14 @@ def pre_filter(query: str, seed: str) -> tuple:
     
     # 6. Одиночный символ: "ремонт пылесосов а"
     if len(tail) == 1 and not tail.isdigit():
-        return True, f"одиночный символ: '{tail}'"
+        # Защита цифрового соседа (в ПОЛНОМ запросе, не в хвосте):
+        # "аккумулятор на скутер 12 в" → tail='в', но слева '12' → характеристика.
+        _saved_by_digit = any(
+            _w == tail and _has_digit_neighbor(_i, q_words)
+            for _i, _w in enumerate(q_words)
+        )
+        if not _saved_by_digit:
+            return True, f"одиночный символ: '{tail}'"
 
     # 7. Токен-спецсимвол в хвосте: "*1", "#2", "**", "©" и т.п.
     # Мусор = нет букв И есть хотя бы один спецсимвол (не цифра).
