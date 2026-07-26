@@ -1051,10 +1051,14 @@ def _build_l2_config(pmi_valid=None, centroid_valid=None, centroid_trash=None):
     return config
 
 
-def _build_l3_config(api_key=None):
-    """Собирает L3 config."""
+def _build_l3_config(api_key=None, model=None, effort=None):
+    """Собирает L3 config. model/effort — из UI (l3_model/l3_effort); None = дефолты l3_filter."""
     config = L3Config()
-    config.api_key = api_key or DEEPSEEK_API_KEY
+    config.api_key = api_key or DEEPSEEK_API_KEY  # легаси: l3_filter сам берёт ключ по провайдеру из env
+    if model:
+        config.model = model
+    if effort:
+        config.reasoning_effort = effort
     return config
 
 
@@ -1063,6 +1067,45 @@ def _build_l2_5_config(api_key=None):
     config = L2_5Config()
     config.api_key = api_key or GEMINI_API_KEY
     return config
+
+
+def _run_l25_l3_fork(result: dict, seed: str, cfg25, cfg3):
+    """Параллельная вилка L2.5 ∥ L3.
+
+    L2.5 чистит VALID (result["keywords"]), L3 разбирает GREY (result["keywords_grey"]) —
+    множества не пересекаются, зависимости по данным нет. Каждый поток получает
+    изолированную копию своего входа (никакой общей мутации), слияние воспроизводит
+    итоговое состояние последовательного прогона L2.5 → L3 байт-в-байт:
+      keywords      = оставленные L2.5 + промоуты L3
+      anchors       = base + срезы L2.5 + срезы L3
+      keywords_grey = ERROR-кейсы L3
+    Возвращает (result, fork_wall, r25, r3). Чистая логика данных — tracer/логи снаружи.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    _in25 = {"keywords": list(result.get("keywords", [])), "anchors": []}
+    _in3 = {"keywords": [], "anchors": [], "keywords_grey": list(result.get("keywords_grey", []))}
+
+    _t0 = time.time()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f25 = ex.submit(apply_l2_5_filter, _in25, seed, True, cfg25)
+        f3 = ex.submit(apply_l3_filter, _in3, seed, True, cfg3)
+        r25 = f25.result()
+        r3 = f3.result()
+    fork_wall = round(time.time() - _t0, 4)
+
+    result["keywords"] = r25.get("keywords", []) + r3.get("keywords", [])
+    result["anchors"] = result.get("anchors", []) + r25.get("anchors", []) + r3.get("anchors", [])
+    result["keywords_grey"] = r3.get("keywords_grey", [])
+    result["l2_5_stats"] = r25.get("l2_5_stats", {})
+    result["_l2_5_trace"] = r25.get("_l2_5_trace", [])
+    result["l3_stats"] = r3.get("l3_stats", {})
+    result["_l3_trace"] = r3.get("_l3_trace", [])
+    kw_count = len(result["keywords"])
+    for ck in ("count", "total_count", "total_unique_keywords"):
+        if ck in result:
+            result[ck] = kw_count
+    return result, fork_wall, r25, r3
 
 
 def apply_filters_traced(result: dict, seed: str, country: str, 
@@ -1308,7 +1351,76 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     # L2.5 GEMINI FLASH-LITE — ЧИСТКА ВАЛИДОВ (между L2 и L3, по result["keywords"], НЕ по grey)
     _l2_5_stage_data = None
     _l2_5_blocked_map = None
-    if run_l25 and result.get("keywords"):
+    _l25_l3_forked = False
+
+    # ── ПАРАЛЛЕЛЬНАЯ ВИЛКА L2.5 ∥ L3 ─────────────────────────────────────────
+    # Оба включены и обоим есть что делать → гоним одновременно (wall = max вместо суммы).
+    # Слияние в _run_l25_l3_fork воспроизводит порядок последовательного прогона.
+    if run_l25 and run_l3 and result.get("keywords") and result.get("keywords_grey"):
+        _l25_l3_forked = True
+        _valids_in = list(result.get("keywords", []))
+        _grey_in = list(result.get("keywords_grey", []))
+        _valids_before = len(_valids_in)
+        parser.tracer.before_filter("l2_5_filter", _valids_in)
+        cfg25 = l2_5_config or _build_l2_5_config()
+        cfg = l3_config or _build_l3_config()
+
+        result, _fork_wall, _r25, _r3 = _run_l25_l3_fork(result, seed, cfg25, cfg)
+        # Сумма _timings должна равняться реальному времени: вилка учитывается один раз
+        _timings["l2_5_filter"] = _fork_wall
+        _timings["l3_filter"] = 0.0
+        logger.info(f"[L2.5∥L3] fork wall={_fork_wall}s (обе стадии одновременно)")
+
+        # ── пост-обработка L2.5 (идентична последовательной ветке) ──
+        l2_5_stats = result.get("l2_5_stats", {})
+        l2_5_trace = result.get("_l2_5_trace", [])
+        _valids_after = len(_r25.get("keywords", []))
+        _l25_removed = [t["keyword"] for t in l2_5_trace if t.get("binary") == 0]
+        logger.info(
+            f"[L2.5] VALID: {l2_5_stats.get('l2_5_valid', 0)}, "
+            f"TRASH: {l2_5_stats.get('l2_5_trash', 0)}, "
+            f"ERROR: {l2_5_stats.get('l2_5_error', 0)} "
+            f"(tokens: {l2_5_stats.get('total_tokens', 0)}, wall: {l2_5_stats.get('wall_time_sec', 0)}s)"
+        )
+        _l25_reasons = {kw: "семантическое несоответствие SEED (L2.5 Gemini)" for kw in _l25_removed}
+        parser.tracer.after_filter("l2_5_filter", _r25.get("keywords", []), reasons=_l25_reasons)
+        _l2_5_stage_data = {
+            "name": "l2_5_filter",
+            "input": _valids_before,
+            "output": _valids_after,
+            "valid": _valids_after,
+            "blocked": _valids_before - _valids_after,
+            "grey": 0,
+            "time": _timings["l2_5_filter"],
+            "tokens": l2_5_stats.get("total_tokens", 0),
+        }
+        _l2_5_blocked_map = {
+            kw: {"blocked_by": "l2_5_filter", "reason": "семантическое несоответствие SEED (L2.5 Gemini)"}
+            for kw in _l25_removed
+        }
+
+        # ── пост-обработка L3 (идентична последовательной ветке) ──
+        parser.tracer.before_filter("l3_filter", _grey_in)
+        l3_stats = result.get("l3_stats", {})
+        l3_trace = result.get("_l3_trace", [])
+        logger.info(
+            f"[L3] VALID: {l3_stats.get('l3_valid', 0)}, "
+            f"TRASH: {l3_stats.get('l3_trash', 0)}, "
+            f"ERROR: {l3_stats.get('l3_error', 0)} "
+            f"(API: {l3_stats.get('api_time', 0)}s)"
+        )
+        l3_valid_kws = [t["keyword"] for t in l3_trace if t.get("label") == "VALID"]
+        l3_trash_kws = [t["keyword"] for t in l3_trace if t.get("label") == "TRASH"]
+        l3_error_kws = [t["keyword"] for t in l3_trace if t.get("label") == "ERROR"]
+        parser.tracer.after_l3_filter(
+            valid=l3_valid_kws,
+            trash=l3_trash_kws,
+            error=l3_error_kws,
+            l3_stats=l3_stats,
+            l3_trace=l3_trace,
+        )
+
+    if not _l25_l3_forked and run_l25 and result.get("keywords"):
         _valids_before = len(result.get("keywords", []))
         parser.tracer.before_filter("l2_5_filter", result.get("keywords", []))
         _t0 = time.time()
@@ -1355,7 +1467,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         }
     
     # L3 DEEPSEEK LLM КЛАССИФИКАТОР
-    if run_l3 and result.get("keywords_grey"):
+    if not _l25_l3_forked and run_l3 and result.get("keywords_grey"):
         parser.tracer.before_filter("l3_filter", result.get("keywords_grey", []))
         _t0 = time.time()
         cfg = l3_config or _build_l3_config()
@@ -1473,6 +1585,8 @@ class ApplyFiltersRequest(BaseModel):
     l2_pmi_valid: float = None
     l2_centroid_valid: float = None
     l2_centroid_trash: float = None
+    l3_model: str = None      # ← модель L3 из UI (ключ реестра MODELS в l3_filter)
+    l3_effort: str = None     # ← effort L3 из UI (low|medium|high)
 
 
 @app.post("/api/apply-filters")
@@ -1493,7 +1607,7 @@ async def apply_filters_endpoint(req: ApplyFiltersRequest):
 
     l2_config = _build_l2_config(req.l2_pmi_valid, req.l2_centroid_valid, req.l2_centroid_trash)
     l2_5_config = _build_l2_5_config()
-    l3_config = _build_l3_config()
+    l3_config = _build_l3_config(model=req.l3_model, effort=req.l3_effort)
 
     result = apply_filters_traced(
         result,
