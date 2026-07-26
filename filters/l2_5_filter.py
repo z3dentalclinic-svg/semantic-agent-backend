@@ -21,7 +21,7 @@ API (Google Generative Language, Gemini):
   candidatesTokenCount, thoughtsTokenCount, totalTokenCount}
 
 Трейс/статы (как у L3): result["_l2_5_trace"], result["l2_5_stats"]
-(stats содержит токены и время).
+(stats содержит токены, время и cost_usd).
 
 Ключ: env GEMINI_API_KEY.
 
@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 # --- Gemini 3.1 Flash-Lite ---
 MODEL = "gemini-3.1-flash-lite"   # если 404 — попробуй "gemini-3.1-flash-lite-preview"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Цены Gemini 3.1 Flash-Lite, $ за 1M токенов (июль 2026).
+# thinking биллится как output → billable_out = output_tokens + thinking_tokens.
+PRICE_IN = 0.25
+PRICE_OUT = 1.50
 
 # thinkingLevel: "minimal" (дешевле/быстрее), "low" (рекоменд. для классификации),
 # "medium"/"high" (точнее/дороже). Старт — "low".
@@ -281,6 +286,10 @@ def _run(
         "output_tokens": sum_output,
         "thinking_tokens": sum_think,
         "total_tokens": sum_total,
+        # Стоимость прогона: input × тариф + (output + thinking) × тариф
+        "cost_usd": round(sum_prompt / 1e6 * PRICE_IN + (sum_output + sum_think) / 1e6 * PRICE_OUT, 6),
+        "price_in": PRICE_IN,
+        "price_out": PRICE_OUT,
         "api_time_sec": round(sum_api, 1),    # суммарно по батчам (если бы последовательно)
         "wall_time_sec": round(wall, 1),      # реальное время (параллельно)
         "batches": total_batches,
@@ -351,7 +360,7 @@ def apply_l2_5_filter(
 
     logger.info(
         f"[L2.5] valid={n_valid} trash={n_trash} error={n_error} | "
-        f"tokens={stats['total_tokens']} wall={stats['wall_time_sec']}s"
+        f"tokens={stats['total_tokens']} wall={stats['wall_time_sec']}s cost=${stats.get('cost_usd', 0)}"
     )
     return result
 
