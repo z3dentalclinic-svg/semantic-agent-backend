@@ -57,6 +57,10 @@ PRICE_OUT = 1.50
 # THINKING_LEVEL = "medium"  # база A/B-теста: 0 флипов medium↔medium на 256 ключах
 THINKING_LEVEL = "low"
 
+# Маркер сборки — попадает в l2_5_stats.build, чтобы каждый экспорт называл
+# исполнявшуюся версию промпта/модели (аналог _build в HTML).
+L2_5_BUILD = "lite + prompt V3 (region+place criteria), 2026-07-27"
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 
@@ -328,6 +332,7 @@ def _run(
 
     stats = {
         "model": MODEL,
+        "build": L2_5_BUILD,
         "thinking_level": config.thinking_level,
         "input": len(kw_strings),
         "prompt_tokens": sum_prompt,
