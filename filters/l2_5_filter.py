@@ -40,14 +40,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
-# --- Gemini 3.1 Flash-Lite ---
-MODEL = "gemini-3.1-flash-lite"   # если 404 — попробуй "gemini-3.1-flash-lite-preview"
+# --- ТЕСТ (июль 2026): Gemini 3.6 Flash вместо Flash-Lite ---
+# Гипотеза: сильнее держит критерий №1 (вставные предлоги, дубли) и сущностных
+# пограничников. Промпт V2 и thinking=low НЕ меняются. Откат — раскомментируй ниже.
+# MODEL = "gemini-3.1-flash-lite"   # если 404 — попробуй "gemini-3.1-flash-lite-preview"
+# PRICE_IN = 0.25
+# PRICE_OUT = 1.50
+MODEL = "gemini-3.6-flash"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# Цены Gemini 3.1 Flash-Lite, $ за 1M токенов (июль 2026).
+# Цены Gemini 3.6 Flash, $ за 1M токенов (июль 2026).
 # thinking биллится как output → billable_out = output_tokens + thinking_tokens.
-PRICE_IN = 0.25
-PRICE_OUT = 1.50
+PRICE_IN = 1.50
+PRICE_OUT = 7.50
 
 # thinkingLevel: "minimal" (дешевле/быстрее), "low" (рекоменд. для классификации),
 # "medium"/"high" (точнее/дороже). Старт — "low".
