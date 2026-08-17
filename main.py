@@ -1946,11 +1946,22 @@ async def light_search_endpoint(
     pp = get_prefix_parser()
     ip = get_infix_parser()
 
+    # ДИАГНОСТИКА ЗАМЕДЛЕНИЯ (авг 2026): замер каждого парсера отдельно.
+    # Wall-времена трёх корутин печатаются одной строкой [LIGHT-PROF] —
+    # виновник 30+ секундного хвоста виден сразу, без модульных прогонов.
+    async def _timed(name, coro):
+        _t = time.time()
+        try:
+            res = await coro
+            return res
+        finally:
+            logger.info(f"[LIGHT-PROF] {name}={round(time.time() - _t, 2)}s")
+
     suffix_res, prefix_res, infix_res = await asyncio.gather(
-        sp.parse(seed=seed, country=country, language=language,
-                 parallel_limit=parallel_limit, include_numbers=use_numbers),
-        pp.parse(seed=seed, operator=operator, country=country, language=language),
-        ip.parse(seed=seed, country=country, language=language),
+        _timed("suffix", sp.parse(seed=seed, country=country, language=language,
+                 parallel_limit=parallel_limit, include_numbers=use_numbers)),
+        _timed("prefix", pp.parse(seed=seed, operator=operator, country=country, language=language)),
+        _timed("infix", ip.parse(seed=seed, country=country, language=language)),
         return_exceptions=True,
     )
 
