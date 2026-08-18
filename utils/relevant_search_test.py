@@ -10,6 +10,7 @@ import json
 import time
 import asyncio
 import httpx
+import pymorphy3
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -96,12 +97,28 @@ B: "{variant}"
 Ищут ли их одни и те же люди с одной и той же целью?
 Покажет ли Google по ним практически одинаковую выдачу?
 
+Внимание на предлоги и падежи: если они меняют
+место или направление действия — это другая цель.
+
 1 — если B это тот же запрос другими словами.
 0 — если B ищут другие люди или с другой целью.
 
 Ответ строго: 1 или 0"""
 
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
+MORPH = pymorphy3.MorphAnalyzer()
+FUNC_POS = {"PREP", "CONJ", "PRCL"}
+
+
+def content_tokens(text):
+    """Мультимножество значимых токенов: служебные (предлог/союз/частица) отброшены."""
+    out = {}
+    for w in norm(text).split():
+        pos = MORPH.parse(w)[0].tag.POS
+        if pos in FUNC_POS:
+            continue
+        out[w] = out.get(w, 0) + 1
+    return out
 
 
 # ---------------- вызовы моделей ----------------
@@ -211,10 +228,14 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     candidates = {}   # norm_variant -> {"variant","votes","positions","sub","orig","cls"}
     run_tables = []
 
+    seed_content = content_tokens(seed)
+
     def add_candidate(variant, pos, cls, sub="", orig=""):
         k = norm(variant)
         if k == seed:
             return
+        if content_tokens(variant) == seed_content:
+            return  # сид с предлогом/перестановкой — не вариант
         c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
                                       "sub": sub, "orig": orig, "cls": set()})
         c["votes"] += 1
