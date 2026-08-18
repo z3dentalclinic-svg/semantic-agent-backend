@@ -291,7 +291,7 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
                 ones += 1
             else:
                 zeros += 1
-        verdict = 1 if ones > zeros else 0
+        verdict = 1 if (ones == VER_RUNS and zeros == 0) else 0  # в работу только единогласный 3-0
         return k, verdict, f"{ones}-{zeros}"
 
     t0 = time.time()
