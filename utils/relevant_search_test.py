@@ -63,6 +63,24 @@ GEN_PROMPT = """Запрос пользователя: "{seed}"
 Ответ строго JSON без пояснений:
 {{"tokens":[{{"word":"...","role":"...","subs":["..."]}}]}}"""
 
+GEN_B_PROMPT = """Запрос пользователя в Google: "{seed}"
+
+Напиши 3-5 запросов, которыми реальный человек ищет
+ТО ЖЕ САМОЕ другими словами. Полные фразы целиком,
+как их вводят в поиск: другая форма слов, другой
+порядок, глагол вместо существительного — всё можно,
+если человек хочет того же.
+
+Не менять: города, бренды, модели, числа.
+Не добавлять: оценки и модификаторы (дешево, лучший,
+срочно, рядом), уточнения, которых нет в запросе.
+
+Давай только запросы, которые сам видел в реальном
+поиске или похожие на них по форме.
+
+Ответ строго JSON без пояснений:
+{{"queries":["...","..."]}}"""
+
 VER_PROMPT = """Два запроса в Google:
 A: "{seed}"
 B: "{variant}"
@@ -173,15 +191,31 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     stats = {"gen": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0},
              "ver": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0}}
 
-    # 3 прогона генерации параллельно
+    # 3 прогона класса A (токенные замены) + 3 прогона класса B (свободные фразы), все параллельно
     gen_prompt = GEN_PROMPT.format(seed=seed)
-    runs = await asyncio.gather(
+    gen_b_prompt = GEN_B_PROMPT.format(seed=seed)
+    all_runs = await asyncio.gather(
         *[call_llm(client, gen_model, gen_thinking, gen_prompt) for _ in range(GEN_RUNS)],
+        *[call_llm(client, gen_model, gen_thinking, gen_b_prompt) for _ in range(GEN_RUNS)],
         return_exceptions=True)
+    runs, runs_b = all_runs[:GEN_RUNS], all_runs[GEN_RUNS:]
 
-    candidates = {}   # norm_variant -> {"variant","votes","positions","runs":[...],"sub","orig"}
+    candidates = {}   # norm_variant -> {"variant","votes","positions","sub","orig","cls"}
     run_tables = []
-    for i, res in enumerate(runs):
+
+    def add_candidate(variant, pos, cls, sub="", orig=""):
+        k = norm(variant)
+        if k == seed:
+            return
+        c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
+                                      "sub": sub, "orig": orig, "cls": set()})
+        c["votes"] += 1
+        c["positions"].append(pos)
+        c["cls"].add(cls)
+        if cls == "A" and sub:      # токенная замена информативнее для колонки
+            c["sub"], c["orig"] = sub, orig
+
+    for res in runs:
         if isinstance(res, Exception):
             run_tables.append({"error": str(res)})
             continue
@@ -192,15 +226,23 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
             run_tables.append({"error": "parse_fail", "raw": res["text"][:500]})
             continue
         run_tables.append({"tokens": data["tokens"]})
-        variants = build_variants(seed, data["tokens"])
-        for pos, (variant, sub, orig) in enumerate(variants, start=1):
-            k = norm(variant)
-            if k == seed:
-                continue
-            c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
-                                          "sub": sub, "orig": orig})
-            c["votes"] += 1
-            c["positions"].append(pos)
+        for pos, (variant, sub, orig) in enumerate(build_variants(seed, data["tokens"]), start=1):
+            add_candidate(variant, pos, "A", sub, orig)
+
+    for res in runs_b:
+        if isinstance(res, Exception):
+            run_tables.append({"error": str(res)})
+            continue
+        stats["gen"]["tin"] += res["tin"]; stats["gen"]["tout"] += res["tout"]
+        stats["gen"]["cost"] += res["cost"]; stats["gen"]["wall"] = max(stats["gen"]["wall"], res["wall"])
+        data = parse_json_block(res["text"])
+        if not data or "queries" not in data:
+            run_tables.append({"error": "parse_fail_b", "raw": res["text"][:500]})
+            continue
+        qs = [str(q) for q in data["queries"]][:5]
+        run_tables.append({"queries": qs})
+        for pos, q in enumerate(qs, start=1):
+            add_candidate(q, pos, "B")
 
     # верификатор — параллельно по всем кандидатам
     keys = list(candidates.keys())
@@ -229,6 +271,7 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     for k, c in candidates.items():
         avg_pos = sum(c["positions"]) / len(c["positions"])
         ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
+                       "cls": "".join(sorted(c["cls"])),
                        "votes": c["votes"], "avg_pos": round(avg_pos, 2),
                        "verdict": verdicts.get(k, -1)})
     ranked.sort(key=lambda x: (-x["votes"], x["avg_pos"]))
@@ -346,11 +389,12 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 async function run(){
   const seeds = document.getElementById('seeds').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!seeds.length){alert('Введи сиды');return}
+  const base = 'https://semantic-agent-backend.onrender.com';
   const btn = document.getElementById('run');
   btn.disabled = true; btn.textContent = 'Работаю...';
   document.getElementById('out').innerHTML = '';
   try{
-    const r = await fetch('/api/relevant-test',{
+    const r = await fetch(base + '/api/relevant-test',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         seeds,
@@ -378,8 +422,12 @@ function render(data){
     // таблицы токенов по прогонам
     for(let i=0;i<res.runs.length;i++){
       const run = res.runs[i];
-      h += '<details><summary>Прогон '+(i+1)+(run.error?' — ОШИБКА':'')+'</summary>';
+      const rlbl = (run.queries||((res.runs[i]||{}).error==='parse_fail_b')) ? 'B'+(i-2) : (i<3?'A'+(i+1):'B'+(i-2));
+      h += '<details><summary>Прогон '+rlbl+(run.error?' — ОШИБКА':'')+'</summary>';
       if(run.error){h+='<p class="err">'+esc(run.error)+(run.raw?'<br>'+esc(run.raw):'')+'</p>'}
+      else if(run.queries){
+        h += '<div style="font-size:13px;padding:4px 0">' + run.queries.map(esc).join('<br>') + '</div>';
+      }
       else{
         h += '<table><tr><th>Слово</th><th>Роль</th><th>Замены</th></tr>';
         for(const tk of run.tokens){
@@ -391,10 +439,11 @@ function render(data){
     }
 
     // кандидаты
-    h += '<table><tr><th>Вариант</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Верификатор</th></tr>';
+    h += '<table><tr><th>Вариант</th><th>Класс</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Верификатор</th></tr>';
     for(const c of res.candidates){
       const v = c.verdict===1?'<span class="ok">1</span>':(c.verdict===0?'<span class="cut">0</span>':'—');
-      h += '<tr><td>'+esc(c.variant)+'</td><td>'+esc(c.orig)+' → '+esc(c.sub)+'</td><td>'+c.votes+'</td><td>'+c.avg_pos+'</td><td>'+v+'</td></tr>';
+      const rep = c.orig ? esc(c.orig)+' → '+esc(c.sub) : '—';
+      h += '<tr><td>'+esc(c.variant)+'</td><td>'+esc(c.cls||'A')+'</td><td>'+rep+'</td><td>'+c.votes+'</td><td>'+c.avg_pos+'</td><td>'+v+'</td></tr>';
     }
     h += '</table>';
 
