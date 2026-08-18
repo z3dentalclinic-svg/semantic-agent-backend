@@ -19,6 +19,7 @@ router = APIRouter()
 GEN_RUNS = 3          # прогонов генерации
 TOP_N = 3             # потолок вариантов в работу
 VER_BATCH = 20        # параллельность верификатора
+VER_RUNS = 3          # голосов верификатора на пару, вердикт большинством
 
 # ---------------- модели ----------------
 # provider: gemini | openai | anthropic
@@ -255,22 +256,33 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     keys = list(candidates.keys())
 
     async def verify(k):
-        res = await call_llm(client, ver_model, ver_thinking,
-                             VER_PROMPT.format(seed=seed, variant=candidates[k]["variant"]))
-        stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
-        stats["ver"]["cost"] += res["cost"]
-        verdict = 1 if res["text"].strip().startswith("1") else 0
-        return k, verdict
+        prompt = VER_PROMPT.format(seed=seed, variant=candidates[k]["variant"])
+        results = await asyncio.gather(
+            *[call_llm(client, ver_model, ver_thinking, prompt) for _ in range(VER_RUNS)],
+            return_exceptions=True)
+        ones = zeros = 0
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+            stats["ver"]["cost"] += res["cost"]
+            if res["text"].strip().startswith("1"):
+                ones += 1
+            else:
+                zeros += 1
+        verdict = 1 if ones > zeros else 0
+        return k, verdict, f"{ones}-{zeros}"
 
     t0 = time.time()
     verdicts = {}
-    for i in range(0, len(keys), VER_BATCH):
-        chunk = keys[i:i + VER_BATCH]
+    per_batch = max(1, VER_BATCH // VER_RUNS)
+    for i in range(0, len(keys), per_batch):
+        chunk = keys[i:i + per_batch]
         results = await asyncio.gather(*[verify(k) for k in chunk], return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
                 continue
-            verdicts[r[0]] = r[1]
+            verdicts[r[0]] = (r[1], r[2])
     stats["ver"]["wall"] = time.time() - t0
 
     # ранжирование: голоса desc, средняя позиция asc
@@ -280,7 +292,8 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
         ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
                        "cls": "".join(sorted(c["cls"])),
                        "votes": c["votes"], "avg_pos": round(avg_pos, 2),
-                       "verdict": verdicts.get(k, -1)})
+                       "verdict": verdicts.get(k, (-1, ""))[0],
+                       "score": verdicts.get(k, (-1, ""))[1]})
     ranked.sort(key=lambda x: (-x["votes"], x["avg_pos"]))
     final = [r["variant"] for r in ranked if r["verdict"] == 1][:TOP_N]
 
@@ -448,7 +461,7 @@ function render(data){
     // кандидаты
     h += '<table><tr><th>Вариант</th><th>Класс</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Верификатор</th></tr>';
     for(const c of res.candidates){
-      const v = c.verdict===1?'<span class="ok">1</span>':(c.verdict===0?'<span class="cut">0</span>':'—');
+      const v = c.verdict===1?'<span class="ok">'+(c.score||'1')+'</span>':(c.verdict===0?'<span class="cut">'+(c.score||'0')+'</span>':'—');
       const rep = c.orig ? esc(c.orig)+' → '+esc(c.sub) : '—';
       h += '<tr><td>'+esc(c.variant)+'</td><td>'+esc(c.cls||'A')+'</td><td>'+rep+'</td><td>'+c.votes+'</td><td>'+c.avg_pos+'</td><td>'+v+'</td></tr>';
     }
