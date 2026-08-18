@@ -43,6 +43,12 @@ from parser.prefix_endpoint import register_prefix_endpoint, get_prefix_parser  
 from parser.infix_endpoint import register_infix_endpoint, get_infix_parser    # ← Infix Map парсер v2.6
 from parser.morph_endpoint import register_morph_endpoint                       # ← Morph Map Parser v1.0
 from clustering_test.endpoint import register_clustering_test_endpoint          # ← Clustering Test (LLM-кластеризация хвостов)
+# --- Релевантный поиск: калибровочный стенд (роутер + страница /relevant-test) ---
+try:
+    from utils.relevant_search_test import router as relevant_router      # файл в utils/
+except ImportError:
+    from relevant_search_test import router as relevant_router            # файл в корне
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,6 +92,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(relevant_router)  # релевантный поиск: /relevant-test + /api/relevant-test
 
 @app.options("/{rest_of_path:path}")
 async def preflight_handler():
