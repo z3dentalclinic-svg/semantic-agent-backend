@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Релевантный поиск — калибровка</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,sans-serif;background:#FAF9F6;color:#1a1a1a;margin:0;padding:24px;max-width:1100px;margin:auto}
+  h1{font-size:20px}
+  textarea{width:100%;height:140px;font-size:14px;padding:10px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
+  select,button{font-size:14px;padding:8px 12px;border-radius:8px;border:1px solid #ccc;margin-right:8px}
+  button{background:#059669;color:#fff;border:none;cursor:pointer;padding:10px 22px}
+  button:disabled{background:#9ca3af}
+  .row{margin:12px 0;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .lbl{font-size:12px;color:#666;margin-right:4px}
+  .seed-block{background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:16px;margin:16px 0}
+  .seed-title{font-weight:600;font-size:16px;margin-bottom:8px}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0}
+  th,td{border:1px solid #e5e5e5;padding:5px 8px;text-align:left}
+  th{background:#f3f4f6}
+  .ok{color:#059669;font-weight:600}
+  .cut{color:#dc2626;font-weight:600}
+  .final{background:#ecfdf5;border-radius:8px;padding:10px;margin-top:8px;font-size:14px}
+  .stats{font-size:12px;color:#666;margin-top:8px}
+  .total{background:#111;color:#fff;border-radius:10px;padding:14px;margin:20px 0;font-size:14px}
+  .err{color:#dc2626;font-size:13px}
+  details{margin:6px 0}
+  summary{cursor:pointer;font-size:13px;color:#555}
+</style>
+</head>
+<body>
+<h1>Релевантный поиск — калибровочный стенд</h1>
+
+<textarea id="seeds" placeholder="Сиды, по одному в строке (до 30)&#10;аккумулятор на скутер&#10;установка кондиционеров в киеве цена"></textarea>
+
+<div class="row">
+  <span class="lbl">Генератор:</span>
+  <select id="gen_model">
+    <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
+    <option value="gemini-flash">gemini-3.6-flash</option>
+    <option value="gpt">gpt-5.5</option>
+    <option value="claude-sonnet">claude-sonnet-4-6</option>
+  </select>
+  <select id="gen_thinking">
+    <option value="off">thinking: off</option>
+    <option value="low" selected>thinking: low</option>
+    <option value="medium">thinking: medium</option>
+  </select>
+  <span class="lbl">Верификатор:</span>
+  <select id="ver_model">
+    <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
+    <option value="gemini-flash">gemini-3.6-flash</option>
+    <option value="gpt">gpt-5.5</option>
+    <option value="claude-sonnet">claude-sonnet-4-6</option>
+  </select>
+  <select id="ver_thinking">
+    <option value="off">thinking: off</option>
+    <option value="low" selected>thinking: low</option>
+    <option value="medium">thinking: medium</option>
+  </select>
+  <button id="run" onclick="run()">Запустить</button>
+</div>
+
+<div id="warn" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:10px;font-size:13px;margin:10px 0"></div>
+<div id="out"></div>
+
+<script>
+// переключатели статичны в разметке, JS для них не нужен
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+async function run(){
+  const seeds = document.getElementById('seeds').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!seeds.length){alert('Введи сиды');return}
+  const btn = document.getElementById('run');
+  btn.disabled = true; btn.textContent = 'Работаю...';
+  document.getElementById('out').innerHTML = '';
+  try{
+    const r = await fetch('/api/relevant-test',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        seeds,
+        gen_model:document.getElementById('gen_model').value,
+        gen_thinking:document.getElementById('gen_thinking').value,
+        ver_model:document.getElementById('ver_model').value,
+        ver_thinking:document.getElementById('ver_thinking').value
+      })});
+    const data = await r.json();
+    render(data);
+  }catch(e){
+    document.getElementById('out').innerHTML = '<p class="err">Ошибка: '+esc(e.message)+'</p>';
+  }
+  btn.disabled = false; btn.textContent = 'Запустить';
+}
+
+function render(data){
+  let h = '';
+  if(data.error){document.getElementById('out').innerHTML='<p class="err">'+esc(data.error)+'</p>';return}
+  for(const res of data.results){
+    h += '<div class="seed-block">';
+    h += '<div class="seed-title">'+esc(res.seed)+'</div>';
+    if(res.error){h+='<p class="err">'+esc(res.error)+'</p></div>';continue}
+
+    // таблицы токенов по прогонам
+    for(let i=0;i<res.runs.length;i++){
+      const run = res.runs[i];
+      h += '<details><summary>Прогон '+(i+1)+(run.error?' — ОШИБКА':'')+'</summary>';
+      if(run.error){h+='<p class="err">'+esc(run.error)+(run.raw?'<br>'+esc(run.raw):'')+'</p>'}
+      else{
+        h += '<table><tr><th>Слово</th><th>Роль</th><th>Замены</th></tr>';
+        for(const tk of run.tokens){
+          h += '<tr><td>'+esc(tk.word)+'</td><td>'+esc(tk.role)+'</td><td>'+esc((tk.subs||[]).join(', '))+'</td></tr>';
+        }
+        h += '</table>';
+      }
+      h += '</details>';
+    }
+
+    // кандидаты
+    h += '<table><tr><th>Вариант</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Верификатор</th></tr>';
+    for(const c of res.candidates){
+      const v = c.verdict===1?'<span class="ok">1</span>':(c.verdict===0?'<span class="cut">0</span>':'—');
+      h += '<tr><td>'+esc(c.variant)+'</td><td>'+esc(c.orig)+' → '+esc(c.sub)+'</td><td>'+c.votes+'</td><td>'+c.avg_pos+'</td><td>'+v+'</td></tr>';
+    }
+    h += '</table>';
+
+    h += '<div class="final"><b>В работу ('+res.final.length+'):</b> '+(res.final.map(esc).join(' • ')||'—')+'</div>';
+
+    const s = res.stats;
+    h += '<div class="stats">Генерация: '+s.gen.tin+'/'+s.gen.tout+' ток, $'+s.gen.cost.toFixed(5)+', '+s.gen.wall.toFixed(1)+'s'
+       + ' | Верификатор: '+s.ver.tin+'/'+s.ver.tout+' ток, $'+s.ver.cost.toFixed(5)+', '+s.ver.wall.toFixed(1)+'s</div>';
+    h += '</div>';
+  }
+  h += '<div class="total">Конфиг: генератор '+esc(data.config.gen)+' | верификатор '+esc(data.config.ver)
+     + '<br>Итого: $'+data.total.cost.toFixed(4)+' | '+data.total.wall.toFixed(1)+'s</div>';
+  document.getElementById('out').innerHTML = h;
+}
+</script>
+</body>
+</html>
