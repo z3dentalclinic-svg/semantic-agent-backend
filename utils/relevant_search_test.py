@@ -118,6 +118,52 @@ SEL_PROMPT = """Мы собираем поисковые подсказки Goog
 Ответ строго JSON без пояснений:
 {{"selected":[номера выбранных]}}"""
 
+FP_CARD_PROMPT = """Мы собираем подсказки Google Autocomplete.
+Исходный запрос: "{seed}"
+
+Кандидаты — переформулировки этого запроса:
+{candidates}
+
+Не выбирай кандидатов. Для КАЖДОГО отдельно опиши коротко:
+- scenario: что человек хочет получить этим запросом и что
+  сделает дальше
+- pool: какого типа продолжения покажет автокомплит
+  (категории, не конкретные фразы)
+- new: что этот кандидат добавляет к поиску по сравнению с
+  исходным запросом; если по сути ничего — напиши "ничего нового"
+- goal: "та же" или "другая" (другая — если меняется место,
+  направление, тип услуги или добавлена оценка)
+
+Описывай поведение человека, не грамматику. Часть речи,
+корень слова, падеж и число слов — не аргументы.
+
+Ответ строго JSON без пояснений:
+{{"cards":[{{"id":1,"scenario":"...","pool":"...","new":"...","goal":"та же"}}]}}"""
+
+FP_SEL_PROMPT = """Мы собираем максимально разные пулы подсказок Google
+Autocomplete по одному намерению.
+
+Исходный запрос: "{seed}"
+
+Кандидаты с картами поискового поведения:
+{cards}
+
+Выбери до {top_n} кандидатов так, чтобы покрыть максимально
+РАЗНЫЕ поисковые сценарии при сохранении интента исходного
+запроса.
+
+Правила:
+- Если у двух кандидатов scenario и pool по сути совпадают —
+  бери одного, самого естественного в реальном поиске.
+- Кандидат с "ничего нового" не занимает слот.
+- Часть речи, корень, падеж, число слов — не аргументы
+  ни за, ни против. Только сценарий и пул.
+- Действительно разных меньше {top_n} — верни меньше.
+  Добор похожими запрещён.
+
+Ответ строго JSON без пояснений:
+{{"selected":[номера]}}"""
+
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
 MORPH = pymorphy3.MorphAnalyzer()
 FUNC_POS = {"PREP", "CONJ", "PRCL"}
@@ -223,7 +269,7 @@ def build_variants(seed, tokens):
     return out
 
 
-async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thinking):
+async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thinking, sel_scheme="v3"):
     seed = norm(seed)
     stats = {"gen": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0},
              "ver": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0}}
@@ -288,6 +334,10 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
         for pos, q in enumerate(qs, start=1):
             add_candidate(q, pos, "B")
 
+    if sel_scheme == "fingerprint":
+        return await finish_fingerprint(client, seed, candidates, run_tables,
+                                        stats, ver_model, ver_thinking)
+
     # селектор: видит весь список, выбирает до TOP_N; 3 вызова, членство большинством
     keys = list(candidates.keys())
     sel_votes = {k: 0 for k in keys}
@@ -332,12 +382,91 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
             "final": final, "stats": stats}
 
 
+async def finish_fingerprint(client, seed, candidates, run_tables, stats,
+                             ver_model, ver_thinking):
+    """Схема отбора FINGERPRINT: карты поведения (1 вызов) -> сет-селектор по картам (3 вызова)."""
+    keys = list(candidates.keys())
+    cards = {}
+    t0 = time.time()
+    if keys:
+        listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
+        res = await call_llm(client, ver_model, ver_thinking,
+                             FP_CARD_PROMPT.format(seed=seed, candidates=listing))
+        stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+        stats["ver"]["cost"] += res["cost"]
+        data = parse_json_block(res["text"])
+        if data and "cards" in data:
+            for c in data["cards"]:
+                try:
+                    idx = int(c.get("id", 0)) - 1
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= idx < len(keys):
+                    cards[keys[idx]] = {"scenario": str(c.get("scenario", "")),
+                                        "pool": str(c.get("pool", "")),
+                                        "new": str(c.get("new", "")),
+                                        "goal": str(c.get("goal", ""))}
+
+    # интент из карты: goal "другая" — отсев до селектора
+    ok_keys = [k for k in keys
+               if not cards.get(k, {}).get("goal", "").strip().lower().startswith("друг")]
+
+    sel_votes = {k: 0 for k in keys}
+    if ok_keys:
+        card_lines = []
+        for i, k in enumerate(ok_keys):
+            c = cards.get(k, {})
+            card_lines.append(f"{i+1}. \"{candidates[k]['variant']}\"\n"
+                              f"   scenario: {c.get('scenario','—')}\n"
+                              f"   pool: {c.get('pool','—')}\n"
+                              f"   new: {c.get('new','—')}")
+        prompt = FP_SEL_PROMPT.format(seed=seed, cards="\n".join(card_lines), top_n=TOP_N)
+        results = await asyncio.gather(
+            *[call_llm(client, ver_model, ver_thinking, prompt) for _ in range(VER_RUNS)],
+            return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+            stats["ver"]["cost"] += res["cost"]
+            data = parse_json_block(res["text"])
+            if not data or "selected" not in data:
+                continue
+            for n in data["selected"]:
+                try:
+                    idx = int(n) - 1
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= idx < len(ok_keys):
+                    sel_votes[ok_keys[idx]] += 1
+    stats["ver"]["wall"] = time.time() - t0
+
+    ranked = []
+    for k, c in candidates.items():
+        avg_pos = sum(c["positions"]) / len(c["positions"])
+        sv = sel_votes.get(k, 0)
+        dropped = k not in ok_keys
+        ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
+                       "cls": "".join(sorted(c["cls"])),
+                       "votes": c["votes"], "avg_pos": round(avg_pos, 2),
+                       "verdict": 0 if dropped else (1 if sv >= 2 else 0),
+                       "score": "цель✗" if dropped else f"{sv}/{VER_RUNS}"})
+    ranked.sort(key=lambda x: (-(0 if x["score"] == "цель✗" else int(x["score"].split("/")[0])),
+                               -x["votes"], x["avg_pos"]))
+    final = [r["variant"] for r in ranked if r["verdict"] == 1][:TOP_N]
+
+    card_list = [{"variant": candidates[k]["variant"], **cards.get(k, {})} for k in keys]
+    return {"seed": seed, "runs": run_tables, "candidates": ranked,
+            "cards": card_list, "final": final, "stats": stats}
+
+
 class TestRequest(BaseModel):
     seeds: list
     gen_model: str = "gemini-flash-lite"
     gen_thinking: str = "low"
     ver_model: str = "gemini-flash-lite"
     ver_thinking: str = "low"
+    sel_scheme: str = "v3"
 
 
 @router.get("/api/relevant-test/config")
@@ -357,14 +486,15 @@ async def relevant_test(req: TestRequest):
             try:
                 results.append(await process_seed(client, seed, req.gen_model,
                                                   req.gen_thinking, req.ver_model,
-                                                  req.ver_thinking))
+                                                  req.ver_thinking, req.sel_scheme))
             except Exception as e:
                 results.append({"seed": seed, "error": str(e)})
     total = {"cost": sum(r["stats"]["gen"]["cost"] + r["stats"]["ver"]["cost"]
                          for r in results if "stats" in r),
              "wall": time.time() - t0}
     return {"results": results, "total": total,
-            "config": {"gen": f"{MODELS[req.gen_model]['model']} / {req.gen_thinking}",
+            "config": {"scheme": req.sel_scheme,
+                       "gen": f"{MODELS[req.gen_model]['model']} / {req.gen_thinking}",
                        "ver": f"{MODELS[req.ver_model]['model']} / {req.ver_thinking}"}}
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -414,6 +544,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="low" selected>thinking: low</option>
     <option value="medium">thinking: medium</option>
   </select>
+  <span class="lbl">Схема:</span>
+  <select id="sel_scheme">
+    <option value="v3" selected>V3 селектор</option>
+    <option value="fingerprint">Fingerprint</option>
+  </select>
   <span class="lbl">Верификатор:</span>
   <select id="ver_model">
     <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
@@ -452,7 +587,8 @@ async function run(){
         gen_model:document.getElementById('gen_model').value,
         gen_thinking:document.getElementById('gen_thinking').value,
         ver_model:document.getElementById('ver_model').value,
-        ver_thinking:document.getElementById('ver_thinking').value
+        ver_thinking:document.getElementById('ver_thinking').value,
+        sel_scheme:document.getElementById('sel_scheme').value
       })});
     const data = await r.json();
     render(data);
@@ -489,6 +625,15 @@ function render(data){
       h += '</details>';
     }
 
+    if(res.cards && res.cards.length){
+      h += '<details><summary>Карты сценариев (fingerprint)</summary>';
+      h += '<table><tr><th>Вариант</th><th>Сценарий</th><th>Пул</th><th>Новое</th><th>Цель</th></tr>';
+      for(const c of res.cards){
+        h += '<tr><td>'+esc(c.variant)+'</td><td>'+esc(c.scenario||'—')+'</td><td>'+esc(c.pool||'—')+'</td><td>'+esc(c.new||'—')+'</td><td>'+esc(c.goal||'—')+'</td></tr>';
+      }
+      h += '</table></details>';
+    }
+
     // кандидаты
     h += '<table><tr><th>Вариант</th><th>Класс</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Селектор</th></tr>';
     for(const c of res.candidates){
@@ -505,7 +650,7 @@ function render(data){
        + ' | Верификатор: '+s.ver.tin+'/'+s.ver.tout+' ток, $'+s.ver.cost.toFixed(5)+', '+s.ver.wall.toFixed(1)+'s</div>';
     h += '</div>';
   }
-  h += '<div class="total">Конфиг: генератор '+esc(data.config.gen)+' | верификатор '+esc(data.config.ver)
+  h += '<div class="total">Схема: '+esc(data.config.scheme||'v3')+' | генератор '+esc(data.config.gen)+' | верификатор '+esc(data.config.ver)
      + '<br>Итого: $'+data.total.cost.toFixed(4)+' | '+data.total.wall.toFixed(1)+'s</div>';
   document.getElementById('out').innerHTML = h;
 }
