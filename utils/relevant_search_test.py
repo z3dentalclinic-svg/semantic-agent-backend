@@ -90,20 +90,25 @@ GEN_B_PROMPT = """Запрос пользователя в Google: "{seed}"
 Ответ строго JSON без пояснений:
 {{"queries":["...","..."]}}"""
 
-VER_PROMPT = """Два запроса в Google:
-A: "{seed}"
-B: "{variant}"
+SEL_PROMPT = """Мы собираем поисковые подсказки Google (автокомплит).
+Запрос пользователя: "{seed}"
 
-Ищут ли их одни и те же люди с одной и той же целью?
-Покажет ли Google по ним практически одинаковую выдачу?
+Кандидаты — переформулировки этого запроса:
+{candidates}
 
-Внимание на предлоги и падежи: если они меняют
-место или направление действия — это другая цель.
+Выбери до {top_n} кандидатов, которые:
+- ищут те же люди с той же целью, что и исходный запрос
+- сформулированы настолько по-разному, что Google
+  покажет по ним разные наборы подсказок
 
-1 — если B это тот же запрос другими словами.
-0 — если B ищут другие люди или с другой целью.
+Однокоренные и почти одинаковые формулировки дают
+одинаковые подсказки — из такой группы бери одну,
+самую употребимую в реальном поиске.
+Внимание на предлоги и падежи: если они меняют место
+или направление действия — это другая цель, не бери.
 
-Ответ строго: 1 или 0"""
+Ответ строго JSON без пояснений:
+{{"selected":[номера выбранных]}}"""
 
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
 MORPH = pymorphy3.MorphAnalyzer()
@@ -275,49 +280,44 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
         for pos, q in enumerate(qs, start=1):
             add_candidate(q, pos, "B")
 
-    # верификатор — параллельно по всем кандидатам
+    # селектор: видит весь список, выбирает до TOP_N; 3 вызова, членство большинством
     keys = list(candidates.keys())
-
-    async def verify(k):
-        prompt = VER_PROMPT.format(seed=seed, variant=candidates[k]["variant"])
+    sel_votes = {k: 0 for k in keys}
+    t0 = time.time()
+    if keys:
+        listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
+        prompt = SEL_PROMPT.format(seed=seed, candidates=listing, top_n=TOP_N)
         results = await asyncio.gather(
             *[call_llm(client, ver_model, ver_thinking, prompt) for _ in range(VER_RUNS)],
             return_exceptions=True)
-        ones = zeros = 0
         for res in results:
             if isinstance(res, Exception):
                 continue
             stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
             stats["ver"]["cost"] += res["cost"]
-            if res["text"].strip().startswith("1"):
-                ones += 1
-            else:
-                zeros += 1
-        verdict = 1 if (ones == VER_RUNS and zeros == 0) else 0  # в работу только единогласный 3-0
-        return k, verdict, f"{ones}-{zeros}"
-
-    t0 = time.time()
-    verdicts = {}
-    per_batch = max(1, VER_BATCH // VER_RUNS)
-    for i in range(0, len(keys), per_batch):
-        chunk = keys[i:i + per_batch]
-        results = await asyncio.gather(*[verify(k) for k in chunk], return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
+            data = parse_json_block(res["text"])
+            if not data or "selected" not in data:
                 continue
-            verdicts[r[0]] = (r[1], r[2])
+            for n in data["selected"]:
+                try:
+                    idx = int(n) - 1
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= idx < len(keys):
+                    sel_votes[keys[idx]] += 1
     stats["ver"]["wall"] = time.time() - t0
 
-    # ранжирование: голоса desc, средняя позиция asc
+    # ранжирование:選 селектора (>=2 из 3) первично, затем голоса генерации и позиция
     ranked = []
     for k, c in candidates.items():
         avg_pos = sum(c["positions"]) / len(c["positions"])
+        sv = sel_votes.get(k, 0)
         ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
                        "cls": "".join(sorted(c["cls"])),
                        "votes": c["votes"], "avg_pos": round(avg_pos, 2),
-                       "verdict": verdicts.get(k, (-1, ""))[0],
-                       "score": verdicts.get(k, (-1, ""))[1]})
-    ranked.sort(key=lambda x: (-x["votes"], x["avg_pos"]))
+                       "verdict": 1 if sv >= 2 else 0,
+                       "score": f"{sv}/{VER_RUNS}"})
+    ranked.sort(key=lambda x: (-int(x["score"].split("/")[0]), -x["votes"], x["avg_pos"]))
     final = [r["variant"] for r in ranked if r["verdict"] == 1][:TOP_N]
 
     return {"seed": seed, "runs": run_tables, "candidates": ranked,
@@ -482,7 +482,7 @@ function render(data){
     }
 
     // кандидаты
-    h += '<table><tr><th>Вариант</th><th>Класс</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Верификатор</th></tr>';
+    h += '<table><tr><th>Вариант</th><th>Класс</th><th>Замена</th><th>Голоса</th><th>Ср. позиция</th><th>Селектор</th></tr>';
     for(const c of res.candidates){
       const v = c.verdict===1?'<span class="ok">'+(c.score||'1')+'</span>':(c.verdict===0?'<span class="cut">'+(c.score||'0')+'</span>':'—');
       const rep = c.orig ? esc(c.orig)+' → '+esc(c.sub) : '—';
