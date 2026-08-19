@@ -110,15 +110,14 @@ MORPH = pymorphy3.MorphAnalyzer()
 FUNC_POS = {"PREP", "CONJ", "PRCL"}
 
 
-def content_tokens(text):
-    """Мультимножество значимых токенов: служебные (предлог/союз/частица) отброшены."""
-    out = {}
+def split_tokens(text):
+    """Два мультимножества: значимые токены и служебные (предлог/союз/частица)."""
+    content, func = {}, {}
     for w in norm(text).split():
         pos = MORPH.parse(w)[0].tag.POS
-        if pos in FUNC_POS:
-            continue
-        out[w] = out.get(w, 0) + 1
-    return out
+        d = func if pos in FUNC_POS else content
+        d[w] = d.get(w, 0) + 1
+    return content, func
 
 
 # ---------------- вызовы моделей ----------------
@@ -228,14 +227,17 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     candidates = {}   # norm_variant -> {"variant","votes","positions","sub","orig","cls"}
     run_tables = []
 
-    seed_content = content_tokens(seed)
+    seed_content, seed_func = split_tokens(seed)
 
     def add_candidate(variant, pos, cls, sub="", orig=""):
         k = norm(variant)
         if k == seed:
             return
-        if content_tokens(variant) == seed_content:
-            return  # сид с предлогом/перестановкой — не вариант
+        v_content, v_func = split_tokens(variant)
+        if v_func != seed_func:
+            return  # служебные слова должны совпадать с сидом: добавленный предлог = не вариант
+        if v_content == seed_content:
+            return  # сид перестановкой — не вариант
         c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
                                       "sub": sub, "orig": orig, "cls": set()})
         c["votes"] += 1
