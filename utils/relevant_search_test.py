@@ -249,7 +249,35 @@ def lemma_tokens(text):
 
 
 # ---------------- вызовы моделей ----------------
-async def call_llm(client, model_key, thinking, prompt):
+RETRYABLE = {429, 500, 502, 503, 504}
+
+
+def _clean_err(e):
+    """Текст ошибки без API-ключей."""
+    s = str(e)
+    for k in (GEMINI_KEY, OPENAI_KEY, ANTHROPIC_KEY):
+        if k:
+            s = s.replace(k, "***")
+    return s
+
+
+async def call_llm(client, model_key, thinking, prompt, _retries=2):
+    for attempt in range(_retries + 1):
+        try:
+            return await _call_llm_once(client, model_key, thinking, prompt)
+        except httpx.HTTPStatusError as e:
+            if attempt < _retries and e.response.status_code in RETRYABLE:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(_clean_err(e)) from None
+        except httpx.TimeoutException as e:
+            if attempt < _retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(_clean_err(e)) from None
+
+
+async def _call_llm_once(client, model_key, thinking, prompt):
     cfg = MODELS[model_key]
     t0 = time.time()
     if cfg["provider"] == "gemini":
