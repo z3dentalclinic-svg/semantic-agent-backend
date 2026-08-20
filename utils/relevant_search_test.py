@@ -168,6 +168,59 @@ Autocomplete по одному намерению.
 Ответ строго JSON без пояснений:
 {{"selected":[номера]}}"""
 
+FAM_PROMPT = """Мы собираем разные входы для Google Autocomplete.
+
+Исходный запрос: "{seed}"
+
+Кандидаты — переформулировки этого запроса:
+{candidates}
+
+Шаг 1. Отбрось кандидатов с другой целью: меняется место,
+направление, тип услуги или добавлена оценка — их номера
+положи в "rejected".
+
+Шаг 2. Остальных сгруппируй в семьи. Семья — это кандидаты,
+которые человек вводит как взаимозаменяемый старт ОДНОГО
+и того же поиска: Google продолжит их практически
+одинаковыми направлениями.
+
+Одна семья, если совпадают цель, точка входа в поиск и
+ожидаемый тип продолжений. Не разделяй по падежу, числу,
+порядку слов, части речи или расширению слова в
+словосочетание.
+Разные семьи, если меняется способ начать поиск: заказать
+услугу против сделать самому, поиск исполнителя против
+поиска товара, другой объект поиска.
+
+Не создавай семьи ради количества: две честные семьи лучше
+трёх надуманных. В каждой семье укажи одного представителя —
+самый естественный и частотный запрос в реальном поиске.
+
+Ответ строго JSON без пояснений:
+{{"rejected":[номера],
+"families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}"""
+
+FAM_AUDIT_PROMPT = """Проверь одну группу поисковых формулировок.
+
+Исходный запрос: "{seed}"
+
+Группа:
+{members}
+
+Все варианты относятся к общей цели исходного запроса.
+Вопрос только один: являются ли они взаимозаменяемым
+первым вводом одного и того же поиска с практически
+одинаковыми продолжениями?
+
+"split" — только если варианты начинают поиск по-разному:
+заказать услугу против сделать самому, найти исполнителя
+против найти товар. Не разделяй по падежу, числу, порядку
+слов или расширению названия в словосочетание.
+
+Ответ строго JSON без пояснений:
+{{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}
+где decision = "keep" или "split"; groups заполняй только при split."""
+
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
 MORPH = pymorphy3.MorphAnalyzer()
 FUNC_POS = {"PREP", "CONJ", "PRCL"}
@@ -356,6 +409,9 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     if sel_scheme == "fingerprint":
         return await finish_fingerprint(client, seed, candidates, run_tables,
                                         stats, ver_model, ver_thinking)
+    if sel_scheme == "families":
+        return await finish_families(client, seed, candidates, run_tables,
+                                     stats, ver_model, ver_thinking)
 
     # селектор: видит весь список, выбирает до TOP_N; 3 вызова, членство большинством
     keys = list(candidates.keys())
@@ -479,6 +535,138 @@ async def finish_fingerprint(client, seed, candidates, run_tables, stats,
             "cards": card_list, "final": final, "stats": stats}
 
 
+async def finish_families(client, seed, candidates, run_tables, stats,
+                          ver_model, ver_thinking):
+    """Схема FAMILIES: кластеризация в семьи (1 вызов) -> аудит семей >=2 (по вызову) -> представители кодом."""
+    keys = list(candidates.keys())
+    rejected, families = set(), []
+    t0 = time.time()
+
+    def cand_rank(k):
+        c = candidates[k]
+        return (-c["votes"], sum(c["positions"]) / len(c["positions"]))
+
+    if keys:
+        listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
+        res = await call_llm(client, ver_model, ver_thinking,
+                             FAM_PROMPT.format(seed=seed, candidates=listing))
+        stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+        stats["ver"]["cost"] += res["cost"]
+        data = parse_json_block(res["text"]) or {}
+
+        def to_keys(nums):
+            out = []
+            for n in nums or []:
+                try:
+                    idx = int(n) - 1
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= idx < len(keys):
+                    out.append(keys[idx])
+            return out
+
+        rejected = set(to_keys(data.get("rejected")))
+        seen = set(rejected)
+        for f in data.get("families", []):
+            members = [k for k in to_keys(f.get("members")) if k not in seen]
+            if not members:
+                continue
+            seen.update(members)
+            rep = to_keys([f.get("representative")])
+            rep = rep[0] if rep and rep[0] in members else min(members, key=cand_rank)
+            families.append({"scenario": str(f.get("scenario", "")), "members": members,
+                             "rep": rep, "reason": str(f.get("reason", ""))})
+        # кандидаты, которых кластеризатор потерял — каждый своей семьёй (не терять данные)
+        for k in keys:
+            if k not in seen:
+                families.append({"scenario": "(вне кластеризации)", "members": [k],
+                                 "rep": k, "reason": "модель не отнесла к семье"})
+
+        # аудит семей из >=2 членов, параллельно
+        async def audit(fi):
+            fam = families[fi]
+            mem_list = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(fam["members"]))
+            res = await call_llm(client, ver_model, ver_thinking,
+                                 FAM_AUDIT_PROMPT.format(seed=seed, members=mem_list))
+            stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+            stats["ver"]["cost"] += res["cost"]
+            d = parse_json_block(res["text"]) or {}
+            return fi, d
+
+        audit_ids = [i for i, f in enumerate(families) if len(f["members"]) >= 2]
+        results = await asyncio.gather(*[audit(i) for i in audit_ids], return_exceptions=True)
+        split_plan = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            fi, d = r
+            if str(d.get("decision", "")).strip().lower() == "split" and d.get("groups"):
+                split_plan[fi] = d
+
+        if split_plan:
+            new_families = []
+            for fi, fam in enumerate(families):
+                if fi not in split_plan:
+                    new_families.append(fam)
+                    continue
+                d = split_plan[fi]
+                used = set()
+                for g in d["groups"]:
+                    mem = []
+                    for n in g or []:
+                        try:
+                            idx = int(n) - 1
+                        except (ValueError, TypeError):
+                            continue
+                        if 0 <= idx < len(fam["members"]):
+                            mem.append(fam["members"][idx]); used.add(idx)
+                    if mem:
+                        new_families.append({"scenario": fam["scenario"] + " (split)",
+                                             "members": mem, "rep": min(mem, key=cand_rank),
+                                             "reason": str(d.get("reason", ""))})
+                left = [m for i, m in enumerate(fam["members"]) if i not in used]
+                if left:
+                    new_families.append({"scenario": fam["scenario"] + " (split)",
+                                         "members": left, "rep": min(left, key=cand_rank),
+                                         "reason": str(d.get("reason", ""))})
+            families = new_families
+    stats["ver"]["wall"] = time.time() - t0
+
+    # финал кодом: представители разных семей, ранг семьи = ранг её представителя
+    families.sort(key=lambda f: cand_rank(f["rep"]))
+    final_keys = [f["rep"] for f in families][:TOP_N]
+
+    fam_of = {}
+    for i, f in enumerate(families):
+        for k in f["members"]:
+            fam_of[k] = (i, f["rep"] == k)
+
+    ranked = []
+    for k, c in candidates.items():
+        avg_pos = sum(c["positions"]) / len(c["positions"])
+        if k in rejected:
+            score = "цель✗"
+        elif k in fam_of:
+            i, is_rep = fam_of[k]
+            score = f"F{i+1}" + ("★" if is_rep else "")
+        else:
+            score = "—"
+        ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
+                       "cls": "".join(sorted(c["cls"])),
+                       "votes": c["votes"], "avg_pos": round(avg_pos, 2),
+                       "verdict": 1 if k in final_keys else 0,
+                       "score": score})
+    ranked.sort(key=lambda x: (-x["verdict"], -x["votes"], x["avg_pos"]))
+    final = [candidates[k]["variant"] for k in final_keys]
+
+    fam_list = [{"scenario": f["scenario"],
+                 "members": [candidates[k]["variant"] for k in f["members"]],
+                 "rep": candidates[f["rep"]]["variant"],
+                 "reason": f["reason"]} for f in families]
+    return {"seed": seed, "runs": run_tables, "candidates": ranked,
+            "families": fam_list, "final": final, "stats": stats}
+
+
 class TestRequest(BaseModel):
     seeds: list
     gen_model: str = "gemini-flash-lite"
@@ -567,6 +755,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <select id="sel_scheme">
     <option value="v3" selected>V3 селектор</option>
     <option value="fingerprint">Fingerprint</option>
+    <option value="families">Families</option>
   </select>
   <span class="lbl">Верификатор:</span>
   <select id="ver_model">
@@ -642,6 +831,15 @@ function render(data){
         h += '</table>';
       }
       h += '</details>';
+    }
+
+    if(res.families && res.families.length){
+      h += '<details open><summary>Семьи (families)</summary>';
+      h += '<table><tr><th>Сценарий</th><th>Члены</th><th>Представитель</th><th>Причина</th></tr>';
+      for(const f of res.families){
+        h += '<tr><td>'+esc(f.scenario)+'</td><td>'+f.members.map(esc).join('<br>')+'</td><td><b>'+esc(f.rep)+'</b></td><td>'+esc(f.reason||'—')+'</td></tr>';
+      }
+      h += '</table></details>';
     }
 
     if(res.cards && res.cards.length){
