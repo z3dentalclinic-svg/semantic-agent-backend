@@ -222,6 +222,10 @@ FAM_PROMPT = """Мы собираем разные входы для Google Auto
 {{"rejected":[номера],
 "families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}"""
 
+FAM_PROMPT_PROD = FAM_PROMPT.replace(
+    '{{"rejected":[номера],\n"families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}',
+    '{{"rejected":[номера],\n"families":[{{"members":[номера],"representative":номер}}]}}')
+
 FAM_AUDIT_PROMPT = """Проверь одну группу поисковых формулировок.
 
 Исходный запрос: "{seed}"
@@ -249,6 +253,10 @@ FAM_AUDIT_PROMPT = """Проверь одну группу поисковых ф
 Ответ строго JSON без пояснений:
 {{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}
 где decision = "keep" или "split"; groups заполняй только при split."""
+
+FAM_AUDIT_PROMPT_PROD = FAM_AUDIT_PROMPT.replace(
+    '{{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}',
+    '{{"decision":"keep","groups":[[номера],[номера]]}}')
 
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
 MORPH = pymorphy3.MorphAnalyzer()
@@ -395,7 +403,7 @@ def build_variants(seed, tokens):
     return out
 
 
-async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thinking, sel_scheme="v3"):
+async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thinking, sel_scheme="v3", mode="test"):
     seed = norm(seed)
     stats = {"gen": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0},
              "ver": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0}}
@@ -468,7 +476,7 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
                                         stats, ver_model, ver_thinking)
     if sel_scheme == "families":
         return await finish_families(client, seed, candidates, run_tables,
-                                     stats, ver_model, ver_thinking)
+                                     stats, ver_model, ver_thinking, mode)
 
     # селектор: видит весь список, выбирает до TOP_N; 3 вызова, членство большинством
     keys = list(candidates.keys())
@@ -593,7 +601,9 @@ async def finish_fingerprint(client, seed, candidates, run_tables, stats,
 
 
 async def finish_families(client, seed, candidates, run_tables, stats,
-                          ver_model, ver_thinking):
+                          ver_model, ver_thinking, mode="test"):
+    fam_prompt = FAM_PROMPT_PROD if mode == "prod" else FAM_PROMPT
+    audit_prompt = FAM_AUDIT_PROMPT_PROD if mode == "prod" else FAM_AUDIT_PROMPT
     """Схема FAMILIES: кластеризация в семьи (1 вызов) -> аудит семей >=2 (по вызову) -> представители кодом."""
     keys = list(candidates.keys())
     rejected, families = set(), []
@@ -606,7 +616,7 @@ async def finish_families(client, seed, candidates, run_tables, stats,
     if keys:
         listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
         res = await call_llm(client, ver_model, ver_thinking,
-                             FAM_PROMPT.format(seed=seed, candidates=listing))
+                             fam_prompt.format(seed=seed, candidates=listing))
         stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
         stats["ver"]["cost"] += res["cost"]
         data = parse_json_block(res["text"]) or {}
@@ -644,7 +654,7 @@ async def finish_families(client, seed, candidates, run_tables, stats,
             fam = families[fi]
             mem_list = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(fam["members"]))
             res = await call_llm(client, ver_model, ver_thinking,
-                                 FAM_AUDIT_PROMPT.format(seed=seed, members=mem_list))
+                                 audit_prompt.format(seed=seed, members=mem_list))
             stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
             stats["ver"]["cost"] += res["cost"]
             d = parse_json_block(res["text"]) or {}
@@ -720,7 +730,8 @@ async def finish_families(client, seed, candidates, run_tables, stats,
                  "members": [candidates[k]["variant"] for k in f["members"]],
                  "rep": candidates[f["rep"]]["variant"],
                  "reason": f["reason"]} for f in families]
-    return {"seed": seed, "runs": run_tables, "candidates": ranked,
+    return {"seed": seed, "runs": [] if mode == "prod" else run_tables,
+            "candidates": ranked,
             "families": fam_list, "final": final, "stats": stats}
 
 
@@ -731,6 +742,7 @@ class TestRequest(BaseModel):
     ver_model: str = "gemini-flash-lite"
     ver_thinking: str = "low"
     sel_scheme: str = "v3"
+    mode: str = "test"
 
 
 @router.get("/api/relevant-test/config")
@@ -750,7 +762,7 @@ async def relevant_test(req: TestRequest):
             try:
                 results.append(await process_seed(client, seed, req.gen_model,
                                                   req.gen_thinking, req.ver_model,
-                                                  req.ver_thinking, req.sel_scheme))
+                                                  req.ver_thinking, req.sel_scheme, req.mode))
             except Exception as e:
                 results.append({"seed": seed, "error": str(e)})
     total = {"cost": sum(r["stats"]["gen"]["cost"] + r["stats"]["ver"]["cost"]
@@ -814,6 +826,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="fingerprint">Fingerprint</option>
     <option value="families">Families</option>
   </select>
+  <span class="lbl">Режим:</span>
+  <select id="mode">
+    <option value="test" selected>тест (полный отчёт)</option>
+    <option value="prod">прод (быстрый)</option>
+  </select>
   <span class="lbl">Верификатор:</span>
   <select id="ver_model">
     <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
@@ -853,7 +870,8 @@ async function run(){
         gen_thinking:document.getElementById('gen_thinking').value,
         ver_model:document.getElementById('ver_model').value,
         ver_thinking:document.getElementById('ver_thinking').value,
-        sel_scheme:document.getElementById('sel_scheme').value
+        sel_scheme:document.getElementById('sel_scheme').value,
+        mode:document.getElementById('mode').value
       })});
     const data = await r.json();
     render(data);
