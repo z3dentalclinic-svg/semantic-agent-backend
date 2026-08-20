@@ -183,6 +183,18 @@ def split_tokens(text):
     return content, func
 
 
+def lemma_tokens(text):
+    """Мультимножество лемм значимых токенов — для отсева морфовариантов сида."""
+    out = {}
+    for w in norm(text).split():
+        p = MORPH.parse(w)[0]
+        if p.tag.POS in FUNC_POS:
+            continue
+        lm = p.normal_form
+        out[lm] = out.get(lm, 0) + 1
+    return out
+
+
 # ---------------- вызовы моделей ----------------
 async def call_llm(client, model_key, thinking, prompt):
     cfg = MODELS[model_key]
@@ -291,6 +303,7 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
     run_tables = []
 
     seed_content, seed_func = split_tokens(seed)
+    seed_lemmas = lemma_tokens(seed)
 
     def add_candidate(variant, pos, cls, sub="", orig=""):
         k = norm(variant)
@@ -301,6 +314,8 @@ async def process_seed(client, seed, gen_model, gen_thinking, ver_model, ver_thi
             return  # служебные слова должны совпадать с сидом: добавленный предлог = не вариант
         if v_content == seed_content:
             return  # сид перестановкой — не вариант
+        if lemma_tokens(variant) == seed_lemmas:
+            return  # морфовариант сида (падеж/число) — не вариант, правило Andrew
         c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
                                       "sub": sub, "orig": orig, "cls": set()})
         c["votes"] += 1
