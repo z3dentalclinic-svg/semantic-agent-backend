@@ -222,26 +222,6 @@ FAM_PROMPT = """Мы собираем разные входы для Google Auto
 {{"rejected":[номера],
 "families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}"""
 
-FAM_PROMPT_PROD = """Раздели переформулировки запроса на группы по отличающему слову и отбрось чужие.
-
-Сид: "{seed}"
-
-Кандидаты:
-{candidates}
-
-Группа = одно отличающее слово в любых его формах (падеж,
-число, глагол и существительное того же слова) или с
-расширением (то же слово плюс уточняющее). Разные слова —
-разные группы, даже синонимы.
-Группа 0 (отброс): другая услуга или другой этап пути к
-результату; потерян объект исходного запроса; изменилось
-место или направление; добавлена оценка.
-
-Ответь одной строкой без пояснений: номер группы для каждого
-кандидата по порядку через запятую (0 = отброшен), затем |
-и номера кандидатов-представителей групп через запятую.
-Формат: 1,1,2,0,3|1,4,6"""
-
 FAM_AUDIT_PROMPT = """Проверь одну группу поисковых формулировок.
 
 Исходный запрос: "{seed}"
@@ -270,15 +250,49 @@ FAM_AUDIT_PROMPT = """Проверь одну группу поисковых ф
 {{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}
 где decision = "keep" или "split"; groups заполняй только при split."""
 
-FAM_AUDIT_PROMPT_PROD = """Сид: "{seed}"
+FAM_PROMPT_PROD = """Раздели переформулировки запроса на группы по отличающему слову и отбрось чужие.
 
-Группа переформулировок:
-{members}
+Сид: "{seed}"
 
-Все они построены на одном отличающем слове (его формы и
-расширения)? Ответь без пояснений: слово одно — 0; слова
-разные — номер подгруппы для каждого по порядку через
-запятую. Формат: 0  либо  1,1,2"""
+Кандидаты:
+{candidates}
+
+Группа = одно отличающее слово в любых его формах (падеж,
+число, глагол и существительное того же слова) или с
+расширением (то же слово плюс уточняющее). Разные слова —
+разные группы, даже синонимы.
+Группа 0 (отброс): другая услуга или другой этап пути к
+результату; потерян объект исходного запроса; изменилось
+место или направление; добавлена оценка.
+
+Ответь одной строкой без пояснений: номер группы для каждого
+кандидата по порядку через запятую (0 = отброшен), затем |
+и номера кандидатов-представителей групп через запятую.
+Формат: 1,1,2,0,3|1,4,6"""
+
+
+def _parse_lean_cluster(text, n):
+    """'1,1,2,0,3|1,4,6' -> (группы по кандидатам, номера представителей) или None."""
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or not any(ch.isdigit() for ch in line):
+            continue
+        parts = line.split("|")
+        try:
+            groups = [int(x) for x in parts[0].replace(" ", "").split(",") if x != ""]
+        except ValueError:
+            continue
+        if len(groups) != n:
+            continue
+        reps = []
+        if len(parts) > 1:
+            try:
+                reps = [int(x) for x in parts[1].replace(" ", "").split(",") if x != ""]
+            except ValueError:
+                reps = []
+        return groups, reps
+    return None
+
 
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
 MORPH = pymorphy3.MorphAnalyzer()
@@ -622,49 +636,88 @@ async def finish_fingerprint(client, seed, candidates, run_tables, stats,
             "cards": card_list, "final": final, "stats": stats}
 
 
-def _parse_lean_cluster(text, n):
-    """'1,1,2,0,3|1,4,6' -> (groups per candidate, rep candidate numbers) или None."""
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or not any(ch.isdigit() for ch in line):
-            continue
-        parts = line.split("|")
-        try:
-            groups = [int(x) for x in parts[0].replace(" ", "").split(",") if x != ""]
-        except ValueError:
-            continue
-        if len(groups) != n:
-            continue
-        reps = []
-        if len(parts) > 1:
-            try:
-                reps = [int(x) for x in parts[1].replace(" ", "").split(",") if x != ""]
-            except ValueError:
-                reps = []
-        return groups, reps
-    return None
+async def finish_fingerprint(client, seed, candidates, run_tables, stats,
+                             ver_model, ver_thinking):
+    """Схема отбора FINGERPRINT: карты поведения (1 вызов) -> сет-селектор по картам (3 вызова)."""
+    keys = list(candidates.keys())
+    cards = {}
+    t0 = time.time()
+    if keys:
+        listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
+        res = await call_llm(client, ver_model, ver_thinking,
+                             FP_CARD_PROMPT.format(seed=seed, candidates=listing))
+        stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+        stats["ver"]["cost"] += res["cost"]
+        data = parse_json_block(res["text"])
+        if data and "cards" in data:
+            for c in data["cards"]:
+                try:
+                    idx = int(c.get("id", 0)) - 1
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= idx < len(keys):
+                    cards[keys[idx]] = {"scenario": str(c.get("scenario", "")),
+                                        "pool": str(c.get("pool", "")),
+                                        "new": str(c.get("new", "")),
+                                        "goal": str(c.get("goal", ""))}
 
+    # интент из карты: goal "другая" — отсев до селектора
+    ok_keys = [k for k in keys
+               if not cards.get(k, {}).get("goal", "").strip().lower().startswith("друг")]
 
-def _parse_lean_audit(text, n):
-    """'0' -> keep; '1,1,2' -> подгруппы; None при мусоре."""
-    for line in text.strip().splitlines():
-        line = line.strip().replace(" ", "")
-        if line == "0":
-            return "keep"
-        try:
-            sub = [int(x) for x in line.split(",") if x != ""]
-        except ValueError:
-            continue
-        if len(sub) == n:
-            return sub
-    return None
+    sel_votes = {k: 0 for k in keys}
+    if ok_keys:
+        card_lines = []
+        for i, k in enumerate(ok_keys):
+            c = cards.get(k, {})
+            card_lines.append(f"{i+1}. \"{candidates[k]['variant']}\"\n"
+                              f"   scenario: {c.get('scenario','—')}\n"
+                              f"   pool: {c.get('pool','—')}\n"
+                              f"   new: {c.get('new','—')}")
+        prompt = FP_SEL_PROMPT.format(seed=seed, cards="\n".join(card_lines), top_n=TOP_N)
+        results = await asyncio.gather(
+            *[call_llm(client, ver_model, ver_thinking, prompt) for _ in range(VER_RUNS)],
+            return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+            stats["ver"]["cost"] += res["cost"]
+            data = parse_json_block(res["text"])
+            if not data or "selected" not in data:
+                continue
+            for n in data["selected"]:
+                try:
+                    idx = int(n) - 1
+                except (ValueError, TypeError):
+                    continue
+                if 0 <= idx < len(ok_keys):
+                    sel_votes[ok_keys[idx]] += 1
+    stats["ver"]["wall"] = time.time() - t0
+
+    ranked = []
+    for k, c in candidates.items():
+        avg_pos = sum(c["positions"]) / len(c["positions"])
+        sv = sel_votes.get(k, 0)
+        dropped = k not in ok_keys
+        ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
+                       "cls": "".join(sorted(c["cls"])),
+                       "votes": c["votes"], "avg_pos": round(avg_pos, 2),
+                       "verdict": 0 if dropped else (1 if sv >= 2 else 0),
+                       "score": "цель✗" if dropped else f"{sv}/{VER_RUNS}"})
+    ranked.sort(key=lambda x: (-(0 if x["score"] == "цель✗" else int(x["score"].split("/")[0])),
+                               -x["votes"], x["avg_pos"]))
+    final = [r["variant"] for r in ranked if r["verdict"] == 1][:TOP_N]
+
+    card_list = [{"variant": candidates[k]["variant"], **cards.get(k, {})} for k in keys]
+    return {"seed": seed, "runs": run_tables, "candidates": ranked,
+            "cards": card_list, "final": final, "stats": stats}
 
 
 async def finish_families(client, seed, candidates, run_tables, stats,
                           ver_model, ver_thinking, mode="test"):
-    fam_prompt = FAM_PROMPT_PROD if mode == "prod" else FAM_PROMPT
-    audit_prompt = FAM_AUDIT_PROMPT_PROD if mode == "prod" else FAM_AUDIT_PROMPT
-    """Схема FAMILIES: кластеризация в семьи (1 вызов) -> аудит семей >=2 (по вызову) -> представители кодом."""
+    """Схема FAMILIES: кластеризация в семьи (1 вызов; в prod — лин-формат) -> представители кодом.
+    Аудит семей отключён для замера скорости (Andrew) — блок сохранён комментарием ниже."""
     keys = list(candidates.keys())
     rejected, families = set(), []
     t0 = time.time()
@@ -675,15 +728,17 @@ async def finish_families(client, seed, candidates, run_tables, stats,
 
     if keys:
         listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
+        fam_prompt = FAM_PROMPT_PROD if mode == "prod" else FAM_PROMPT
         res = await call_llm(client, ver_model, ver_thinking,
                              fam_prompt.format(seed=seed, candidates=listing))
         stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
         stats["ver"]["cost"] += res["cost"]
+
         data = {}
         if mode == "prod":
             lean = _parse_lean_cluster(res["text"], len(keys))
             if lean is None:
-                # откат: полный JSON-промпт, чтобы прод не падал от формата
+                # мусорный лин-ответ -> откат этого вызова на полный JSON-промпт
                 res = await call_llm(client, ver_model, ver_thinking,
                                      FAM_PROMPT.format(seed=seed, candidates=listing))
                 stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
@@ -723,73 +778,35 @@ async def finish_families(client, seed, candidates, run_tables, stats,
             rep = rep[0] if rep and rep[0] in members else min(members, key=cand_rank)
             families.append({"scenario": str(f.get("scenario", "")), "members": members,
                              "rep": rep, "reason": str(f.get("reason", ""))})
-        # кандидаты, которых кластеризатор потерял — каждый своей семьёй (не терять данные)
         for k in keys:
             if k not in seen:
                 families.append({"scenario": "(вне кластеризации)", "members": [k],
                                  "rep": k, "reason": "модель не отнесла к семье"})
 
-        # аудит семей из >=2 членов, параллельно
-        async def audit(fi):
-            fam = families[fi]
-            mem_list = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(fam["members"]))
-            res = await call_llm(client, ver_model, ver_thinking,
-                                 audit_prompt.format(seed=seed, members=mem_list))
-            stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
-            stats["ver"]["cost"] += res["cost"]
-            if mode == "prod":
-                lean = _parse_lean_audit(res["text"], len(fam["members"]))
-                if lean == "keep" or lean is None:
-                    return fi, {}
-                sub_map = {}
-                for idx, g in enumerate(lean):
-                    sub_map.setdefault(g, []).append(idx + 1)
-                if len(sub_map) < 2:
-                    return fi, {}
-                return fi, {"decision": "split", "groups": list(sub_map.values())}
-            d = parse_json_block(res["text"]) or {}
-            return fi, d
+        # === АУДИТ ОТКЛЮЧЁН для замера скорости (Andrew). Не удалять — точка отката. ===
+        # async def audit(fi):
+        #     fam = families[fi]
+        #     mem_list = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(fam["members"]))
+        #     res = await call_llm(client, ver_model, ver_thinking,
+        #                          FAM_AUDIT_PROMPT.format(seed=seed, members=mem_list))
+        #     stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+        #     stats["ver"]["cost"] += res["cost"]
+        #     d = parse_json_block(res["text"]) or {}
+        #     return fi, d
+        # audit_ids = [i for i, f in enumerate(families) if len(f["members"]) >= 2]
+        # results = await asyncio.gather(*[audit(i) for i in audit_ids], return_exceptions=True)
+        # split_plan = {}
+        # for r in results:
+        #     if isinstance(r, Exception):
+        #         continue
+        #     fi, d = r
+        #     if str(d.get("decision", "")).strip().lower() == "split" and d.get("groups"):
+        #         split_plan[fi] = d
+        # if split_plan:
+        #     ... (полная логика дробления — в истории git / прошлой версии файла)
 
-        audit_ids = [i for i, f in enumerate(families) if len(f["members"]) >= 2]
-        results = await asyncio.gather(*[audit(i) for i in audit_ids], return_exceptions=True)
-        split_plan = {}
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            fi, d = r
-            if str(d.get("decision", "")).strip().lower() == "split" and d.get("groups"):
-                split_plan[fi] = d
-
-        if split_plan:
-            new_families = []
-            for fi, fam in enumerate(families):
-                if fi not in split_plan:
-                    new_families.append(fam)
-                    continue
-                d = split_plan[fi]
-                used = set()
-                for g in d["groups"]:
-                    mem = []
-                    for n in g or []:
-                        try:
-                            idx = int(n) - 1
-                        except (ValueError, TypeError):
-                            continue
-                        if 0 <= idx < len(fam["members"]):
-                            mem.append(fam["members"][idx]); used.add(idx)
-                    if mem:
-                        new_families.append({"scenario": fam["scenario"] + " (split)",
-                                             "members": mem, "rep": min(mem, key=cand_rank),
-                                             "reason": str(d.get("reason", ""))})
-                left = [m for i, m in enumerate(fam["members"]) if i not in used]
-                if left:
-                    new_families.append({"scenario": fam["scenario"] + " (split)",
-                                         "members": left, "rep": min(left, key=cand_rank),
-                                         "reason": str(d.get("reason", ""))})
-            families = new_families
     stats["ver"]["wall"] = time.time() - t0
 
-    # финал кодом: представители разных семей, ранг семьи = ранг её представителя
     families.sort(key=lambda f: cand_rank(f["rep"]))
     final_keys = [f["rep"] for f in families][:TOP_N]
 
@@ -823,8 +840,6 @@ async def finish_families(client, seed, candidates, run_tables, stats,
     return {"seed": seed, "runs": [] if mode == "prod" else run_tables,
             "candidates": ranked,
             "families": fam_list, "final": final, "stats": stats}
-
-
 class TestRequest(BaseModel):
     seeds: list
     gen_model: str = "gemini-flash-lite"
@@ -916,11 +931,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="fingerprint">Fingerprint</option>
     <option value="families">Families</option>
   </select>
-  <span class="lbl">Режим:</span>
-  <select id="mode">
-    <option value="test" selected>тест (полный отчёт)</option>
-    <option value="prod">прод (быстрый)</option>
-  </select>
   <span class="lbl">Верификатор:</span>
   <select id="ver_model">
     <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
@@ -960,8 +970,7 @@ async function run(){
         gen_thinking:document.getElementById('gen_thinking').value,
         ver_model:document.getElementById('ver_model').value,
         ver_thinking:document.getElementById('ver_thinking').value,
-        sel_scheme:document.getElementById('sel_scheme').value,
-        mode:document.getElementById('mode').value
+        sel_scheme:document.getElementById('sel_scheme').value
       })});
     const data = await r.json();
     render(data);
