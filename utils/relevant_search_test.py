@@ -28,10 +28,11 @@ VER_RUNS = 3          # голосов верификатора на пару, �
 MODELS = {
     "gemini-flash-lite": {"provider": "gemini", "model": "gemini-3.1-flash-lite", "price": [0.10, 0.40]},
     "gemini-flash":      {"provider": "gemini", "model": "gemini-3.6-flash",      "price": [0.30, 2.50]},
+    "gemini-flash-37":   {"provider": "gemini", "model": "gemini-3.7-flash",      "price": [0.75, 3.75]},
     "gpt":               {"provider": "openai", "model": "gpt-5.5",               "price": [1.25, 10.00]},
     "claude-sonnet":     {"provider": "anthropic", "model": "claude-sonnet-4-6", "price": [3.00, 15.00]},
 }
-THINKING = ["off", "low", "medium"]
+THINKING = ["off", "low", "medium", "b384", "b512", "b768"]  # bN = thinkingBudget N токенов
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -356,13 +357,15 @@ async def _call_llm_once(client, model_key, thinking, prompt):
     if cfg["provider"] == "gemini":
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['model']}:generateContent?key={GEMINI_KEY}"
         body = {"contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 1.0}}
+                "generationConfig": {}}  # temperature/top_p сняты: не поддерживаются 3.6+
         if thinking == "off":
             body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
         elif thinking == "low":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
         elif thinking == "medium":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "medium"}
+        elif thinking.startswith("b") and thinking[1:].isdigit():
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": int(thinking[1:])}
         r = await client.post(url, json=body, timeout=90)
         r.raise_for_status()
         d = r.json()
@@ -917,6 +920,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <select id="gen_model">
     <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
     <option value="gemini-flash">gemini-3.6-flash</option>
+    <option value="gemini-flash-37">gemini-3.7-flash</option>
     <option value="gpt">gpt-5.5</option>
     <option value="claude-sonnet">claude-sonnet-4-6</option>
   </select>
@@ -924,6 +928,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="off">thinking: off</option>
     <option value="low" selected>thinking: low</option>
     <option value="medium">thinking: medium</option>
+    <option value="b384">thinking: budget 384</option>
+    <option value="b512">thinking: budget 512</option>
+    <option value="b768">thinking: budget 768</option>
   </select>
   <span class="lbl">Схема:</span>
   <select id="sel_scheme">
@@ -931,10 +938,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="fingerprint">Fingerprint</option>
     <option value="families">Families</option>
   </select>
+  <span class="lbl">Режим:</span>
+  <select id="mode">
+    <option value="test" selected>тест (полный отчёт)</option>
+    <option value="prod">прод (быстрый)</option>
+  </select>
   <span class="lbl">Верификатор:</span>
   <select id="ver_model">
     <option value="gemini-flash-lite">gemini-3.1-flash-lite</option>
     <option value="gemini-flash">gemini-3.6-flash</option>
+    <option value="gemini-flash-37">gemini-3.7-flash</option>
     <option value="gpt">gpt-5.5</option>
     <option value="claude-sonnet">claude-sonnet-4-6</option>
   </select>
@@ -942,6 +955,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="off">thinking: off</option>
     <option value="low" selected>thinking: low</option>
     <option value="medium">thinking: medium</option>
+    <option value="b384">thinking: budget 384</option>
+    <option value="b512">thinking: budget 512</option>
+    <option value="b768">thinking: budget 768</option>
   </select>
   <button id="run" onclick="run()">Запустить</button>
 </div>
@@ -970,7 +986,8 @@ async function run(){
         gen_thinking:document.getElementById('gen_thinking').value,
         ver_model:document.getElementById('ver_model').value,
         ver_thinking:document.getElementById('ver_thinking').value,
-        sel_scheme:document.getElementById('sel_scheme').value
+        sel_scheme:document.getElementById('sel_scheme').value,
+        mode:document.getElementById('mode').value
       })});
     const data = await r.json();
     render(data);
