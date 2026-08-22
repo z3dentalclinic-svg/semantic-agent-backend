@@ -222,9 +222,25 @@ FAM_PROMPT = """Мы собираем разные входы для Google Auto
 {{"rejected":[номера],
 "families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}"""
 
-FAM_PROMPT_PROD = FAM_PROMPT.replace(
-    '{{"rejected":[номера],\n"families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}',
-    '{{"rejected":[номера],\n"families":[{{"members":[номера],"representative":номер}}]}}')
+FAM_PROMPT_PROD = """Раздели переформулировки запроса на группы по отличающему слову и отбрось чужие.
+
+Сид: "{seed}"
+
+Кандидаты:
+{candidates}
+
+Группа = одно отличающее слово в любых его формах (падеж,
+число, глагол и существительное того же слова) или с
+расширением (то же слово плюс уточняющее). Разные слова —
+разные группы, даже синонимы.
+Группа 0 (отброс): другая услуга или другой этап пути к
+результату; потерян объект исходного запроса; изменилось
+место или направление; добавлена оценка.
+
+Ответь одной строкой без пояснений: номер группы для каждого
+кандидата по порядку через запятую (0 = отброшен), затем |
+и номера кандидатов-представителей групп через запятую.
+Формат: 1,1,2,0,3|1,4,6"""
 
 FAM_AUDIT_PROMPT = """Проверь одну группу поисковых формулировок.
 
@@ -254,9 +270,15 @@ FAM_AUDIT_PROMPT = """Проверь одну группу поисковых ф
 {{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}
 где decision = "keep" или "split"; groups заполняй только при split."""
 
-FAM_AUDIT_PROMPT_PROD = FAM_AUDIT_PROMPT.replace(
-    '{{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}',
-    '{{"decision":"keep","groups":[[номера],[номера]]}}')
+FAM_AUDIT_PROMPT_PROD = """Сид: "{seed}"
+
+Группа переформулировок:
+{members}
+
+Все они построены на одном отличающем слове (его формы и
+расширения)? Ответь без пояснений: слово одно — 0; слова
+разные — номер подгруппы для каждого по порядку через
+запятую. Формат: 0  либо  1,1,2"""
 
 FROZEN_ROLES = {"geo", "brand", "num", "func"}
 MORPH = pymorphy3.MorphAnalyzer()
@@ -600,6 +622,44 @@ async def finish_fingerprint(client, seed, candidates, run_tables, stats,
             "cards": card_list, "final": final, "stats": stats}
 
 
+def _parse_lean_cluster(text, n):
+    """'1,1,2,0,3|1,4,6' -> (groups per candidate, rep candidate numbers) или None."""
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or not any(ch.isdigit() for ch in line):
+            continue
+        parts = line.split("|")
+        try:
+            groups = [int(x) for x in parts[0].replace(" ", "").split(",") if x != ""]
+        except ValueError:
+            continue
+        if len(groups) != n:
+            continue
+        reps = []
+        if len(parts) > 1:
+            try:
+                reps = [int(x) for x in parts[1].replace(" ", "").split(",") if x != ""]
+            except ValueError:
+                reps = []
+        return groups, reps
+    return None
+
+
+def _parse_lean_audit(text, n):
+    """'0' -> keep; '1,1,2' -> подгруппы; None при мусоре."""
+    for line in text.strip().splitlines():
+        line = line.strip().replace(" ", "")
+        if line == "0":
+            return "keep"
+        try:
+            sub = [int(x) for x in line.split(",") if x != ""]
+        except ValueError:
+            continue
+        if len(sub) == n:
+            return sub
+    return None
+
+
 async def finish_families(client, seed, candidates, run_tables, stats,
                           ver_model, ver_thinking, mode="test"):
     fam_prompt = FAM_PROMPT_PROD if mode == "prod" else FAM_PROMPT
@@ -619,7 +679,27 @@ async def finish_families(client, seed, candidates, run_tables, stats,
                              fam_prompt.format(seed=seed, candidates=listing))
         stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
         stats["ver"]["cost"] += res["cost"]
-        data = parse_json_block(res["text"]) or {}
+        data = {}
+        if mode == "prod":
+            lean = _parse_lean_cluster(res["text"], len(keys))
+            if lean is None:
+                # откат: полный JSON-промпт, чтобы прод не падал от формата
+                res = await call_llm(client, ver_model, ver_thinking,
+                                     FAM_PROMPT.format(seed=seed, candidates=listing))
+                stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+                stats["ver"]["cost"] += res["cost"]
+                data = parse_json_block(res["text"]) or {}
+            else:
+                groups, reps = lean
+                fam_map = {}
+                for idx, g in enumerate(groups):
+                    fam_map.setdefault(g, []).append(idx + 1)
+                data = {"rejected": fam_map.pop(0, []),
+                        "families": [{"members": mem,
+                                      "representative": next((r for r in reps if r in mem), 0)}
+                                     for g, mem in sorted(fam_map.items())]}
+        else:
+            data = parse_json_block(res["text"]) or {}
 
         def to_keys(nums):
             out = []
@@ -657,6 +737,16 @@ async def finish_families(client, seed, candidates, run_tables, stats,
                                  audit_prompt.format(seed=seed, members=mem_list))
             stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
             stats["ver"]["cost"] += res["cost"]
+            if mode == "prod":
+                lean = _parse_lean_audit(res["text"], len(fam["members"]))
+                if lean == "keep" or lean is None:
+                    return fi, {}
+                sub_map = {}
+                for idx, g in enumerate(lean):
+                    sub_map.setdefault(g, []).append(idx + 1)
+                if len(sub_map) < 2:
+                    return fi, {}
+                return fi, {"decision": "split", "groups": list(sub_map.values())}
             d = parse_json_block(res["text"]) or {}
             return fi, d
 
