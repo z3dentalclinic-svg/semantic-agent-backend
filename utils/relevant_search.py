@@ -46,7 +46,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.6 (+ merge-audit: attach-verb families collapse to one slot)"
 # BUILD = "relevant_search_prod_1.6.1 (merge-audit also collapses word-extension and translit slots)"
 # BUILD = "relevant_search_prod_1.7 (cluster: 3-vote aggregation + code root-split of families)"
-BUILD = "relevant_search_prod_1.7.1 (root-split: strict full-matching, translit-bridge fixed)"
+# BUILD = "relevant_search_prod_1.7.1 (root-split: strict full-matching, translit-bridge fixed)"
+BUILD = "relevant_search_prod_1.7.2 (merge guard: slot must root-contain all seed words)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -766,7 +767,37 @@ async def _cluster_families(client, seed, candidates, stats):
             stats["ver"]["merge_error"] = str(e)
             lean = None
         if lean is not None:
+            # Кодовый страж склейки: слот из НЕСКОЛЬКИХ семей принимается, только если
+            # каждый его представитель содержит все леммы сида (равенство/корень).
+            # «Поставить/вставить зубной имплант» — содержат (имплант~имплантация,
+            # зубной~зубов) → склейка законна. «Заказать/приобрести айфон 16» — «купить»
+            # отсутствует, слова сида ЗАМЕНЕНЫ разными словами → это разные семьи,
+            # модельная склейка отклоняется. Правило закона семей — в код.
+            seed_lm2 = lemma_tokens(seed)
+
+            def contains_seed_by_root(k):
+                v = lemma_tokens(candidates[k]["variant"])
+                return all(any(l == vl or _same_root(l, vl) for vl in v) for l in seed_lm2)
+
             slots_arr, chosen = lean
+            guard_broken = 0
+            seen_slot = {}
+            for fi in range(len(slots_arr)):
+                sl = slots_arr[fi]
+                if sl <= 0:
+                    continue
+                seen_slot.setdefault(sl, []).append(fi)
+            next_free = max(slots_arr, default=0) + 1
+            for sl, fis in seen_slot.items():
+                if len(fis) < 2:
+                    continue
+                if not all(contains_seed_by_root(rep_keys[fi]) for fi in fis):
+                    guard_broken += 1
+                    for fi in fis[1:]:   # склейка отклонена: каждый остаётся своим слотом
+                        slots_arr[fi] = next_free
+                        next_free += 1
+            if guard_broken:
+                stats["ver"]["merge_guard_rejected"] = guard_broken
             slot_map = {}
             for fi, slot in enumerate(slots_arr):
                 slot_map.setdefault(slot if slot > 0 else f"solo{fi}", []).append(fi)
