@@ -1,13 +1,20 @@
 # relevant_worker.py
 # Воркер релевантного поиска — НОВЫЙ режим рядом со старым, старый /api/light-search не трогается.
 #
-# Шаг 1 (этот файл): сид → сырой парсинг ‖ генерация вариантов → варианты парсятся ПО ОЧЕРЕДИ
-#   → общий контейнер с дедупликацией и пометкой источника. Фильтры НЕ применяются (filters=none):
-#   подключение цепочки pre…L3 к объединённому сырью — следующий шаг, отдельно.
+# Шаг 1: сид → сырой парсинг ‖ генерация вариантов → варианты парсятся ПО ОЧЕРЕДИ → контейнер
+#   с дедупликацией и меткой источника на каждом ключе (filters=none — только сбор сырья).
+# Шаг 2 (конвейер с инкрементальным дедупом): цепочка фильтров seed-специфична (L0/L1.5/L2 —
+#   ключ относительно сида), поэтому каждый источник фильтруется СО СВОИМ сидом, как отдельный
+#   прямой поиск. Источник спарсился → ключи, уже виденные у предыдущих источников, выкинуты
+#   (ключ фильтруется один раз — сидом, который принёс его первым; двух вердиктов не бывает) →
+#   остаток уходит в фильтры в фоне, пока парсится следующий источник. Слияние VALID/GREY/blocked
+#   после фильтров. Замеры экономии дедупа и перекрытия фильтрации с парсингом — в ответе.
 #
-# Подключение в main.py (после определения light_search_endpoint):
+# Подключение в main.py (после apply_filters_endpoint; старый путь не меняется):
 #   from relevant_worker import register_relevant_worker
-#   register_relevant_worker(app, light_search_endpoint)
+#   register_relevant_worker(app, light_search_endpoint,
+#       filter_ctx={"apply": apply_filters_traced, "l2": _build_l2_config,
+#                   "l25": _build_l2_5_config, "l3": _build_l3_config})
 #
 # Эндпоинты: GET /api/relevant-search (воркер), GET /relevant-search (промежуточный HTML).
 
@@ -24,16 +31,66 @@ except ImportError:
     from relevant_search import relevant_variants, BUILD as RS_BUILD         # файл в корне
 
 logger = logging.getLogger(__name__)
-WORKER_BUILD = "relevant_worker 0.1 (raw merge, no filters)"
+# WORKER_BUILD = "relevant_worker 0.1 (raw merge, no filters)"
+# WORKER_BUILD = "relevant_worker 0.2 (pipeline: per-source filters + incremental dedup)"
+WORKER_BUILD = "relevant_worker 0.2.1 (pipeline; filter crash -> keys to GREY as filter_error)"
+DEFAULT_FILTERS = "pre,geo,bpf,rel,l0,l15v2,l2,l25,l3"   # полная цепочка как в autopilot/index
 
 
 def _norm_key(kw):
     return " ".join(str(kw).lower().split())
 
 
-def register_relevant_worker(app, light_search_fn):
+def _cost(stats):
+    """cost_usd из stats-объекта стадии (терпимо к типу и отсутствию) — как stageCost в autopilot."""
+    if not isinstance(stats, dict) or stats.get("error"):
+        return 0.0
+    v = stats.get("cost_usd", stats.get("cost"))
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def register_relevant_worker(app, light_search_fn, filter_ctx=None):
     """light_search_fn — функция light_search_endpoint из main.py (вызов напрямую, минуя HTTP),
-    чтобы сырьё вариантов совпадало с сырьём index/autopilot."""
+    чтобы сырьё вариантов совпадало с сырьём index/autopilot.
+    filter_ctx — {"apply": apply_filters_traced, "l2": _build_l2_config,
+                  "l25": _build_l2_5_config, "l3": _build_l3_config} из main.py.
+    Без filter_ctx воркер умеет только filters=none (сбор сырья)."""
+
+    # Цепочки фильтров не пересекаются между собой (parser.tracer и
+    # parser.skip_relevance_filter — глобальные), но перекрываются с парсингом следующего источника.
+    filter_lock = asyncio.Lock()
+
+    def _filter_sync(keywords, seed, country, language, filters, l2, l3_model, l3_effort):
+        """Один прогон цепочки фильтров для одного источника — зеркало apply_filters_endpoint."""
+        result = {"seed": seed, "method": "relevant-search", "keywords": list(keywords),
+                  "anchors": [], "count": len(keywords), "anchors_count": 0}
+        l2_config = filter_ctx["l2"](*l2)
+        l2_5_config = filter_ctx["l25"]()
+        l3_config = filter_ctx["l3"](model=l3_model, effort=l3_effort)
+        return filter_ctx["apply"](result, seed=seed, country=country, method="relevant-search",
+                                   language=language, enabled_filters=filters,
+                                   l2_config=l2_config, l2_5_config=l2_5_config, l3_config=l3_config)
+
+    async def _filter_source(src_entry, keywords, seed, country, language, filters, l2, l3_model, l3_effort):
+        """При падении всей цепочки исключением (не сбой L2.5/L3 — те ловятся внутри цепочки)
+        ключи источника уходят в GREY с пометкой filter_error, чтобы не пропадать из результата."""
+        async with filter_lock:
+            src_entry["filter_start"] = time.time()
+            try:
+                res = await asyncio.to_thread(_filter_sync, keywords, seed, country, language,
+                                              filters, l2, l3_model, l3_effort)
+            except Exception as e:
+                logger.error(f"[RELEVANT] filter error for '{seed}': {e}")
+                src_entry["filter_error"] = str(e)
+                res = {"keywords": [], "keywords_grey": list(keywords), "anchors": [],
+                       "_trace": {"blocked_keywords": {}},
+                       "_filter_error": str(e), "_filter_timings": {}}
+            src_entry["filter_end"] = time.time()
+            src_entry["filter_wall"] = round(src_entry["filter_end"] - src_entry["filter_start"], 2)
+            return res
 
     async def _raw_parse(seed, country, region_id, language, use_numbers, parallel_limit, operator):
         """Сырой парсинг одного запроса тем же путём, что light-search с filters=none."""
@@ -56,10 +113,21 @@ def register_relevant_worker(app, light_search_fn):
         use_numbers: bool = Query(False),
         parallel_limit: int = Query(5),
         operator: str = Query("купить"),
+        filters: str = Query(DEFAULT_FILTERS, description="none = только сбор сырья"),
+        l3_model: str = Query(None),
+        l3_effort: str = Query(None),
+        l2_pmi_valid: float = Query(None),
+        l2_centroid_valid: float = Query(None),
+        l2_centroid_trash: float = Query(None),
     ):
         t_total = time.time()
         seed_in = " ".join(seed.strip().split())
         stages = {}
+        do_filter = filters.lower().strip() != "none"
+        if do_filter and not filter_ctx:
+            return {"error": "filter_ctx не передан в register_relevant_worker — фильтры недоступны"}
+        l2 = (l2_pmi_valid, l2_centroid_valid, l2_centroid_trash)
+        filter_tasks = []   # (src_entry, task) — фильтрация в фоне по конвейеру
 
         # ── Этап 1: сид в парсер ‖ генерация вариантов ──────────────────
         t0 = time.time()
@@ -88,7 +156,8 @@ def register_relevant_worker(app, light_search_fn):
         container = {}
 
         def absorb(res, src):
-            new = 0
+            """Инкрементальный дедуп: в фильтры уходят только ключи, не виденные у предыдущих источников."""
+            fresh = []
             for kw in res.get("keywords") or []:
                 k = _norm_key(kw)
                 if not k:
@@ -96,56 +165,129 @@ def register_relevant_worker(app, light_search_fn):
                 e = container.get(k)
                 if e is None:
                     container[k] = {"keyword": kw, "sources": [src]}
-                    new += 1
+                    fresh.append(kw)
                 elif src not in e["sources"]:
                     e["sources"].append(src)
-            return new
+            return fresh
 
-        seed_new = absorb(seed_res, "seed")
+        def start_filter(entry, fresh, src_seed):
+            if do_filter and fresh:
+                entry["to_filter"] = len(fresh)
+                task = asyncio.create_task(_filter_source(entry, fresh, src_seed, country, language,
+                                                          filters, l2, l3_model, l3_effort))
+                filter_tasks.append((entry, task))
+            else:
+                entry["to_filter"] = len(fresh) if do_filter else 0
+
+        seed_fresh = absorb(seed_res, "seed")
         sources = [{"id": "seed", "query": seed_used, "raw": len(seed_res.get("keywords") or []),
-                    "new": seed_new, "wall": seed_res.get("_wall", 0),
+                    "new": len(seed_fresh), "wall": seed_res.get("_wall", 0),
                     "suffix": seed_res.get("suffix_count", 0), "prefix": seed_res.get("prefix_count", 0),
                     "infix": seed_res.get("infix_count", 0)}]
+        start_filter(sources[0], seed_fresh, seed_used)
 
         # ── Этап 2: варианты ПО ОЧЕРЕДИ ────────────────────────────────
         t0 = time.time()
         for i, v in enumerate(variants, start=1):
             src = f"v{i}"
+            t_parse = time.time()
             try:
                 vres = await _raw_parse(v, country, region_id, language, use_numbers, parallel_limit, operator)
             except Exception as e:
                 logger.error(f"[RELEVANT] variant '{v}' parse error: {e}")
                 sources.append({"id": src, "query": v, "error": str(e), "raw": 0, "new": 0, "wall": 0})
                 continue
-            n_new = absorb(vres, src)
-            sources.append({"id": src, "query": vres.get("seed", v), "raw": len(vres.get("keywords") or []),
-                            "new": n_new, "wall": vres.get("_wall", 0),
-                            "suffix": vres.get("suffix_count", 0), "prefix": vres.get("prefix_count", 0),
-                            "infix": vres.get("infix_count", 0)})
+            fresh = absorb(vres, src)
+            v_seed = vres.get("seed", v)
+            entry = {"id": src, "query": v_seed, "raw": len(vres.get("keywords") or []),
+                     "new": len(fresh), "wall": vres.get("_wall", 0),
+                     "parse_start": round(t_parse, 3), "parse_end": round(time.time(), 3),
+                     "suffix": vres.get("suffix_count", 0), "prefix": vres.get("prefix_count", 0),
+                     "infix": vres.get("infix_count", 0)}
+            sources.append(entry)
+            start_filter(entry, fresh, v_seed)
         stages["variants_parse"] = round(time.time() - t0, 2)
 
         merged = sorted(container.values(), key=lambda e: e["keyword"].lower())
-        elapsed = round(time.time() - t_total, 2)
-        logger.info(
-            f"[RELEVANT] seed='{seed_used}' | variants={len(variants)} | "
-            f"seed_raw={sources[0]['raw']} merged={len(merged)} | {elapsed}s"
-        )
-
-        return {
+        out = {
             "seed": seed_used,
             "original_seed": seed_in if seed_used != seed_in else None,
             "method": "relevant_search",
             "build": {"worker": WORKER_BUILD, "relevant": RS_BUILD},
-            "keywords": [e["keyword"] for e in merged],          # формат light-search: список строк
+            "keywords": [e["keyword"] for e in merged],          # сырьё; при фильтрации ниже заменяется на VALID
             "keywords_sources": {e["keyword"]: e["sources"] for e in merged},
             "count": len(merged),
+            "raw_count": len(merged),
+            "filters": filters,
             "sources": sources,
             "relevant": {"final": rel.get("final", []), "families": rel.get("families", []),
                          "candidates": rel.get("candidates", []), "stats": rel.get("stats", {}),
                          "error": rel_error},
             "stages": stages,
-            "elapsed_time": elapsed,
         }
+
+        # ── Этап 3: дождаться хвоста конвейера и слить результаты фильтров ──
+        if do_filter:
+            t0 = time.time()
+            parse_done = time.time()
+            valid, grey, anchors, blocked_trace = [], [], [], {}
+            seen_v, seen_g = set(), set()
+            cost25 = cost3 = 0.0
+            per_source_stats = {}
+            for entry, task in filter_tasks:
+                res = await task
+                if res.get("_filter_error"):
+                    entry["grey_reason"] = "filter_error"
+                for kw in res.get("keywords") or []:
+                    k = _norm_key(kw if isinstance(kw, str) else kw.get("query", kw.get("keyword", "")))
+                    if k and k not in seen_v:
+                        seen_v.add(k); valid.append(kw)
+                for kw in res.get("keywords_grey") or []:
+                    k = _norm_key(kw if isinstance(kw, str) else kw.get("query", kw.get("keyword", "")))
+                    if k and k not in seen_g:
+                        seen_g.add(k); grey.append(kw)
+                anchors.extend(res.get("anchors") or [])
+                tr = res.get("_trace") or {}
+                if isinstance(tr, dict):
+                    blocked_trace.update(tr.get("blocked_keywords") or {})
+                s25 = res.get("l2_5_stats") or res.get("l25_stats") or {}
+                s3 = res.get("l3_stats") or {}
+                c25 = _cost(s25); c3 = _cost(s3)
+                cost25 += c25; cost3 += c3
+                entry["valid"] = len(res.get("keywords") or [])
+                entry["grey"] = len(res.get("keywords_grey") or [])
+                entry["blocked"] = len(res.get("anchors") or [])
+                entry["cost_l25"] = round(c25, 5); entry["cost_l3"] = round(c3, 5)
+                entry["filter_timings"] = res.get("_filter_timings", {})
+                per_source_stats[entry["id"]] = {"l2_5_stats": s25, "l3_stats": s3}
+            stages["filters_tail_wait"] = round(time.time() - t0, 2)   # сколько ждали хвост после парсинга
+
+            # Перекрытие: время фильтрации, прошедшее, пока ещё шёл парсинг (= сэкономлено конвейером)
+            overlap = 0.0
+            for entry in sources:
+                fs, fe = entry.get("filter_start"), entry.get("filter_end")
+                if fs and fe:
+                    overlap += max(0.0, min(fe, parse_done) - fs)
+            stages["filters_overlap_with_parse"] = round(overlap, 2)
+            stages["dedup_removed"] = sum(e["raw"] - e["new"] for e in sources)
+
+            out["keywords"] = valid
+            out["keywords_grey"] = grey
+            out["anchors"] = anchors
+            out["count"] = len(valid)
+            out["anchors_count"] = len(anchors)
+            out["_trace"] = {"blocked_keywords": blocked_trace}
+            out["l2_5_stats"] = {"cost_usd": round(cost25, 6), "per_source": {k: v["l2_5_stats"] for k, v in per_source_stats.items()}}
+            out["l3_stats"] = {"cost_usd": round(cost3, 6), "per_source": {k: v["l3_stats"] for k, v in per_source_stats.items()}}
+
+        elapsed = round(time.time() - t_total, 2)
+        out["elapsed_time"] = elapsed
+        logger.info(
+            f"[RELEVANT] seed='{seed_used}' | variants={len(variants)} | "
+            f"seed_raw={sources[0]['raw']} raw_merged={len(merged)} valid={out['count']} | "
+            f"filters={filters} | {elapsed}s"
+        )
+        return out
 
     @app.get("/relevant-search", response_class=HTMLResponse)
     async def relevant_search_page():
