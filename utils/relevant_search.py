@@ -45,7 +45,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.5 (+ seed+adverb code cut; translit/translation of seed word -> group 0)"
 # BUILD = "relevant_search_prod_1.6 (+ merge-audit: attach-verb families collapse to one slot)"
 # BUILD = "relevant_search_prod_1.6.1 (merge-audit also collapses word-extension and translit slots)"
-BUILD = "relevant_search_prod_1.7 (cluster: 3-vote aggregation + code root-split of families)"
+# BUILD = "relevant_search_prod_1.7 (cluster: 3-vote aggregation + code root-split of families)"
+BUILD = "relevant_search_prod_1.7.1 (root-split: strict full-matching, translit-bridge fixed)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -708,7 +709,19 @@ async def _cluster_families(client, seed, candidates, stats):
         return [l for l, c in v.items() for _ in range(c - seed_lm.get(l, 0)) if c > seed_lm.get(l, 0)]
 
     def related(d1, d2):
-        return any(a == b or _same_root(a, b) for a in d1 for b in d2)
+        """Связь = буква закона «одно отличающее слово (в формах или с расширением)»:
+        ВСЕ отличия меньшего множества паросочетаются с отличиями большего по
+        равенству/корню; лишние леммы большего — расширение, допустимо.
+        Частичное пересечение («заказать iphone»/«приобрести iphone» через мост
+        iphone) связью НЕ является — мост склеивал разные слова в одну семью."""
+        a, b = (d1, d2) if len(d1) <= len(d2) else (d2, d1)
+        if not a:
+            return True
+        from itertools import permutations
+        for perm in permutations(b, len(a)):
+            if all(x == y or _same_root(x, y) for x, y in zip(a, perm)):
+                return True
+        return False
 
     split_out = []
     for f in families:
