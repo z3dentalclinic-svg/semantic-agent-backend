@@ -43,7 +43,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.3 (cluster lean V2: immediate-operation criterion)"
 # BUILD = "relevant_search_prod_1.4 (+ derivative-of-seed code cut; reps ordered by real usage)"
 # BUILD = "relevant_search_prod_1.5 (+ seed+adverb code cut; translit/translation of seed word -> group 0)"
-BUILD = "relevant_search_prod_1.6 (+ merge-audit: attach-verb families collapse to one slot)"
+# BUILD = "relevant_search_prod_1.6 (+ merge-audit: attach-verb families collapse to one slot)"
+BUILD = "relevant_search_prod_1.6.1 (merge-audit also collapses word-extension and translit slots)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -233,6 +234,11 @@ MERGE_PROMPT = """Проверь список строк — кандидаты 
 а различаются они только глаголом-обвязкой — действием над этим ядром
 (например, поставить / вставить / установить): продолжения автокомплита
 у таких строк совпадают.
+
+Также ОДИН вход, когда отличающее слово у кандидатов одно и то же:
+у одного оно с уточняющим словом (расширением), или записано другим
+языком или алфавитом, или в другой форме. Расширение и запись слова —
+не новый вход.
 
 НЕ склеивай кандидатов, если:
 - различающее слово само называет услугу или действие-услугу — разные
