@@ -18,10 +18,12 @@
 #
 # Эндпоинты: GET /api/relevant-search (воркер), GET /relevant-search (промежуточный HTML).
 
+import re
 import time
 import asyncio
 import logging
 import httpx
+from pydantic import BaseModel
 from fastapi import Query
 from fastapi.responses import HTMLResponse
 
@@ -35,7 +37,8 @@ logger = logging.getLogger(__name__)
 # WORKER_BUILD = "relevant_worker 0.2 (pipeline: per-source filters + incremental dedup)"
 # WORKER_BUILD = "relevant_worker 0.2.1 (pipeline; filter crash -> keys to GREY as filter_error)"
 # WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original seed, 3.7-flash b512)"
-WORKER_BUILD = "relevant_worker 0.4 (cross filter: own subject-criterion prompt)"
+# WORKER_BUILD = "relevant_worker 0.4 (cross filter: own subject-criterion prompt)"
+WORKER_BUILD = "relevant_worker 0.5 (+ input sanitizer; + /api/relevant-gen batch test)"
 # Перекрёстный L2.5: VALID варианта прошёл цепочку со СВОИМ сидом, но исходного сида не видел —
 # «доставка букетов из конфет» валиден для сида «доставка букетов» и мусор для «доставка цветов».
 # Поэтому VALID каждого варианта дополнительно гонится через тот же L2.5 с ИСХОДНЫМ сидом.
@@ -59,8 +62,20 @@ CROSS_SYSTEM_PROMPT = """Тебе даются SEED, регион поиска �
 DEFAULT_FILTERS = "pre,geo,bpf,rel,l0,l15v2,l2,l25,l3"   # полная цепочка как в autopilot/index
 
 
+class RelevantGenRequest(BaseModel):
+    seeds: list   # до 30 сидов
+
+
 def _norm_key(kw):
     return " ".join(str(kw).lower().split())
+
+
+def _sanitize_query(q):
+    """Срез ведущих маркеров списка/нумерации, попавших при копировании («• x», «- x», «1. x»)."""
+    q = str(q).strip()
+    q = re.sub(r"^[^0-9a-zA-Z\u0400-\u04FF]+", "", q)
+    q = re.sub(r"^\d+[.)]\s+", "", q)
+    return q.strip()
 
 
 def _cost(stats):
@@ -181,7 +196,7 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
         l2_centroid_trash: float = Query(None),
     ):
         t_total = time.time()
-        seed_in = " ".join(seed.strip().split())
+        seed_in = " ".join(_sanitize_query(seed).split())
         stages = {}
         do_filter = filters.lower().strip() != "none"
         if do_filter and not filter_ctx:
@@ -362,6 +377,29 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
             f"filters={filters} | {elapsed}s"
         )
         return out
+
+    # ── Калибровка ТОЛЬКО цепочки генерации (прод-конфиг, без парсинга и фильтров) ──
+    @app.post("/api/relevant-gen")
+    async def relevant_gen_endpoint(req: RelevantGenRequest):
+        seeds = [_sanitize_query(x) for x in (req.seeds or []) if str(x).strip()][:30]
+        if not seeds:
+            return {"error": "нет сидов"}
+        t0 = time.time()
+        results, total_cost = [], 0.0
+        async with httpx.AsyncClient() as client:
+            for seed in seeds:   # последовательно, без шторма квоты
+                try:
+                    r = await relevant_variants(seed, client)
+                    st = r.get("stats", {})
+                    total_cost += st.get("total_cost", 0)
+                    results.append({"seed": r.get("seed", seed), "final": r.get("final", []),
+                                    "families": r.get("families", []),
+                                    "candidates": r.get("candidates", []), "stats": st})
+                except Exception as e:
+                    logger.error(f"[RELEVANT-GEN] '{seed}': {e}")
+                    results.append({"seed": seed, "error": str(e)})
+        return {"results": results, "build": RS_BUILD,
+                "total": {"cost": round(total_cost, 5), "wall": round(time.time() - t0, 1)}}
 
     @app.get("/relevant-search", response_class=HTMLResponse)
     async def relevant_search_page():
