@@ -41,7 +41,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.2 (gen prompts: same-intent requirement)"
 # BUILD = "relevant_search_prod_1.2.1 (+ input sanitizer: list markers stripped)"
 # BUILD = "relevant_search_prod_1.3 (cluster lean V2: immediate-operation criterion)"
-BUILD = "relevant_search_prod_1.4 (+ derivative-of-seed code cut; reps ordered by real usage)"
+# BUILD = "relevant_search_prod_1.4 (+ derivative-of-seed code cut; reps ordered by real usage)"
+BUILD = "relevant_search_prod_1.5 (+ seed+adverb code cut; translit/translation of seed word -> group 0)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -141,6 +142,9 @@ FAM_PROMPT_PROD = """Отбери переформулировки запрос�
 Общая цепочка действий не делает операции одинаковыми.
 Также группа 0: потерян объект сида (замена синонимом допустима),
 изменилось место или направление, добавлена оценка.
+Также группа 0: кандидат отличается от сида только записью того же
+слова на другом языке или алфавите (перевод названия, транслитерация,
+латиница вместо кириллицы) — это тот же вход поиска, не новый вариант.
 
 Шаг 3. Прошедших раздели на группы по отличающему слову: одна группа =
 одно отличающее слово в его формах или с расширением; разные слова —
@@ -292,6 +296,26 @@ def _same_root(a, b):
     m = min(len(a), len(b))
     # одно слово — префикс другого («цвет»/«цветок») или длинная общая основа
     return (p >= 3 and p == m) or (p >= 5 and p >= 0.6 * m)
+
+
+AUX_POS = {"ADVB", "NPRO", "PRED"}   # где/как/куда, местоимения, предикативы — довесок, не новое слово
+
+
+def is_seed_plus_aux(variant, seed_lemmas):
+    """Кандидат = сид целиком + только вопросительные/наречные/местоименные довески:
+    «где купить айфон 16», «купить айфон 16 недорого» при сиде «купить айфон 16».
+    Вход тот же (довесок — вопрос или оценка, «оценка» и так группа 0 у кластера) —
+    не вариант. Определение по POS pymorphy, без словарей слов."""
+    v = lemma_tokens(variant)
+    if any(v.get(l, 0) < c for l, c in seed_lemmas.items()):
+        return False   # сид не содержится целиком
+    extra = []
+    for l, c in v.items():
+        d = c - seed_lemmas.get(l, 0)
+        extra.extend([l] * d)
+    if not extra:
+        return False   # это морфовариант, его ловит другое правило
+    return all((MORPH.parse(l)[0].tag.POS in AUX_POS) for l in extra)
 
 
 def is_word_derivative(variant_lemmas, seed_lemmas):
@@ -448,6 +472,8 @@ async def _generate_candidates(client, seed, stats):
             return  # морфовариант сида (падеж/число) — не вариант
         if is_word_derivative(v_lemmas, seed_lemmas):
             return  # словообразовательная форма слова сида — семья сида, не отдельный вход
+        if is_seed_plus_aux(variant, seed_lemmas):
+            return  # сид + вопросительный/наречный довесок («где …») — тот же вход
         c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
                                       "sub": sub, "orig": orig, "cls": set()})
         c["votes"] += 1
