@@ -2044,7 +2044,10 @@ try:
     from utils.relevant_worker import register_relevant_worker      # файл в utils/
 except ImportError:
     from relevant_worker import register_relevant_worker            # файл в корне
-register_relevant_worker(app, light_search_endpoint)
+# register_relevant_worker(app, light_search_endpoint)  # v0.1: только сбор сырья
+register_relevant_worker(app, light_search_endpoint,
+    filter_ctx={"apply": apply_filters_traced, "l2": _build_l2_config,   # v0.2: конвейер —
+                "l25": _build_l2_5_config, "l3": _build_l3_config})      # фильтры со своим сидом на источник
 
 
 @app.get("/api/deep-search")
