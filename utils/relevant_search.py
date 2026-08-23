@@ -1,0 +1,542 @@
+# relevant_search.py
+# Релевантный поиск — прод-версия (финал калибровки, схема FAMILIES).
+# Вход: сид. Выход: до TOP_N переформулировок для параллельного парсинга.
+#
+# Прод-конфигурация (утверждена):
+#   модель gemini-3.7-flash оба этапа
+#   генератор thinkingBudget=768, кластер thinkingBudget=512
+#   лин-промпт кластера, откат на полный JSON при парс-фейле, аудит семей выключен
+#
+# Публичный вход: await relevant_variants(seed, client) -> dict
+#   {"seed", "final": [...], "families": [...], "candidates": [...], "stats": {...}}
+# Калибровочный стенд (relevant_search_test.py) остаётся отдельно, к проду не подключён.
+
+import os
+import re
+import json
+import time
+import asyncio
+import httpx
+import pymorphy3
+
+# ---------------- конфиг (зафиксирован) ----------------
+GEN_MODEL = "gemini-3.7-flash"
+VER_MODEL = "gemini-3.7-flash"
+GEN_THINKING_BUDGET = 768
+VER_THINKING_BUDGET = 512
+PRICE = [0.75, 3.75]   # $/1M input, output — правь под актуальный прайс
+
+GEN_RUNS = 3          # прогонов генерации на каждый класс (A токенные, B свободные)
+TOP_N = 3             # потолок вариантов в работу; добор запрещён
+BUILD = "relevant_search_prod_1.0"
+
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
+
+# ---------------- промпты (утверждены) ----------------
+GEN_PROMPT = """Запрос пользователя: "{seed}"
+
+Разбери запрос на слова. Для каждого слова укажи роль:
+- obj (предмет), act (действие), app (к чему относится),
+  comm (цена/купить/отзывы и т.п.), geo (город/страна),
+  brand (бренд/модель), num (число/характеристика), func (предлог/союз)
+
+Для ролей geo, brand, num, func замен НЕ давать — пустой список.
+
+Для остальных слов дай 0-3 замены. Замена — это слово, которым
+другой реальный человек заменил бы это слово, ища ТО ЖЕ САМОЕ
+в Google. Проверяй подстановкой: замена должна встать на место
+исходного слова в "{seed}" так, чтобы запрос искали те же люди
+с той же целью.
+
+НЕ давать:
+- оценки и модификаторы (дешево, лучший, срочно, рядом)
+- обобщения (устройство вместо конкретного предмета)
+- сужения (конкретная модель вместо общего слова)
+- слова, меняющие цель поиска
+
+Давай только замены, которые сам видел в реальных
+поисковых запросах или названиях товаров.
+
+Ответ строго JSON без пояснений:
+{{"tokens":[{{"word":"...","role":"...","subs":["..."]}}]}}"""
+
+GEN_B_PROMPT = """Запрос пользователя в Google: "{seed}"
+
+Напиши 4-7 запросов, которыми реальный человек ищет
+ТО ЖЕ САМОЕ другими словами. Полные фразы целиком,
+как их вводят в поиск.
+
+Используй разные формы:
+- через глагол (что человек хочет сделать)
+- через название самой услуги или предмета
+- через того, кто эту услугу оказывает или где
+  этот предмет берут
+
+Не менять: города, бренды, модели, числа.
+Не добавлять: оценки и модификаторы (дешево, лучший,
+срочно, рядом).
+Не конкретизируй предмет: если в запросе не сказано,
+что именно доставляют/ремонтируют/ищут — в твоих
+запросах этого тоже нет.
+
+Давай только запросы, которые сам видел в реальном
+поиске или похожие на них по форме.
+
+Ответ строго JSON без пояснений:
+{{"queries":["...","..."]}}"""
+
+# Лин-промпт кластера (прод)
+FAM_PROMPT_PROD = """Раздели переформулировки запроса на группы по отличающему слову и отбрось чужие.
+
+Сид: "{seed}"
+
+Кандидаты:
+{candidates}
+
+Группа = одно отличающее слово в любых его формах (падеж,
+число, глагол и существительное того же слова) или с
+расширением (то же слово плюс уточняющее). Разные слова —
+разные группы, даже синонимы.
+Группа 0 (отброс): другая услуга или другой этап пути к
+результату; потерян объект исходного запроса; изменилось
+место или направление; добавлена оценка.
+
+Ответь одной строкой без пояснений: номер группы для каждого
+кандидата по порядку через запятую (0 = отброшен), затем |
+и номера кандидатов-представителей групп через запятую.
+Формат: 1,1,2,0,3|1,4,6"""
+
+# Полный JSON-промпт кластера — откат при парс-фейле лин-ответа (режектор 3/3, кластер 3/3 заморожены)
+FAM_PROMPT = """Мы собираем разные входы для Google Autocomplete.
+
+Исходный запрос: "{seed}"
+
+Кандидаты — переформулировки этого запроса:
+{candidates}
+
+Шаг 1. Найди в исходном запросе главное слово услуги или
+действия — это якорь интента.
+
+Кандидат сохраняет интент, только если ищет ТУ ЖЕ услугу:
+- тем же словом, его формой или синонимом того же действия
+- через организацию или место, где эту услугу оказывают
+- через способ или канал выполнения этой услуги
+- с другим объектом той же услуги
+
+Отбрось в "rejected" кандидатов про ДРУГУЮ услугу или про
+другой этап пути к результату — даже смежный, даже ведущий
+к тому же итогу: смежный интент — не наш интент.
+Отбрось кандидатов, потерявших ОБЪЕКТ исходного запроса:
+объект можно заменить синонимом или родственным словом,
+но без объекта запрос расширяется на другие области и
+охватывает чужие интенты.
+Также отбрось: меняется место или направление действия,
+добавлена оценка.
+
+Шаг 2. Остальных сгруппируй в семьи.
+
+Важно: у всех оставшихся кандидатов цель и интент УЖЕ
+одинаковы — это проверено раньше. Общая цель — НЕ причина
+объединять в одну семью.
+
+Критерий семьи — лексический. Найди у каждого кандидата
+слово, которым он отличается от исходного запроса.
+
+Одна семья = одно и то же отличающее слово в любых видах:
+- его формы: падеж, число, глагол и существительное от
+  того же слова (одно действие в двух формах)
+- его расширения: то же слово плюс уточняющее слово
+
+РАЗНЫЕ отличающие слова = РАЗНЫЕ семьи. Даже если слова
+синонимы. Даже если оба — глаголы одного действия разными
+словами. Автокомплит продолжает разные строки разными
+подсказками, поэтому разные слова — всегда отдельные семьи.
+
+Не создавай семьи ради количества, но и не сливай разные
+слова в одну семью. В каждой семье укажи одного
+представителя — самый естественный и частотный запрос
+в реальном поиске.
+
+Ответ строго JSON без пояснений:
+{{"rejected":[номера],
+"families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}"""
+
+# Аудит семей — в проде ВЫКЛЮЧЕН (точка отката, не удалять)
+FAM_AUDIT_PROMPT = """Проверь одну группу поисковых формулировок.
+
+Исходный запрос: "{seed}"
+
+Группа:
+{members}
+
+Все варианты относятся к общей цели исходного запроса.
+Вопрос только один: являются ли они взаимозаменяемым
+первым вводом одного и того же поиска с практически
+одинаковыми продолжениями?
+
+Общая цель — не причина держать их вместе: цель у всех
+одна по условию. Критерий лексический: одна семья = одно
+и то же ключевое слово в разных формах (падеж, число,
+глагол/существительное того же слова) или с расширением
+(то же слово плюс уточняющее).
+"split" — если в группе есть кандидаты, построенные на
+РАЗНЫХ словах (даже синонимах): разные слова дают разные
+подсказки.
+"keep" — если все кандидаты построены на одном слове.
+Пары «одно слово в двух формах» и «слово и его расширение»
+не разделяй никогда.
+
+Ответ строго JSON без пояснений:
+{{"decision":"keep","groups":[[номера],[номера]],"reason":"до 14 слов"}}
+где decision = "keep" или "split"; groups заполняй только при split."""
+
+
+# ---------------- морфология / кодовые отсевы ----------------
+FROZEN_ROLES = {"geo", "brand", "num", "func"}
+MORPH = pymorphy3.MorphAnalyzer()
+FUNC_POS = {"PREP", "CONJ", "PRCL"}
+
+
+def norm(s):
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def split_tokens(text):
+    """Два мультимножества: значимые токены и служебные (предлог/союз/частица)."""
+    content, func = {}, {}
+    for w in norm(text).split():
+        pos = MORPH.parse(w)[0].tag.POS
+        d = func if pos in FUNC_POS else content
+        d[w] = d.get(w, 0) + 1
+    return content, func
+
+
+def lemma_tokens(text):
+    """Мультимножество лемм значимых токенов — для отсева морфовариантов сида."""
+    out = {}
+    for w in norm(text).split():
+        p = MORPH.parse(w)[0]
+        if p.tag.POS in FUNC_POS:
+            continue
+        lm = p.normal_form
+        out[lm] = out.get(lm, 0) + 1
+    return out
+
+
+# is_word_derivative (словообразовательная форма слова сида: "имплантирование" при "имплантация")
+# — готов, НЕ внедрён по решению Andrew. Класс известный, фикс в запасе.
+
+
+# ---------------- вызовы модели ----------------
+RETRYABLE = {429, 500, 502, 503, 504}
+
+
+def _clean_err(e):
+    s = str(e)
+    if GEMINI_KEY:
+        s = s.replace(GEMINI_KEY, "***")
+    return s
+
+
+async def call_llm(client, model, thinking_budget, prompt, _retries=2):
+    for attempt in range(_retries + 1):
+        try:
+            return await _call_llm_once(client, model, thinking_budget, prompt)
+        except httpx.HTTPStatusError as e:
+            if attempt < _retries and e.response.status_code in RETRYABLE:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(_clean_err(e)) from None
+        except httpx.TimeoutException as e:
+            if attempt < _retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(_clean_err(e)) from None
+
+
+async def _call_llm_once(client, model, thinking_budget, prompt):
+    t0 = time.time()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": int(thinking_budget)}}}
+    r = await client.post(url, json=body, timeout=90)
+    r.raise_for_status()
+    d = r.json()
+    text = "".join(p.get("text", "") for p in d["candidates"][0]["content"]["parts"])
+    um = d.get("usageMetadata", {})
+    tin = um.get("promptTokenCount", 0)
+    tout = um.get("candidatesTokenCount", 0) + um.get("thoughtsTokenCount", 0)
+    cost = tin / 1e6 * PRICE[0] + tout / 1e6 * PRICE[1]
+    return {"text": text, "tin": tin, "tout": tout, "cost": cost, "wall": time.time() - t0}
+
+
+def parse_json_block(text):
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _parse_lean_cluster(text, n):
+    """'1,1,2,0,3|1,4,6' -> (группы по кандидатам, номера представителей) или None."""
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or not any(ch.isdigit() for ch in line):
+            continue
+        parts = line.split("|")
+        try:
+            groups = [int(x) for x in parts[0].replace(" ", "").split(",") if x != ""]
+        except ValueError:
+            continue
+        if len(groups) != n:
+            continue
+        reps = []
+        if len(parts) > 1:
+            try:
+                reps = [int(x) for x in parts[1].replace(" ", "").split(",") if x != ""]
+            except ValueError:
+                reps = []
+        return groups, reps
+    return None
+
+
+# ---------------- генерация кандидатов ----------------
+def build_variants(seed, tokens):
+    """Одиночная замена токена. Возвращает [(variant, sub_word, orig_word)] в порядке появления."""
+    words = seed.split()
+    out = []
+    for tk in tokens:
+        if tk.get("role") in FROZEN_ROLES:
+            continue
+        w = tk.get("word", "")
+        if w not in words:
+            continue
+        idx = words.index(w)
+        for sub in tk.get("subs", [])[:3]:
+            sub = str(sub).strip()
+            if not sub or norm(sub) == norm(w):
+                continue
+            v = words.copy()
+            v[idx] = sub
+            out.append((" ".join(v), sub, w))
+    return out
+
+
+async def _generate_candidates(client, seed, stats):
+    """3 прогона класса A (токенные замены) + 3 прогона класса B (свободные фразы), все параллельно.
+    Кодовые отсевы до кластера: паритет служебных слов, перестановка сида, морфовариант сида."""
+    gen_prompt = GEN_PROMPT.format(seed=seed)
+    gen_b_prompt = GEN_B_PROMPT.format(seed=seed)
+    all_runs = await asyncio.gather(
+        *[call_llm(client, GEN_MODEL, GEN_THINKING_BUDGET, gen_prompt) for _ in range(GEN_RUNS)],
+        *[call_llm(client, GEN_MODEL, GEN_THINKING_BUDGET, gen_b_prompt) for _ in range(GEN_RUNS)],
+        return_exceptions=True)
+    runs, runs_b = all_runs[:GEN_RUNS], all_runs[GEN_RUNS:]
+
+    candidates = {}   # norm_variant -> {"variant","votes","positions","sub","orig","cls"}
+    errors = []
+    seed_content, seed_func = split_tokens(seed)
+    seed_lemmas = lemma_tokens(seed)
+
+    def add_candidate(variant, pos, cls, sub="", orig=""):
+        k = norm(variant)
+        if k == seed:
+            return
+        v_content, v_func = split_tokens(variant)
+        if v_func != seed_func:
+            return  # служебные слова должны совпадать с сидом: добавленный предлог = не вариант
+        if v_content == seed_content:
+            return  # сид перестановкой — не вариант
+        if lemma_tokens(variant) == seed_lemmas:
+            return  # морфовариант сида (падеж/число) — не вариант
+        c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
+                                      "sub": sub, "orig": orig, "cls": set()})
+        c["votes"] += 1
+        c["positions"].append(pos)
+        c["cls"].add(cls)
+        if cls == "A" and sub:
+            c["sub"], c["orig"] = sub, orig
+
+    def account(res):
+        stats["gen"]["tin"] += res["tin"]; stats["gen"]["tout"] += res["tout"]
+        stats["gen"]["cost"] += res["cost"]; stats["gen"]["wall"] = max(stats["gen"]["wall"], res["wall"])
+
+    for res in runs:
+        if isinstance(res, Exception):
+            errors.append(f"gen_a: {res}")
+            continue
+        account(res)
+        data = parse_json_block(res["text"])
+        if not data or "tokens" not in data:
+            errors.append("gen_a: parse_fail")
+            continue
+        for pos, (variant, sub, orig) in enumerate(build_variants(seed, data["tokens"]), start=1):
+            add_candidate(variant, pos, "A", sub, orig)
+
+    for res in runs_b:
+        if isinstance(res, Exception):
+            errors.append(f"gen_b: {res}")
+            continue
+        account(res)
+        data = parse_json_block(res["text"])
+        if not data or "queries" not in data:
+            errors.append("gen_b: parse_fail")
+            continue
+        for pos, q in enumerate([str(q) for q in data["queries"]][:7], start=1):
+            add_candidate(q, pos, "B")
+
+    return candidates, errors
+
+
+# ---------------- кластеризация в семьи ----------------
+async def _cluster_families(client, seed, candidates, stats):
+    """Один вызов лин-кластера; при парс-фейле — откат на полный JSON-промпт.
+    Возвращает (rejected: set[key], families: list[{members, rep, scenario, reason}])."""
+    keys = list(candidates.keys())
+    rejected, families = set(), []
+    if not keys:
+        return rejected, families
+
+    def cand_rank(k):
+        c = candidates[k]
+        return (-c["votes"], sum(c["positions"]) / len(c["positions"]))
+
+    def account(res):
+        stats["ver"]["tin"] += res["tin"]; stats["ver"]["tout"] += res["tout"]
+        stats["ver"]["cost"] += res["cost"]
+
+    listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
+    res = await call_llm(client, VER_MODEL, VER_THINKING_BUDGET,
+                         FAM_PROMPT_PROD.format(seed=seed, candidates=listing))
+    account(res)
+
+    lean = _parse_lean_cluster(res["text"], len(keys))
+    if lean is None:
+        stats["ver"]["fallback_json"] = True
+        res = await call_llm(client, VER_MODEL, VER_THINKING_BUDGET,
+                             FAM_PROMPT.format(seed=seed, candidates=listing))
+        account(res)
+        data = parse_json_block(res["text"]) or {}
+    else:
+        groups, reps = lean
+        fam_map = {}
+        for idx, g in enumerate(groups):
+            fam_map.setdefault(g, []).append(idx + 1)
+        data = {"rejected": fam_map.pop(0, []),
+                "families": [{"members": mem,
+                              "representative": next((r for r in reps if r in mem), 0)}
+                             for g, mem in sorted(fam_map.items())]}
+
+    def to_keys(nums):
+        out = []
+        for n in nums or []:
+            try:
+                idx = int(n) - 1
+            except (ValueError, TypeError):
+                continue
+            if 0 <= idx < len(keys):
+                out.append(keys[idx])
+        return out
+
+    rejected = set(to_keys(data.get("rejected")))
+    seen = set(rejected)
+    for f in data.get("families", []):
+        members = [k for k in to_keys(f.get("members")) if k not in seen]
+        if not members:
+            continue
+        seen.update(members)
+        rep = to_keys([f.get("representative")])
+        rep = rep[0] if rep and rep[0] in members else min(members, key=cand_rank)
+        families.append({"scenario": str(f.get("scenario", "")), "members": members,
+                         "rep": rep, "reason": str(f.get("reason", ""))})
+    for k in keys:
+        if k not in seen:
+            families.append({"scenario": "(вне кластеризации)", "members": [k],
+                             "rep": k, "reason": "модель не отнесла к семье"})
+
+    # === АУДИТ СЕМЕЙ ВЫКЛЮЧЕН в проде (Andrew). Не удалять — точка отката. ===
+    # async def audit(fi):
+    #     fam = families[fi]
+    #     mem_list = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(fam["members"]))
+    #     res = await call_llm(client, VER_MODEL, VER_THINKING_BUDGET,
+    #                          FAM_AUDIT_PROMPT.format(seed=seed, members=mem_list))
+    #     account(res)
+    #     d = parse_json_block(res["text"]) or {}
+    #     return fi, d
+    # audit_ids = [i for i, f in enumerate(families) if len(f["members"]) >= 2]
+    # results = await asyncio.gather(*[audit(i) for i in audit_ids], return_exceptions=True)
+    # split_plan = {}
+    # for r in results:
+    #     if isinstance(r, Exception):
+    #         continue
+    #     fi, d = r
+    #     if str(d.get("decision", "")).strip().lower() == "split" and d.get("groups"):
+    #         split_plan[fi] = d
+    # if split_plan:
+    #     ... (полная логика дробления — в relevant_search_test.py / истории git)
+
+    families.sort(key=lambda f: cand_rank(f["rep"]))
+    return rejected, families
+
+
+# ---------------- публичный вход ----------------
+async def relevant_variants(seed, client=None):
+    """Сид -> до TOP_N переформулировок (представители семей). Добор запрещён:
+    сколько семей выжило, столько и вариантов."""
+    seed = norm(seed)
+    stats = {"build": BUILD,
+             "gen": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0},
+             "ver": {"tin": 0, "tout": 0, "cost": 0.0, "wall": 0.0}}
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient()
+    t_total = time.time()
+    try:
+        candidates, errors = await _generate_candidates(client, seed, stats)
+        t0 = time.time()
+        rejected, families = await _cluster_families(client, seed, candidates, stats)
+        stats["ver"]["wall"] = time.time() - t0
+    finally:
+        if own_client:
+            await client.aclose()
+
+    final_keys = [f["rep"] for f in families][:TOP_N]
+    fam_of = {}
+    for i, f in enumerate(families):
+        for k in f["members"]:
+            fam_of[k] = (i, f["rep"] == k)
+
+    ranked = []
+    for k, c in candidates.items():
+        avg_pos = sum(c["positions"]) / len(c["positions"])
+        if k in rejected:
+            score = "цель✗"
+        elif k in fam_of:
+            i, is_rep = fam_of[k]
+            score = f"F{i+1}" + ("★" if is_rep else "")
+        else:
+            score = "—"
+        ranked.append({"variant": c["variant"], "sub": c["sub"], "orig": c["orig"],
+                       "cls": "".join(sorted(c["cls"])),
+                       "votes": c["votes"], "avg_pos": round(avg_pos, 2),
+                       "verdict": 1 if k in final_keys else 0,
+                       "score": score})
+    ranked.sort(key=lambda x: (-x["verdict"], -x["votes"], x["avg_pos"]))
+
+    stats["total_cost"] = stats["gen"]["cost"] + stats["ver"]["cost"]
+    stats["total_wall"] = time.time() - t_total
+    if errors:
+        stats["errors"] = errors
+
+    return {"seed": seed,
+            "final": [candidates[k]["variant"] for k in final_keys],
+            "families": [{"scenario": f["scenario"],
+                          "members": [candidates[k]["variant"] for k in f["members"]],
+                          "rep": candidates[f["rep"]]["variant"],
+                          "reason": f["reason"]} for f in families],
+            "candidates": ranked,
+            "stats": stats}
