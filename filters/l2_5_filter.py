@@ -80,6 +80,7 @@ class L2_5Config:
     thinking_budget: Optional[int] = None   # задан → thinkingBudget вместо thinkingLevel
     price_in: float = PRICE_IN
     price_out: float = PRICE_OUT
+    system_prompt: Optional[str] = None     # задан → вместо SYSTEM_PROMPT (перекрёстный фильтр)
 
 
 # V1 (откат): резал по «не сочетается в реальности» — стабильно убивал класс
@@ -300,7 +301,7 @@ def _process_batch(
         try:
             t0 = time.time()
             response, diag = _call_gemini(
-                config.api_key, SYSTEM_PROMPT, user_prompt,
+                config.api_key, config.system_prompt or SYSTEM_PROMPT, user_prompt,
                 config.timeout, config.thinking_level,
                 model=config.model, thinking_budget=config.thinking_budget,
             )
