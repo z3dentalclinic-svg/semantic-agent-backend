@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 # WORKER_BUILD = "relevant_worker 0.1 (raw merge, no filters)"
 # WORKER_BUILD = "relevant_worker 0.2 (pipeline: per-source filters + incremental dedup)"
 # WORKER_BUILD = "relevant_worker 0.2.1 (pipeline; filter crash -> keys to GREY as filter_error)"
-WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original seed, 3.7-flash b512)"
+# WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original seed, 3.7-flash b512)"
+WORKER_BUILD = "relevant_worker 0.4 (cross filter: own subject-criterion prompt)"
 # Перекрёстный L2.5: VALID варианта прошёл цепочку со СВОИМ сидом, но исходного сида не видел —
 # «доставка букетов из конфет» валиден для сида «доставка букетов» и мусор для «доставка цветов».
 # Поэтому VALID каждого варианта дополнительно гонится через тот же L2.5 с ИСХОДНЫМ сидом.
@@ -42,6 +43,14 @@ WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original see
 CROSS_L25_MODEL = "gemini-3.7-flash"
 CROSS_L25_BUDGET = 512
 CROSS_L25_PRICE = (0.75, 3.75)   # $/1M in, out — как в relevant_search.PRICE
+
+# Свой промпт перекрёстного фильтра (формулировка Andrew): вопрос один — тот же ли
+# поисковый интент, что у SEED. V3.2 в цепочке не трогается. Правка узла 2/3.
+CROSS_SYSTEM_PROMPT = """Тебе даются SEED, регион поиска и список ключевых слов. Ключевые слова получены переформулировкой SEED другими словами, поэтому сами по себе другие слова — не признак другого интента.
+
+Твоя задача — проверить каждое ключевое слово: соответствует ли оно тому же поисковому интенту, что SEED. Тот же интент — 1 (валид). Другой интент — 0 (невалид).
+
+Верни только строку из 1 и 0 через запятую, по числу запросов, без пояснений."""
 DEFAULT_FILTERS = "pre,geo,bpf,rel,l0,l15v2,l2,l25,l3"   # полная цепочка как в autopilot/index
 
 
@@ -92,7 +101,8 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
             t0 = time.time()
             cfg = L2_5Config(region=country, language=language,
                              model=CROSS_L25_MODEL, thinking_budget=CROSS_L25_BUDGET,
-                             price_in=CROSS_L25_PRICE[0], price_out=CROSS_L25_PRICE[1])
+                             price_in=CROSS_L25_PRICE[0], price_out=CROSS_L25_PRICE[1],
+                             system_prompt=CROSS_SYSTEM_PROMPT)
             n_before = len(result["keywords"])
             # apply_l2_5_filter пишет свои stats/trace в те же ключи result — сохранить цепочные,
             # иначе стоимость цепочного L2.5 теряется, а перекрёстная считается дважды
@@ -333,7 +343,10 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
             out["count"] = len(valid)
             out["anchors_count"] = len(anchors)
             out["_trace"] = {"blocked_keywords": blocked_trace}
-            out["l2_5_stats"] = {"cost_usd": round(cost25, 6), "per_source": {k: v["l2_5_stats"] for k, v in per_source_stats.items()}}
+            out["l2_5_stats"] = {"cost_usd": round(cost25, 6),
+                                 "per_source": {k: v["l2_5_stats"] for k, v in per_source_stats.items()},
+                                 "cross_per_source": {k: v.get("cross_l2_5_stats") for k, v in per_source_stats.items()
+                                                      if v.get("cross_l2_5_stats")}}
             out["l3_stats"] = {"cost_usd": round(cost3, 6), "per_source": {k: v["l3_stats"] for k, v in per_source_stats.items()}}
 
         elapsed = round(time.time() - t_total, 2)
