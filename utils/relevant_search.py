@@ -42,7 +42,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.2.1 (+ input sanitizer: list markers stripped)"
 # BUILD = "relevant_search_prod_1.3 (cluster lean V2: immediate-operation criterion)"
 # BUILD = "relevant_search_prod_1.4 (+ derivative-of-seed code cut; reps ordered by real usage)"
-BUILD = "relevant_search_prod_1.5 (+ seed+adverb code cut; translit/translation of seed word -> group 0)"
+# BUILD = "relevant_search_prod_1.5 (+ seed+adverb code cut; translit/translation of seed word -> group 0)"
+BUILD = "relevant_search_prod_1.6 (+ merge-audit: attach-verb families collapse to one slot)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -213,6 +214,40 @@ FAM_PROMPT = """Мы собираем разные входы для Google Auto
 Ответ строго JSON без пояснений:
 {{"rejected":[номера],
 "families":[{{"scenario":"до 10 слов","members":[номера],"representative":номер,"reason":"кратко почему остальные не дают отдельный слот"}}]}}"""
+
+# Мерж-аудит представителей (схема вместо 4-й правки лин-промпта, Andrew 2026-08-23):
+# один вызов после кластера, вход — только представители семей. Склеивает семьи,
+# различающиеся лишь глаголом-обвязкой вокруг общего ядра сида («поставить/вставить/
+# установить зубной имплант» → один вход). Разные услуги/исполнители не склеивает
+# («починить»/«отремонтировать», «ремонт»/«сервис» — разные входы, калибровка Andrew).
+# Риск асимметричен: перелив = потеря слабого варианта, не мусор.
+MERGE_PROMPT = """Проверь список строк — кандидаты на разные входы Google Autocomplete для одного запроса.
+
+Сид: "{seed}"
+
+Кандидаты:
+{reps}
+
+Два кандидата дают ОДИН вход, когда у них одно смысловое ядро, содержащее
+все значимые слова сида (в любых формах или однокоренных вариантах),
+а различаются они только глаголом-обвязкой — действием над этим ядром
+(например, поставить / вставить / установить): продолжения автокомплита
+у таких строк совпадают.
+
+НЕ склеивай кандидатов, если:
+- различающее слово само называет услугу или действие-услугу — разные
+  услуги остаются разными входами, даже синонимы;
+- различающее слово называет исполнителя или место — это отдельный вход;
+- различие в предмете или его уточнении.
+
+Сомневаешься — не склеивай.
+
+Ответь одной строкой без пояснений: номер входа для каждого кандидата
+по порядку через запятую, затем | и по одному представителю каждого
+входа — самому употребимому в реальном поиске — через запятую,
+в порядке употребимости.
+Формат: 1,1,2,3|1,4,5"""
+
 
 # Аудит семей — в проде ВЫКЛЮЧЕН (точка отката, не удалять)
 FAM_AUDIT_PROMPT = """Проверь одну группу поисковых формулировок.
@@ -608,6 +643,44 @@ async def _cluster_families(client, seed, candidates, stats):
     # Порядок семей: употребимость от модели (лин-ответ) первична; кодовый ранг
     # (голоса/позиция) — запасной, и единственный при откате на JSON.
     families.sort(key=lambda f: (model_rep_order.get(f["rep"], 10 ** 6), cand_rank(f["rep"])))
+
+    # ── Мерж-аудит: семьи, различающиеся лишь глаголом-обвязкой, схлопываются ──
+    if len(families) >= 2:
+        rep_keys = [f["rep"] for f in families]
+        listing_r = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(rep_keys))
+        try:
+            res = await call_llm(client, VER_MODEL, VER_THINKING,
+                                 MERGE_PROMPT.format(seed=seed, reps=listing_r))
+            account(res)
+            lean = _parse_lean_cluster(res["text"], len(rep_keys))
+        except Exception as e:
+            stats["ver"]["merge_error"] = str(e)
+            lean = None
+        if lean is not None:
+            slots_arr, chosen = lean
+            slot_map = {}
+            for fi, slot in enumerate(slots_arr):
+                slot_map.setdefault(slot if slot > 0 else f"solo{fi}", []).append(fi)
+            chosen_fi = [c - 1 for c in chosen if 1 <= c <= len(rep_keys)]
+            merged, used = [], set()
+            def build(slot_members, rep_fi):
+                mem = []
+                for fi in slot_members:
+                    mem.extend(families[fi]["members"])
+                base = families[rep_fi]
+                merged.append({"scenario": base["scenario"], "members": mem,
+                               "rep": base["rep"], "reason": base["reason"]})
+            for c_fi in chosen_fi:   # порядок употребимости от модели
+                slot = slots_arr[c_fi] if slots_arr[c_fi] > 0 else f"solo{c_fi}"
+                if slot in used:
+                    continue
+                used.add(slot)
+                build(slot_map[slot], c_fi)
+            for slot, mems in slot_map.items():   # хвост, не названный представителями
+                if slot not in used:
+                    build(mems, mems[0])
+            stats["ver"]["merge"] = {"in": len(families), "out": len(merged)}
+            families = merged
     return rejected, families
 
 
