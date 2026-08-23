@@ -48,7 +48,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.7 (cluster: 3-vote aggregation + code root-split of families)"
 # BUILD = "relevant_search_prod_1.7.1 (root-split: strict full-matching, translit-bridge fixed)"
 # BUILD = "relevant_search_prod_1.7.2 (merge guard: slot must root-contain all seed words)"
-BUILD = "relevant_search_prod_1.8 (axis-diverse final pick: cover different replaced seed words)"
+# BUILD = "relevant_search_prod_1.8 (axis-diverse final pick: cover different replaced seed words)"
+BUILD = "relevant_search_prod_1.8.1 (axis novelty = uncovered seed lemma, not new lemma-set)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -858,12 +859,21 @@ async def relevant_variants(seed, client=None):
         return frozenset(l for l in seed_lm_axis
                          if not any(l == vl or _same_root(l, vl) for vl in v))
 
-    final_keys, seen_axes = [], set()
-    for f in families:                      # проход 1: только новые оси
+    # Новизна оси = хотя бы одна ещё НЕ покрытая лемма сида. Комбо-ось
+    # ({аренда,авто} после {авто} и {аренда}) нового не покрывает — пропуск,
+    # чтобы дошла очередь до непокрытой оси («залог→депозит»).
+    final_keys, covered, addition_taken = [], set(), False
+    for f in families:                      # проход 1: только оси с новой леммой
         ax = family_axis(f)
-        if ax not in seen_axes:
-            final_keys.append(f["rep"])
-            seen_axes.add(ax)
+        if ax:
+            if not (ax - covered):
+                continue
+            covered |= ax
+        else:
+            if addition_taken:
+                continue
+            addition_taken = True           # чистая добавка без замены — одна ось
+        final_keys.append(f["rep"])
         if len(final_keys) == TOP_N:
             break
     if len(final_keys) < TOP_N:            # проход 2: добор по употребимости
