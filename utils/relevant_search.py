@@ -49,7 +49,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.7.1 (root-split: strict full-matching, translit-bridge fixed)"
 # BUILD = "relevant_search_prod_1.7.2 (merge guard: slot must root-contain all seed words)"
 # BUILD = "relevant_search_prod_1.8 (axis-diverse final pick: cover different replaced seed words)"
-BUILD = "relevant_search_prod_1.8.1 (axis novelty = uncovered seed lemma, not new lemma-set)"
+# BUILD = "relevant_search_prod_1.8.1 (axis novelty = uncovered seed lemma, not new lemma-set)"
+BUILD = "relevant_search_prod_1.8.2 (additions get own axes; merge ranks colloquial last)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -256,7 +257,9 @@ MERGE_PROMPT = """Проверь список строк — кандидаты 
 Ответь одной строкой без пояснений: номер входа для каждого кандидата
 по порядку через запятую, затем | и по одному представителю каждого
 входа — самому употребимому в реальном поиске — через запятую,
-в порядке употребимости.
+в порядке употребимости. Разговорные, просторечные и редкие
+словоформы ставь после стандартных названий, даже если они
+звучат естественно.
 Формат: 1,1,2,3|1,4,5"""
 
 
@@ -855,24 +858,26 @@ async def relevant_variants(seed, client=None):
     seed_lm_axis = lemma_tokens(seed)
 
     def family_axis(f):
+        """Ось = замещённые леммы сида; у добавок без замены — сами добавленные
+        слова (клиника/стоматология/установка — разные оси, а не одна «добавка»)."""
         v = lemma_tokens(candidates[f["rep"]]["variant"])
-        return frozenset(l for l in seed_lm_axis
-                         if not any(l == vl or _same_root(l, vl) for vl in v))
+        replaced = frozenset(l for l in seed_lm_axis
+                             if not any(l == vl or _same_root(l, vl) for vl in v))
+        if replaced:
+            return replaced
+        added = frozenset(vl for vl in v
+                          if not any(l == vl or _same_root(l, vl) for l in seed_lm_axis))
+        return frozenset("+" + a for a in added)
 
     # Новизна оси = хотя бы одна ещё НЕ покрытая лемма сида. Комбо-ось
     # ({аренда,авто} после {авто} и {аренда}) нового не покрывает — пропуск,
     # чтобы дошла очередь до непокрытой оси («залог→депозит»).
-    final_keys, covered, addition_taken = [], set(), False
+    final_keys, covered = [], set()
     for f in families:                      # проход 1: только оси с новой леммой
         ax = family_axis(f)
-        if ax:
-            if not (ax - covered):
-                continue
-            covered |= ax
-        else:
-            if addition_taken:
-                continue
-            addition_taken = True           # чистая добавка без замены — одна ось
+        if ax and not (ax - covered):
+            continue
+        covered |= ax
         final_keys.append(f["rep"])
         if len(final_keys) == TOP_N:
             break
