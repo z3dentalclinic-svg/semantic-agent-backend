@@ -3,8 +3,8 @@
 # Вход: сид. Выход: до TOP_N переформулировок для параллельного парсинга.
 #
 # Прод-конфигурация (утверждена):
-#   модель gemini-3.7-flash оба этапа
-#   генератор thinkingBudget=768, кластер thinkingBudget=512
+#   генератор gemini-3.6-flash thinkingLevel=medium, кластер gemini-3.7-flash thinkingBudget=768
+#   (связка 1.0 — 3.7 оба, b768/b512 — закомментирована в конфиге как точка отката)
 #   лин-промпт кластера, откат на полный JSON при парс-фейле, аудит семей выключен
 #
 # Публичный вход: await relevant_variants(seed, client) -> dict
@@ -19,16 +19,25 @@ import asyncio
 import httpx
 import pymorphy3
 
-# ---------------- конфиг (зафиксирован) ----------------
-GEN_MODEL = "gemini-3.7-flash"
+# ---------------- конфиг ----------------
+# Связка 1.0 (точка отката): 3.7-flash оба этапа, генератор b768, кластер b512.
+# Прогон «доставка цветов» показал шум генератора («купить цветов», класс A, 3 голоса)
+# и пропуск кластера на b512 → генератор возвращён на 3.6/medium (Andrew: работал
+# нормально), кластеру бюджет поднят до 768 для перестраховки.
+# GEN_MODEL = "gemini-3.7-flash"
+# GEN_THINKING = 768
+GEN_MODEL = "gemini-3.6-flash"
+GEN_THINKING = "medium"        # 3.6: thinking уровнем (thinkingLevel), не бюджетом
 VER_MODEL = "gemini-3.7-flash"
-GEN_THINKING_BUDGET = 768
-VER_THINKING_BUDGET = 512
-PRICE = [0.75, 3.75]   # $/1M input, output — правь под актуальный прайс
+# VER_THINKING = 512
+VER_THINKING = 768
+# $/1M input, output по моделям — правь под актуальный прайс
+PRICES = {"gemini-3.7-flash": (0.75, 3.75), "gemini-3.6-flash": (1.50, 7.50)}
 
 GEN_RUNS = 3          # прогонов генерации на каждый класс (A токенные, B свободные)
 TOP_N = 3             # потолок вариантов в работу; добор запрещён
-BUILD = "relevant_search_prod_1.0"
+# BUILD = "relevant_search_prod_1.0"
+BUILD = "relevant_search_prod_1.1 (gen 3.6/medium, cluster 3.7/b768)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -239,10 +248,11 @@ def _clean_err(e):
     return s
 
 
-async def call_llm(client, model, thinking_budget, prompt, _retries=2):
+async def call_llm(client, model, thinking, prompt, _retries=2):
+    """thinking: int → thinkingBudget (3.7), str → thinkingLevel (3.6: minimal|low|medium|high)."""
     for attempt in range(_retries + 1):
         try:
-            return await _call_llm_once(client, model, thinking_budget, prompt)
+            return await _call_llm_once(client, model, thinking, prompt)
         except httpx.HTTPStatusError as e:
             if attempt < _retries and e.response.status_code in RETRYABLE:
                 await asyncio.sleep(1.5 * (attempt + 1))
@@ -255,11 +265,13 @@ async def call_llm(client, model, thinking_budget, prompt, _retries=2):
             raise RuntimeError(_clean_err(e)) from None
 
 
-async def _call_llm_once(client, model, thinking_budget, prompt):
+async def _call_llm_once(client, model, thinking, prompt):
     t0 = time.time()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+    tc = ({"thinkingLevel": thinking} if isinstance(thinking, str)
+          else {"thinkingBudget": int(thinking)})
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"thinkingConfig": {"thinkingBudget": int(thinking_budget)}}}
+            "generationConfig": {"thinkingConfig": tc}}
     r = await client.post(url, json=body, timeout=90)
     r.raise_for_status()
     d = r.json()
@@ -267,7 +279,8 @@ async def _call_llm_once(client, model, thinking_budget, prompt):
     um = d.get("usageMetadata", {})
     tin = um.get("promptTokenCount", 0)
     tout = um.get("candidatesTokenCount", 0) + um.get("thoughtsTokenCount", 0)
-    cost = tin / 1e6 * PRICE[0] + tout / 1e6 * PRICE[1]
+    price = PRICES.get(model, (0.75, 3.75))
+    cost = tin / 1e6 * price[0] + tout / 1e6 * price[1]
     return {"text": text, "tin": tin, "tout": tout, "cost": cost, "wall": time.time() - t0}
 
 
@@ -332,8 +345,8 @@ async def _generate_candidates(client, seed, stats):
     gen_prompt = GEN_PROMPT.format(seed=seed)
     gen_b_prompt = GEN_B_PROMPT.format(seed=seed)
     all_runs = await asyncio.gather(
-        *[call_llm(client, GEN_MODEL, GEN_THINKING_BUDGET, gen_prompt) for _ in range(GEN_RUNS)],
-        *[call_llm(client, GEN_MODEL, GEN_THINKING_BUDGET, gen_b_prompt) for _ in range(GEN_RUNS)],
+        *[call_llm(client, GEN_MODEL, GEN_THINKING, gen_prompt) for _ in range(GEN_RUNS)],
+        *[call_llm(client, GEN_MODEL, GEN_THINKING, gen_b_prompt) for _ in range(GEN_RUNS)],
         return_exceptions=True)
     runs, runs_b = all_runs[:GEN_RUNS], all_runs[GEN_RUNS:]
 
@@ -410,14 +423,14 @@ async def _cluster_families(client, seed, candidates, stats):
         stats["ver"]["cost"] += res["cost"]
 
     listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
-    res = await call_llm(client, VER_MODEL, VER_THINKING_BUDGET,
+    res = await call_llm(client, VER_MODEL, VER_THINKING,
                          FAM_PROMPT_PROD.format(seed=seed, candidates=listing))
     account(res)
 
     lean = _parse_lean_cluster(res["text"], len(keys))
     if lean is None:
         stats["ver"]["fallback_json"] = True
-        res = await call_llm(client, VER_MODEL, VER_THINKING_BUDGET,
+        res = await call_llm(client, VER_MODEL, VER_THINKING,
                              FAM_PROMPT.format(seed=seed, candidates=listing))
         account(res)
         data = parse_json_block(res["text"]) or {}
@@ -462,7 +475,7 @@ async def _cluster_families(client, seed, candidates, stats):
     # async def audit(fi):
     #     fam = families[fi]
     #     mem_list = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(fam["members"]))
-    #     res = await call_llm(client, VER_MODEL, VER_THINKING_BUDGET,
+    #     res = await call_llm(client, VER_MODEL, VER_THINKING,
     #                          FAM_AUDIT_PROMPT.format(seed=seed, members=mem_list))
     #     account(res)
     #     d = parse_json_block(res["text"]) or {}
