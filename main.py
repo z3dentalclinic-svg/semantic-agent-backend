@@ -2037,6 +2037,16 @@ async def light_search_endpoint(
     return apply_smart_fix(result, seed, language)
 
 
+# --- Релевантный поиск: воркер (новый режим РЯДОМ со старым; /api/light-search не меняется) ---
+# /api/relevant-search + /relevant-search. Регистрация после light_search_endpoint: воркер
+# вызывает его напрямую как функцию, чтобы сырьё вариантов совпадало с index/autopilot.
+try:
+    from utils.relevant_worker import register_relevant_worker      # файл в utils/
+except ImportError:
+    from relevant_worker import register_relevant_worker            # файл в корне
+register_relevant_worker(app, light_search_endpoint)
+
+
 @app.get("/api/deep-search")
 async def deep_search_endpoint(
     seed: str = Query(..., description="Базовый запрос"),
