@@ -40,7 +40,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.1 (gen 3.6/medium, cluster 3.7/b768)"
 # BUILD = "relevant_search_prod_1.2 (gen prompts: same-intent requirement)"
 # BUILD = "relevant_search_prod_1.2.1 (+ input sanitizer: list markers stripped)"
-BUILD = "relevant_search_prod_1.3 (cluster lean V2: immediate-operation criterion)"
+# BUILD = "relevant_search_prod_1.3 (cluster lean V2: immediate-operation criterion)"
+BUILD = "relevant_search_prod_1.4 (+ derivative-of-seed code cut; reps ordered by real usage)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -145,6 +146,10 @@ FAM_PROMPT_PROD = """Отбери переформулировки запрос�
 одно отличающее слово в его формах или с расширением; разные слова —
 разные группы, даже синонимы. В каждой группе укажи представителя —
 самый естественный запрос.
+
+Номера представителей перечисли в порядке употребимости в реальном
+поиске: сначала обычные формулировки, которыми люди действительно
+ищут; разговорные, книжные и редкие словоформы — в конец.
 
 Ответь одной строкой без пояснений: номер группы для каждого кандидата
 по порядку через запятую (0 = не прошёл), затем | и номера представителей.
@@ -275,8 +280,40 @@ def lemma_tokens(text):
     return out
 
 
-# is_word_derivative (словообразовательная форма слова сида: "имплантирование" при "имплантация")
-# — готов, НЕ внедрён по решению Andrew. Класс известный, фикс в запасе.
+def _same_root(a, b):
+    """Словообразовательное родство двух лемм: общий префикс достаточной длины
+    («имплантация»/«имплантирование», «доставка»/«доставить», «заказ»/«заказать»).
+    Без словарей: только длина общей основы."""
+    p = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        p += 1
+    m = min(len(a), len(b))
+    # одно слово — префикс другого («цвет»/«цветок») или длинная общая основа
+    return (p >= 3 and p == m) or (p >= 5 and p >= 0.6 * m)
+
+
+def is_word_derivative(variant_lemmas, seed_lemmas):
+    """Кандидат = сид, в котором одно слово заменено словообразовательной формой
+    того же слова («имплантирование зубов» при сиде «имплантация зубов»).
+    По лексическому критерию семья такого кандидата — сам сид, отдельного входа
+    автокомплита он не даёт. Внедрён по решению Andrew (2026-08-23)."""
+    if sum(variant_lemmas.values()) != sum(seed_lemmas.values()):
+        return False
+    v_only = [l for l, c in variant_lemmas.items() for _ in range(c - seed_lemmas.get(l, 0)) if c > seed_lemmas.get(l, 0)]
+    s_only = [l for l, c in seed_lemmas.items() for _ in range(c - variant_lemmas.get(l, 0)) if c > variant_lemmas.get(l, 0)]
+    if not v_only or len(v_only) != len(s_only) or len(v_only) > 3:
+        return False
+    # Полное паросочетание отличающихся лемм по корню: каждая пара должна быть
+    # словообразовательным родством. Лемма-шум pymorphy («цветов»→цвет,
+    # «цветы»→цветок) — тоже однокоренная пара, поэтому требование «ровно одна
+    # отличающаяся пара» давало ложные пропуски.
+    from itertools import permutations
+    for perm in permutations(s_only):
+        if all(_same_root(v, sl) for v, sl in zip(v_only, perm)):
+            return True
+    return False
 
 
 # ---------------- вызовы модели ----------------
@@ -406,8 +443,11 @@ async def _generate_candidates(client, seed, stats):
             return  # служебные слова должны совпадать с сидом: добавленный предлог = не вариант
         if v_content == seed_content:
             return  # сид перестановкой — не вариант
-        if lemma_tokens(variant) == seed_lemmas:
+        v_lemmas = lemma_tokens(variant)
+        if v_lemmas == seed_lemmas:
             return  # морфовариант сида (падеж/число) — не вариант
+        if is_word_derivative(v_lemmas, seed_lemmas):
+            return  # словообразовательная форма слова сида — семья сида, не отдельный вход
         c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
                                       "sub": sub, "orig": orig, "cls": set()})
         c["votes"] += 1
@@ -454,6 +494,7 @@ async def _cluster_families(client, seed, candidates, stats):
     Возвращает (rejected: set[key], families: list[{members, rep, scenario, reason}])."""
     keys = list(candidates.keys())
     rejected, families = set(), []
+    model_rep_order = {}   # key -> позиция в списке представителей от модели (порядок употребимости)
     if not keys:
         return rejected, families
 
@@ -479,6 +520,9 @@ async def _cluster_families(client, seed, candidates, stats):
         data = parse_json_block(res["text"]) or {}
     else:
         groups, reps = lean
+        for i, r in enumerate(reps):
+            if 1 <= r <= len(keys):
+                model_rep_order.setdefault(keys[r - 1], i)
         fam_map = {}
         for idx, g in enumerate(groups):
             fam_map.setdefault(g, []).append(idx + 1)
@@ -535,7 +579,9 @@ async def _cluster_families(client, seed, candidates, stats):
     # if split_plan:
     #     ... (полная логика дробления — в relevant_search_test.py / истории git)
 
-    families.sort(key=lambda f: cand_rank(f["rep"]))
+    # Порядок семей: употребимость от модели (лин-ответ) первична; кодовый ранг
+    # (голоса/позиция) — запасной, и единственный при откате на JSON.
+    families.sort(key=lambda f: (model_rep_order.get(f["rep"], 10 ** 6), cand_rank(f["rep"])))
     return rejected, families
 
 
