@@ -44,7 +44,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.4 (+ derivative-of-seed code cut; reps ordered by real usage)"
 # BUILD = "relevant_search_prod_1.5 (+ seed+adverb code cut; translit/translation of seed word -> group 0)"
 # BUILD = "relevant_search_prod_1.6 (+ merge-audit: attach-verb families collapse to one slot)"
-BUILD = "relevant_search_prod_1.6.1 (merge-audit also collapses word-extension and translit slots)"
+# BUILD = "relevant_search_prod_1.6.1 (merge-audit also collapses word-extension and translit slots)"
+BUILD = "relevant_search_prod_1.7 (cluster: 3-vote aggregation + code root-split of families)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -556,9 +557,14 @@ async def _generate_candidates(client, seed, stats):
 
 
 # ---------------- кластеризация в семьи ----------------
+CLUSTER_VOTES = 3   # параллельных вызовов лин-кластера; вердикты агрегируются большинством
+
+
 async def _cluster_families(client, seed, candidates, stats):
-    """Один вызов лин-кластера; при парс-фейле — откат на полный JSON-промпт.
-    Возвращает (rejected: set[key], families: list[{members, rep, scenario, reason}])."""
+    """3 параллельных вызова лин-кластера, агрегация большинством (группа 0 и пары семей);
+    один валидный ответ — работаем по нему; ноль — откат на полный JSON-промпт.
+    Систематическую склейку синонимов модель чинит не голосование, а кодовый
+    пост-сплит семей по корням (ниже). Возвращает (rejected, families)."""
     keys = list(candidates.keys())
     rejected, families = set(), []
     model_rep_order = {}   # key -> позиция в списке представителей от модели (порядок употребимости)
@@ -574,29 +580,74 @@ async def _cluster_families(client, seed, candidates, stats):
         stats["ver"]["cost"] += res["cost"]
 
     listing = "\n".join(f"{i+1}. {candidates[k]['variant']}" for i, k in enumerate(keys))
-    res = await call_llm(client, VER_MODEL, VER_THINKING,
-                         FAM_PROMPT_PROD.format(seed=seed, candidates=listing))
-    account(res)
+    calls = await asyncio.gather(
+        *[call_llm(client, VER_MODEL, VER_THINKING,
+                   FAM_PROMPT_PROD.format(seed=seed, candidates=listing))
+          for _ in range(CLUSTER_VOTES)],
+        return_exceptions=True)
+    parses = []
+    for res in calls:
+        if isinstance(res, Exception):
+            continue
+        account(res)
+        lean = _parse_lean_cluster(res["text"], len(keys))
+        if lean is not None:
+            parses.append(lean)
+    stats["ver"]["cluster_votes_ok"] = len(parses)
 
-    lean = _parse_lean_cluster(res["text"], len(keys))
-    if lean is None:
+    n = len(keys)
+    if not parses:
         stats["ver"]["fallback_json"] = True
         res = await call_llm(client, VER_MODEL, VER_THINKING,
                              FAM_PROMPT.format(seed=seed, candidates=listing))
         account(res)
         data = parse_json_block(res["text"]) or {}
     else:
-        groups, reps = lean
-        for i, r in enumerate(reps):
-            if 1 <= r <= len(keys):
-                model_rep_order.setdefault(keys[r - 1], i)
-        fam_map = {}
-        for idx, g in enumerate(groups):
-            fam_map.setdefault(g, []).append(idx + 1)
-        data = {"rejected": fam_map.pop(0, []),
-                "families": [{"members": mem,
-                              "representative": next((r for r in reps if r in mem), 0)}
-                             for g, mem in sorted(fam_map.items())]}
+        need = len(parses) // 2 + 1   # большинство валидных ответов
+        zero_cnt = [0] * n
+        pair_cnt = {}
+        rep_pos = {}                  # idx -> [позиции в списке представителей]
+        for groups, reps in parses:
+            for i, g in enumerate(groups):
+                if g == 0:
+                    zero_cnt[i] += 1
+            by_g = {}
+            for i, g in enumerate(groups):
+                if g > 0:
+                    by_g.setdefault(g, []).append(i)
+            for mem in by_g.values():
+                for a in range(len(mem)):
+                    for b in range(a + 1, len(mem)):
+                        pair_cnt[(mem[a], mem[b])] = pair_cnt.get((mem[a], mem[b]), 0) + 1
+            for pos, r in enumerate(reps):
+                if 1 <= r <= n:
+                    rep_pos.setdefault(r - 1, []).append(pos)
+        rejected_idx = {i for i in range(n) if zero_cnt[i] >= need}
+        # компоненты по парам-большинству среди неотсеянных
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        for (a, b), c in pair_cnt.items():
+            if c >= need and a not in rejected_idx and b not in rejected_idx:
+                parent[find(a)] = find(b)
+        comps = {}
+        for i in range(n):
+            if i not in rejected_idx:
+                comps.setdefault(find(i), []).append(i)
+        def rep_score(i):
+            ps = rep_pos.get(i)
+            return (0, sum(ps) / len(ps)) if ps else (1, 0)
+        fams = []
+        for mem in comps.values():
+            r = min(mem, key=lambda i: (rep_score(i), cand_rank(keys[i])))
+            fams.append({"members": [m + 1 for m in mem], "representative": r + 1})
+        for f in fams:
+            i = f["representative"] - 1
+            if i in rep_pos:
+                model_rep_order[keys[i]] = sum(rep_pos[i]) / len(rep_pos[i])
+        data = {"rejected": [i + 1 for i in sorted(rejected_idx)], "families": fams}
 
     def to_keys(nums):
         out = []
@@ -645,6 +696,45 @@ async def _cluster_families(client, seed, candidates, stats):
     #         split_plan[fi] = d
     # if split_plan:
     #     ... (полная логика дробления — в relevant_search_test.py / истории git)
+
+    # ── Кодовый пост-сплит: закон «разные слова — разные семьи» доисполняет код ──
+    # Модель систематически склеивает синонимы одного действия («заказать»+«приобрести»).
+    # Члены остаются вместе, только если их отличающие от сида леммы связаны корнем
+    # или общим словом (расширение); иначе семья механически режется по корневым группам.
+    seed_lm = lemma_tokens(seed)
+
+    def diff_lemmas(k):
+        v = lemma_tokens(candidates[k]["variant"])
+        return [l for l, c in v.items() for _ in range(c - seed_lm.get(l, 0)) if c > seed_lm.get(l, 0)]
+
+    def related(d1, d2):
+        return any(a == b or _same_root(a, b) for a in d1 for b in d2)
+
+    split_out = []
+    for f in families:
+        if len(f["members"]) < 2:
+            split_out.append(f)
+            continue
+        diffs = {k: diff_lemmas(k) for k in f["members"]}
+        groups_ = []
+        for k in f["members"]:
+            for g in groups_:
+                if any(related(diffs[k], diffs[m]) for m in g):
+                    g.append(k)
+                    break
+            else:
+                groups_.append([k])
+        if len(groups_) == 1:
+            split_out.append(f)
+            continue
+        for g in groups_:
+            r = f["rep"] if f["rep"] in g else min(g, key=cand_rank)
+            split_out.append({"scenario": f["scenario"], "members": g, "rep": r,
+                              "reason": (f["reason"] + " " if f["reason"] else "") + "(сплит по корню)"
+                              if r != f["rep"] else f["reason"]})
+    if len(split_out) != len(families):
+        stats["ver"]["root_split"] = {"in": len(families), "out": len(split_out)}
+    families = split_out
 
     # Порядок семей: употребимость от модели (лин-ответ) первична; кодовый ранг
     # (голоса/позиция) — запасной, и единственный при откате на JSON.
