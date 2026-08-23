@@ -74,6 +74,12 @@ class L2_5Config:
     max_retries: int = 4          # = 5 попыток с exponential backoff
     max_parallel: int = 4         # Gemini: 4 потока
     thinking_level: str = THINKING_LEVEL
+    # Переопределение модели для отдельного прогона (перекрёстный L2.5 в relevant_worker):
+    # дефолты = старое поведение, основной пайплайн не меняется.
+    model: str = MODEL
+    thinking_budget: Optional[int] = None   # задан → thinkingBudget вместо thinkingLevel
+    price_in: float = PRICE_IN
+    price_out: float = PRICE_OUT
 
 
 # V1 (откат): резал по «не сочетается в реальности» — стабильно убивал класс
@@ -179,13 +185,15 @@ def _call_gemini(
     user_prompt: str,
     timeout: int,
     thinking_level: str,
+    model: str = MODEL,
+    thinking_budget: Optional[int] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Google Generative Language API, Gemini 3.1 Flash-Lite."""
     import requests
 
     # Ключ — ТОЛЬКО в заголовке x-goog-api-key, не в URL: query-параметр ?key=
     # попадает в логи HTTP-клиентов (httpx печатает полный URL) — так ключ и утёк.
-    url = f"{API_BASE}/{MODEL}:generateContent"
+    url = f"{API_BASE}/{model}:generateContent"
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
@@ -193,7 +201,11 @@ def _call_gemini(
             "temperature": 0,
             # Если API вернёт 400 на thinkingConfig — замени на плоское
             # "thinkingLevel": thinking_level прямо в generationConfig.
-            "thinkingConfig": {"thinkingLevel": thinking_level},
+            # thinking_budget задан (перекрёстный прогон, 3.7-flash) → thinkingBudget,
+            # иначе прежний thinkingLevel.
+            "thinkingConfig": ({"thinkingBudget": int(thinking_budget)}
+                               if thinking_budget is not None
+                               else {"thinkingLevel": thinking_level}),
         },
     }
 
@@ -289,7 +301,8 @@ def _process_batch(
             t0 = time.time()
             response, diag = _call_gemini(
                 config.api_key, SYSTEM_PROMPT, user_prompt,
-                config.timeout, config.thinking_level
+                config.timeout, config.thinking_level,
+                model=config.model, thinking_budget=config.thinking_budget,
             )
             dt = time.time() - t0
             labels = _parse_labels(response, len(batch))
@@ -333,7 +346,7 @@ def _run(
     workers = min(config.max_parallel, total_batches) if total_batches else 1
 
     logger.info(
-        f"[L2.5] Gemini={MODEL} thinking={config.thinking_level} | "
+        f"[L2.5] Gemini={config.model} thinking={config.thinking_budget or config.thinking_level} | "
         f"{len(kw_strings)} valids, {total_batches} batches, {workers} workers"
     )
 
@@ -366,18 +379,19 @@ def _run(
             all_labels.extend([None] * len(batches[idx]))
 
     stats = {
-        "model": MODEL,
+        "model": config.model,
         "build": L2_5_BUILD,
-        "thinking_level": config.thinking_level,
+        "thinking_level": (f"budget={config.thinking_budget}"
+                           if config.thinking_budget is not None else config.thinking_level),
         "input": len(kw_strings),
         "prompt_tokens": sum_prompt,
         "output_tokens": sum_output,
         "thinking_tokens": sum_think,
         "total_tokens": sum_total,
         # Стоимость прогона: input × тариф + (output + thinking) × тариф
-        "cost_usd": round(sum_prompt / 1e6 * PRICE_IN + (sum_output + sum_think) / 1e6 * PRICE_OUT, 6),
-        "price_in": PRICE_IN,
-        "price_out": PRICE_OUT,
+        "cost_usd": round(sum_prompt / 1e6 * config.price_in + (sum_output + sum_think) / 1e6 * config.price_out, 6),
+        "price_in": config.price_in,
+        "price_out": config.price_out,
         "api_time_sec": round(sum_api, 1),    # суммарно по батчам (если бы последовательно)
         "wall_time_sec": round(wall, 1),      # реальное время (параллельно)
         "batches": total_batches,
@@ -434,12 +448,12 @@ def apply_l2_5_filter(
             result["anchors"].append({
                 "keyword": kw,
                 "anchor_reason": "L2_5_TRASH",
-                "l2_5": {"label": "TRASH", "binary": 0, "source": MODEL},
+                "l2_5": {"label": "TRASH", "binary": 0, "source": config.model},
             })
         else:
             bucket = "ERROR"; n_error += 1
             kept.append(orig)  # ошибка парсинга → НЕ режем
-        trace.append({"keyword": kw, "label": bucket, "binary": lab, "source": MODEL})
+        trace.append({"keyword": kw, "label": bucket, "binary": lab, "source": config.model})
 
     result["keywords"] = kept
     result["_l2_5_trace"] = trace
