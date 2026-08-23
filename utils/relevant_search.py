@@ -47,7 +47,8 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.6.1 (merge-audit also collapses word-extension and translit slots)"
 # BUILD = "relevant_search_prod_1.7 (cluster: 3-vote aggregation + code root-split of families)"
 # BUILD = "relevant_search_prod_1.7.1 (root-split: strict full-matching, translit-bridge fixed)"
-BUILD = "relevant_search_prod_1.7.2 (merge guard: slot must root-contain all seed words)"
+# BUILD = "relevant_search_prod_1.7.2 (merge guard: slot must root-contain all seed words)"
+BUILD = "relevant_search_prod_1.8 (axis-diverse final pick: cover different replaced seed words)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -845,7 +846,32 @@ async def relevant_variants(seed, client=None):
         if own_client:
             await client.aclose()
 
-    final_keys = [f["rep"] for f in families][:TOP_N]
+    # ── Осевой отбор тройки: покрыть РАЗНЫЕ заменённые слова сида ──────────
+    # Ось семьи = леммы сида, замещённые в представителе (нет равной/однокоренной).
+    # У многословного сида замены самого частотного слова забивали всю тройку
+    # («прокат/автопрокат/напрокат» при живой оси «залог→депозит»). Жадный отбор:
+    # по употребимости, но непокрытая ось имеет приоритет; добор — по употребимости.
+    seed_lm_axis = lemma_tokens(seed)
+
+    def family_axis(f):
+        v = lemma_tokens(candidates[f["rep"]]["variant"])
+        return frozenset(l for l in seed_lm_axis
+                         if not any(l == vl or _same_root(l, vl) for vl in v))
+
+    final_keys, seen_axes = [], set()
+    for f in families:                      # проход 1: только новые оси
+        ax = family_axis(f)
+        if ax not in seen_axes:
+            final_keys.append(f["rep"])
+            seen_axes.add(ax)
+        if len(final_keys) == TOP_N:
+            break
+    if len(final_keys) < TOP_N:            # проход 2: добор по употребимости
+        for f in families:
+            if f["rep"] not in final_keys:
+                final_keys.append(f["rep"])
+                if len(final_keys) == TOP_N:
+                    break
     fam_of = {}
     for i, f in enumerate(families):
         for k in f["members"]:
