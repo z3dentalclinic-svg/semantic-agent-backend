@@ -33,7 +33,15 @@ except ImportError:
 logger = logging.getLogger(__name__)
 # WORKER_BUILD = "relevant_worker 0.1 (raw merge, no filters)"
 # WORKER_BUILD = "relevant_worker 0.2 (pipeline: per-source filters + incremental dedup)"
-WORKER_BUILD = "relevant_worker 0.2.1 (pipeline; filter crash -> keys to GREY as filter_error)"
+# WORKER_BUILD = "relevant_worker 0.2.1 (pipeline; filter crash -> keys to GREY as filter_error)"
+WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original seed, 3.7-flash b512)"
+# Перекрёстный L2.5: VALID варианта прошёл цепочку со СВОИМ сидом, но исходного сида не видел —
+# «доставка букетов из конфет» валиден для сида «доставка букетов» и мусор для «доставка цветов».
+# Поэтому VALID каждого варианта дополнительно гонится через тот же L2.5 с ИСХОДНЫМ сидом.
+# VALID сида не гонится: его фильтр-сид и есть исходный, второй прогон дал бы тот же ответ.
+CROSS_L25_MODEL = "gemini-3.7-flash"
+CROSS_L25_BUDGET = 512
+CROSS_L25_PRICE = (0.75, 3.75)   # $/1M in, out — как в relevant_search.PRICE
 DEFAULT_FILTERS = "pre,geo,bpf,rel,l0,l15v2,l2,l25,l3"   # полная цепочка как в autopilot/index
 
 
@@ -59,29 +67,66 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
                   "l25": _build_l2_5_config, "l3": _build_l3_config} из main.py.
     Без filter_ctx воркер умеет только filters=none (сбор сырья)."""
 
+    try:
+        from filters.l2_5_filter import apply_l2_5_filter, L2_5Config
+    except ImportError:
+        apply_l2_5_filter = L2_5Config = None   # без модуля перекрёстный L2.5 отключён
+
     # Цепочки фильтров не пересекаются между собой (parser.tracer и
     # parser.skip_relevance_filter — глобальные), но перекрываются с парсингом следующего источника.
     filter_lock = asyncio.Lock()
 
-    def _filter_sync(keywords, seed, country, language, filters, l2, l3_model, l3_effort):
-        """Один прогон цепочки фильтров для одного источника — зеркало apply_filters_endpoint."""
+    def _filter_sync(keywords, seed, country, language, filters, l2, l3_model, l3_effort, cross_seed=None):
+        """Один прогон цепочки фильтров для одного источника — зеркало apply_filters_endpoint.
+        cross_seed задан (источник-вариант) → после цепочки его VALID гонится через
+        перекрёстный L2.5 с исходным сидом; срезы уходят в anchors с reason L2_5_TRASH."""
         result = {"seed": seed, "method": "relevant-search", "keywords": list(keywords),
                   "anchors": [], "count": len(keywords), "anchors_count": 0}
         l2_config = filter_ctx["l2"](*l2)
         l2_5_config = filter_ctx["l25"]()
         l3_config = filter_ctx["l3"](model=l3_model, effort=l3_effort)
-        return filter_ctx["apply"](result, seed=seed, country=country, method="relevant-search",
-                                   language=language, enabled_filters=filters,
-                                   l2_config=l2_config, l2_5_config=l2_5_config, l3_config=l3_config)
+        result = filter_ctx["apply"](result, seed=seed, country=country, method="relevant-search",
+                                     language=language, enabled_filters=filters,
+                                     l2_config=l2_config, l2_5_config=l2_5_config, l3_config=l3_config)
+        if cross_seed and apply_l2_5_filter and result.get("keywords"):
+            t0 = time.time()
+            cfg = L2_5Config(region=country, language=language,
+                             model=CROSS_L25_MODEL, thinking_budget=CROSS_L25_BUDGET,
+                             price_in=CROSS_L25_PRICE[0], price_out=CROSS_L25_PRICE[1])
+            n_before = len(result["keywords"])
+            # apply_l2_5_filter пишет свои stats/trace в те же ключи result — сохранить цепочные,
+            # иначе стоимость цепочного L2.5 теряется, а перекрёстная считается дважды
+            chain_stats, chain_trace = result.get("l2_5_stats"), result.get("_l2_5_trace")
+            n_anchors_before = len(result.get("anchors") or [])
+            try:
+                # тот же промпт V3, тот же интерфейс — меняется только сид (исходный) и модель
+                result = apply_l2_5_filter(result, seed=cross_seed, enable_l2_5=True, config=cfg)
+                xs = result.get("l2_5_stats") or {}
+                result["cross_l2_5_stats"] = xs
+                result["cross_l2_5_stats"]["cut"] = n_before - len(result["keywords"])
+                result["_cross_l2_5_trace"] = result.get("_l2_5_trace")
+                # срезы перекрёстного прогона помечаются отдельной причиной,
+                # чтобы в Blocked их было видно отдельно от цепочного L2.5
+                for a in result["anchors"][n_anchors_before:]:
+                    if isinstance(a, dict) and a.get("anchor_reason") == "L2_5_TRASH":
+                        a["anchor_reason"] = "L2_5_CROSS_TRASH"
+                result["cross_l2_5_cut_keys"] = [a["keyword"] for a in result["anchors"][n_anchors_before:]
+                                                 if isinstance(a, dict)]
+            except Exception as e:
+                logger.error(f"[RELEVANT] cross L2.5 error for '{seed}': {e}")
+                result["cross_l2_5_stats"] = {"error": str(e), "input": n_before}
+            result["cross_l2_5_stats"]["wall"] = round(time.time() - t0, 2)
+            result["l2_5_stats"], result["_l2_5_trace"] = chain_stats, chain_trace
+        return result
 
-    async def _filter_source(src_entry, keywords, seed, country, language, filters, l2, l3_model, l3_effort):
+    async def _filter_source(src_entry, keywords, seed, country, language, filters, l2, l3_model, l3_effort, cross_seed=None):
         """При падении всей цепочки исключением (не сбой L2.5/L3 — те ловятся внутри цепочки)
         ключи источника уходят в GREY с пометкой filter_error, чтобы не пропадать из результата."""
         async with filter_lock:
             src_entry["filter_start"] = time.time()
             try:
                 res = await asyncio.to_thread(_filter_sync, keywords, seed, country, language,
-                                              filters, l2, l3_model, l3_effort)
+                                              filters, l2, l3_model, l3_effort, cross_seed)
             except Exception as e:
                 logger.error(f"[RELEVANT] filter error for '{seed}': {e}")
                 src_entry["filter_error"] = str(e)
@@ -170,11 +215,11 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
                     e["sources"].append(src)
             return fresh
 
-        def start_filter(entry, fresh, src_seed):
+        def start_filter(entry, fresh, src_seed, cross_seed=None):
             if do_filter and fresh:
                 entry["to_filter"] = len(fresh)
                 task = asyncio.create_task(_filter_source(entry, fresh, src_seed, country, language,
-                                                          filters, l2, l3_model, l3_effort))
+                                                          filters, l2, l3_model, l3_effort, cross_seed))
                 filter_tasks.append((entry, task))
             else:
                 entry["to_filter"] = len(fresh) if do_filter else 0
@@ -205,7 +250,7 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
                      "suffix": vres.get("suffix_count", 0), "prefix": vres.get("prefix_count", 0),
                      "infix": vres.get("infix_count", 0)}
             sources.append(entry)
-            start_filter(entry, fresh, v_seed)
+            start_filter(entry, fresh, v_seed, cross_seed=seed_used)   # перекрёстный L2.5 с исходным сидом
         stages["variants_parse"] = round(time.time() - t0, 2)
 
         merged = sorted(container.values(), key=lambda e: e["keyword"].lower())
@@ -258,8 +303,19 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
                 entry["grey"] = len(res.get("keywords_grey") or [])
                 entry["blocked"] = len(res.get("anchors") or [])
                 entry["cost_l25"] = round(c25, 5); entry["cost_l3"] = round(c3, 5)
+                xs = res.get("cross_l2_5_stats") or {}
+                if xs:
+                    cx = _cost(xs)
+                    cost25 += cx
+                    entry["cross_cut"] = xs.get("cut", 0)
+                    entry["cross_cut_keys"] = res.get("cross_l2_5_cut_keys") or []
+                    entry["cost_cross"] = round(cx, 5)
+                    entry["cross_wall"] = xs.get("wall", 0)
+                    if xs.get("error"):
+                        entry["cross_error"] = xs["error"]
                 entry["filter_timings"] = res.get("_filter_timings", {})
-                per_source_stats[entry["id"]] = {"l2_5_stats": s25, "l3_stats": s3}
+                per_source_stats[entry["id"]] = {"l2_5_stats": s25, "l3_stats": s3,
+                                                 "cross_l2_5_stats": xs or None}
             stages["filters_tail_wait"] = round(time.time() - t0, 2)   # сколько ждали хвост после парсинга
 
             # Перекрытие: время фильтрации, прошедшее, пока ещё шёл парсинг (= сэкономлено конвейером)
