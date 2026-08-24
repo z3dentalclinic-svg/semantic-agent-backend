@@ -122,6 +122,13 @@ register_morph_endpoint(app)
 # ═══ CLUSTERING TEST (LLM-кластеризация хвостов) ═══
 register_clustering_test_endpoint(app)
 
+# --- Минус-слова: стенд (mw_0.2). 4 вызова цепочкой, без парсинга и фильтров: /minus-test + /api/minus-test ---
+try:
+    from utils.minus_words_test import register_minus_words_test    # файл в utils/ (minus_test.html рядом)
+except ImportError:
+    from minus_words_test import register_minus_words_test          # файл в корне
+register_minus_words_test(app)
+
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
 #     """
