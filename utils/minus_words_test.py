@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.4"
+BUILD = "mw_0.5"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -46,7 +46,7 @@ MODELS: dict[str, dict] = {
 }
 SEARCH_PRICE_PER_CALL = {"gemini": 0.035, "openai": 0.01, "anthropic": 0.01}
 
-DEFAULT_FINDER = "gemini-3.1-flash-lite"
+DEFAULT_FINDER = "gemini-3.7-flash"  # lite в поиск не ходит (2 прогона), 3.7 — ходит
 DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-sol"]  # порядок = порядок цепочки
 
 # ─── промпты (формулировки Andrew, дословно) ───
@@ -59,7 +59,8 @@ FINDER_PROMPT = (
 EXTENDER_PROMPT = (
     "Вот список минус слов:\n{found}\n\n"
     "Вот сид: «{seed}»\nВот регион поиска: {region}\n"
-    "Дополни этот список недостающими минус словами.\n"
+    "Дополни этот список недостающими минус словами. Добавляй только те слова, "
+    "которые ты точно знаешь и в которых уверен, что для рекламы этого сида в этом регионе это минус-слово.\n"
     "Ответ: только новые слова, одно на строку, без нумерации и пояснений."
 )
 
