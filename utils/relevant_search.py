@@ -52,7 +52,9 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.8.1 (axis novelty = uncovered seed lemma, not new lemma-set)"
 # BUILD = "relevant_search_prod_1.8.2 (additions get own axes; merge ranks colloquial last)"
 # BUILD = "relevant_search_prod_1.9 (hard cut: any adverb/pronoun beyond seed kills candidate)"
-BUILD = "relevant_search_prod_1.10 (question-word ban in gen prompts + stop-word list cut)"
+# BUILD = "relevant_search_prod_1.10 (question-word ban in gen prompts + stop-word list cut)"
+BUILD = "relevant_search_prod_1.11 (+ recycle: <=1 variant -> one fresh regeneration)"
+RECYCLE_MIN_VARIANTS = 2   # меньше — свежий повтор генерации (один раз)
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -892,10 +894,22 @@ async def relevant_variants(seed, client=None):
         client = httpx.AsyncClient()
     t_total = time.time()
     try:
-        candidates, errors = await _generate_candidates(client, seed, stats)
-        t0 = time.time()
-        rejected, families = await _cluster_families(client, seed, candidates, stats)
-        stats["ver"]["wall"] = time.time() - t0
+        # Рецикл (Andrew): недетерминированность генерации изредка даёт один вариант
+        # («доставка цветов» → только «доставка букетов»; повтор дал три). Если семей
+        # меньше RECYCLE_MIN_VARIANTS — одна свежая попытка генерация+кластер с нуля;
+        # из двух попыток берётся та, где семей больше. Стоимость обеих — в stats.
+        best = None
+        for attempt in range(2):
+            candidates, errors = await _generate_candidates(client, seed, stats)
+            t0 = time.time()
+            rejected, families = await _cluster_families(client, seed, candidates, stats)
+            stats["ver"]["wall"] = time.time() - t0
+            if best is None or len(families) > len(best[2]):
+                best = (candidates, errors, families, rejected)
+            if len(best[2]) >= RECYCLE_MIN_VARIANTS:
+                break
+            stats["recycle_attempts"] = attempt + 2
+        candidates, errors, families, rejected = best
     finally:
         if own_client:
             await client.aclose()
