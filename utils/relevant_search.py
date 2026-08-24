@@ -50,7 +50,9 @@ TOP_N = 3             # потолок вариантов в работу; до�
 # BUILD = "relevant_search_prod_1.7.2 (merge guard: slot must root-contain all seed words)"
 # BUILD = "relevant_search_prod_1.8 (axis-diverse final pick: cover different replaced seed words)"
 # BUILD = "relevant_search_prod_1.8.1 (axis novelty = uncovered seed lemma, not new lemma-set)"
-BUILD = "relevant_search_prod_1.8.2 (additions get own axes; merge ranks colloquial last)"
+# BUILD = "relevant_search_prod_1.8.2 (additions get own axes; merge ranks colloquial last)"
+# BUILD = "relevant_search_prod_1.9 (hard cut: any adverb/pronoun beyond seed kills candidate)"
+BUILD = "relevant_search_prod_1.10 (question-word ban in gen prompts + stop-word list cut)"
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Пул ключей при параллельных сидах — хвост интеграции, пока один ключ.
@@ -74,6 +76,8 @@ GEN_PROMPT = """Запрос пользователя: "{seed}"
 Замена обязана сохранять тот же поисковый интент, что у
 "{seed}": ту же услугу или цель и тот же этап пути к ней.
 Слово другого этапа или смежной цели — не замена.
+Не давай вопросительных слов (что, где, когда, куда, сколько,
+как, почему) — если только они не входят в сам "{seed}".
 
 НЕ давать:
 - оценки и модификаторы (дешево, лучший, срочно, рядом)
@@ -96,6 +100,9 @@ GEN_B_PROMPT = """Запрос пользователя в Google: "{seed}"
 Каждый запрос обязан сохранять тот же поисковый интент,
 что "{seed}": ту же услугу или цель и тот же этап пути
 к ней. Запрос про смежную цель или другой этап не годится.
+Не пиши вопросительных запросов и запросов со словами
+вопроса (что, где, когда, куда, сколько, как, почему) —
+если только сам "{seed}" не является вопросом.
 
 Используй разные формы:
 - через глагол (что человек хочет сделать)
@@ -349,7 +356,45 @@ def _same_root(a, b):
 
 AUX_POS = {"ADVB", "NPRO", "PRED"}   # где/как/куда, местоимения, предикативы — довесок, не новое слово
 
+# Служебные и вопросительные слова — единый источник: parser.stop_words в main.py
+# (копия; при изменении там — синхронизировать здесь). Список продиктован Andrew:
+# правило работает по СЛОВАМ, не по POS-классам (решение 2026-08-23 после отката POS-правила).
+STOP_WORDS_UNION = frozenset().union(
+    {'и', 'в', 'во', 'не', 'на', 'с', 'от', 'для', 'по', 'о', 'об', 'к', 'у', 'за',
+     'из', 'со', 'до', 'при', 'без', 'над', 'под', 'а', 'но', 'да', 'или', 'чтобы',
+     'что', 'как', 'где', 'когда', 'куда', 'откуда', 'почему', 'сколько', 'зачем'},
+    {'і', 'від', 'але', 'та', 'або', 'що', 'як', 'де', 'коли', 'куди', 'звідки', 'чому', 'скільки'},
+    {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'from', 'up', 'about',
+     'into', 'through', 'during', 'and', 'or', 'but', 'when', 'where', 'how', 'why', 'what'},
+)
 
+
+def stopword_beyond_seed(variant, seed_tokens):
+    """True, если у кандидата есть служебное/вопросительное слово из списка,
+    которого нет в самом сиде (сид-вопрос сохраняет право на свои слова)."""
+    return any(w in STOP_WORDS_UNION and w not in seed_tokens
+               for w in norm(variant).split())
+
+
+def aux_lemmas(text):
+    """Мультимножество наречных/местоименных/предикативных лемм фразы."""
+    out = {}
+    for w in norm(text).split():
+        p = MORPH.parse(w)[0]
+        if p.tag.POS in AUX_POS:
+            lm = p.normal_form
+            out[lm] = out.get(lm, 0) + 1
+    return out
+
+
+def _aux_beyond_seed(variant, seed_aux):
+    """True, если у кандидата есть наречие/местоимение/предикатив сверх сидовых."""
+    v = aux_lemmas(variant)
+    return any(c > seed_aux.get(l, 0) for l, c in v.items())
+
+
+# is_seed_plus_aux (вхождение сида + довесок) вытеснен жёстким _aux_beyond_seed —
+# оставлен как точка отката.
 def is_seed_plus_aux(variant, seed_lemmas):
     """Кандидат = сид целиком + только вопросительные/наречные/местоименные довески:
     «где купить айфон 16», «купить айфон 16 недорого» при сиде «купить айфон 16».
@@ -506,6 +551,7 @@ async def _generate_candidates(client, seed, stats):
     errors = []
     seed_content, seed_func = split_tokens(seed)
     seed_lemmas = lemma_tokens(seed)
+    seed_token_set = set(norm(seed).split())
 
     def add_candidate(variant, pos, cls, sub="", orig=""):
         k = norm(variant)
@@ -521,8 +567,12 @@ async def _generate_candidates(client, seed, stats):
             return  # морфовариант сида (падеж/число) — не вариант
         if is_word_derivative(v_lemmas, seed_lemmas):
             return  # словообразовательная форма слова сида — семья сида, не отдельный вход
-        if is_seed_plus_aux(variant, seed_lemmas):
-            return  # сид + вопросительный/наречный довесок («где …») — тот же вход
+        # Срез по СПИСКУ служебных/вопросительных слов (Andrew): слово из списка,
+        # отсутствующее в сиде, убивает кандидата сразу — без POS-классов и без
+        # проверки вхождения сида (транслит-обход «где купить iphone 16» закрыт).
+        # POS-правило 1.9 (_aux_beyond_seed) откачено: резало наречия без команды.
+        if stopword_beyond_seed(variant, seed_token_set):
+            return
         c = candidates.setdefault(k, {"variant": variant, "votes": 0, "positions": [],
                                       "sub": sub, "orig": orig, "cls": set()})
         c["votes"] += 1
