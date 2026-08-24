@@ -957,3 +957,239 @@ async def run_clustering(
         'raw_llm_responses_per_chunk': raw_responses,
         'errors': all_errors,
     }
+
+
+# ============================================================
+# Мульти-сид вход для релевантного поиска (2026-08-24).
+# Отличие от run_clustering ТОЛЬКО в шаге 1: хвосты режутся ПО ИСТОЧНИКАМ,
+# каждый со своим сидом (ключ варианта относительно варианта, иначе payload
+# мусорный: «служба доставки цветов киев» при исходном сиде дал бы «служба киев»).
+# Затем один общий пул: одинаковый хвост от разных источников — одна строка,
+# один LLM-вызов на всё. Шаги 2-6 — копия из run_clustering (не рефакторил,
+# чтобы не трогать боевой путь; при правках там — синхронизировать здесь).
+# ============================================================
+
+async def run_clustering_multi(
+    sources: list,
+    model: str,
+) -> dict:
+    """
+    sources: [{'id','seed','keywords',['region'],['language']}, ...] —
+    первый источник считается исходным сидом (его seed идёт в промпт и merge).
+    """
+    t_total_start = time.time()
+    if not sources:
+        raise ValueError('sources is empty')
+    seed = sources[0].get('seed')
+    region = sources[0].get('region', 'ua')
+    language = sources[0].get('language', 'ru')
+    if not seed:
+        raise ValueError('sources[0].seed missing')
+
+    # 1. Хвосты по источникам, каждый со своим сидом; общий пул с дедупом хвостов
+    t0 = time.time()
+    unique_payloads: list[str] = []
+    payload_to_keywords: dict[str, list[str]] = {}
+    payload_sources: dict[str, list[str]] = {}
+    total_keywords = 0
+    for src in sources:
+        src_seed = src.get('seed') or seed
+        src_id = src.get('id', src_seed)
+        kws = [k if isinstance(k, str) else k.get('query', k.get('keyword', '')) for k in (src.get('keywords') or [])]
+        kws = [k for k in kws if k]
+        total_keywords += len(kws)
+        u, p2k = build_payload_mapping(kws, src_seed)
+        for payload in u:
+            if payload not in payload_to_keywords:
+                unique_payloads.append(payload)
+                payload_to_keywords[payload] = []
+                payload_sources[payload] = []
+            payload_to_keywords[payload].extend(p2k[payload])
+            if src_id not in payload_sources[payload]:
+                payload_sources[payload].append(src_id)
+    keywords = [kw for kws in payload_to_keywords.values() for kw in kws]
+    t_extract = time.time() - t0
+
+    # 2. Нарезка на чанки
+    chunks = _chunk_payloads(unique_payloads, CHUNK_SIZE)
+
+    # 3. Параллельные LLM вызовы по всем чанкам
+    t_chunks_start = time.time()
+    chunk_tasks = [
+        _call_chunk_with_retry(
+            chunk_idx=i,
+            chunk_payloads=chunk,
+            seed=seed,
+            region=region,
+            language=language,
+            model=model,
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+    chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=False)
+    t_chunks = time.time() - t_chunks_start
+
+    # 4. Сборка глобального assignments (offset по индексам внутри чанка)
+    # и сбор всех уникальных имён кластеров с префиксом чанка.
+    global_assignments: dict[str, str] = {}  # global_pid → prefixed_name
+    all_prefixed_names: list[str] = []  # для merge-вызова
+    chunk_diag: list[dict] = []
+    chunk_errors: list[str] = []
+    failed_chunks = 0
+
+    for cr in chunk_results:
+        chunk_diag.append(cr['diag'])
+        if cr['error']:
+            chunk_errors.append(f"chunk {cr['chunk_idx']}: {cr['error']}")
+            failed_chunks += 1
+            continue
+
+        offset = cr['chunk_idx'] * CHUNK_SIZE
+        for local_pid, name in cr['assignments'].items():
+            prefixed = f"c{cr['chunk_idx']}:{name}"
+            if prefixed not in all_prefixed_names:
+                all_prefixed_names.append(prefixed)
+            global_pid = str(offset + int(local_pid))
+            global_assignments[global_pid] = prefixed
+
+    # 5. Merge имён кластеров через дешёвый LLM-вызов
+    t_merge_start = time.time()
+    merge_diag: dict = {
+        'attempted': False,
+        'names_before': len(all_prefixed_names),
+        'names_after': len(all_prefixed_names),
+        'merge_time_sec': 0.0,
+        'merge_tokens_in': 0,
+        'merge_tokens_out': 0,
+        'merge_cost_usd': 0.0,
+        'merge_error': None,
+    }
+    name_remap: dict[str, str] = {}  # prefixed_name → canonical_name
+    if len(all_prefixed_names) > 1:
+        merge_diag['attempted'] = True
+        try:
+            name_remap, merge_meta = await _merge_cluster_names(
+                prefixed_names=all_prefixed_names,
+                seed=seed,
+                language=language,
+                merge_model=MERGE_MODEL,
+            )
+            merge_diag['merge_tokens_in'] = merge_meta['tokens_in']
+            merge_diag['merge_tokens_out'] = merge_meta['tokens_out']
+            merge_diag['merge_cost_usd'] = merge_meta['cost_usd']
+            merge_diag['names_after'] = len(set(name_remap.values()))
+        except Exception as e:
+            merge_diag['merge_error'] = f'{type(e).__name__}: {e}'
+            # Фолбэк: каждое имя само себе каноническое (без чанк-префикса)
+            for n in all_prefixed_names:
+                name_remap[n] = n.split(':', 1)[1] if ':' in n else n
+    else:
+        # Один кластер на всё — нечего мерджить
+        for n in all_prefixed_names:
+            name_remap[n] = n.split(':', 1)[1] if ':' in n else n
+    merge_diag['merge_time_sec'] = round(time.time() - t_merge_start, 3)
+
+    # Применяем remap к global_assignments
+    final_assignments: dict[str, str] = {}
+    for gpid, prefixed in global_assignments.items():
+        final_assignments[gpid] = name_remap.get(
+            prefixed, prefixed.split(':', 1)[1] if ':' in prefixed else prefixed
+        )
+
+    # 6. Разворот на ключи
+    cluster_to_keywords, unassigned = expand_clusters(
+        final_assignments, unique_payloads, payload_to_keywords,
+    )
+
+    cluster_sizes = {c: len(kws) for c, kws in cluster_to_keywords.items()}
+    sorted_sizes = sorted(cluster_sizes.items(), key=lambda x: -x[1])
+
+    # Агрегаты по чанкам
+    total_tokens_in = sum(d['tokens_in'] for d in chunk_diag) + merge_diag['merge_tokens_in']
+    total_tokens_out = sum(d['tokens_out'] for d in chunk_diag) + merge_diag['merge_tokens_out']
+    chunk_cost = sum(
+        calc_cost(model, d['tokens_in'], d['tokens_out']) for d in chunk_diag
+    )
+    total_cost = round(chunk_cost + merge_diag['merge_cost_usd'], 6)
+
+    chunk_api_times = [d['api_time_sec'] for d in chunk_diag]
+    max_chunk_api = max(chunk_api_times) if chunk_api_times else 0.0
+    json_parse_ok = all(d['json_parse_ok'] for d in chunk_diag) and not failed_chunks
+
+    wall_time = time.time() - t_total_start
+    max_size = sorted_sizes[0][1] if sorted_sizes else 0
+    max_pct = round(100 * max_size / len(keywords), 1) if keywords else 0
+
+    # Собираем ошибки из всех источников
+    all_errors: list[str] = []
+    all_errors.extend(chunk_errors)
+    if merge_diag['merge_error']:
+        all_errors.append(f'merge: {merge_diag["merge_error"]}')
+    for d in chunk_diag:
+        if d.get('parse_error'):
+            all_errors.append(f"chunk {d['chunk_idx']} parse: {d['parse_error']}")
+
+    # Сырые ответы чанков для отладки
+    raw_responses = {
+        f'chunk_{d["chunk_idx"]}': d.get('raw_response', '')
+        for d in chunk_diag
+    }
+
+    result_sources = {p: payload_sources[p] for p in unique_payloads}
+    return {
+        'multi_seed': True,
+        'sources_count': len(sources),
+        'payload_sources': result_sources,
+        'model': model,
+        'seed': seed,
+        'region': region,
+        'language': language,
+
+        'input_keywords_count': len(keywords),
+        'unique_payloads_count': len(unique_payloads),
+
+        'clusters': cluster_to_keywords,
+        'cluster_sizes': dict(sorted_sizes),
+
+        'metrics': {
+            'wall_time_sec': round(wall_time, 3),
+            'extract_time_sec': round(t_extract, 3),
+            'chunks_phase_time_sec': round(t_chunks, 3),
+            'max_chunk_api_time_sec': round(max_chunk_api, 3),
+            'merge_time_sec': merge_diag['merge_time_sec'],
+            'api_time_sec': round(t_chunks + merge_diag['merge_time_sec'], 3),
+
+            'tokens_input': total_tokens_in,
+            'tokens_output': total_tokens_out,
+            'cost_usd': total_cost,
+
+            'json_parse_ok': json_parse_ok,
+            'clusters_count': len(cluster_to_keywords),
+            'unassigned_keywords': unassigned,
+            'max_cluster_size': max_size,
+            'max_cluster_pct': max_pct,
+
+            # === C1-специфичная диагностика ===
+            'chunks_count': len(chunks),
+            'chunk_size': CHUNK_SIZE,
+            'failed_chunks': failed_chunks,
+            'chunk_api_times_sec': [round(t, 3) for t in chunk_api_times],
+            'chunk_tokens_in': [d['tokens_in'] for d in chunk_diag],
+            'chunk_tokens_out': [d['tokens_out'] for d in chunk_diag],
+            'chunk_clusters_count': [d.get('clusters_count', 0) for d in chunk_diag],
+            'chunk_retries': [d.get('retries', 0) for d in chunk_diag],
+            # === C1.5 hedged retry диагностика ===
+            'chunk_hedge_used': [d.get('hedge_used', False) for d in chunk_diag],
+            'chunk_hedge_won': [d.get('hedge_won', False) for d in chunk_diag],
+            'chunk_fallback_used': [d.get('fallback_used', False) for d in chunk_diag],
+            'chunk_fallback_won': [d.get('fallback_won', False) for d in chunk_diag],
+            'chunk_used_model': [d.get('used_model', model) for d in chunk_diag],
+            'chunk_primary_error': [d.get('primary_error') for d in chunk_diag],
+            'chunk_hedge_error': [d.get('hedge_error') for d in chunk_diag],
+            'chunk_fallback_error': [d.get('fallback_error') for d in chunk_diag],
+            'merge_diag': merge_diag,
+        },
+
+        'raw_llm_responses_per_chunk': raw_responses,
+        'errors': all_errors,
+    }
