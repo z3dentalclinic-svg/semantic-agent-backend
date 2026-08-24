@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 # WORKER_BUILD = "relevant_worker 0.2.1 (pipeline; filter crash -> keys to GREY as filter_error)"
 # WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original seed, 3.7-flash b512)"
 # WORKER_BUILD = "relevant_worker 0.4 (cross filter: own subject-criterion prompt)"
-WORKER_BUILD = "relevant_worker 0.5 (+ input sanitizer; + /api/relevant-gen batch test)"
+# WORKER_BUILD = "relevant_worker 0.5 (+ input sanitizer; + /api/relevant-gen batch test)"
+WORKER_BUILD = "relevant_worker 0.6 (+ single-call multi-seed clustering after filters)"
 # Перекрёстный L2.5: VALID варианта прошёл цепочку со СВОИМ сидом, но исходного сида не видел —
 # «доставка букетов из конфет» валиден для сида «доставка букетов» и мусор для «доставка цветов».
 # Поэтому VALID каждого варианта дополнительно гонится через тот же L2.5 с ИСХОДНЫМ сидом.
@@ -100,6 +101,10 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
         from filters.l2_5_filter import apply_l2_5_filter, L2_5Config
     except ImportError:
         apply_l2_5_filter = L2_5Config = None   # без модуля перекрёстный L2.5 отключён
+    try:
+        from clustering_test.runner import run_clustering_multi   # мульти-сид кластеризация
+    except ImportError:
+        run_clustering_multi = None
 
     # Цепочки фильтров не пересекаются между собой (parser.tracer и
     # parser.skip_relevance_filter — глобальные), но перекрываются с парсингом следующего источника.
@@ -189,6 +194,8 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
         parallel_limit: int = Query(5),
         operator: str = Query("купить"),
         filters: str = Query(DEFAULT_FILTERS, description="none = только сбор сырья"),
+        clustering: bool = Query(False, description="кластеризация после фильтров (один вызов, все источники)"),
+        cluster_model: str = Query("gemini-3.1-flash-lite-preview"),
         l3_model: str = Query(None),
         l3_effort: str = Query(None),
         l2_pmi_valid: float = Query(None),
@@ -309,6 +316,7 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
             seen_v, seen_g = set(), set()
             cost25 = cost3 = 0.0
             per_source_stats = {}
+            cluster_sources = []   # [{id, seed, keywords}] для мульти-сид кластеризации
             for entry, task in filter_tasks:
                 res = await task
                 if res.get("_filter_error"):
@@ -346,6 +354,9 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
                 entry["filter_timings"] = res.get("_filter_timings", {})
                 per_source_stats[entry["id"]] = {"l2_5_stats": s25, "l3_stats": s3,
                                                  "cross_l2_5_stats": xs or None}
+                cluster_sources.append({"id": entry["id"], "seed": entry["query"],
+                                        "region": country, "language": language,
+                                        "keywords": list(res.get("keywords") or [])})
             stages["filters_tail_wait"] = round(time.time() - t0, 2)   # сколько ждали хвост после парсинга
 
             # Перекрытие: время фильтрации, прошедшее, пока ещё шёл парсинг (= сэкономлено конвейером)
@@ -363,6 +374,18 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
             out["count"] = len(valid)
             out["anchors_count"] = len(anchors)
             out["_trace"] = {"blocked_keywords": blocked_trace}
+            # ── Кластеризация одним вызовом: хвосты по источникам (свой сид), пул общий ──
+            if clustering and run_clustering_multi and any(cs["keywords"] for cs in cluster_sources):
+                t0 = time.time()
+                try:
+                    out["clustering"] = await run_clustering_multi(cluster_sources, cluster_model)
+                except Exception as e:
+                    logger.error(f"[RELEVANT] clustering error: {e}")
+                    out["clustering"] = {"error": str(e)}
+                stages["clustering"] = round(time.time() - t0, 2)
+            elif clustering and not run_clustering_multi:
+                out["clustering"] = {"error": "clustering_test.runner.run_clustering_multi недоступен"}
+
             out["l2_5_stats"] = {"cost_usd": round(cost25, 6),
                                  "per_source": {k: v["l2_5_stats"] for k, v in per_source_stats.items()},
                                  "cross_per_source": {k: v.get("cross_l2_5_stats") for k, v in per_source_stats.items()
