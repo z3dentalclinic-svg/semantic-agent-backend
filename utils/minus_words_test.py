@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.5"
+BUILD = "mw_0.6"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -49,19 +49,27 @@ SEARCH_PRICE_PER_CALL = {"gemini": 0.035, "openai": 0.01, "anthropic": 0.01}
 DEFAULT_FINDER = "gemini-3.7-flash"  # lite в поиск не ходит (2 прогона), 3.7 — ходит
 DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-sol"]  # порядок = порядок цепочки
 
-# ─── промпты (формулировки Andrew, дословно) ───
-FINDER_PROMPT = (
-    "Найди пожалуйста самый полный список минус слов для рекламы Google Ads для этого сида: «{seed}».\n"
-    "Обязательно используй поиск Google. Искать только в интернете — готовые опубликованные списки. "
-    "Ничего не придумывай сам: если слова нет в найденных источниках, не пиши его.\n"
-    "Ответ: одно минус-слово на строку, без нумерации и пояснений."
+# ─── промпты mw_0.6: генератор по синтезу консилиума (реконструкция запросов с сидом, без категорий-примеров);
+#     вызовы 2–4 — ТОЛЬКО удаление (док 10), ответ номерами того, что оставить (лин-формат L3) ───
+GEN_PROMPT = (
+    "Регион: {region}. Фраза: «{seed}».\n"
+    "Обязательно используй поиск Google.\n"
+    "Представь реальные поисковые запросы Google из этого региона, в которых есть эта фраза.\n"
+    "Шаг 1. Составь фразы, где человек не является клиентом того, кто рекламируется по этой фразе.\n"
+    "Шаг 2. Из этих фраз выпиши слова, которые и делают запрос нецелевым.\n"
+    "Не выписывай слово, если оно уточняет, характеризует или выбирает тот же товар или услугу, "
+    "или если такой запрос с фразой люди не набирают. Проверка: убери слово из запроса — "
+    "если человек остался тем же клиентом, слово не подходит.\n"
+    "Регион влияет только на язык и форму запросов.\n"
+    "Одно слово на строку, без пояснений. Если уверенных слов мало — выпиши мало."
 )
-EXTENDER_PROMPT = (
-    "Вот список минус слов:\n{found}\n\n"
-    "Вот сид: «{seed}»\nВот регион поиска: {region}\n"
-    "Дополни этот список недостающими минус словами. Добавляй только те слова, "
-    "которые ты точно знаешь и в которых уверен, что для рекламы этого сида в этом регионе это минус-слово.\n"
-    "Ответ: только новые слова, одно на строку, без нумерации и пояснений."
+PRUNE_PROMPT = (
+    "Регион: {region}. Фраза: «{seed}».\n"
+    "Ниже пронумерованный список слов-кандидатов в минус-слова для рекламы по этой фразе.\n"
+    "Проверь каждое: запрос «{seed} + слово» реально набирают, и человек в нём не является клиентом того, "
+    "кто рекламируется по этой фразе. Слово, уточняющее или выбирающее тот же товар или услугу, не подходит. "
+    "Проверка: убери слово из запроса — если человек остался тем же клиентом, слово не подходит.\n"
+    "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
 )
 
 
@@ -197,6 +205,18 @@ def parse_list(text: str) -> list[str]:
     return out
 
 
+_NUMS = re.compile(r"\d+")
+
+
+def parse_keep(text: str, n: int) -> set[int] | None:
+    """Номера оставить (1-based). None = ответ не разобран → fail-open, список не трогаем."""
+    nums = {int(x) for x in _NUMS.findall(text)}
+    nums = {x for x in nums if 1 <= x <= n}
+    if not nums:            # пустой или нечисловой ответ = fail-open (срез «всё» кодом не признаём)
+        return None
+    return nums
+
+
 def merge(stages: list[tuple[str, list[str]]]) -> list[dict]:
     """stages: [(model, слова, которые эта модель ДОБАВИЛА)] в порядке цепочки"""
     rows, seen = [], set()
@@ -223,33 +243,44 @@ async def run_minus(req: MinusReq) -> dict:
     t0 = time.perf_counter()
     seed = req.seed.strip()
 
-    # 1. finder — единственный вызов с поиском
-    finder = await call_model(req.finder, FINDER_PROMPT.format(seed=seed), search=True, thinking=req.thinking)
+    # 1. генератор — единственный вызов с поиском
+    finder = await call_model(req.finder, GEN_PROMPT.format(seed=seed, region=req.region),
+                              search=True, thinking=req.thinking)
     current = parse_list(finder["text"])
     stages: list[tuple[str, list[str]]] = [(finder["model"], list(current))]
     calls = [finder]
+    removed: list[dict] = []
 
-    # 2-4. цепочка: каждая модель получает список, дополненный предыдущей
+    # 2-4. цепочка: только удаление, каждый получает список после предыдущего
     for m in req.extenders:
-        prompt = EXTENDER_PROMPT.format(found="\n".join(current) or "(пусто)", seed=seed, region=req.region)
-        r = await call_model(m, prompt, search=False, thinking=req.thinking)
+        if not current:
+            break
+        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
+        r = await call_model(m, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
+                             search=False, thinking=req.thinking)
         calls.append(r)
-        added = [w for w in parse_list(r["text"]) if w not in set(current)]
-        stages.append((m, added))
-        current = current + added
+        keep = parse_keep(r["text"], len(current))
+        if keep is None:                      # fail-open
+            r["error"] = (r["error"] or "") + " | parse fail → list untouched"
+            stages.append((m, []))
+            continue
+        cut = [w for i, w in enumerate(current) if (i + 1) not in keep]
+        removed += [{"word": w, "by": m} for w in cut]
+        current = [w for i, w in enumerate(current) if (i + 1) in keep]
+        stages.append((m, cut))               # для отчёта: что ЭТА модель срезала
 
-    rows = merge(stages)
+    rows = [{"word": w, "stage": 1, "by": finder["model"]} for w in current]  # merge() оставлен для отката на схему «дополнение»
     stats = {
         "build": BUILD,
         "seed": seed, "region": req.region, "thinking": req.thinking,
         "total_cost": round(sum(c["cost"] for c in calls), 5),
         "total_wall": round(time.perf_counter() - t0, 2),
         "finder_count": len(stages[0][1]),
-        "added_by_stage": {m: len(ws) for m, ws in stages[1:]},
-        "merged_count": len(rows),
+        "removed_by_stage": {m: len(ws) for m, ws in stages[1:]},
+        "final_count": len(current),
         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
     }
-    return {"rows": rows, "list": current, "stats": stats,
+    return {"rows": rows, "list": current, "removed": removed, "stats": stats,
             "raw": {c["model"]: c["text"] for c in calls}}
 
 
