@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.2"
+BUILD = "mw_0.4"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -40,17 +40,20 @@ MODELS: dict[str, dict] = {
     "gemini-3.6-flash":      {"vendor": "gemini",    "price": (0.30, 2.50), "search": True},
     "gemini-3.1-flash-lite": {"vendor": "gemini",    "price": (0.10, 0.40), "search": True},
     "gpt-5.6-sol":           {"vendor": "openai",    "price": (1.25, 10.0), "search": True},
+    "claude-sonnet-4-6":     {"vendor": "anthropic", "price": (3.0, 15.0),  "search": True},
     "claude-fable-5":        {"vendor": "anthropic", "price": (5.0, 25.0),  "search": True},
     "claude-opus-5":         {"vendor": "anthropic", "price": (15.0, 75.0), "search": True},
 }
 SEARCH_PRICE_PER_CALL = {"gemini": 0.035, "openai": 0.01, "anthropic": 0.01}
 
 DEFAULT_FINDER = "gemini-3.1-flash-lite"
-DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-fable-5", "gpt-5.6-sol"]  # порядок = порядок цепочки
+DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-sol"]  # порядок = порядок цепочки
 
 # ─── промпты (формулировки Andrew, дословно) ───
 FINDER_PROMPT = (
     "Найди пожалуйста самый полный список минус слов для рекламы Google Ads для этого сида: «{seed}».\n"
+    "Обязательно используй поиск Google. Искать только в интернете — готовые опубликованные списки. "
+    "Ничего не придумывай сам: если слова нет в найденных источниках, не пиши его.\n"
     "Ответ: одно минус-слово на строку, без нумерации и пояснений."
 )
 EXTENDER_PROMPT = (
