@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.7"
+BUILD = "mw_0.8"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -61,7 +61,7 @@ def region_code(region: str) -> str | None:
         return r.upper()
     return REGION_CODES.get(r)
 
-DEFAULT_FINDER = "gpt-5.6-luna"      # единственный вендор с ПРИНУДИТЕЛЬНЫМ поиском (tool_choice) и страной поиска
+DEFAULT_FINDER = "gemini-3.7-flash"  # Luna «искал» без источников (0.7); Gemini 3.7 реально открывал страницы (0.4)
 DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-luna"]  # порядок = порядок цепочки
 DEFAULT_CENSOR = "gemini-3.7-flash"
 
@@ -92,21 +92,44 @@ PRUNE_PROMPT = (
 
 # ══════════════════════════ вызовы вендоров ══════════════════════════
 
+GEMINI_SEARCH_SYSTEM = (
+    "Сегодняшняя дата: {today}. Твоя внутренняя база устарела. "
+    "Ответ обязан строиться только на результатах Google Search, выполненного сейчас."
+)
+
+
 async def _call_gemini(model: str, prompt: str, search: bool, thinking: str, country: str | None = None) -> dict:
     key = os.environ["GEMINI_API_KEY"]
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    body: dict = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
-    gen: dict = {}
-    if thinking != "off":
-        gen["thinkingConfig"] = {"thinkingLevel": thinking}
-    if gen:
-        body["generationConfig"] = gen
-    if search:
-        body["tools"] = [{"google_search": {}}]
+
+    def _body(search_tool: dict | None) -> dict:
+        body: dict = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+        gen: dict = {}
+        if thinking != "off":
+            gen["thinkingConfig"] = {"thinkingLevel": thinking}
+        if search_tool is not None:
+            gen["temperature"] = 0.0          # детерминированное решение «искать»
+            body["system_instruction"] = {"parts": [{"text": GEMINI_SEARCH_SYSTEM.format(
+                today=time.strftime("%Y-%m-%d"))}]}
+            body["tools"] = [search_tool]
+        if gen:
+            body["generationConfig"] = gen
+        return body
+
+    # порядок попыток: legacy google_search_retrieval с порогом 0.0 (по совету Gemini) → google_search
+    variants = ([("retrieval_t0", {"google_search_retrieval": {"dynamic_retrieval_config": {
+                    "mode": "MODE_DYNAMIC", "dynamic_threshold": 0.0}}}),
+                 ("google_search", {"google_search": {}})] if search else [("none", None)])
+    used = "none"
     async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(url, json=body)
-        r.raise_for_status()
-        d = r.json()
+        for name, tool in variants:
+            r = await c.post(url, json=_body(tool))
+            if r.status_code == 400 and name == "retrieval_t0":
+                continue                      # инструмент не поддержан моделью → следующий вариант
+            r.raise_for_status()
+            d = r.json()
+            used = name
+            break
     text = "".join(p.get("text", "") for p in d["candidates"][0]["content"].get("parts", []))
     um = d.get("usageMetadata", {})
     sources = []
@@ -122,6 +145,8 @@ async def _call_gemini(model: str, prompt: str, search: bool, thinking: str, cou
         "think": um.get("thoughtsTokenCount", 0),
         "sources": sources,
         "searched": bool(gm),
+        "n_search": len(gm.get("webSearchQueries", [])) or (1 if gm else 0),
+        "search_tool": used,
     }
 
 
