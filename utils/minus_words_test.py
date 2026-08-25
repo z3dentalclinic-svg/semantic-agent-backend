@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.9"
+BUILD = "mw_1.0"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -78,6 +78,12 @@ EXTENDER_PROMPT = (
     "Вот сид: «{seed}»\nВот регион поиска: {region}\n"
     "Дополни этот список недостающими минус словами.\n"
     "Ответ: только новые слова, одно на строку, без нумерации и пояснений."
+)
+RELATE_PROMPT = (
+    "Сид: «{seed}». Регион: {region}.\n"
+    "Ниже пронумерованный список слов. Для каждого слова ответь на вопрос: "
+    "фраза «{seed} + слово» — это уточнение или расширение сида?\n"
+    "Ответ: номера слов, для которых ДА, через запятую. Ничего кроме номеров.\n\n{numbered}"
 )
 PRUNE_PROMPT = (
     "Регион: {region}. Фраза: «{seed}».\n"
@@ -332,7 +338,9 @@ class MinusReq(BaseModel):
     filters: str = "pre,geo,bpf,l0,l15v2,l2"   # бесплатные фильтры парсера над фразами «сид + слово»; "" = выкл
     country: str = "ua"
     language: str = "ru"
-    run_censor: bool = False       # LLM-цензор после фильтров (пока смотрим срезы — выкл)
+    run_relate: bool = True        # LLM-1: слово — уточнение/расширение сида? нет → мусор
+    relate_model: str = DEFAULT_CENSOR
+    run_censor: bool = True        # LLM-2: среди уточнений — что минус (PRUNE)
 
 
 async def run_minus(req: MinusReq) -> dict:
@@ -342,6 +350,7 @@ async def run_minus(req: MinusReq) -> dict:
     # 1. finder — единственный вызов с поиском (принудительный у OpenAI, страна из региона)
     finder = await call_model(req.finder, FINDER_PROMPT.format(seed=seed, region=req.region),
                               search=True, thinking=req.thinking, country=region_code(req.region))
+    finder["role"] = "finder"
     current = parse_list(finder["text"])
     stages: list[tuple[str, list[str]]] = [(finder["model"], list(current))]
     calls = [finder]
@@ -350,6 +359,7 @@ async def run_minus(req: MinusReq) -> dict:
     for m in req.extenders:
         prompt = EXTENDER_PROMPT.format(found="\n".join(current) or "(пусто)", seed=seed, region=req.region)
         r = await call_model(m, prompt, search=False, thinking=req.thinking)
+        r["role"] = "extend"
         calls.append(r)
         added = [w for w in parse_list(r["text"]) if w not in set(current)]
         stages.append((m, added))
@@ -368,12 +378,29 @@ async def run_minus(req: MinusReq) -> dict:
         filt["wall"] = round(time.perf_counter() - t1, 2)
         current = filt["valid"] + filt["grey"]           # в цензор/итог идёт всё, что не TRASH
 
-    # 6. LLM-цензор (опционально), только удаление
+    # 6. LLM-1 — «уточнение/расширение сида?»: нет → мусор
+    unrelated: list[dict] = []
+    if req.run_relate and current:
+        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
+        rl = await call_model(req.relate_model, RELATE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
+                              search=False, thinking=req.thinking)
+        rl["role"] = "relate"
+        calls.append(rl)
+        keep = parse_keep(rl["text"], len(current))
+        if keep is None:
+            rl["error"] = (rl["error"] or "") + " | parse fail → list untouched"
+        else:
+            unrelated = [{"word": w, "by": rl["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
+            current = [w for i, w in enumerate(current) if (i + 1) in keep]
+    after_relate = list(current)
+
+    # 7. LLM-2 — цензор среди уточнений: что минус (только удаление)
     removed: list[dict] = []
     if req.run_censor and current:
         numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
         cz = await call_model(req.censor, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
                               search=False, thinking=req.thinking)
+        cz["role"] = "censor"
         calls.append(cz)
         keep = parse_keep(cz["text"], len(current))
         if keep is None:                          # fail-open
@@ -395,6 +422,8 @@ async def run_minus(req: MinusReq) -> dict:
         "filters": {"valid": len(filt["valid"]), "grey": len(filt["grey"]), "trash": len(filt["trash"]),
                     "by_filter": filt["by_filter"], "wall": filt.get("wall"), "error": filt.get("error"),
                     "timings": filt.get("timings", {})},
+        "unrelated_by_llm1": len(unrelated),
+        "after_relate": len(after_relate),
         "removed_by_censor": len(removed),
         "final_count": len(current),
         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
@@ -402,8 +431,9 @@ async def run_minus(req: MinusReq) -> dict:
     grey_set = set(filt["grey"])
     for r in rows:
         r["bucket"] = "grey" if r["word"] in grey_set else "valid"
-    return {"rows": rows, "list": current, "removed": removed, "trash": filt["trash"], "stats": stats,
-            "raw": {c["model"]: c["text"] for c in calls}}
+    return {"rows": rows, "list": current, "removed": removed, "unrelated": unrelated, "trash": filt["trash"],
+            "stats": stats,
+            "raw": {f"{i+1}. {c.get('role', 'gen')} {c['model']}": c["text"] for i, c in enumerate(calls)}}
 
 
 # ══════════════════════════ регистрация ══════════════════════════
