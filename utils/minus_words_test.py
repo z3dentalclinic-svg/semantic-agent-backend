@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.8"
+BUILD = "mw_0.9"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -279,6 +279,47 @@ def merge(stages: list[tuple[str, list[str]]]) -> list[dict]:
     return rows
 
 
+# ══════════════════════════ фильтры парсера (без LLM) над фразами «сид + слово» ══════════════════════════
+
+def run_parser_filters(words: list[str], seed: str, country: str, language: str, filters: str) -> dict:
+    """Синхронно: main.apply_filters_traced над фразами. Возвращает раскладку по словам."""
+    import main as _main                                     # lazy: main импортирует этот модуль
+    phrases = {f"{seed} {w}": w for w in words}
+    result = {"seed": seed, "method": "minus-test", "keywords": list(phrases), "anchors": [],
+              "count": len(phrases), "anchors_count": 0}
+    l2_config = _main._build_l2_config(None, None, None)
+    result = _main.apply_filters_traced(result, seed=seed, country=country, method="minus-test",
+                                        language=language, enabled_filters=filters, l2_config=l2_config)
+
+    def _kw(k):  # ключ может быть str или {"query": ...}
+        return (k if isinstance(k, str) else k.get("query", "")).lower().strip()
+
+    valid = [phrases[_kw(k)] for k in result.get("keywords", []) if _kw(k) in phrases]
+    grey = [phrases[_kw(k)] for k in result.get("keywords_grey", []) if _kw(k) in phrases]
+    blocked = (result.get("_trace") or {}).get("blocked_keywords", {}) or {}
+    trash: list[dict] = []
+    seen = set(valid) | set(grey)
+    for ph, info in blocked.items():
+        w = phrases.get(ph.lower().strip())
+        if w and w not in seen:
+            seen.add(w)
+            trash.append({"word": w, "by": info.get("blocked_by", "?"), "reason": info.get("reason", "")})
+    for a in result.get("anchors", []):                     # то, что не попало в blocked_keywords трейсера
+        ph = a if isinstance(a, str) else a.get("query", a.get("keyword", ""))
+        w = phrases.get(str(ph).lower().strip())
+        if w and w not in seen:
+            seen.add(w)
+            trash.append({"word": w, "by": (a.get("anchor_reason", "anchor") if isinstance(a, dict) else "anchor"), "reason": ""})
+    for w in words:                                         # на всякий случай — ничего не терять
+        if w not in seen:
+            trash.append({"word": w, "by": "unknown", "reason": "не найдено ни в одном ведре"})
+    by_filter: dict[str, int] = {}
+    for t in trash:
+        by_filter[t["by"]] = by_filter.get(t["by"], 0) + 1
+    return {"valid": valid, "grey": grey, "trash": trash, "by_filter": by_filter,
+            "timings": result.get("_filter_timings", {})}
+
+
 # ══════════════════════════ конвейер ══════════════════════════
 
 class MinusReq(BaseModel):
@@ -288,6 +329,10 @@ class MinusReq(BaseModel):
     extenders: list[str] = DEFAULT_EXTENDERS
     censor: str = DEFAULT_CENSOR
     thinking: str = "low"          # off | low | medium | high
+    filters: str = "pre,geo,bpf,l0,l15v2,l2"   # бесплатные фильтры парсера над фразами «сид + слово»; "" = выкл
+    country: str = "ua"
+    language: str = "ru"
+    run_censor: bool = False       # LLM-цензор после фильтров (пока смотрим срезы — выкл)
 
 
 async def run_minus(req: MinusReq) -> dict:
@@ -309,20 +354,33 @@ async def run_minus(req: MinusReq) -> dict:
         added = [w for w in parse_list(r["text"]) if w not in set(current)]
         stages.append((m, added))
         current = current + added
-    before_censor = list(current)
+    before_filters = list(current)
 
-    # 5. цензор — один вызов, только удаление
+    # 5. бесплатные фильтры парсера над фразами «сид + слово»
+    filt: dict = {"valid": current, "grey": [], "trash": [], "by_filter": {}, "timings": {}, "error": None}
+    if req.filters.strip():
+        t1 = time.perf_counter()
+        try:
+            filt = await asyncio.to_thread(run_parser_filters, current, seed, req.country, req.language, req.filters)
+            filt["error"] = None
+        except Exception as e:  # noqa: BLE001
+            filt["error"] = f"{type(e).__name__}: {e}"
+        filt["wall"] = round(time.perf_counter() - t1, 2)
+        current = filt["valid"] + filt["grey"]           # в цензор/итог идёт всё, что не TRASH
+
+    # 6. LLM-цензор (опционально), только удаление
     removed: list[dict] = []
-    numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
-    cz = await call_model(req.censor, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
-                          search=False, thinking=req.thinking)
-    calls.append(cz)
-    keep = parse_keep(cz["text"], len(current))
-    if keep is None:                          # fail-open
-        cz["error"] = (cz["error"] or "") + " | parse fail → list untouched"
-    else:
-        removed = [{"word": w, "by": cz["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
-        current = [w for i, w in enumerate(current) if (i + 1) in keep]
+    if req.run_censor and current:
+        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
+        cz = await call_model(req.censor, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
+                              search=False, thinking=req.thinking)
+        calls.append(cz)
+        keep = parse_keep(cz["text"], len(current))
+        if keep is None:                          # fail-open
+            cz["error"] = (cz["error"] or "") + " | parse fail → list untouched"
+        else:
+            removed = [{"word": w, "by": cz["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
+            current = [w for i, w in enumerate(current) if (i + 1) in keep]
 
     origin = {w: (m, i + 1) for i, (m, ws) in enumerate(stages) for w in ws}
     rows = [{"word": w, "stage": origin[w][1], "by": origin[w][0]} for w in current]
@@ -333,12 +391,18 @@ async def run_minus(req: MinusReq) -> dict:
         "total_wall": round(time.perf_counter() - t0, 2),
         "finder_count": len(stages[0][1]),
         "added_by_stage": {m: len(ws) for m, ws in stages[1:]},
-        "before_censor": len(before_censor),
+        "before_filters": len(before_filters),
+        "filters": {"valid": len(filt["valid"]), "grey": len(filt["grey"]), "trash": len(filt["trash"]),
+                    "by_filter": filt["by_filter"], "wall": filt.get("wall"), "error": filt.get("error"),
+                    "timings": filt.get("timings", {})},
         "removed_by_censor": len(removed),
         "final_count": len(current),
         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
     }
-    return {"rows": rows, "list": current, "removed": removed, "stats": stats,
+    grey_set = set(filt["grey"])
+    for r in rows:
+        r["bucket"] = "grey" if r["word"] in grey_set else "valid"
+    return {"rows": rows, "list": current, "removed": removed, "trash": filt["trash"], "stats": stats,
             "raw": {c["model"]: c["text"] for c in calls}}
 
 
