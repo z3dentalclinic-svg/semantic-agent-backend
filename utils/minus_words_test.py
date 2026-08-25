@@ -32,36 +32,52 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_0.6"
+BUILD = "mw_0.7"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
     "gemini-3.7-flash":      {"vendor": "gemini",    "price": (0.30, 2.50), "search": True},
     "gemini-3.6-flash":      {"vendor": "gemini",    "price": (0.30, 2.50), "search": True},
     "gemini-3.1-flash-lite": {"vendor": "gemini",    "price": (0.10, 0.40), "search": True},
-    "gpt-5.6-sol":           {"vendor": "openai",    "price": (1.25, 10.0), "search": True},
+    "gpt-5.6-sol":           {"vendor": "openai",    "price": (4.0, 20.0),  "search": True},
+    "gpt-5.6-terra":         {"vendor": "openai",    "price": (2.0, 12.0),  "search": True},
+    "gpt-5.6-luna":          {"vendor": "openai",    "price": (0.20, 1.20), "search": True},
     "claude-sonnet-4-6":     {"vendor": "anthropic", "price": (3.0, 15.0),  "search": True},
     "claude-fable-5":        {"vendor": "anthropic", "price": (5.0, 25.0),  "search": True},
     "claude-opus-5":         {"vendor": "anthropic", "price": (15.0, 75.0), "search": True},
 }
-SEARCH_PRICE_PER_CALL = {"gemini": 0.035, "openai": 0.01, "anthropic": 0.01}
+SEARCH_PRICE_PER_CALL = {"gemini": 0.035, "openai": 0.01, "anthropic": 0.01}   # openai: за каждый поиск + 8k input-токенов
+OPENAI_SEARCH_INPUT_TOKENS = 8000
 
-DEFAULT_FINDER = "gemini-3.7-flash"  # lite в поиск не ходит (2 прогона), 3.7 — ходит
-DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-sol"]  # порядок = порядок цепочки
+# Регион → ISO-код страны для user_location поиска OpenAI (конфиг, дополнять по мере надобности)
+REGION_CODES = {"украина": "UA", "ukraine": "UA", "россия": "RU", "russia": "RU", "казахстан": "KZ",
+                "kazakhstan": "KZ", "польша": "PL", "poland": "PL", "германия": "DE", "germany": "DE",
+                "беларусь": "BY", "belarus": "BY", "ирландия": "IE", "ireland": "IE", "сша": "US", "usa": "US"}
 
-# ─── промпты mw_0.6: генератор по синтезу консилиума (реконструкция запросов с сидом, без категорий-примеров);
-#     вызовы 2–4 — ТОЛЬКО удаление (док 10), ответ номерами того, что оставить (лин-формат L3) ───
-GEN_PROMPT = (
-    "Регион: {region}. Фраза: «{seed}».\n"
-    "Обязательно используй поиск Google.\n"
-    "Представь реальные поисковые запросы Google из этого региона, в которых есть эта фраза.\n"
-    "Шаг 1. Составь фразы, где человек не является клиентом того, кто рекламируется по этой фразе.\n"
-    "Шаг 2. Из этих фраз выпиши слова, которые и делают запрос нецелевым.\n"
-    "Не выписывай слово, если оно уточняет, характеризует или выбирает тот же товар или услугу, "
-    "или если такой запрос с фразой люди не набирают. Проверка: убери слово из запроса — "
-    "если человек остался тем же клиентом, слово не подходит.\n"
-    "Регион влияет только на язык и форму запросов.\n"
-    "Одно слово на строку, без пояснений. Если уверенных слов мало — выпиши мало."
+
+def region_code(region: str) -> str | None:
+    r = region.strip().lower()
+    if len(r) == 2 and r.isalpha():
+        return r.upper()
+    return REGION_CODES.get(r)
+
+DEFAULT_FINDER = "gpt-5.6-luna"      # единственный вендор с ПРИНУДИТЕЛЬНЫМ поиском (tool_choice) и страной поиска
+DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-luna"]  # порядок = порядок цепочки
+DEFAULT_CENSOR = "gemini-3.7-flash"
+
+# ─── промпты mw_0.7: широкая генерация (как в 0.5) + цензор (PRUNE из 0.6) ───
+FINDER_PROMPT = (
+    "Найди пожалуйста самый полный список минус слов для рекламы Google Ads для этого сида: «{seed}». "
+    "Регион: {region}.\n"
+    "Сделай один поиск в интернете и собери слова из найденных опубликованных списков. "
+    "Ничего не придумывай сам: если слова нет в найденных источниках, не пиши его.\n"
+    "Ответ: одно минус-слово на строку, без нумерации и пояснений."
+)
+EXTENDER_PROMPT = (
+    "Вот список минус слов:\n{found}\n\n"
+    "Вот сид: «{seed}»\nВот регион поиска: {region}\n"
+    "Дополни этот список недостающими минус словами.\n"
+    "Ответ: только новые слова, одно на строку, без нумерации и пояснений."
 )
 PRUNE_PROMPT = (
     "Регион: {region}. Фраза: «{seed}».\n"
@@ -71,11 +87,12 @@ PRUNE_PROMPT = (
     "Проверка: убери слово из запроса — если человек остался тем же клиентом, слово не подходит.\n"
     "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
 )
+# GEN_PROMPT из 0.6 (узкий генератор) снят — точность без широты; см. git-историю для отката
 
 
 # ══════════════════════════ вызовы вендоров ══════════════════════════
 
-async def _call_gemini(model: str, prompt: str, search: bool, thinking: str) -> dict:
+async def _call_gemini(model: str, prompt: str, search: bool, thinking: str, country: str | None = None) -> dict:
     key = os.environ["GEMINI_API_KEY"]
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body: dict = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
@@ -108,22 +125,27 @@ async def _call_gemini(model: str, prompt: str, search: bool, thinking: str) -> 
     }
 
 
-async def _call_openai(model: str, prompt: str, search: bool, thinking: str) -> dict:
+async def _call_openai(model: str, prompt: str, search: bool, thinking: str, country: str | None = None) -> dict:
     key = os.environ["OPENAI_API_KEY"]
     body: dict = {"model": model, "input": prompt}
     if thinking != "off":
         body["reasoning"] = {"effort": thinking}
     if search:
-        body["tools"] = [{"type": "web_search"}]
+        tool: dict = {"type": "web_search"}
+        if country:
+            tool["user_location"] = {"type": "approximate", "country": country}
+        body["tools"] = [tool]
+        body["tool_choice"] = {"type": "web_search"}   # принудительный поиск
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post("https://api.openai.com/v1/responses",
                          headers={"Authorization": f"Bearer {key}"}, json=body)
         r.raise_for_status()
         d = r.json()
-    text, sources, searched = "", [], False
+    text, sources, searched, n_search = "", [], False, 0
     for item in d.get("output", []):
         if item.get("type") == "web_search_call":
             searched = True
+            n_search += 1
         if item.get("type") == "message":
             for ct in item.get("content", []):
                 if ct.get("type") == "output_text":
@@ -134,10 +156,10 @@ async def _call_openai(model: str, prompt: str, search: bool, thinking: str) -> 
     u = d.get("usage", {})
     return {"text": text, "in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0),
             "think": u.get("output_tokens_details", {}).get("reasoning_tokens", 0),
-            "sources": sources, "searched": searched}
+            "sources": sources, "searched": searched, "n_search": n_search}
 
 
-async def _call_anthropic(model: str, prompt: str, search: bool, thinking: str) -> dict:
+async def _call_anthropic(model: str, prompt: str, search: bool, thinking: str, country: str | None = None) -> dict:
     key = os.environ["ANTHROPIC_API_KEY"]
     body: dict = {"model": model, "max_tokens": 4000,
                   "messages": [{"role": "user", "content": prompt}]}
@@ -170,18 +192,21 @@ async def _call_anthropic(model: str, prompt: str, search: bool, thinking: str) 
 _CALLERS = {"gemini": _call_gemini, "openai": _call_openai, "anthropic": _call_anthropic}
 
 
-async def call_model(model: str, prompt: str, *, search: bool, thinking: str) -> dict:
+async def call_model(model: str, prompt: str, *, search: bool, thinking: str, country: str | None = None) -> dict:
     meta = MODELS[model]
     t0 = time.perf_counter()
     try:
-        res = await _CALLERS[meta["vendor"]](model, prompt, search, thinking)
+        res = await _CALLERS[meta["vendor"]](model, prompt, search, thinking, country)
         err = None
     except Exception as e:  # noqa: BLE001
         res, err = {"text": "", "in": 0, "out": 0, "think": 0, "sources": [], "searched": False}, f"{type(e).__name__}: {e}"
     pin, pout = meta["price"]
     cost = (res["in"] * pin + (res["out"] + res["think"]) * pout) / 1_000_000
     if search and res["searched"]:
-        cost += SEARCH_PRICE_PER_CALL[meta["vendor"]]
+        n = res.get("n_search", 1) or 1
+        cost += SEARCH_PRICE_PER_CALL[meta["vendor"]] * n
+        if meta["vendor"] == "openai":
+            cost += OPENAI_SEARCH_INPUT_TOKENS * n * pin / 1_000_000
     res.update({"model": model, "wall": round(time.perf_counter() - t0, 2),
                 "cost": round(cost, 5), "error": err, "search": search})
     return res
@@ -236,6 +261,7 @@ class MinusReq(BaseModel):
     region: str = "Украина"
     finder: str = DEFAULT_FINDER
     extenders: list[str] = DEFAULT_EXTENDERS
+    censor: str = DEFAULT_CENSOR
     thinking: str = "low"          # off | low | medium | high
 
 
@@ -243,40 +269,47 @@ async def run_minus(req: MinusReq) -> dict:
     t0 = time.perf_counter()
     seed = req.seed.strip()
 
-    # 1. генератор — единственный вызов с поиском
-    finder = await call_model(req.finder, GEN_PROMPT.format(seed=seed, region=req.region),
-                              search=True, thinking=req.thinking)
+    # 1. finder — единственный вызов с поиском (принудительный у OpenAI, страна из региона)
+    finder = await call_model(req.finder, FINDER_PROMPT.format(seed=seed, region=req.region),
+                              search=True, thinking=req.thinking, country=region_code(req.region))
     current = parse_list(finder["text"])
     stages: list[tuple[str, list[str]]] = [(finder["model"], list(current))]
     calls = [finder]
-    removed: list[dict] = []
 
-    # 2-4. цепочка: только удаление, каждый получает список после предыдущего
+    # 2-4. цепочка «дополни»: каждый получает список, дополненный предыдущим
     for m in req.extenders:
-        if not current:
-            break
-        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
-        r = await call_model(m, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
-                             search=False, thinking=req.thinking)
+        prompt = EXTENDER_PROMPT.format(found="\n".join(current) or "(пусто)", seed=seed, region=req.region)
+        r = await call_model(m, prompt, search=False, thinking=req.thinking)
         calls.append(r)
-        keep = parse_keep(r["text"], len(current))
-        if keep is None:                      # fail-open
-            r["error"] = (r["error"] or "") + " | parse fail → list untouched"
-            stages.append((m, []))
-            continue
-        cut = [w for i, w in enumerate(current) if (i + 1) not in keep]
-        removed += [{"word": w, "by": m} for w in cut]
-        current = [w for i, w in enumerate(current) if (i + 1) in keep]
-        stages.append((m, cut))               # для отчёта: что ЭТА модель срезала
+        added = [w for w in parse_list(r["text"]) if w not in set(current)]
+        stages.append((m, added))
+        current = current + added
+    before_censor = list(current)
 
-    rows = [{"word": w, "stage": 1, "by": finder["model"]} for w in current]  # merge() оставлен для отката на схему «дополнение»
+    # 5. цензор — один вызов, только удаление
+    removed: list[dict] = []
+    numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
+    cz = await call_model(req.censor, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
+                          search=False, thinking=req.thinking)
+    calls.append(cz)
+    keep = parse_keep(cz["text"], len(current))
+    if keep is None:                          # fail-open
+        cz["error"] = (cz["error"] or "") + " | parse fail → list untouched"
+    else:
+        removed = [{"word": w, "by": cz["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
+        current = [w for i, w in enumerate(current) if (i + 1) in keep]
+
+    origin = {w: (m, i + 1) for i, (m, ws) in enumerate(stages) for w in ws}
+    rows = [{"word": w, "stage": origin[w][1], "by": origin[w][0]} for w in current]
     stats = {
         "build": BUILD,
         "seed": seed, "region": req.region, "thinking": req.thinking,
         "total_cost": round(sum(c["cost"] for c in calls), 5),
         "total_wall": round(time.perf_counter() - t0, 2),
         "finder_count": len(stages[0][1]),
-        "removed_by_stage": {m: len(ws) for m, ws in stages[1:]},
+        "added_by_stage": {m: len(ws) for m, ws in stages[1:]},
+        "before_censor": len(before_censor),
+        "removed_by_censor": len(removed),
         "final_count": len(current),
         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
     }
@@ -295,11 +328,12 @@ def register_minus_words_test(app: FastAPI) -> None:
 
     @app.post("/api/minus-test")
     async def minus_api(req: MinusReq):
-        unknown = [m for m in [req.finder, *req.extenders] if m not in MODELS]
+        unknown = [m for m in [req.finder, *req.extenders, req.censor] if m not in MODELS]
         if unknown:
             return JSONResponse({"error": f"unknown models: {unknown}"}, status_code=400)
         return await run_minus(req)
 
     @app.get("/api/minus-test/models")
     async def minus_models():
-        return {"models": list(MODELS), "finder": DEFAULT_FINDER, "extenders": DEFAULT_EXTENDERS, "build": BUILD}
+        return {"models": list(MODELS), "finder": DEFAULT_FINDER, "extenders": DEFAULT_EXTENDERS,
+                "censor": DEFAULT_CENSOR, "build": BUILD}
