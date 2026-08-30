@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "mw_1.1"
+BUILD = "mw_1.2"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -294,7 +294,11 @@ def merge(stages: list[tuple[str, list[str]]]) -> list[dict]:
 def run_parser_filters(words: list[str], seed: str, country: str, language: str, filters: str) -> dict:
     """Синхронно: main.apply_filters_traced над фразами. Возвращает раскладку по словам."""
     import main as _main                                     # lazy: main импортирует этот модуль
-    phrases = {f"{seed} {w}": w for w in words}
+
+    def norm(t: str) -> str:
+        return re.sub(r"\s+", " ", str(t).lower()).strip()
+
+    phrases = {norm(f"{seed} {w}"): w for w in words}
     result = {"seed": seed, "method": "minus-test", "keywords": list(phrases), "anchors": [],
               "count": len(phrases), "anchors_count": 0}
     l2_config = _main._build_l2_config(None, None, None)
@@ -302,7 +306,7 @@ def run_parser_filters(words: list[str], seed: str, country: str, language: str,
                                         language=language, enabled_filters=filters, l2_config=l2_config)
 
     def _kw(k):  # ключ может быть str или {"query": ...}
-        return (k if isinstance(k, str) else k.get("query", "")).lower().strip()
+        return norm(k if isinstance(k, str) else k.get("query", ""))
 
     valid = [phrases[_kw(k)] for k in result.get("keywords", []) if _kw(k) in phrases]
     grey = [phrases[_kw(k)] for k in result.get("keywords_grey", []) if _kw(k) in phrases]
@@ -310,13 +314,13 @@ def run_parser_filters(words: list[str], seed: str, country: str, language: str,
     trash: list[dict] = []
     seen = set(valid) | set(grey)
     for ph, info in blocked.items():
-        w = phrases.get(ph.lower().strip())
+        w = phrases.get(norm(ph))
         if w and w not in seen:
             seen.add(w)
             trash.append({"word": w, "by": info.get("blocked_by", "?"), "reason": info.get("reason", "")})
     for a in result.get("anchors", []):                     # то, что не попало в blocked_keywords трейсера
         ph = a if isinstance(a, str) else a.get("query", a.get("keyword", ""))
-        w = phrases.get(str(ph).lower().strip())
+        w = phrases.get(norm(ph))
         if w and w not in seen:
             seen.add(w)
             trash.append({"word": w, "by": (a.get("anchor_reason", "anchor") if isinstance(a, dict) else "anchor"), "reason": ""})
@@ -347,9 +351,17 @@ class MinusReq(BaseModel):
     run_censor: bool = True        # LLM-2: среди уточнений — что минус (PRUNE)
 
 
+_SEED_JUNK = re.compile(r"^[\s\d\.\)\-•*]+")
+
+
+def clean_seed(seed: str) -> str:
+    """Срезает нумерацию/маркеры из вставленного списка и схлопывает пробелы/табы."""
+    return re.sub(r"\s+", " ", _SEED_JUNK.sub("", seed)).strip()
+
+
 async def run_minus(req: MinusReq) -> dict:
     t0 = time.perf_counter()
-    seed = req.seed.strip()
+    seed = clean_seed(req.seed)
 
     # 1. finder — единственный вызов с поиском (принудительный у OpenAI, страна из региона)
     finder = await call_model(req.finder, FINDER_PROMPT.format(seed=seed, region=req.region),
@@ -380,7 +392,14 @@ async def run_minus(req: MinusReq) -> dict:
         except Exception as e:  # noqa: BLE001
             filt["error"] = f"{type(e).__name__}: {e}"
         filt["wall"] = round(time.perf_counter() - t1, 2)
-        current = filt["valid"] + filt["grey"]           # в цензор/итог идёт всё, что не TRASH
+        mapped = filt["valid"] + filt["grey"]
+        unknown_all = filt["trash"] and all(t["by"] == "unknown" for t in filt["trash"]) and not mapped
+        if unknown_all:                                   # сопоставление фраза→слово не сработало → fail-open
+            filt["error"] = (filt.get("error") or "") + " | mapping fail → list untouched"
+            filt["trash"], filt["by_filter"] = [], {}
+            filt["valid"] = list(current)
+        else:
+            current = mapped                              # в цензор/итог идёт всё, что не TRASH
 
     # 6. LLM-1 — «уточнение/расширение сида?»: нет → мусор
     unrelated: list[dict] = []
