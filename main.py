@@ -1148,6 +1148,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     parts = [x.strip() for x in ef.split(",")]
     run_pre = "pre" in parts
     run_geo = "geo" in parts
+    run_geoexist = "geoexist" in parts   # LLM-проверка существования гео-элементов (geo_exist_filter)
     run_bpf = "bpf" in parts
     run_l0 = "l0" in parts
     # L1.5 version: l15 → v1 (старый), l15v2 → v2 (E5-large + inverted)
@@ -1159,7 +1160,7 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     run_l3 = "l3" in parts
     
     l15_version = "v2" if run_l15_v2 else ("v1" if run_l15_v1 else "off")
-    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} bpf={run_bpf} l0={run_l0} l1.5={l15_version} l2={run_l2} l2.5={run_l25} l3={run_l3}")
+    logger.info(f"[FILTERS] enabled_filters='{enabled_filters}' → pre={run_pre} geo={run_geo} geoexist={run_geoexist} bpf={run_bpf} l0={run_l0} l1.5={l15_version} l2={run_l2} l2.5={run_l25} l3={run_l3}")
     
     parser.tracer.start_request(seed=seed, country=country, method=method)
     
@@ -1215,7 +1216,20 @@ def apply_filters_traced(result: dict, seed: str, country: str,
         for kw in (before_set - after_set):
             result["anchors"].append(kw)
         before_set = after_set
-    
+
+    # GEO EXIST (LLM): существование гео-хвостов в локации сида; включается флагом "geoexist"
+    if run_geoexist:
+        from filters import apply_geo_exist_filter, GeoExistConfig
+        parser.tracer.before_filter("geo_exist_filter", result.get("keywords", []))
+        _t0 = time.time()
+        result = apply_geo_exist_filter(result, seed=seed, config=GeoExistConfig(country=country))
+        _timings["geo_exist_filter"] = round(time.time() - _t0, 4)
+        _ge_reasons = {kw: {"blocked_by": "geo_exist_filter", "reason": f"гео не существует: {t['tail']}"}
+                       for t in result.get("_geo_exist_trace", []) if not t["exists"] for kw in t["keywords"]}
+        parser.tracer.after_filter("geo_exist_filter", result.get("keywords", []), reasons=_ge_reasons)
+        after_set = set(k.lower().strip() if isinstance(k, str) else k.get("query","").lower().strip() for k in result.get("keywords", []))
+        before_set = after_set
+
     # BATCH POST-FILTER
     _bpf_own_geo = set()  # метка own_geo от BPF → передаётся в L0
     if run_bpf:
