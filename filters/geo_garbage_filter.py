@@ -937,6 +937,7 @@ def filter_geo_garbage(data: dict, seed: str, target_country: str = 'ua', brand_
 
     # Основной город — для логов и гейтов `if seed_city:` (= это гео-сид)
     seed_city = seed_cities[0] if seed_cities else None
+    data["_geo_seed_cities"] = list(seed_cities)  # для geo_exist_filter (LLM-проверка существования гео)
 
     if not seed_city:
         logger.warning(f"[GEO_WHITE_LIST] ⚠️ No city in seed: '{seed}'. All queries pass.")
