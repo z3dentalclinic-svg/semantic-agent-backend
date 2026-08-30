@@ -19,6 +19,7 @@ import logging
 
 from .batch_post_filter import BatchPostFilter
 from .geo_garbage_filter import filter_geo_garbage, OCCUPIED_TERRITORIES
+from .geo_exist_filter import apply_geo_exist_filter, GeoExistConfig
 from .pre_filter import pre_filter, apply_pre_filter
 from .infix_filter import filter_infix_results
 from .relevance_filter import filter_relevant_keywords
@@ -57,6 +58,8 @@ __all__ = [
     'BatchPostFilter',
     'DISTRICTS_EXTENDED',
     'filter_geo_garbage',
+    'apply_geo_exist_filter',
+    'GeoExistConfig',
     'OCCUPIED_TERRITORIES',
     'pre_filter',
     'apply_pre_filter',
