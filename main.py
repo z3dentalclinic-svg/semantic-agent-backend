@@ -1148,7 +1148,9 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     parts = [x.strip() for x in ef.split(",")]
     run_pre = "pre" in parts
     run_geo = "geo" in parts
-    run_geoexist = "geoexist" in parts   # LLM-проверка существования гео-элементов (geo_exist_filter)
+    # geo_exist: АВТОМАТ (решение Andrew) — запускается сам, если в сиде есть гео
+    # (триггер внутри фильтра: нет гео → no_geo_in_seed, ноль вызовов). Отключение: флаг "nogeoexist".
+    run_geoexist = "nogeoexist" not in parts
     run_bpf = "bpf" in parts
     run_l0 = "l0" in parts
     # L1.5 version: l15 → v1 (старый), l15v2 → v2 (E5-large + inverted)
