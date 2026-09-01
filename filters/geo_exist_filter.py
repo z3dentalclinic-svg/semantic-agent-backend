@@ -29,7 +29,7 @@ MODEL = "gemini-3.7-flash"  # ge_1.3: lite пропускал киевские �
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 PRICE_IN = 0.30    # $/1M gemini-3.7-flash; thinking биллится как output
 PRICE_OUT = 2.50
-GEO_EXIST_BUILD = "ge_1.3 glue-two-steps 3.7-flash, 2026-09-01"
+GEO_EXIST_BUILD = "ge_1.4 3.7-flash + google_search, 2026-09-01"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -64,9 +64,10 @@ _NUM_RE = re.compile(r"\d+")
 class GeoExistConfig:
     api_key: str = ""
     country: str = "ua"
-    timeout: int = 60
+    timeout: int = 90          # с поиском вызов дольше
     thinking_level: str = "low"
     model: str = MODEL
+    use_search: bool = True    # ge_1.4: grounding — модель сверяется с картой, а не с памятью
 
 
 def _kw_str(kw: Any) -> str:
@@ -100,7 +101,7 @@ def _geo_tail(kw: str, seed_toks: set) -> Optional[str]:
 
 
 def _call_gemini(api_key: str, user_prompt: str, timeout: int,
-                 thinking_level: str, model: str) -> Tuple[str, Dict[str, Any]]:
+                 thinking_level: str, model: str, use_search: bool = False) -> Tuple[str, Dict[str, Any]]:
     import requests
     # Ключ ТОЛЬКО в заголовке (не в URL — утекает в логи HTTP-клиентов).
     url = f"{API_BASE}/{model}:generateContent"
@@ -112,6 +113,8 @@ def _call_gemini(api_key: str, user_prompt: str, timeout: int,
             "thinkingConfig": {"thinkingLevel": thinking_level},
         },
     }
+    if use_search:
+        payload["tools"] = [{"google_search": {}}]   # решение Andrew: проверка по реальной карте
     try:
         response = requests.post(
             url,
@@ -130,10 +133,13 @@ def _call_gemini(api_key: str, user_prompt: str, timeout: int,
     parts = (cands[0].get("content") or {}).get("parts") or []
     text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
     um = data.get("usageMetadata", {}) or {}
+    gm = cands[0].get("groundingMetadata", {}) or {}
     diag = {
         "prompt_tokens": um.get("promptTokenCount", 0),
         "output_tokens": um.get("candidatesTokenCount", 0),
         "thinking_tokens": um.get("thoughtsTokenCount", 0),
+        "searched": bool(gm),
+        "n_search": len(gm.get("webSearchQueries", []) or []),
     }
     if not text:
         raise Exception(f"GeoExist empty text (finishReason={cands[0].get('finishReason')})")
@@ -187,7 +193,7 @@ def apply_geo_exist_filter(
     stats.update({"skipped": False, "location": location, "checked": len(tails)})
     try:
         text, diag = _call_gemini(config.api_key, prompt, config.timeout,
-                                  config.thinking_level, config.model)
+                                  config.thinking_level, config.model, config.use_search)
     except Exception as e:      # fail-open: ключи не трогаем
         stats["error"] = str(e)[:300]
         stats["wall"] = round(time.time() - t0, 2)
@@ -230,6 +236,8 @@ def apply_geo_exist_filter(
     result["_geo_exist_trace"] = trace
     cost = (diag["prompt_tokens"] * PRICE_IN
             + (diag["output_tokens"] + diag["thinking_tokens"]) * PRICE_OUT) / 1_000_000
+    if diag.get("searched"):
+        cost += 0.035 * max(diag.get("n_search", 1), 1)   # оценка платы за grounding-поиск
     stats.update({"trash": n_trash, "kept": len(kept), "wall": round(time.time() - t0, 2),
                   "tokens": diag, "cost_usd": round(cost, 6)})
     logger.info(f"[GEO_EXIST] location='{location}' tails={len(tails)} trash={n_trash} "
