@@ -7,12 +7,12 @@ geo_exist_filter.py — гео-фильтр склеек. build: ge_2.0 (мак�
   A. Классификатор (lite, промпт-основа ge_1.2 «склейки» в 2 шага):
      JSON с полем reasoning (CoT будит фактологию lite) и статусом на каждый хвост:
      NOT_GEO | GEO_LOCAL | GEO_FOREIGN | GEO_UNCERTAIN | RENAMED
-  B. Evidence кодом для GEO_UNCERTAIN (+подтверждение GEO_FOREIGN при confirm_foreign):
-     OpenStreetMap Nominatim (бесплатно): найден ли объект в локации; где найден вообще.
-  C. Судья (lite) по карточкам доказательств: LOCAL | FOREIGN | UNKNOWN.
-Политика среза (асимметричная, консенсус консилиума):
-     TRASH = GEO_FOREIGN этапа A (при confirm_foreign=False) ∪ FOREIGN судьи по доказательствам.
-     NOT_GEO / GEO_LOCAL / UNKNOWN / RENAMED → KEEP. Fail-open на любом сбое или несоблюдении схемы.
+  B. Точечный судья настоящести (gemini-3.7-flash + google_search) ТОЛЬКО для GEO_UNCERTAIN:
+     один хвост = один вызов, параллельно; вопрос «настоящий запрос или случайная склейка» (or_1.2:
+     36/40 верных вердиктов, 0 UNKNOWN на полтавском корпусе). Nominatim снят — судья его покрывает.
+Политика среза (асимметричная):
+     TRASH = GEO_FOREIGN этапа A (у «склеечного» промпта 0 ложных за серию) ∪ GLUE судьи.
+     NOT_GEO / GEO_LOCAL / REAL / UNKNOWN / RENAMED → KEEP. Fail-open на любом сбое/схеме.
 RENAMED → KEEP: решение Andrew по переименованным (гагарина/лермонтова) — отдельной политики пока нет.
 
 Вызов как раньше: apply_geo_exist_filter(result, seed, ...) после geo_garbage_filter,
@@ -37,11 +37,9 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.7-flash": (0.30, 2.50),
 }
-GEO_EXIST_BUILD = "ge_2.0 hypothesis->evidence->adjudicator, 2026-09-01"
+GEO_EXIST_BUILD = "ge_3.0 lite-router -> pointwise gemini judge, 2026-09-01"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_UA = "semantic-agent-geo-exist/2.0"
 
 SYSTEM_PROMPT = "Ты проверяешь географию поисковых запросов. Отвечаешь строго в заданном формате."
 
@@ -59,25 +57,25 @@ CLASSIFY_PROMPT = (
     "GEO_FOREIGN — гео-объект другого города, случайная склейка.\n"
     "GEO_UNCERTAIN — гео-объект, но принадлежность этой локации не уверена.\n"
     "RENAMED — переименованный или исторический объект этой локации.\n"
-    "Если сомневаешься между GEO_FOREIGN и GEO_UNCERTAIN — ставь GEO_UNCERTAIN.\n"
+    "GEO_LOCAL ставь только если ТВЁРДО знаешь, что объект есть именно в этой локации; "
+    "при любом сомнении — GEO_UNCERTAIN. Если сомневаешься между GEO_FOREIGN и GEO_UNCERTAIN — "
+    "тоже GEO_UNCERTAIN.\n"
     "Ответ строго JSON без текста вокруг:\n"
     '{{"reasoning": "краткое обоснование по сомнительным (1-3 предложения)", '
     '"items": [{{"n": 1, "status": "..."}}]}}\n\n{numbered}'
 )
 
-# Этап C — судья по доказательствам, не по памяти. FOREIGN требует положительного подтверждения
-# чужой локации; недостаток данных = UNKNOWN, не FOREIGN.
-ADJUDICATE_PROMPT = (
-    "Локация исходного запроса: {location}, {country}.\n"
-    "Ниже гео-кандидаты и результаты внешней проверки по справочнику карт (OpenStreetMap).\n"
-    "Для каждого кандидата определи отношение к локации ТОЛЬКО по приведённым данным:\n"
-    "LOCAL — данные подтверждают объект в этой локации.\n"
-    "FOREIGN — данные подтверждают объект в другой локации, а в этой он не найден.\n"
-    "UNKNOWN — данных недостаточно или они неоднозначны.\n"
-    "Не используй собственные знания об улицах и объектах, если они не подтверждаются данными. "
-    "Совпадение названия в другом городе само по себе не делает объект FOREIGN, если он найден и в этой "
-    "локации. Для FOREIGN нужно положительное подтверждение другой локации. При сомнении — UNKNOWN.\n"
-    'Ответ строго JSON: {{"items": [{{"n": 1, "verdict": "LOCAL|FOREIGN|UNKNOWN"}}]}}\n\n{cards}'
+# Этап B — точечный судья настоящести (промпт or_1.2 + строка про услугу внутри объекта: кейс
+# эпицентр/екватор — модель судила наличие услуги, а не настоящесть запроса).
+JUDGE_PROMPT = (
+    "Локация: {location}, {country}. Поисковый запрос: «{seed} {tail}».\n"
+    "Проверь через поиск Google: это настоящий запрос, который мог ввести живой человек, ищущий "
+    "«{seed}» — или случайная склейка подсказок (гео-элемент не относится к локации, не существует, "
+    "или такой связки никто не ищет)?\n"
+    "Не оценивай, оказывается ли услуга внутри названного объекта: человек ищет услугу рядом "
+    "с ориентиром, и это настоящий запрос.\n"
+    "Первая строка ответа — строго одно слово: REAL или GLUE или UNKNOWN. "
+    "Вторая строка — причина в 5-10 слов."
 )
 
 _TOKEN_RE = re.compile(r"[а-яёіїєґa-z0-9\-']+")
@@ -92,13 +90,10 @@ class GeoExistConfig:
     timeout: int = 60
     thinking_level: str = "low"
     classifier_model: str = MODEL_CLASSIFIER
-    adjudicator_model: str = MODEL_ADJUDICATOR
-    # тумблеры этапов
-    use_reasoning_json: bool = True     # A: JSON+reasoning (False — резерв, поведение не меняет: формат A всегда JSON)
-    use_evidence: bool = True           # B: Nominatim для GEO_UNCERTAIN
-    confirm_foreign: bool = False       # True = GEO_FOREIGN этапа A тоже резать только по доказательству
-    use_adjudicator: bool = True        # C: судья LLM (False = решает код: найден в локации → LOCAL и т.д.)
-    nominatim_limit: int = 12           # максимум карточек за прогон (rate limit OSM ~1 rps → ~2 c на карточку)
+    judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
+    use_judge: bool = True                  # False = только этап A (его FOREIGN)
+    judge_limit: int = 8                    # максимум сомнительных на судью за прогон
+    judge_parallel: int = 6                 # параллельность точечных вызовов
 
 
 def _kw_str(kw: Any) -> str:
@@ -127,15 +122,20 @@ def _geo_tail(kw: str, seed_toks: set) -> Optional[str]:
 
 # ─────────────── LLM ───────────────
 
-def _call_gemini(api_key: str, model: str, user_prompt: str, timeout: int, thinking_level: str) -> Tuple[str, Dict]:
+def _call_gemini(api_key: str, model: str, user_prompt: str, timeout: int, thinking_level: str,
+                 json_mime: bool = True, search: bool = False) -> Tuple[str, Dict]:
     import requests
     url = f"{API_BASE}/{model}:generateContent"
-    payload = {
+    gen: Dict[str, Any] = {"temperature": 0, "thinkingConfig": {"thinkingLevel": thinking_level}}
+    if json_mime:
+        gen["responseMimeType"] = "application/json"
+    payload: Dict[str, Any] = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0, "thinkingConfig": {"thinkingLevel": thinking_level},
-                             "responseMimeType": "application/json"},
+        "generationConfig": gen,
     }
+    if search:
+        payload["tools"] = [{"google_search": {}}]
     try:
         r = requests.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
                           json=payload, timeout=timeout)
@@ -153,7 +153,8 @@ def _call_gemini(api_key: str, model: str, user_prompt: str, timeout: int, think
     if not text:
         raise Exception(f"GeoExist empty text (finishReason={cands[0].get('finishReason')})")
     return text, {"in": um.get("promptTokenCount", 0), "out": um.get("candidatesTokenCount", 0),
-                  "think": um.get("thoughtsTokenCount", 0), "model": model}
+                  "think": um.get("thoughtsTokenCount", 0), "model": model,
+                  "searched": bool(cands[0].get("groundingMetadata"))}
 
 
 def _parse_json(text: str) -> Optional[dict]:
@@ -178,45 +179,34 @@ def _cost(diags: List[Dict]) -> float:
     return round(total, 6)
 
 
-# ─────────────── Evidence: Nominatim (OSM, бесплатно) ───────────────
+# ─────────────── Точечный судья (параллельно) ───────────────
 
-def _nominatim(query: str, country: str, timeout: int = 10) -> List[Dict]:
-    import requests
-    try:
-        r = requests.get(NOMINATIM_URL,
-                         params={"q": query, "format": "json", "limit": 5,
-                                 "countrycodes": country, "accept-language": "uk,ru"},
-                         headers={"User-Agent": NOMINATIM_UA}, timeout=timeout)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+def _judge_tails(tails: List[str], seed: str, location: str, cfg: "GeoExistConfig",
+                 diags: List[Dict]) -> Dict[str, Tuple[str, str, bool]]:
+    """tail → (verdict REAL|GLUE|UNKNOWN, reason, searched). Ошибка вызова → UNKNOWN (fail-open)."""
+    from concurrent.futures import ThreadPoolExecutor
 
+    def one(tail: str):
+        try:
+            text, dg = _call_gemini(cfg.api_key, cfg.judge_model,
+                                    JUDGE_PROMPT.format(seed=seed, tail=tail, location=location,
+                                                        country=cfg.country),
+                                    cfg.timeout, cfg.thinking_level, json_mime=False, search=True)
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            v = lines[0].split()[0].upper() if lines else "UNKNOWN"
+            if v not in ("REAL", "GLUE", "UNKNOWN"):
+                v = "UNKNOWN"
+            return tail, v, (lines[1] if len(lines) > 1 else "")[:120], dg
+        except Exception as e:  # noqa: BLE001
+            return tail, "UNKNOWN", f"err: {str(e)[:80]}", None
 
-def _evidence_card(tail: str, location: str, country: str) -> Dict[str, Any]:
-    """Найден ли объект в локации; в каких населённых пунктах найден вообще."""
-    local = _nominatim(f"{tail}, {location}", country)
-    time.sleep(1.05)                                   # rate limit OSM ~1 rps
-    anywhere = _nominatim(tail, country)
-    time.sleep(1.05)
-    loc_low = location.lower()
-    local_hits = [h.get("display_name", "")[:120] for h in local
-                  if loc_low in h.get("display_name", "").lower()]
-    other = [h.get("display_name", "")[:120] for h in anywhere
-             if h.get("display_name") and loc_low not in h.get("display_name", "").lower()]
-    return {"tail": tail, "found_in_location": bool(local_hits),
-            "local_hits": local_hits[:3], "found_elsewhere": other[:3]}
-
-
-def _cards_text(cards: List[Dict]) -> str:
-    lines = []
-    for i, c in enumerate(cards):
-        lines.append(f"{i+1}. «{c['tail']}»")
-        lines.append("   найден в локации: " + ("да — " + "; ".join(c["local_hits"]) if c["found_in_location"] else "нет"))
-        lines.append("   найден в других местах: " + ("; ".join(c["found_elsewhere"]) if c["found_elsewhere"] else "нет"))
-    return "\n".join(lines)
+    out: Dict[str, Tuple[str, str, bool]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, cfg.judge_parallel)) as ex:
+        for tail, v, reason, dg in ex.map(one, tails):
+            if dg:
+                diags.append(dg)
+            out[tail] = (v, reason, bool(dg and dg.get("searched")))
+    return out
 
 
 # ─────────────── Основной вход ───────────────
@@ -290,50 +280,22 @@ def apply_geo_exist_filter(
         status.setdefault(t, "GEO_UNCERTAIN")            # не размечен → в сомнительные, не в треш
     stats["stages"]["classifier"]["counts"] = {s: sum(1 for v in status.values() if v == s) for s in _STATUSES}
 
-    # ── Этап B: evidence для сомнительных (и FOREIGN при confirm_foreign)
-    need = [t for t in tails if status[t] == "GEO_UNCERTAIN"]
-    if config.confirm_foreign:
-        need += [t for t in tails if status[t] == "GEO_FOREIGN"]
-    need = need[:config.nominatim_limit]
-    cards: List[Dict] = []
-    if config.use_evidence and need:
-        for t in need:
-            cards.append(_evidence_card(t, location, config.country))
-        stats["stages"]["evidence"] = {"cards": len(cards),
-                                       "found_local": sum(1 for c in cards if c["found_in_location"])}
+    # ── Этап B: точечный судья настоящести — только сомнительные
+    need = [t for t in tails if status[t] == "GEO_UNCERTAIN"][: config.judge_limit]
+    judged: Dict[str, Tuple[str, str, bool]] = {}
+    if config.use_judge and need:
+        judged = _judge_tails(need, seed, location, config, diags)
+        stats["stages"]["judge"] = {
+            "asked": len(need),
+            "verdicts": {v: sum(1 for x in judged.values() if x[0] == v) for v in ("REAL", "GLUE", "UNKNOWN")},
+            "searched": sum(1 for x in judged.values() if x[2])}
 
-    # ── Этап C: судья
-    verdict: Dict[str, str] = {}
-    if cards:
-        if config.use_adjudicator:
-            try:
-                text, dg = _call_gemini(config.api_key, config.adjudicator_model,
-                                        ADJUDICATE_PROMPT.format(location=location, country=config.country,
-                                                                 cards=_cards_text(cards)),
-                                        config.timeout, config.thinking_level)
-                diags.append(dg)
-                parsed = _parse_json(text)
-                for it in (parsed or {}).get("items", []):
-                    n, v = it.get("n"), str(it.get("verdict", "")).upper()
-                    if isinstance(n, int) and 1 <= n <= len(cards) and v in _VERDICTS:
-                        verdict[cards[n - 1]["tail"]] = v
-            except Exception as e:                        # сбой судьи → сомнительные остаются KEEP
-                stats["stages"]["adjudicator_error"] = str(e)[:200]
-        else:                                             # решает код по карточке
-            for c in cards:
-                if c["found_in_location"]:
-                    verdict[c["tail"]] = "LOCAL"
-                elif c["found_elsewhere"]:
-                    verdict[c["tail"]] = "FOREIGN"
-                else:
-                    verdict[c["tail"]] = "UNKNOWN"
-
-    # ── Политика среза: только доказанное чужое
+    # ── Политика среза: FOREIGN этапа A + GLUE судьи; всё остальное живёт
     trash_tails = set()
     for t in tails:
-        if status[t] == "GEO_FOREIGN" and not config.confirm_foreign:
+        if status[t] == "GEO_FOREIGN":
             trash_tails.add(t)
-        elif verdict.get(t) == "FOREIGN":
+        elif judged.get(t, ("",))[0] == "GLUE":
             trash_tails.add(t)
 
     if "anchors" not in result:
@@ -342,14 +304,19 @@ def apply_geo_exist_filter(
     n_trash = 0
     for t in tails:
         keep = t not in trash_tails
-        trace.append({"tail": t, "status": status[t], "verdict": verdict.get(t),
+        jv = judged.get(t)
+        trace.append({"tail": t, "status": status[t],
+                      "verdict": jv[0] if jv else None, "reason": jv[1] if jv else None,
                       "exists": keep, "keywords": [_kw_str(k) for k in tail_to_kws[t]]})
         if not keep:
             for k in tail_to_kws[t]:
                 trash_kw.add(_kw_str(k).lower())
+                jv = judged.get(t)
                 result["anchors"].append({"keyword": _kw_str(k), "anchor_reason": "GEO_EXIST_TRASH",
                                           "geo_exist": {"tail": t, "status": status[t],
-                                                        "verdict": verdict.get(t), "location": location}})
+                                                        "verdict": jv[0] if jv else None,
+                                                        "reason": jv[1] if jv else None,
+                                                        "location": location}})
                 n_trash += 1
     result["keywords"] = [kw for kw in keywords if _kw_str(kw).lower() not in trash_kw]
     if "count" in result:
