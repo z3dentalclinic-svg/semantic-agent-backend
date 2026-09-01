@@ -29,19 +29,23 @@ MODEL = "gemini-3.1-flash-lite"
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 PRICE_IN = 0.25    # $/1M, июль 2026; thinking биллится как output
 PRICE_OUT = 1.50
-GEO_EXIST_BUILD = "ge_1.0 lin-numbers, 2026-08-30"
+GEO_EXIST_BUILD = "ge_1.2 glue-two-steps, 2026-09-01"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 # Промпт утверждён Andrew (итерации: не «город» — сиды бывают Буковель/Закарпатье;
 # без «общих обозначений места»; без «рядом с ней» — только внутри локации).
 SYSTEM_PROMPT = "Ты проверяешь географию поисковых запросов. Отвечаешь только номерами."
+# ge_1.2 — рамка Andrew: вопрос не «существует ли», а «реальное гео-уточнение или случайная склейка»;
+# два явных шага, чтобы «полтавский шлях» (гео, но чужого города) не путался с не-гео («на дому»).
 USER_PROMPT = (
     "Локация: {location}, {country}.\n"
-    "Ниже пронумерованный список гео-элементов (улицы, районы, населённые пункты, курорты, "
-    "ориентиры) из поисковых запросов с этой локацией.\n"
-    "Для каждого ответь на вопрос: существует ли реально такой гео-элемент в пределах этой локации?\n"
-    "Ответ: номера элементов, которые СУЩЕСТВУЮТ, через запятую. Ничего кроме номеров.\n\n{numbered}"
+    "Ниже пронумерованные фрагменты из поисковых запросов с этой локацией.\n"
+    "Шаг 1. Определи, какие фрагменты являются гео-элементами (улица, район, населённый пункт, "
+    "ТЦ, ориентир). Остальные пропусти и не выводи.\n"
+    "Шаг 2. Для каждого гео-элемента реши: это реальное гео-уточнение этой локации — или случайная "
+    "склейка подсказок (гео другого города либо место, которого в этой локации нет)?\n"
+    "Ответ: номера случайных склеек через запятую. Если их нет — 0. Ничего кроме номеров.\n\n{numbered}"
 )
 
 # Маркеры ТИПА гео-элемента — только для ОТБОРА кандидатов на LLM-проверку
@@ -87,18 +91,10 @@ def _seed_location(result: Dict[str, Any], seed: str) -> str:
 
 
 def _geo_tail(kw: str, seed_toks: set) -> Optional[str]:
-    """Хвост ключа после вычитания токенов сида, если в нём есть гео-признак."""
+    """ge_1.1: хвост ключа после вычитания токенов сида — БЕЗ маркерного отбора.
+    Гео это или нет — решает LLM (маркеры пропускали «юбилейный», «левый берег», «полтавский шлях»)."""
     tail = [t for t in _tokens(kw) if t not in seed_toks]
     if not tail:
-        return None
-    has_marker = any(any(t.startswith(m) for m in _GEO_TYPE_MARKERS) for t in tail)
-    if not has_marker:
-        try:
-            from .geo_garbage_filter import _has_geo_parse
-        except ImportError:
-            from geo_garbage_filter import _has_geo_parse
-        has_marker = any(_has_geo_parse(t) for t in tail)
-    if not has_marker:
         return None
     return " ".join(tail)
 
@@ -199,11 +195,12 @@ def apply_geo_exist_filter(
         return result
 
     nums = {int(x) for x in _NUM_RE.findall(text)}
-    exists = {tails[i] for i in range(len(tails)) if (i + 1) in nums}
-    if not nums:                # нечисловой ответ = fail-open («ничего не существует» кодом не признаём)
+    if not nums:                # нечисловой ответ = fail-open (0 = «несуществующих нет» — валидный ответ)
         stats["error"] = f"parse fail: {text[:120]}"
         stats["wall"] = round(time.time() - t0, 2)
         return result
+    nonexist = {tails[i] for i in range(len(tails)) if (i + 1) in nums}   # номера = склейки = ТРЕШ
+    exists = {t for t in tails if t not in nonexist}
 
     if "anchors" not in result:
         result["anchors"] = []
