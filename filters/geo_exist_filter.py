@@ -25,11 +25,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-3.1-flash-lite"
+MODEL = "gemini-3.7-flash"  # ge_1.3: lite пропускал киевские склейки (ялтинская, юбилейный) — решение Andrew
 API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-PRICE_IN = 0.25    # $/1M, июль 2026; thinking биллится как output
-PRICE_OUT = 1.50
-GEO_EXIST_BUILD = "ge_1.2 glue-two-steps, 2026-09-01"
+PRICE_IN = 0.30    # $/1M gemini-3.7-flash; thinking биллится как output
+PRICE_OUT = 2.50
+GEO_EXIST_BUILD = "ge_1.3 glue-two-steps 3.7-flash, 2026-09-01"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
