@@ -3,17 +3,19 @@ geo_exist_filter.py — гео-фильтр склеек. build: ge_2.0 (мак�
 
 Схема: LLM выдвигает гипотезы → код приносит факты → LLM судит по фактам. Память модели не источник истины.
 
-Этапы (каждый выключается конфигом — для теста «что работает, что нет»):
-  A. Классификатор (lite, промпт-основа ge_1.2 «склейки» в 2 шага):
-     JSON с полем reasoning (CoT будит фактологию lite) и статусом на каждый хвост:
-     NOT_GEO | GEO_LOCAL | GEO_FOREIGN | GEO_UNCERTAIN | RENAMED
-  B. Точечный судья настоящести (gemini-3.7-flash + google_search) ТОЛЬКО для GEO_UNCERTAIN:
-     один хвост = один вызов, параллельно; вопрос «настоящий запрос или случайная склейка» (or_1.2:
-     36/40 верных вердиктов, 0 UNKNOWN на полтавском корпусе). Nominatim снят — судья его покрывает.
-Политика среза (асимметричная):
-     TRASH = GEO_FOREIGN этапа A (у «склеечного» промпта 0 ложных за серию) ∪ GLUE судьи.
-     NOT_GEO / GEO_LOCAL / REAL / UNKNOWN / RENAMED → KEEP. Fail-open на любом сбое/схеме.
-RENAMED → KEEP: решение Andrew по переименованным (гагарина/лермонтова) — отдельной политики пока нет.
+Схема ge_3.1 (решение Andrew — ансамбль дешёвых lite-прогонов вместо дорогого судьи):
+ТРИ lite-вызова ПАРАЛЛЕЛЬНО (стена ~2-3 с, цена ~$0.001), у каждого своя постановка задачи:
+  1. GLUE    — промпт ge_1.2 дословно («реальное гео-уточнение или случайная склейка», 2 шага,
+               «не-гео пропусти»); лучший по серии: 7 верных/0 ложных.
+  2. STATUS  — статусная разметка (NOT_GEO|GEO_LOCAL|GEO_FOREIGN|GEO_UNCERTAIN|RENAMED) с reasoning;
+               режет только свой GEO_FOREIGN (приморский район, полтавский шлях — 0 ложных).
+  3. ATTRIB  — позитивная привязка: «к какому городу Украины фрагмент относится в первую очередь»;
+               уверенно чужой город (ялтинская → Киев) = срез. Позитивную атрибуцию lite знает —
+               в отличие от доказательства отсутствия.
+Срез = ОБЪЕДИНЕНИЕ трёх. Вето: NOT_GEO и RENAMED от STATUS защищают хвост от среза любой постановкой
+(не-гео и переименованные не режем — решения Andrew). Сбой любого вызова = его вклад пуст (fail-open);
+сбой всех трёх = фильтр молчит.
+Точечный судья (gemini+search) остался в коде ВЫКЛЮЧЕННЫМ (use_judge=False) — для стенда.
 
 Вызов как раньше: apply_geo_exist_filter(result, seed, ...) после geo_garbage_filter,
 локация из result["_geo_seed_cities"]. Срезы → anchors GEO_EXIST_TRASH.
@@ -37,7 +39,7 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.7-flash": (0.30, 2.50),
 }
-GEO_EXIST_BUILD = "ge_3.0 lite-router -> pointwise gemini judge, 2026-09-01"
+GEO_EXIST_BUILD = "ge_3.1 lite-ensemble x3 union, 2026-09-01"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -63,6 +65,28 @@ CLASSIFY_PROMPT = (
     "Ответ строго JSON без текста вокруг:\n"
     '{{"reasoning": "краткое обоснование по сомнительным (1-3 предложения)", '
     '"items": [{{"n": 1, "status": "..."}}]}}\n\n{numbered}'
+)
+
+# Постановка 1 — GLUE: промпт ge_1.2 ДОСЛОВНО (лучший по серии, менять запрещено без прогона).
+GLUE_PROMPT = (
+    "Локация: {location}, {country}.\n"
+    "Ниже пронумерованные фрагменты из поисковых запросов с этой локацией.\n"
+    "Шаг 1. Определи, какие фрагменты являются гео-элементами (улица, район, населённый пункт, "
+    "ТЦ, ориентир). Остальные пропусти и не выводи.\n"
+    "Шаг 2. Для каждого гео-элемента реши: это реальное гео-уточнение этой локации — или случайная "
+    "склейка подсказок (гео другого города либо место, которого в этой локации нет)?\n"
+    "Ответ: номера случайных склеек через запятую. Если их нет — 0. Ничего кроме номеров.\n\n{numbered}"
+)
+
+# Постановка 3 — ATTRIB: позитивная привязка к городу (ялтинская → Киев lite знает уверенно).
+ATTRIB_PROMPT = (
+    "Локация запроса: {location}, {country}.\n"
+    "Ниже пронумерованные фрагменты из поисковых запросов.\n"
+    "Для каждого фрагмента, который является названием гео-объекта (улица, район, ТЦ, ориентир, "
+    "населённый пункт), определи город Украины, к которому этот объект относится В ПЕРВУЮ ОЧЕРЕДЬ.\n"
+    "Указывай город только если уверен. Фрагменты, которые не являются гео-объектами, а также "
+    "объекты, существующие во многих городах, и объекты самой локации — НЕ включай в ответ.\n"
+    'Ответ строго JSON: {{"items": [{{"n": 1, "city": "Киев"}}]}}. Если таких нет: {{"items": []}}\n\n{numbered}'
 )
 
 # Этап B — точечный судья настоящести (промпт or_1.2 + строка про услугу внутри объекта: кейс
@@ -91,7 +115,7 @@ class GeoExistConfig:
     thinking_level: str = "low"
     classifier_model: str = MODEL_CLASSIFIER
     judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
-    use_judge: bool = True                  # False = только этап A (его FOREIGN)
+    use_judge: bool = False                 # ge_3.1: судья выключен (время), ансамбль решает
     judge_limit: int = 8                    # максимум сомнительных на судью за прогон
     judge_parallel: int = 6                 # параллельность точечных вызовов
 
@@ -252,36 +276,87 @@ def apply_geo_exist_filter(
     stats.update({"skipped": False, "location": location, "checked": len(tails)})
     diags: List[Dict] = []
 
-    # ── Этап A: классификатор со статусами и reasoning
+    # ── Ансамбль: три lite-постановки параллельно
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(tails))
-    status: Dict[str, str] = {}
-    try:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def run_glue():
+        text, dg = _call_gemini(config.api_key, config.classifier_model,
+                                GLUE_PROMPT.format(location=location, country=config.country,
+                                                   numbered=numbered),
+                                config.timeout, config.thinking_level, json_mime=False)
+        nums = {int(x) for x in re.findall(r"\d+", text)}
+        if not nums:
+            raise Exception(f"glue parse fail: {text[:100]}")
+        return {tails[i] for i in range(len(tails)) if (i + 1) in nums}, dg
+
+    def run_status():
         text, dg = _call_gemini(config.api_key, config.classifier_model,
                                 CLASSIFY_PROMPT.format(location=location, country=config.country,
                                                        numbered=numbered),
                                 config.timeout, config.thinking_level)
-        diags.append(dg)
         parsed = _parse_json(text)
         if not parsed or "items" not in parsed:
-            raise Exception(f"classifier parse fail: {text[:150]}")
+            raise Exception(f"status parse fail: {text[:100]}")
+        st = {}
         for it in parsed["items"]:
-            n, st = it.get("n"), str(it.get("status", "")).upper()
-            if isinstance(n, int) and 1 <= n <= len(tails) and st in _STATUSES:
-                status[tails[n - 1]] = st
-        stats["stages"]["classifier"] = {
-            "reasoning": str(parsed.get("reasoning", ""))[:600],
-            "counts": {}}
-    except Exception as e:                               # fail-open всего фильтра
-        stats["error"] = str(e)[:300]
-        stats["wall"] = round(time.time() - t0, 2)
-        logger.error(f"[GEO_EXIST] stage A: {e} — fail-open")
-        return result
-    for t in tails:
-        status.setdefault(t, "GEO_UNCERTAIN")            # не размечен → в сомнительные, не в треш
-    stats["stages"]["classifier"]["counts"] = {s: sum(1 for v in status.values() if v == s) for s in _STATUSES}
+            n, v = it.get("n"), str(it.get("status", "")).upper()
+            if isinstance(n, int) and 1 <= n <= len(tails) and v in _STATUSES:
+                st[tails[n - 1]] = v
+        return st, dg
 
-    # ── Этап B: точечный судья настоящести — только сомнительные
-    need = [t for t in tails if status[t] == "GEO_UNCERTAIN"][: config.judge_limit]
+    def run_attrib():
+        text, dg = _call_gemini(config.api_key, config.classifier_model,
+                                ATTRIB_PROMPT.format(location=location, country=config.country,
+                                                     numbered=numbered),
+                                config.timeout, config.thinking_level)
+        parsed = _parse_json(text)
+        if parsed is None or "items" not in parsed:
+            raise Exception(f"attrib parse fail: {text[:100]}")
+        loc_low = location.lower()
+        out = {}
+        for it in parsed["items"]:
+            n, city = it.get("n"), str(it.get("city", "")).strip()
+            if isinstance(n, int) and 1 <= n <= len(tails) and city and city.lower() not in loc_low and loc_low not in city.lower():
+                out[tails[n - 1]] = city
+        return out, dg
+
+    glue_cut: set = set()
+    status: Dict[str, str] = {}
+    attrib: Dict[str, str] = {}
+    errors = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {"glue": ex.submit(run_glue), "status": ex.submit(run_status), "attrib": ex.submit(run_attrib)}
+        for name, fut in futs.items():
+            try:
+                val, dg = fut.result()
+                diags.append(dg)
+                if name == "glue":
+                    glue_cut = val
+                elif name == "status":
+                    status = val
+                else:
+                    attrib = val
+            except Exception as e:  # noqa: BLE001 — сбой постановки = её вклад пуст
+                errors.append(f"{name}: {str(e)[:120]}")
+    if errors:
+        stats["stage_errors"] = errors
+    if len(errors) == 3:                                  # все три упали → фильтр молчит
+        stats["error"] = "all ensemble calls failed"
+        stats["wall"] = round(time.time() - t0, 2)
+        logger.error("[GEO_EXIST] ансамбль целиком упал — fail-open")
+        return result
+
+    status_foreign = {t for t, v in status.items() if v == "GEO_FOREIGN"}
+    protected = {t for t, v in status.items() if v in ("NOT_GEO", "RENAMED")}   # вето Andrew
+    stats["stages"] = {
+        "glue": {"cut": len(glue_cut)},
+        "status": {"counts": {v: sum(1 for x in status.values() if x == v) for v in _STATUSES}},
+        "attrib": {"foreign": len(attrib)},
+    }
+
+    # ── Этап B: точечный судья — по умолчанию ВЫКЛЮЧЕН (use_judge=False), оставлен для стенда
+    need = [t for t in tails if status.get(t) == "GEO_UNCERTAIN"][: config.judge_limit]
     judged: Dict[str, Tuple[str, str, bool]] = {}
     if config.use_judge and need:
         judged = _judge_tails(need, seed, location, config, diags)
@@ -290,12 +365,12 @@ def apply_geo_exist_filter(
             "verdicts": {v: sum(1 for x in judged.values() if x[0] == v) for v in ("REAL", "GLUE", "UNKNOWN")},
             "searched": sum(1 for x in judged.values() if x[2])}
 
-    # ── Политика среза: FOREIGN этапа A + GLUE судьи; всё остальное живёт
+    # ── Политика: объединение срезов минус вето
     trash_tails = set()
     for t in tails:
-        if status[t] == "GEO_FOREIGN":
-            trash_tails.add(t)
-        elif judged.get(t, ("",))[0] == "GLUE":
+        if t in protected:
+            continue
+        if t in glue_cut or t in status_foreign or t in attrib or judged.get(t, ("",))[0] == "GLUE":
             trash_tails.add(t)
 
     if "anchors" not in result:
@@ -305,7 +380,9 @@ def apply_geo_exist_filter(
     for t in tails:
         keep = t not in trash_tails
         jv = judged.get(t)
-        trace.append({"tail": t, "status": status[t],
+        by = [src for src, hit in (("glue", t in glue_cut), ("status", t in status_foreign),
+                                   ("attrib", t in attrib), ("judge", jv[0] == "GLUE" if jv else False)) if hit]
+        trace.append({"tail": t, "status": status.get(t), "by": by, "city": attrib.get(t),
                       "verdict": jv[0] if jv else None, "reason": jv[1] if jv else None,
                       "exists": keep, "keywords": [_kw_str(k) for k in tail_to_kws[t]]})
         if not keep:
@@ -313,7 +390,7 @@ def apply_geo_exist_filter(
                 trash_kw.add(_kw_str(k).lower())
                 jv = judged.get(t)
                 result["anchors"].append({"keyword": _kw_str(k), "anchor_reason": "GEO_EXIST_TRASH",
-                                          "geo_exist": {"tail": t, "status": status[t],
+                                          "geo_exist": {"tail": t, "status": status.get(t), "by": by, "city": attrib.get(t),
                                                         "verdict": jv[0] if jv else None,
                                                         "reason": jv[1] if jv else None,
                                                         "location": location}})
