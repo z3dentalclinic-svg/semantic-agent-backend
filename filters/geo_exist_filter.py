@@ -1,6 +1,15 @@
 """
-geo_exist_filter.py — гео-фильтр склеек. build: ge_4.0 (конвейер, решение Andrew 2026-09-04)
+geo_exist_filter.py — гео-фильтр склеек. build: ge_4.1 (конвейер: lite low + 3.7 low, счётчики)
 
+Схема ge_4.1 — два прохода последовательно, без HTTP-оракулов:
+  Проход 1 — lite, thinking low (классификация; high дал 30/30 PLACE, но ×10 thinking-токенов и +10 с).
+  Проход 2 — gemini-3.7-flash, thinking low (ge_4.0: lite на «есть ли район в городе» оставил левый
+             берег, юбилейный, солнечный ×2, западня с уверенным «микрорайон Полтавы» — закон 6 на районах).
+  Счётчики (ge_4.1): на каждый проход wall/tokens/cost в stats["stages"], плюс call_no и накопленные
+             итоги процесса stats["process_totals"] — чтобы измерить §8.4 (сколько раз фильтр
+             вызывается за прогон автопилота).
+  Промпт CLASS: правило «слово может быть и сервисным, и названием заведения → SERVICE»
+             (ge_4.0 срезал «форум» как ТЦ).
 Схема ge_4.0 — два lite-прохода последовательно, thinking high, без HTTP-оракулов:
   Проход 1 (CLASS, батч по всем хвостам, вопрос «что это за слово», знание города не нужно):
       SERVICE — сервисное/коммерческое слово (цена, отзывы, на дому)      → пропуск (вето, как NOT_GEO)
@@ -41,9 +50,12 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.7-flash": (0.30, 2.50),
 }
-GEO_EXIST_BUILD = "ge_4.0 conveyor class+area, thinking high, 2026-09-04"
+GEO_EXIST_BUILD = "ge_4.1 conveyor lite-low + 3.7-low, counters, 2026-09-04"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+
+# ge_4.1: счётчики процесса — сколько раз фильтр вызван за жизнь процесса и что это стоило (§8.4)
+_PROCESS_TOTALS: Dict[str, Any] = {"calls": 0, "wall": 0.0, "cost_usd": 0.0, "llm_calls": 0}
 
 SYSTEM_PROMPT = "Ты проверяешь географию поисковых запросов. Отвечаешь строго в заданном формате."
 
@@ -123,6 +135,7 @@ CLASS_PROMPT = (
     "человека в роли названия (щорса, гагарина, лесі українки) — это улица → PLACE.\n"
     "AREA — территория без адреса: район города, микрорайон, часть города (центр, левый берег, "
     "возле вокзала, в районе ...), населённый пункт, область, страна.\n"
+    "Если слово может быть и сервисным словом, и названием заведения (форум, галерея, планета) — SERVICE.\n"
     "Если не уверен между PLACE и AREA — ставь AREA. Если фрагмент непонятен — AREA.\n"
     "Ответ строго JSON без текста вокруг: "
     '{{"items": [{{"n": 1, "class": "SERVICE|PLACE|AREA"}}]}}\n\n{numbered}'
@@ -156,7 +169,8 @@ class GeoExistConfig:
     api_key: str = ""
     country: str = "ua"
     timeout: int = 60
-    thinking_level: str = "high"   # ge_4.0: «на максимум» (было low)
+    thinking_level: str = "low"    # ge_4.1: обратно low (ge_4.0 high — ×10 thinking, +10 с, 30/30 и на low)
+    area_model: str = "gemini-3.7-flash"   # ge_4.1: проход 2 на 3.7 (lite память районов не держит)
     classifier_model: str = MODEL_CLASSIFIER
     judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
     use_judge: bool = False                 # ge_3.1: судья выключен (время), ансамбль решает
@@ -237,6 +251,10 @@ def _parse_json(text: str) -> Optional[dict]:
             except Exception:
                 return None
     return None
+
+
+def _cost1(dg: Dict) -> float:
+    return _cost([dg])
 
 
 def _cost(diags: List[Dict]) -> float:
@@ -423,6 +441,7 @@ def apply_geo_exist_filter(
 
     # Проход 1 — CLASS (батч по всем хвостам)
     cls: Dict[str, str] = {}
+    t_cls = time.time()
     try:
         text, dg = _call_gemini(config.api_key, config.classifier_model,
                                 CLASS_PROMPT.format(location=location, country=config.country,
@@ -440,25 +459,35 @@ def apply_geo_exist_filter(
         stats["error"] = f"class: {str(e)[:160]}"
         stats["wall"] = round(time.time() - t0, 2)
         stats["cost_usd"] = _cost(diags)
+        _PROCESS_TOTALS["calls"] += 1
+        _PROCESS_TOTALS["wall"] += stats["wall"]
+        stats["process_totals"] = dict(_PROCESS_TOTALS)
         logger.error(f"[GEO_EXIST] проход CLASS упал — fail-open: {stats['error']}")
         return result
+    cls_diag = diags[-1]
 
     place = {t for t, v in cls.items() if v == "PLACE"}
     service = {t for t, v in cls.items() if v == "SERVICE"}
     area = [t for t in tails if t not in place and t not in service]   # AREA + нераспознанные
     stats["stages"] = {"class": {"counts": {v: sum(1 for x in cls.values() if x == v) for v in _CLASSES},
-                                 "unclassified": sum(1 for t in tails if t not in cls)}}
+                                 "unclassified": sum(1 for t in tails if t not in cls),
+                                 "model": cls_diag["model"], "wall": round(time.time() - t_cls, 2),
+                                 "tokens": {"in": cls_diag["in"], "out": cls_diag["out"], "think": cls_diag["think"]},
+                                 "cost_usd": _cost1(cls_diag)}}
 
     # Проход 2 — AREA (точечный список); сбой = AREA остаются
     area_ans: Dict[str, Tuple[str, str]] = {}
+    area_diag: Optional[Dict] = None
     if area:
         numbered_area = "\n".join(f"{i+1}. {t}" for i, t in enumerate(area))
+        t_area = time.time()
         try:
-            text, dg = _call_gemini(config.api_key, config.classifier_model,
+            text, dg = _call_gemini(config.api_key, config.area_model,
                                     AREA_PROMPT.format(location=location, country=config.country,
                                                        numbered=numbered_area),
                                     config.timeout, config.thinking_level)
             diags.append(dg)
+            area_diag = dg
             parsed = _parse_json(text)
             if not parsed or "items" not in parsed:
                 raise Exception(f"area parse fail: {text[:100]}")
@@ -471,7 +500,11 @@ def apply_geo_exist_filter(
             logger.warning(f"[GEO_EXIST] проход AREA упал — AREA остаются: {e}")
         stats["stages"]["area"] = {"asked": len(area),
                                    "answers": {v: sum(1 for x in area_ans.values() if x[0] == v)
-                                               for v in _AREA_ANSWERS}}
+                                               for v in _AREA_ANSWERS},
+                                   "model": config.area_model, "wall": round(time.time() - t_area, 2),
+                                   "tokens": ({"in": area_diag["in"], "out": area_diag["out"],
+                                               "think": area_diag["think"]} if area_diag else None),
+                                   "cost_usd": _cost1(area_diag) if area_diag else 0.0}
 
     # Политика: PLACE → OUT; AREA+NO → OUT; всё остальное остаётся
     trash_tails = set(place) | {t for t, (v, _) in area_ans.items() if v == "NO"}
@@ -526,6 +559,17 @@ def apply_geo_exist_filter(
     stats.update({"trash": n_trash, "kept": len(result["keywords"]),
                   "wall": round(time.time() - t0, 2), "cost_usd": _cost(diags),
                   "llm_calls": len(diags), "tokens": diags})
-    logger.info(f"[GEO_EXIST] {GEO_EXIST_BUILD} loc='{location}' tails={len(tails)} trash={n_trash} "
-                f"cost=${stats['cost_usd']} wall={stats['wall']}s")
+    _PROCESS_TOTALS["calls"] += 1
+    _PROCESS_TOTALS["wall"] = round(_PROCESS_TOTALS["wall"] + stats["wall"], 2)
+    _PROCESS_TOTALS["cost_usd"] = round(_PROCESS_TOTALS["cost_usd"] + stats["cost_usd"], 6)
+    _PROCESS_TOTALS["llm_calls"] += len(diags)
+    stats["process_totals"] = dict(_PROCESS_TOTALS)
+    st = stats["stages"]
+    logger.info(f"[GEO_EXIST] {GEO_EXIST_BUILD} call#{_PROCESS_TOTALS['calls']} loc='{location}' "
+                f"tails={len(tails)} trash={n_trash} "
+                f"class={st['class']['wall']}s/${st['class']['cost_usd']} "
+                f"area={st.get('area', {}).get('wall', 0)}s/${st.get('area', {}).get('cost_usd', 0)} "
+                f"total={stats['wall']}s/${stats['cost_usd']} "
+                f"process: calls={_PROCESS_TOTALS['calls']} wall={_PROCESS_TOTALS['wall']}s "
+                f"cost=${_PROCESS_TOTALS['cost_usd']}")
     return result
