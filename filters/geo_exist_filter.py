@@ -1,6 +1,11 @@
 """
-geo_exist_filter.py — гео-фильтр склеек. build: ge_4.1 (конвейер: lite low + 3.7 low, счётчики)
+geo_exist_filter.py — гео-фильтр склеек. build: ge_4.2 (журнал вызовов в JSON, подробные why 3.7)
 
+ge_4.2: stats["process_calls"] — журнал ВСЕХ вызовов фильтра за процесс (call_no, location, хвосты,
+        wall/tokens/cost по проходам) — чтобы разбивка первого вызова не терялась при перезаписи
+        stats вторым. Временно (area_why_detail=True): 3.7 пишет по каждому AREA 1-2 предложения —
+        что за объект, где в локации, откуда уверенность — чтобы увидеть причину ошибок по тем,
+        кого он оставляет; после разбора выключить флагом.
 Схема ge_4.1 — два прохода последовательно, без HTTP-оракулов:
   Проход 1 — lite, thinking low (классификация; high дал 30/30 PLACE, но ×10 thinking-токенов и +10 с).
   Проход 2 — gemini-3.7-flash, thinking low (ge_4.0: lite на «есть ли район в городе» оставил левый
@@ -50,12 +55,13 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.7-flash": (0.30, 2.50),
 }
-GEO_EXIST_BUILD = "ge_4.1 conveyor lite-low + 3.7-low, counters, 2026-09-04"
+GEO_EXIST_BUILD = "ge_4.2 conveyor, process_calls journal, area why detail, 2026-09-04"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 # ge_4.1: счётчики процесса — сколько раз фильтр вызван за жизнь процесса и что это стоило (§8.4)
 _PROCESS_TOTALS: Dict[str, Any] = {"calls": 0, "wall": 0.0, "cost_usd": 0.0, "llm_calls": 0}
+_PROCESS_CALLS: List[Dict[str, Any]] = []   # ge_4.2: журнал вызовов, попадает в stats["process_calls"]
 
 SYSTEM_PROMPT = "Ты проверяешь географию поисковых запросов. Отвечаешь строго в заданном формате."
 
@@ -152,9 +158,15 @@ AREA_PROMPT = (
     "(это район или город в другом месте страны, либо такого объекта не существует). "
     "UNKNOWN — не уверен.\n"
     "NO ставь только при твёрдой уверенности; при сомнении — UNKNOWN.\n"
+    "{why_rule}"
     "Ответ строго JSON без текста вокруг: "
-    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN", "why": "3-8 слов"}}]}}\n\n{numbered}'
+    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN", "why": "{why_fmt}"}}]}}\n\n{numbered}'
 )
+# ge_4.2: два режима пояснений — короткий (штатный) и подробный (временно, для разбора ошибок)
+_WHY_SHORT = ("", "3-8 слов")
+_WHY_DETAIL = ("В поле why по КАЖДОМУ фрагменту 1-2 предложения: что это за объект (район, парк, село, "
+               "микрорайон), где именно он находится и в каком городе, и откуда уверенность — "
+               "это важно и для YES, и для UNKNOWN.\n", "1-2 предложения")
 _CLASSES = {"SERVICE", "PLACE", "AREA"}
 _AREA_ANSWERS = {"YES", "NO", "UNKNOWN"}
 # ────────────────────────────────────────────────────────────────────────────────
@@ -171,6 +183,7 @@ class GeoExistConfig:
     timeout: int = 60
     thinking_level: str = "low"    # ge_4.1: обратно low (ge_4.0 high — ×10 thinking, +10 с, 30/30 и на low)
     area_model: str = "gemini-3.7-flash"   # ge_4.1: проход 2 на 3.7 (lite память районов не держит)
+    area_why_detail: bool = True            # ge_4.2: ВРЕМЕННО подробные why от 3.7; после разбора → False
     classifier_model: str = MODEL_CLASSIFIER
     judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
     use_judge: bool = False                 # ge_3.1: судья выключен (время), ансамбль решает
@@ -462,6 +475,9 @@ def apply_geo_exist_filter(
         _PROCESS_TOTALS["calls"] += 1
         _PROCESS_TOTALS["wall"] += stats["wall"]
         stats["process_totals"] = dict(_PROCESS_TOTALS)
+        _PROCESS_CALLS.append({"call_no": _PROCESS_TOTALS["calls"], "location": location,
+                               "tails": len(tails), "error": stats["error"], "wall": stats["wall"]})
+        stats["process_calls"] = list(_PROCESS_CALLS)
         logger.error(f"[GEO_EXIST] проход CLASS упал — fail-open: {stats['error']}")
         return result
     cls_diag = diags[-1]
@@ -484,7 +500,9 @@ def apply_geo_exist_filter(
         try:
             text, dg = _call_gemini(config.api_key, config.area_model,
                                     AREA_PROMPT.format(location=location, country=config.country,
-                                                       numbered=numbered_area),
+                                                       numbered=numbered_area,
+                                                       why_rule=(_WHY_DETAIL if config.area_why_detail else _WHY_SHORT)[0],
+                                                       why_fmt=(_WHY_DETAIL if config.area_why_detail else _WHY_SHORT)[1]),
                                     config.timeout, config.thinking_level)
             diags.append(dg)
             area_diag = dg
@@ -494,7 +512,7 @@ def apply_geo_exist_filter(
             for it in parsed["items"]:
                 n, v = it.get("n"), str(it.get("answer", "")).upper()
                 if isinstance(n, int) and 1 <= n <= len(area) and v in _AREA_ANSWERS:
-                    area_ans[area[n - 1]] = (v, str(it.get("why", ""))[:120])
+                    area_ans[area[n - 1]] = (v, str(it.get("why", ""))[:400 if config.area_why_detail else 120])
         except Exception as e:  # noqa: BLE001
             stats["stage_errors"] = [f"area: {str(e)[:160]}"]
             logger.warning(f"[GEO_EXIST] проход AREA упал — AREA остаются: {e}")
@@ -565,6 +583,16 @@ def apply_geo_exist_filter(
     _PROCESS_TOTALS["llm_calls"] += len(diags)
     stats["process_totals"] = dict(_PROCESS_TOTALS)
     st = stats["stages"]
+    _PROCESS_CALLS.append({
+        "call_no": _PROCESS_TOTALS["calls"], "location": location, "tails": len(tails), "trash": n_trash,
+        "wall": stats["wall"], "cost_usd": stats["cost_usd"],
+        "class": {k: st["class"].get(k) for k in ("counts", "wall", "tokens", "cost_usd")},
+        "area": ({k: st["area"].get(k) for k in ("asked", "answers", "wall", "tokens", "cost_usd")}
+                 if "area" in st else None),
+        "trash_tails": sorted(trash_tails),
+        "area_kept": {t: list(v) for t, v in area_ans.items() if v[0] != "NO"},
+    })
+    stats["process_calls"] = list(_PROCESS_CALLS)
     logger.info(f"[GEO_EXIST] {GEO_EXIST_BUILD} call#{_PROCESS_TOTALS['calls']} loc='{location}' "
                 f"tails={len(tails)} trash={n_trash} "
                 f"class={st['class']['wall']}s/${st['class']['cost_usd']} "
