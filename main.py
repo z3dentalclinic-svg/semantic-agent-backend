@@ -1150,7 +1150,10 @@ def apply_filters_traced(result: dict, seed: str, country: str,
     run_geo = "geo" in parts
     # geo_exist: АВТОМАТ (решение Andrew) — запускается сам, если в сиде есть гео
     # (триггер внутри фильтра: нет гео → no_geo_in_seed, ноль вызовов). Отключение: флаг "nogeoexist".
-    run_geoexist = "nogeoexist" not in parts
+    # run_geoexist = "nogeoexist" not in parts   # ← до 2026-09-05: срабатывал и при filters="none"/без "geo" —
+    #   автопилот сначала тянет сырьё с filters=none, и geo_exist отрабатывал на сыром харвесте (300 хвостов,
+    #   16 с, $0.0125 за прогон впустую — §8.4). Теперь только вместе с geo_garbage, после него.
+    run_geoexist = run_geo and ("nogeoexist" not in parts)
     run_bpf = "bpf" in parts
     run_l0 = "l0" in parts
     # L1.5 version: l15 → v1 (старый), l15v2 → v2 (E5-large + inverted)
