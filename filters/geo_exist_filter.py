@@ -1,6 +1,10 @@
 """
-geo_exist_filter.py — гео-фильтр склеек. build: ge_4.2 (журнал вызовов в JSON, подробные why 3.7)
+geo_exist_filter.py — гео-фильтр склеек. build: ge_4.3 (проход 2 на GPT-5.6 Sol, low)
 
+ge_4.3: проход 2 — gpt-5.6-sol, reasoning_effort low (решение Andrew): клиент OpenAI перенесён из
+        l3_filter._call_openai дословно (Chat Completions, max_completion_tokens, без temperature;
+        completion_tokens уже включает reasoning → биллинг по нему). Ключ env OPENAI_API_KEY. Модель
+        прохода 2 выбирается по префиксу: gpt-* → OpenAI, иначе Gemini. Нет ключа / сбой → AREA остаются.
 ge_4.2: stats["process_calls"] — журнал ВСЕХ вызовов фильтра за процесс (call_no, location, хвосты,
         wall/tokens/cost по проходам) — чтобы разбивка первого вызова не терялась при перезаписи
         stats вторым. Временно (area_why_detail=True): 3.7 пишет по каждому AREA 1-2 предложения —
@@ -54,8 +58,10 @@ API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 PRICES = {  # $/1M (in, out); thinking биллится как output
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.7-flash": (0.30, 2.50),
+    "gpt-5.6-sol": (5.00, 30.00),      # ge_4.3; у OpenAI reasoning уже внутри completion_tokens
 }
-GEO_EXIST_BUILD = "ge_4.2 conveyor, process_calls journal, area why detail, 2026-09-04"
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+GEO_EXIST_BUILD = "ge_4.3 conveyor, area on gpt-5.6-sol low, 2026-09-05"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -182,7 +188,9 @@ class GeoExistConfig:
     country: str = "ua"
     timeout: int = 60
     thinking_level: str = "low"    # ge_4.1: обратно low (ge_4.0 high — ×10 thinking, +10 с, 30/30 и на low)
-    area_model: str = "gemini-3.7-flash"   # ge_4.1: проход 2 на 3.7 (lite память районов не держит)
+    # area_model: str = "gemini-3.7-flash"   # ge_4.1–4.2: 3.7 low — тоже конструирует районы (левый берег, солнечный)
+    area_model: str = "gpt-5.6-sol"          # ge_4.3: проход 2 на Sol; префикс gpt- → OpenAI-клиент
+    area_effort: str = "low"                 # ge_4.3: reasoning_effort для OpenAI (none|low|medium|high|xhigh)
     area_why_detail: bool = True            # ge_4.2: ВРЕМЕННО подробные why от 3.7; после разбора → False
     classifier_model: str = MODEL_CLASSIFIER
     judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
@@ -250,6 +258,51 @@ def _call_gemini(api_key: str, model: str, user_prompt: str, timeout: int, think
     return text, {"in": um.get("promptTokenCount", 0), "out": um.get("candidatesTokenCount", 0),
                   "think": um.get("thoughtsTokenCount", 0), "model": model,
                   "searched": bool(cands[0].get("groundingMetadata"))}
+
+
+def _call_openai(api_key: str, model: str, user_prompt: str, timeout: int, effort: str) -> Tuple[str, Dict]:
+    """ge_4.3: OpenAI Chat Completions — перенос l3_filter._call_openai. Возвращает (text, diag) в формате
+    _call_gemini: in/out/think/model; think=0, т.к. reasoning уже входит в completion_tokens."""
+    import requests
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                     {"role": "user", "content": user_prompt}],
+        "max_completion_tokens": 8192,
+        "stream": False,
+        "reasoning_effort": effort,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        r = requests.post(OPENAI_API_URL, headers={"Content-Type": "application/json",
+                                                    "Authorization": f"Bearer {api_key}"},
+                          json=payload, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"GeoExist OpenAI network error: {type(e).__name__}: {e}")
+    if r.status_code != 200:
+        raise Exception(f"GeoExist OpenAI API error {r.status_code}: {r.text[:400]}")
+    d = r.json()
+    choices = d.get("choices") or []
+    if not choices:
+        raise Exception(f"GeoExist OpenAI no choices: {str(d)[:300]}")
+    text = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not text:
+        raise Exception(f"GeoExist OpenAI empty text (finish_reason={choices[0].get('finish_reason')})")
+    um = d.get("usage", {}) or {}
+    return text, {"in": um.get("prompt_tokens", 0) or 0, "out": um.get("completion_tokens", 0) or 0,
+                  "think": 0, "model": model, "searched": False,
+                  "reasoning_tokens": ((um.get("completion_tokens_details") or {}).get("reasoning_tokens")),
+                  "effort_sent": effort}
+
+
+def _call_area_model(cfg: "GeoExistConfig", user_prompt: str) -> Tuple[str, Dict]:
+    """ge_4.3: проход 2 — OpenAI для gpt-*, иначе Gemini."""
+    if cfg.area_model.startswith("gpt-"):
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not key:
+            raise Exception("no OPENAI_API_KEY")
+        return _call_openai(key, cfg.area_model, user_prompt, cfg.timeout, cfg.area_effort)
+    return _call_gemini(cfg.api_key, cfg.area_model, user_prompt, cfg.timeout, cfg.thinking_level)
 
 
 def _parse_json(text: str) -> Optional[dict]:
@@ -498,12 +551,11 @@ def apply_geo_exist_filter(
         numbered_area = "\n".join(f"{i+1}. {t}" for i, t in enumerate(area))
         t_area = time.time()
         try:
-            text, dg = _call_gemini(config.api_key, config.area_model,
-                                    AREA_PROMPT.format(location=location, country=config.country,
-                                                       numbered=numbered_area,
-                                                       why_rule=(_WHY_DETAIL if config.area_why_detail else _WHY_SHORT)[0],
-                                                       why_fmt=(_WHY_DETAIL if config.area_why_detail else _WHY_SHORT)[1]),
-                                    config.timeout, config.thinking_level)
+            text, dg = _call_area_model(config,
+                                        AREA_PROMPT.format(location=location, country=config.country,
+                                                           numbered=numbered_area,
+                                                           why_rule=(_WHY_DETAIL if config.area_why_detail else _WHY_SHORT)[0],
+                                                           why_fmt=(_WHY_DETAIL if config.area_why_detail else _WHY_SHORT)[1]))
             diags.append(dg)
             area_diag = dg
             parsed = _parse_json(text)
@@ -519,7 +571,9 @@ def apply_geo_exist_filter(
         stats["stages"]["area"] = {"asked": len(area),
                                    "answers": {v: sum(1 for x in area_ans.values() if x[0] == v)
                                                for v in _AREA_ANSWERS},
-                                   "model": config.area_model, "wall": round(time.time() - t_area, 2),
+                                   "model": config.area_model, "effort": (config.area_effort if config.area_model.startswith("gpt-") else config.thinking_level),
+                                   "reasoning_tokens": (area_diag or {}).get("reasoning_tokens"),
+                                   "wall": round(time.time() - t_area, 2),
                                    "tokens": ({"in": area_diag["in"], "out": area_diag["out"],
                                                "think": area_diag["think"]} if area_diag else None),
                                    "cost_usd": _cost1(area_diag) if area_diag else 0.0}
