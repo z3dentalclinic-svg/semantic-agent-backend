@@ -1,21 +1,23 @@
 """
-geo_exist_filter.py — гео-фильтр склеек. build: ge_2.0 (максимальная сборка по своду консилиума)
+geo_exist_filter.py — гео-фильтр склеек. build: ge_4.0 (конвейер, решение Andrew 2026-09-04)
 
-Схема: LLM выдвигает гипотезы → код приносит факты → LLM судит по фактам. Память модели не источник истины.
+Схема ge_4.0 — два lite-прохода последовательно, thinking high, без HTTP-оракулов:
+  Проход 1 (CLASS, батч по всем хвостам, вопрос «что это за слово», знание города не нужно):
+      SERVICE — сервисное/коммерческое слово (цена, отзывы, на дому)      → пропуск (вето, как NOT_GEO)
+      PLACE   — улица, ТЦ, магазин, заведение, любой адресный объект     → OUT
+      AREA    — район, ориентир-местность, населённый пункт, страна      → на проход 2
+      не распознано / нет в ответе                                        → на проход 2 (не в срез)
+  Проход 2 (AREA, точечный список только по AREA): «есть ли это в локации или её округе».
+      NO → OUT; YES/UNKNOWN → остаётся.
+Обоснование (эталон v2, сид «заправка картриджей полтава»): щорса и пушкина внутри сида неотличимы —
+оба из городского пула Google; различает их только сервис на месте, а он снаружи. Правило
+«улица/объект → OUT» снимает все 28 склеек эталона ценой 8 уличных ключей с сервисом (объём ~0).
+Ялтинская-класс (уверенная ошибка памяти, закон 6) исчезает: вопрос «есть ли в городе» задаётся
+только районам и населённым пунктам, а улицы уходят классом.
+Сбой прохода 1 = фильтр молчит (fail-open). Сбой прохода 2 = AREA остаются.
 
-Схема ge_3.1 (решение Andrew — ансамбль дешёвых lite-прогонов вместо дорогого судьи):
-ТРИ lite-вызова ПАРАЛЛЕЛЬНО (стена ~2-3 с, цена ~$0.001), у каждого своя постановка задачи:
-  1. GLUE    — промпт ge_1.2 дословно («реальное гео-уточнение или случайная склейка», 2 шага,
-               «не-гео пропусти»); лучший по серии: 7 верных/0 ложных.
-  2. STATUS  — статусная разметка (NOT_GEO|GEO_LOCAL|GEO_FOREIGN|GEO_UNCERTAIN|RENAMED) с reasoning;
-               режет только свой GEO_FOREIGN (приморский район, полтавский шлях — 0 ложных).
-  3. ATTRIB  — позитивная привязка: «к какому городу Украины фрагмент относится в первую очередь»;
-               уверенно чужой город (ялтинская → Киев) = срез. Позитивную атрибуцию lite знает —
-               в отличие от доказательства отсутствия.
-Срез = ОБЪЕДИНЕНИЕ трёх. Вето: NOT_GEO и RENAMED от STATUS защищают хвост от среза любой постановкой
-(не-гео и переименованные не режем — решения Andrew). Сбой любого вызова = его вклад пуст (fail-open);
-сбой всех трёх = фильтр молчит.
-Точечный судья (gemini+search) остался в коде ВЫКЛЮЧЕННЫМ (use_judge=False) — для стенда.
+Схема ge_3.3 (ансамбль GLUE/STATUS/ATTRIB + выключенный судья) сохранена в коде закомментированной
+для отката — см. блок «# ge_3.3 ENSEMBLE (rollback)».
 
 Вызов как раньше: apply_geo_exist_filter(result, seed, ...) после geo_garbage_filter,
 локация из result["_geo_seed_cities"]. Срезы → anchors GEO_EXIST_TRASH.
@@ -39,7 +41,7 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3.7-flash": (0.30, 2.50),
 }
-GEO_EXIST_BUILD = "ge_3.3 attrib guarded (rollback 3.2), 2026-09-02"
+GEO_EXIST_BUILD = "ge_4.0 conveyor class+area, thinking high, 2026-09-04"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -105,6 +107,45 @@ JUDGE_PROMPT = (
     "Вторая строка — причина в 5-10 слов."
 )
 
+
+# ── ge_4.0 ──────────────────────────────────────────────────────────────────────
+# Проход 1 — CLASS. Знание города не требуется: вопрос «что это за тип слова». При сомнении — AREA,
+# чтобы сомнительное шло на проверку, а не в срез (ложный срез хуже пропуска).
+CLASS_PROMPT = (
+    "Локация запроса: {location}, {country}.\n"
+    "Ниже пронумерованные фрагменты из поисковых запросов с этой локацией. Для КАЖДОГО фрагмента "
+    "определи тип слова. Знать локацию для этого не нужно — оценивай только, чем является фрагмент.\n"
+    "Классы:\n"
+    "SERVICE — сервисное или коммерческое слово, не гео (цена, отзывы, на дому, адреса, недорого, "
+    "фото, обучение, работа, онлайн и т.п.).\n"
+    "PLACE — конкретный адресный объект: улица, переулок, проспект, бульвар, площадь-улица, ТЦ, ТРЦ, "
+    "магазин, рынок, заведение, институт, вокзал-здание, любое место с адресом. Фамилия или имя "
+    "человека в роли названия (щорса, гагарина, лесі українки) — это улица → PLACE.\n"
+    "AREA — территория без адреса: район города, микрорайон, часть города (центр, левый берег, "
+    "возле вокзала, в районе ...), населённый пункт, область, страна.\n"
+    "Если не уверен между PLACE и AREA — ставь AREA. Если фрагмент непонятен — AREA.\n"
+    "Ответ строго JSON без текста вокруг: "
+    '{{"items": [{{"n": 1, "class": "SERVICE|PLACE|AREA"}}]}}\n\n{numbered}'
+)
+
+# Проход 2 — AREA. Точечный список (обычно 3-10 фрагментов), только территории.
+AREA_PROMPT = (
+    "Локация запроса: {location}, {country}.\n"
+    "Ниже пронумерованные фрагменты — районы, части города, населённые пункты или страна из поисковых "
+    "запросов с этой локацией. Для каждого ответь: относится ли эта территория к локации или её "
+    "ближайшей округе (районы и части самого города; соседние населённые пункты, откуда или куда "
+    "логично ехать; область и страна локации)?\n"
+    "YES — да, относится. NO — твёрдо знаешь, что такой территории в локации и её округе нет "
+    "(это район или город в другом месте страны, либо такого объекта не существует). "
+    "UNKNOWN — не уверен.\n"
+    "NO ставь только при твёрдой уверенности; при сомнении — UNKNOWN.\n"
+    "Ответ строго JSON без текста вокруг: "
+    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN", "why": "3-8 слов"}}]}}\n\n{numbered}'
+)
+_CLASSES = {"SERVICE", "PLACE", "AREA"}
+_AREA_ANSWERS = {"YES", "NO", "UNKNOWN"}
+# ────────────────────────────────────────────────────────────────────────────────
+
 _TOKEN_RE = re.compile(r"[а-яёіїєґa-z0-9\-']+")
 _STATUSES = {"NOT_GEO", "GEO_LOCAL", "GEO_FOREIGN", "GEO_UNCERTAIN", "RENAMED"}
 _VERDICTS = {"LOCAL", "FOREIGN", "UNKNOWN"}
@@ -115,7 +156,7 @@ class GeoExistConfig:
     api_key: str = ""
     country: str = "ua"
     timeout: int = 60
-    thinking_level: str = "low"
+    thinking_level: str = "high"   # ge_4.0: «на максимум» (было low)
     classifier_model: str = MODEL_CLASSIFIER
     judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
     use_judge: bool = False                 # ge_3.1: судья выключен (время), ансамбль решает
@@ -279,123 +320,203 @@ def apply_geo_exist_filter(
     stats.update({"skipped": False, "location": location, "checked": len(tails)})
     diags: List[Dict] = []
 
-    # ── Ансамбль: три lite-постановки параллельно
+    # ── ge_3.3 ENSEMBLE (rollback): раскомментировать блок и убрать конвейер ge_4.0 ниже
+    # # ── Ансамбль: три lite-постановки параллельно
+    # numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(tails))
+    # from concurrent.futures import ThreadPoolExecutor
+    #
+    # def run_glue():
+    #     text, dg = _call_gemini(config.api_key, config.classifier_model,
+    #                             GLUE_PROMPT.format(location=location, country=config.country,
+    #                                                numbered=numbered),
+    #                             config.timeout, config.thinking_level, json_mime=False)
+    #     nums = {int(x) for x in re.findall(r"\d+", text)}
+    #     if not nums:
+    #         raise Exception(f"glue parse fail: {text[:100]}")
+    #     return {tails[i] for i in range(len(tails)) if (i + 1) in nums}, dg
+    #
+    # def run_status():
+    #     text, dg = _call_gemini(config.api_key, config.classifier_model,
+    #                             CLASSIFY_PROMPT.format(location=location, country=config.country,
+    #                                                    numbered=numbered),
+    #                             config.timeout, config.thinking_level)
+    #     parsed = _parse_json(text)
+    #     if not parsed or "items" not in parsed:
+    #         raise Exception(f"status parse fail: {text[:100]}")
+    #     st = {}
+    #     for it in parsed["items"]:
+    #         n, v = it.get("n"), str(it.get("status", "")).upper()
+    #         if isinstance(n, int) and 1 <= n <= len(tails) and v in _STATUSES:
+    #             st[tails[n - 1]] = v
+    #     return st, dg
+    #
+    # def run_attrib():
+    #     text, dg = _call_gemini(config.api_key, config.classifier_model,
+    #                             ATTRIB_PROMPT.format(location=location, country=config.country,
+    #                                                  numbered=numbered),
+    #                             config.timeout, config.thinking_level)
+    #     parsed = _parse_json(text)
+    #     if parsed is None or "items" not in parsed:
+    #         raise Exception(f"attrib parse fail: {text[:100]}")
+    #     loc_low = location.lower()
+    #     out = {}
+    #     for it in parsed["items"]:
+    #         n, city = it.get("n"), str(it.get("city", "")).strip()
+    #         if isinstance(n, int) and 1 <= n <= len(tails) and city and city.lower() not in loc_low and loc_low not in city.lower():
+    #             out[tails[n - 1]] = city
+    #     return out, dg
+    #
+    # glue_cut: set = set()
+    # status: Dict[str, str] = {}
+    # attrib: Dict[str, str] = {}
+    # errors = []
+    # with ThreadPoolExecutor(max_workers=3) as ex:
+    #     futs = {"glue": ex.submit(run_glue), "status": ex.submit(run_status), "attrib": ex.submit(run_attrib)}
+    #     for name, fut in futs.items():
+    #         try:
+    #             val, dg = fut.result()
+    #             diags.append(dg)
+    #             if name == "glue":
+    #                 glue_cut = val
+    #             elif name == "status":
+    #                 status = val
+    #             else:
+    #                 attrib = val
+    #         except Exception as e:  # noqa: BLE001 — сбой постановки = её вклад пуст
+    #             errors.append(f"{name}: {str(e)[:120]}")
+    # if errors:
+    #     stats["stage_errors"] = errors
+    # if len(errors) == 3:                                  # все три упали → фильтр молчит
+    #     stats["error"] = "all ensemble calls failed"
+    #     stats["wall"] = round(time.time() - t0, 2)
+    #     logger.error("[GEO_EXIST] ансамбль целиком упал — fail-open")
+    #     return result
+    #
+    # status_foreign = {t for t, v in status.items() if v == "GEO_FOREIGN"}
+    # protected = {t for t, v in status.items() if v in ("NOT_GEO", "RENAMED")}   # вето Andrew
+    # stats["stages"] = {
+    #     "glue": {"cut": len(glue_cut)},
+    #     "status": {"counts": {v: sum(1 for x in status.values() if x == v) for v in _STATUSES}},
+    #     "attrib": {"foreign": len(attrib)},
+    # }
+    #
+    # # ── Этап B: точечный судья — по умолчанию ВЫКЛЮЧЕН (use_judge=False), оставлен для стенда
+    # need = [t for t in tails if status.get(t) == "GEO_UNCERTAIN"][: config.judge_limit]
+    # judged: Dict[str, Tuple[str, str, bool]] = {}
+    # if config.use_judge and need:
+    #     judged = _judge_tails(need, seed, location, config, diags)
+    #     stats["stages"]["judge"] = {
+    #         "asked": len(need),
+    #         "verdicts": {v: sum(1 for x in judged.values() if x[0] == v) for v in ("REAL", "GLUE", "UNKNOWN")},
+    #         "searched": sum(1 for x in judged.values() if x[2])}
+    #
+    # # ── Политика: объединение срезов минус вето
+    # trash_tails = set()
+    # for t in tails:
+    #     if t in protected:
+    #         continue
+    #     if t in glue_cut or t in status_foreign or t in attrib or judged.get(t, ("",))[0] == "GLUE":
+    #         trash_tails.add(t)
+
+    # ── ge_4.0 КОНВЕЙЕР ─────────────────────────────────────────────────────────
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(tails))
-    from concurrent.futures import ThreadPoolExecutor
 
-    def run_glue():
+    # Проход 1 — CLASS (батч по всем хвостам)
+    cls: Dict[str, str] = {}
+    try:
         text, dg = _call_gemini(config.api_key, config.classifier_model,
-                                GLUE_PROMPT.format(location=location, country=config.country,
-                                                   numbered=numbered),
-                                config.timeout, config.thinking_level, json_mime=False)
-        nums = {int(x) for x in re.findall(r"\d+", text)}
-        if not nums:
-            raise Exception(f"glue parse fail: {text[:100]}")
-        return {tails[i] for i in range(len(tails)) if (i + 1) in nums}, dg
-
-    def run_status():
-        text, dg = _call_gemini(config.api_key, config.classifier_model,
-                                CLASSIFY_PROMPT.format(location=location, country=config.country,
-                                                       numbered=numbered),
+                                CLASS_PROMPT.format(location=location, country=config.country,
+                                                    numbered=numbered),
                                 config.timeout, config.thinking_level)
+        diags.append(dg)
         parsed = _parse_json(text)
         if not parsed or "items" not in parsed:
-            raise Exception(f"status parse fail: {text[:100]}")
-        st = {}
+            raise Exception(f"class parse fail: {text[:100]}")
         for it in parsed["items"]:
-            n, v = it.get("n"), str(it.get("status", "")).upper()
-            if isinstance(n, int) and 1 <= n <= len(tails) and v in _STATUSES:
-                st[tails[n - 1]] = v
-        return st, dg
-
-    def run_attrib():
-        text, dg = _call_gemini(config.api_key, config.classifier_model,
-                                ATTRIB_PROMPT.format(location=location, country=config.country,
-                                                     numbered=numbered),
-                                config.timeout, config.thinking_level)
-        parsed = _parse_json(text)
-        if parsed is None or "items" not in parsed:
-            raise Exception(f"attrib parse fail: {text[:100]}")
-        loc_low = location.lower()
-        out = {}
-        for it in parsed["items"]:
-            n, city = it.get("n"), str(it.get("city", "")).strip()
-            if isinstance(n, int) and 1 <= n <= len(tails) and city and city.lower() not in loc_low and loc_low not in city.lower():
-                out[tails[n - 1]] = city
-        return out, dg
-
-    glue_cut: set = set()
-    status: Dict[str, str] = {}
-    attrib: Dict[str, str] = {}
-    errors = []
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futs = {"glue": ex.submit(run_glue), "status": ex.submit(run_status), "attrib": ex.submit(run_attrib)}
-        for name, fut in futs.items():
-            try:
-                val, dg = fut.result()
-                diags.append(dg)
-                if name == "glue":
-                    glue_cut = val
-                elif name == "status":
-                    status = val
-                else:
-                    attrib = val
-            except Exception as e:  # noqa: BLE001 — сбой постановки = её вклад пуст
-                errors.append(f"{name}: {str(e)[:120]}")
-    if errors:
-        stats["stage_errors"] = errors
-    if len(errors) == 3:                                  # все три упали → фильтр молчит
-        stats["error"] = "all ensemble calls failed"
+            n, v = it.get("n"), str(it.get("class", "")).upper()
+            if isinstance(n, int) and 1 <= n <= len(tails) and v in _CLASSES:
+                cls[tails[n - 1]] = v
+    except Exception as e:  # noqa: BLE001 — сбой прохода 1 = фильтр молчит (fail-open)
+        stats["error"] = f"class: {str(e)[:160]}"
         stats["wall"] = round(time.time() - t0, 2)
-        logger.error("[GEO_EXIST] ансамбль целиком упал — fail-open")
+        stats["cost_usd"] = _cost(diags)
+        logger.error(f"[GEO_EXIST] проход CLASS упал — fail-open: {stats['error']}")
         return result
 
-    status_foreign = {t for t, v in status.items() if v == "GEO_FOREIGN"}
-    protected = {t for t, v in status.items() if v in ("NOT_GEO", "RENAMED")}   # вето Andrew
-    stats["stages"] = {
-        "glue": {"cut": len(glue_cut)},
-        "status": {"counts": {v: sum(1 for x in status.values() if x == v) for v in _STATUSES}},
-        "attrib": {"foreign": len(attrib)},
-    }
+    place = {t for t, v in cls.items() if v == "PLACE"}
+    service = {t for t, v in cls.items() if v == "SERVICE"}
+    area = [t for t in tails if t not in place and t not in service]   # AREA + нераспознанные
+    stats["stages"] = {"class": {"counts": {v: sum(1 for x in cls.values() if x == v) for v in _CLASSES},
+                                 "unclassified": sum(1 for t in tails if t not in cls)}}
 
-    # ── Этап B: точечный судья — по умолчанию ВЫКЛЮЧЕН (use_judge=False), оставлен для стенда
-    need = [t for t in tails if status.get(t) == "GEO_UNCERTAIN"][: config.judge_limit]
-    judged: Dict[str, Tuple[str, str, bool]] = {}
-    if config.use_judge and need:
-        judged = _judge_tails(need, seed, location, config, diags)
-        stats["stages"]["judge"] = {
-            "asked": len(need),
-            "verdicts": {v: sum(1 for x in judged.values() if x[0] == v) for v in ("REAL", "GLUE", "UNKNOWN")},
-            "searched": sum(1 for x in judged.values() if x[2])}
+    # Проход 2 — AREA (точечный список); сбой = AREA остаются
+    area_ans: Dict[str, Tuple[str, str]] = {}
+    if area:
+        numbered_area = "\n".join(f"{i+1}. {t}" for i, t in enumerate(area))
+        try:
+            text, dg = _call_gemini(config.api_key, config.classifier_model,
+                                    AREA_PROMPT.format(location=location, country=config.country,
+                                                       numbered=numbered_area),
+                                    config.timeout, config.thinking_level)
+            diags.append(dg)
+            parsed = _parse_json(text)
+            if not parsed or "items" not in parsed:
+                raise Exception(f"area parse fail: {text[:100]}")
+            for it in parsed["items"]:
+                n, v = it.get("n"), str(it.get("answer", "")).upper()
+                if isinstance(n, int) and 1 <= n <= len(area) and v in _AREA_ANSWERS:
+                    area_ans[area[n - 1]] = (v, str(it.get("why", ""))[:120])
+        except Exception as e:  # noqa: BLE001
+            stats["stage_errors"] = [f"area: {str(e)[:160]}"]
+            logger.warning(f"[GEO_EXIST] проход AREA упал — AREA остаются: {e}")
+        stats["stages"]["area"] = {"asked": len(area),
+                                   "answers": {v: sum(1 for x in area_ans.values() if x[0] == v)
+                                               for v in _AREA_ANSWERS}}
 
-    # ── Политика: объединение срезов минус вето
-    trash_tails = set()
-    for t in tails:
-        if t in protected:
-            continue
-        if t in glue_cut or t in status_foreign or t in attrib or judged.get(t, ("",))[0] == "GLUE":
-            trash_tails.add(t)
+    # Политика: PLACE → OUT; AREA+NO → OUT; всё остальное остаётся
+    trash_tails = set(place) | {t for t, (v, _) in area_ans.items() if v == "NO"}
+    # ────────────────────────────────────────────────────────────────────────────
 
     if "anchors" not in result:
         result["anchors"] = []
+    # ge_3.3 trace (rollback):
+    # trace, trash_kw = [], set()
+    # n_trash = 0
+    # for t in tails:
+    #     keep = t not in trash_tails
+    #     jv = judged.get(t)
+    #     by = [src for src, hit in (("glue", t in glue_cut), ("status", t in status_foreign),
+    #                                ("attrib", t in attrib), ("judge", jv[0] == "GLUE" if jv else False)) if hit]
+    #     trace.append({"tail": t, "status": status.get(t), "by": by, "city": attrib.get(t),
+    #                   "verdict": jv[0] if jv else None, "reason": jv[1] if jv else None,
+    #                   "exists": keep, "keywords": [_kw_str(k) for k in tail_to_kws[t]]})
+    #     if not keep:
+    #         for k in tail_to_kws[t]:
+    #             trash_kw.add(_kw_str(k).lower())
+    #             jv = judged.get(t)
+    #             result["anchors"].append({"keyword": _kw_str(k), "anchor_reason": "GEO_EXIST_TRASH",
+    #                                       "geo_exist": {"tail": t, "status": status.get(t), "by": by, "city": attrib.get(t),
+    #                                                     "verdict": jv[0] if jv else None,
+    #                                                     "reason": jv[1] if jv else None,
+    #                                                     "location": location}})
+    #             n_trash += 1
     trace, trash_kw = [], set()
     n_trash = 0
     for t in tails:
         keep = t not in trash_tails
-        jv = judged.get(t)
-        by = [src for src, hit in (("glue", t in glue_cut), ("status", t in status_foreign),
-                                   ("attrib", t in attrib), ("judge", jv[0] == "GLUE" if jv else False)) if hit]
-        trace.append({"tail": t, "status": status.get(t), "by": by, "city": attrib.get(t),
-                      "verdict": jv[0] if jv else None, "reason": jv[1] if jv else None,
-                      "exists": keep, "keywords": [_kw_str(k) for k in tail_to_kws[t]]})
+        av = area_ans.get(t)
+        by = "PLACE" if t in place else ("AREA_NO" if (av and av[0] == "NO") else None)
+        rec = {"tail": t, "class": cls.get(t), "area": av[0] if av else None,
+               "why": av[1] if av else None, "by": by, "exists": keep,
+               "keywords": [_kw_str(k) for k in tail_to_kws[t]]}
+        trace.append(rec)
         if not keep:
             for k in tail_to_kws[t]:
                 trash_kw.add(_kw_str(k).lower())
-                jv = judged.get(t)
                 result["anchors"].append({"keyword": _kw_str(k), "anchor_reason": "GEO_EXIST_TRASH",
-                                          "geo_exist": {"tail": t, "status": status.get(t), "by": by, "city": attrib.get(t),
-                                                        "verdict": jv[0] if jv else None,
-                                                        "reason": jv[1] if jv else None,
+                                          "geo_exist": {"tail": t, "class": cls.get(t), "by": by,
+                                                        "area": av[0] if av else None,
+                                                        "why": av[1] if av else None,
                                                         "location": location}})
                 n_trash += 1
     result["keywords"] = [kw for kw in keywords if _kw_str(kw).lower() not in trash_kw]
