@@ -1,6 +1,15 @@
 """
-geo_exist_filter.py — гео-фильтр склеек. build: ge_4.3 (проход 2 на GPT-5.6 Sol, low)
+geo_exist_filter.py — гео-фильтр склеек. build: ge_4.4 (проход 2: NOT_PLACE, правило «только сам город»; проход 3: поиск на UNKNOWN)
 
+ge_4.4 (решение Andrew 2026-09-05):
+  Проход 2 — обратно gemini-3.7-flash low (Sol low: 21 с, $0.03, левый берег YES по той же конструкции).
+      Промпт: статус NOT_PLACE (не территория → keep, слой L3); YES только для частей самого города,
+      самого города, соседнего населённого пункта целиком, области/страны как таковых; районы и части
+      ДРУГИХ городов, даже той же области — NO (Sol пропустил юбилейный как «микрорайон Кременчуга →
+      область»); территория, которую привязать нельзя, — UNKNOWN, не YES по рассуждению.
+  Проход 3 — поиск ТОЛЬКО на UNKNOWN прохода 2 (1–3 хвоста на сид): gemini-3.7-flash + google_search,
+      параллельно; NO → OUT, YES/UNKNOWN → keep. Единственное место, где тратится поиск.
+  Подробные why выключены (area_why_detail=False) — задачу выполнили.
 ge_4.3: проход 2 — gpt-5.6-sol, reasoning_effort low (решение Andrew): клиент OpenAI перенесён из
         l3_filter._call_openai дословно (Chat Completions, max_completion_tokens, без temperature;
         completion_tokens уже включает reasoning → биллинг по нему). Ключ env OPENAI_API_KEY. Модель
@@ -61,7 +70,7 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gpt-5.6-sol": (5.00, 30.00),      # ge_4.3; у OpenAI reasoning уже внутри completion_tokens
 }
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-GEO_EXIST_BUILD = "ge_4.3 conveyor, area on gpt-5.6-sol low, 2026-09-05"
+GEO_EXIST_BUILD = "ge_4.4 conveyor, NOT_PLACE + own-city rule, search on UNKNOWN, 2026-09-05"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -153,28 +162,45 @@ CLASS_PROMPT = (
     '{{"items": [{{"n": 1, "class": "SERVICE|PLACE|AREA"}}]}}\n\n{numbered}'
 )
 
-# Проход 2 — AREA. Точечный список (обычно 3-10 фрагментов), только территории.
+# Проход 2 — AREA. Точечный список (обычно 3-15 фрагментов), только территории.
+# ge_4.4: четыре статуса; YES ограничен самим городом; NOT_PLACE для мусора, попавшего в AREA.
 AREA_PROMPT = (
     "Локация запроса: {location}, {country}.\n"
-    "Ниже пронумерованные фрагменты — районы, части города, населённые пункты или страна из поисковых "
-    "запросов с этой локацией. Для каждого ответь: относится ли эта территория к локации или её "
-    "ближайшей округе (районы и части самого города; соседние населённые пункты, откуда или куда "
-    "логично ехать; область и страна локации)?\n"
-    "YES — да, относится. NO — твёрдо знаешь, что такой территории в локации и её округе нет "
-    "(это район или город в другом месте страны, либо такого объекта не существует). "
-    "UNKNOWN — не уверен.\n"
-    "NO ставь только при твёрдой уверенности; при сомнении — UNKNOWN.\n"
+    "Ниже пронумерованные фрагменты из поисковых запросов с этой локацией, которые на предыдущем шаге "
+    "были отнесены к территориям (район, часть города, населённый пункт, страна). Для каждого дай статус:\n"
+    "YES — это часть САМОГО города локации (район, микрорайон, центр, окрестности вокзала и т.п.), либо сам "
+    "город, либо соседний населённый пункт ЦЕЛИКОМ, откуда или куда логично ехать, либо область или страна "
+    "локации как таковые.\n"
+    "NO — твёрдо знаешь, что это территория ДРУГОГО города или региона (район, микрорайон, часть другого "
+    "города — даже если он в той же области), либо такой территории не существует.\n"
+    "UNKNOWN — это название территории, но привязать его именно к этому городу ты не можешь (например, "
+    "распространённое имя микрорайона, которое есть во многих городах, и про этот город ты не уверен). "
+    "Не ставь YES по рассуждению вида «в городе есть река, значит есть левый берег»: YES — только если "
+    "знаешь, что жители так называют часть этого города.\n"
+    "NOT_PLACE — фрагмент вообще не является территорией (предмет, услуга, число, случайное слово).\n"
     "{why_rule}"
     "Ответ строго JSON без текста вокруг: "
-    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN", "why": "{why_fmt}"}}]}}\n\n{numbered}'
+    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN|NOT_PLACE", "why": "{why_fmt}"}}]}}\n\n{numbered}'
 )
 # ge_4.2: два режима пояснений — короткий (штатный) и подробный (временно, для разбора ошибок)
 _WHY_SHORT = ("", "3-8 слов")
 _WHY_DETAIL = ("В поле why по КАЖДОМУ фрагменту 1-2 предложения: что это за объект (район, парк, село, "
                "микрорайон), где именно он находится и в каком городе, и откуда уверенность — "
                "это важно и для YES, и для UNKNOWN.\n", "1-2 предложения")
+
+# Проход 3 — поиск только на UNKNOWN прохода 2 (ge_4.4).
+SEARCH_PROMPT = (
+    "Локация: {location}, {country}. Из поискового запроса «{seed} {tail}» выделена территория «{tail}».\n"
+    "Проверь через поиск Google: есть ли в городе {location} район, микрорайон, часть города или "
+    "местность с таким названием, которое употребляют жители или карты? Соседние населённые пункты "
+    "с таким названием тоже считаются.\n"
+    "Не считай подтверждением одноимённые районы других городов и общие рассуждения — только "
+    "факт про {location}.\n"
+    "Первая строка ответа — строго одно слово: YES или NO или UNKNOWN. "
+    "Вторая строка — причина в 5-15 слов, с указанием, что нашёл."
+)
 _CLASSES = {"SERVICE", "PLACE", "AREA"}
-_AREA_ANSWERS = {"YES", "NO", "UNKNOWN"}
+_AREA_ANSWERS = {"YES", "NO", "UNKNOWN", "NOT_PLACE"}
 # ────────────────────────────────────────────────────────────────────────────────
 
 _TOKEN_RE = re.compile(r"[а-яёіїєґa-z0-9\-']+")
@@ -188,10 +214,12 @@ class GeoExistConfig:
     country: str = "ua"
     timeout: int = 60
     thinking_level: str = "low"    # ge_4.1: обратно low (ge_4.0 high — ×10 thinking, +10 с, 30/30 и на low)
-    # area_model: str = "gemini-3.7-flash"   # ge_4.1–4.2: 3.7 low — тоже конструирует районы (левый берег, солнечный)
-    area_model: str = "gpt-5.6-sol"          # ge_4.3: проход 2 на Sol; префикс gpt- → OpenAI-клиент
+    area_model: str = "gemini-3.7-flash"     # ge_4.4: обратно 3.7 low; Sol (ge_4.3) — 21 с, $0.03, тот же ответ по левому берегу
+    # area_model: str = "gpt-5.6-sol"        # ge_4.3 (rollback): префикс gpt- → OpenAI-клиент
     area_effort: str = "low"                 # ge_4.3: reasoning_effort для OpenAI (none|low|medium|high|xhigh)
-    area_why_detail: bool = True            # ge_4.2: ВРЕМЕННО подробные why от 3.7; после разбора → False
+    area_why_detail: bool = False            # ge_4.2: подробные why; ge_4.4 выключены — задачу выполнили
+    search_on_unknown: bool = True           # ge_4.4: проход 3 — поиск только на UNKNOWN прохода 2
+    search_model: str = "gemini-3.7-flash"   # ge_4.4: модель прохода 3 (с google_search)
     classifier_model: str = MODEL_CLASSIFIER
     judge_model: str = "gemini-3.7-flash"   # точечный судья, с google_search
     use_judge: bool = False                 # ge_3.1: судья выключен (время), ансамбль решает
@@ -349,6 +377,36 @@ def _judge_tails(tails: List[str], seed: str, location: str, cfg: "GeoExistConfi
             if v not in ("REAL", "GLUE", "UNKNOWN"):
                 v = "UNKNOWN"
             return tail, v, (lines[1] if len(lines) > 1 else "")[:120], dg
+        except Exception as e:  # noqa: BLE001
+            return tail, "UNKNOWN", f"err: {str(e)[:80]}", None
+
+    out: Dict[str, Tuple[str, str, bool]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, cfg.judge_parallel)) as ex:
+        for tail, v, reason, dg in ex.map(one, tails):
+            if dg:
+                diags.append(dg)
+            out[tail] = (v, reason, bool(dg and dg.get("searched")))
+    return out
+
+
+# ─────────────── Проход 3: поиск на UNKNOWN (ge_4.4) ───────────────
+
+def _search_unknown(tails: List[str], seed: str, location: str, cfg: "GeoExistConfig",
+                    diags: List[Dict]) -> Dict[str, Tuple[str, str, bool]]:
+    """tail → (YES|NO|UNKNOWN, reason, searched). Ошибка вызова → UNKNOWN (fail-open, хвост остаётся)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(tail: str):
+        try:
+            text, dg = _call_gemini(cfg.api_key, cfg.search_model,
+                                    SEARCH_PROMPT.format(seed=seed, tail=tail, location=location,
+                                                         country=cfg.country),
+                                    cfg.timeout, cfg.thinking_level, json_mime=False, search=True)
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            v = re.sub(r"[^A-Z]", "", lines[0].split()[0].upper()) if lines else "UNKNOWN"
+            if v not in ("YES", "NO", "UNKNOWN"):
+                v = "UNKNOWN"
+            return tail, v, (lines[1] if len(lines) > 1 else "")[:160], dg
         except Exception as e:  # noqa: BLE001
             return tail, "UNKNOWN", f"err: {str(e)[:80]}", None
 
@@ -578,8 +636,26 @@ def apply_geo_exist_filter(
                                                "think": area_diag["think"]} if area_diag else None),
                                    "cost_usd": _cost1(area_diag) if area_diag else 0.0}
 
-    # Политика: PLACE → OUT; AREA+NO → OUT; всё остальное остаётся
-    trash_tails = set(place) | {t for t, (v, _) in area_ans.items() if v == "NO"}
+    # Проход 3 — поиск ТОЛЬКО на UNKNOWN прохода 2 (ge_4.4); сбой/нет → хвост остаётся
+    unknown = [t for t, (v, _) in area_ans.items() if v == "UNKNOWN"][: config.judge_limit]
+    searched: Dict[str, Tuple[str, str, bool]] = {}
+    if config.search_on_unknown and unknown:
+        t_search = time.time()
+        n_before = len(diags)
+        searched = _search_unknown(unknown, seed, location, config, diags)
+        s_diags = diags[n_before:]
+        stats["stages"]["search"] = {"asked": len(unknown),
+                                     "answers": {v: sum(1 for x in searched.values() if x[0] == v)
+                                                 for v in ("YES", "NO", "UNKNOWN")},
+                                     "searched": sum(1 for x in searched.values() if x[2]),
+                                     "model": config.search_model, "wall": round(time.time() - t_search, 2),
+                                     "tokens": {"in": sum(d["in"] for d in s_diags), "out": sum(d["out"] for d in s_diags),
+                                                "think": sum(d["think"] for d in s_diags)},
+                                     "cost_usd": _cost(s_diags)}
+
+    # Политика: PLACE → OUT; AREA+NO → OUT; UNKNOWN+поиск NO → OUT; NOT_PLACE/YES/UNKNOWN остаются
+    trash_tails = (set(place) | {t for t, (v, _) in area_ans.items() if v == "NO"}
+                   | {t for t, (v, _, _) in searched.items() if v == "NO"})
     # ────────────────────────────────────────────────────────────────────────────
 
     if "anchors" not in result:
@@ -610,9 +686,13 @@ def apply_geo_exist_filter(
     for t in tails:
         keep = t not in trash_tails
         av = area_ans.get(t)
-        by = "PLACE" if t in place else ("AREA_NO" if (av and av[0] == "NO") else None)
+        sv = searched.get(t)
+        by = ("PLACE" if t in place else "AREA_NO" if (av and av[0] == "NO")
+              else "SEARCH_NO" if (sv and sv[0] == "NO") else None)
         rec = {"tail": t, "class": cls.get(t), "area": av[0] if av else None,
-               "why": av[1] if av else None, "by": by, "exists": keep,
+               "why": av[1] if av else None,
+               "search": sv[0] if sv else None, "search_why": sv[1] if sv else None,
+               "by": by, "exists": keep,
                "keywords": [_kw_str(k) for k in tail_to_kws[t]]}
         trace.append(rec)
         if not keep:
@@ -622,6 +702,8 @@ def apply_geo_exist_filter(
                                           "geo_exist": {"tail": t, "class": cls.get(t), "by": by,
                                                         "area": av[0] if av else None,
                                                         "why": av[1] if av else None,
+                                                        "search": sv[0] if sv else None,
+                                                        "search_why": sv[1] if sv else None,
                                                         "location": location}})
                 n_trash += 1
     result["keywords"] = [kw for kw in keywords if _kw_str(kw).lower() not in trash_kw]
@@ -643,14 +725,18 @@ def apply_geo_exist_filter(
         "class": {k: st["class"].get(k) for k in ("counts", "wall", "tokens", "cost_usd")},
         "area": ({k: st["area"].get(k) for k in ("asked", "answers", "wall", "tokens", "cost_usd")}
                  if "area" in st else None),
+        "search": ({k: st["search"].get(k) for k in ("asked", "answers", "searched", "wall", "tokens", "cost_usd")}
+                   if "search" in st else None),
         "trash_tails": sorted(trash_tails),
         "area_kept": {t: list(v) for t, v in area_ans.items() if v[0] != "NO"},
+        "search_results": {t: list(v[:2]) for t, v in searched.items()},
     })
     stats["process_calls"] = list(_PROCESS_CALLS)
     logger.info(f"[GEO_EXIST] {GEO_EXIST_BUILD} call#{_PROCESS_TOTALS['calls']} loc='{location}' "
                 f"tails={len(tails)} trash={n_trash} "
                 f"class={st['class']['wall']}s/${st['class']['cost_usd']} "
                 f"area={st.get('area', {}).get('wall', 0)}s/${st.get('area', {}).get('cost_usd', 0)} "
+                f"search={st.get('search', {}).get('asked', 0)}q/{st.get('search', {}).get('wall', 0)}s/${st.get('search', {}).get('cost_usd', 0)} "
                 f"total={stats['wall']}s/${stats['cost_usd']} "
                 f"process: calls={_PROCESS_TOTALS['calls']} wall={_PROCESS_TOTALS['wall']}s "
                 f"cost=${_PROCESS_TOTALS['cost_usd']}")
