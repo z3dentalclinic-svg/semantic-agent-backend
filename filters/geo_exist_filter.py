@@ -1,6 +1,8 @@
 """
-geo_exist_filter.py — гео-фильтр склеек. build: ge_4.4 (проход 2: NOT_PLACE, правило «только сам город»; проход 3: поиск на UNKNOWN)
+geo_exist_filter.py — гео-фильтр склеек. build: ge_4.5 (ge_4.4 без пояснений: только статусы, экономия output-токенов)
 
+ge_4.5 (2026-09-06): пояснения выключены совсем — проход 2 отдаёт только статусы, проход 3 — одно слово.
+        Поля why/search_why в трейсе оставлены (null), режим area_why_detail сохранён для разбора ошибок.
 ge_4.4 (решение Andrew 2026-09-05):
   Проход 2 — обратно gemini-3.7-flash low (Sol low: 21 с, $0.03, левый берег YES по той же конструкции).
       Промпт: статус NOT_PLACE (не территория → keep, слой L3); YES только для частей самого города,
@@ -70,7 +72,7 @@ PRICES = {  # $/1M (in, out); thinking биллится как output
     "gpt-5.6-sol": (5.00, 30.00),      # ge_4.3; у OpenAI reasoning уже внутри completion_tokens
 }
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-GEO_EXIST_BUILD = "ge_4.4 conveyor, NOT_PLACE + own-city rule, search on UNKNOWN, 2026-09-05"
+GEO_EXIST_BUILD = "ge_4.5 conveyor, statuses only, 2026-09-06"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -180,13 +182,15 @@ AREA_PROMPT = (
     "NOT_PLACE — фрагмент вообще не является территорией (предмет, услуга, число, случайное слово).\n"
     "{why_rule}"
     "Ответ строго JSON без текста вокруг: "
-    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN|NOT_PLACE", "why": "{why_fmt}"}}]}}\n\n{numbered}'
+    '{{"items": [{{"n": 1, "answer": "YES|NO|UNKNOWN|NOT_PLACE"{why_fmt}}}]}}\n\n{numbered}'
 )
 # ge_4.2: два режима пояснений — короткий (штатный) и подробный (временно, для разбора ошибок)
-_WHY_SHORT = ("", "3-8 слов")
+# ge_4.5: штатно why нет вообще (только статусы); detail-режим оставлен для разбора ошибок.
+# _WHY_SHORT = ("", "3-8 слов")   # ge_4.2–4.4
+_WHY_SHORT = ("", "")
 _WHY_DETAIL = ("В поле why по КАЖДОМУ фрагменту 1-2 предложения: что это за объект (район, парк, село, "
                "микрорайон), где именно он находится и в каком городе, и откуда уверенность — "
-               "это важно и для YES, и для UNKNOWN.\n", "1-2 предложения")
+               "это важно и для YES, и для UNKNOWN.\n", ', "why": "1-2 предложения"')
 
 # Проход 3 — поиск только на UNKNOWN прохода 2 (ge_4.4).
 SEARCH_PROMPT = (
@@ -196,8 +200,8 @@ SEARCH_PROMPT = (
     "с таким названием тоже считаются.\n"
     "Не считай подтверждением одноимённые районы других городов и общие рассуждения — только "
     "факт про {location}.\n"
-    "Первая строка ответа — строго одно слово: YES или NO или UNKNOWN. "
-    "Вторая строка — причина в 5-15 слов, с указанием, что нашёл."
+    "Ответ — строго одно слово: YES или NO или UNKNOWN. Без пояснений."
+    # ge_4.4: "Первая строка ... Вторая строка — причина в 5-15 слов" — пояснения выключены в ge_4.5
 )
 _CLASSES = {"SERVICE", "PLACE", "AREA"}
 _AREA_ANSWERS = {"YES", "NO", "UNKNOWN", "NOT_PLACE"}
@@ -406,7 +410,7 @@ def _search_unknown(tails: List[str], seed: str, location: str, cfg: "GeoExistCo
             v = re.sub(r"[^A-Z]", "", lines[0].split()[0].upper()) if lines else "UNKNOWN"
             if v not in ("YES", "NO", "UNKNOWN"):
                 v = "UNKNOWN"
-            return tail, v, (lines[1] if len(lines) > 1 else "")[:160], dg
+            return tail, v, ((lines[1] if len(lines) > 1 else "")[:160] or None), dg
         except Exception as e:  # noqa: BLE001
             return tail, "UNKNOWN", f"err: {str(e)[:80]}", None
 
@@ -622,7 +626,7 @@ def apply_geo_exist_filter(
             for it in parsed["items"]:
                 n, v = it.get("n"), str(it.get("answer", "")).upper()
                 if isinstance(n, int) and 1 <= n <= len(area) and v in _AREA_ANSWERS:
-                    area_ans[area[n - 1]] = (v, str(it.get("why", ""))[:400 if config.area_why_detail else 120])
+                    area_ans[area[n - 1]] = (v, (str(it.get("why", ""))[:400] or None) if config.area_why_detail else None)
         except Exception as e:  # noqa: BLE001
             stats["stage_errors"] = [f"area: {str(e)[:160]}"]
             logger.warning(f"[GEO_EXIST] проход AREA упал — AREA остаются: {e}")
