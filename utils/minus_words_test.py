@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.2"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.3"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,10 +497,15 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.2"
+BUILD_SEM = "ms_0.3"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
+# ms_0.3: группа у ключа одна (бренд перебивает контакты → «где находится … хонда» попадал в brand и шёл пословно),
+#         поэтому смотрим ещё сигналы L0 из _l0_trace: инфо-сигнал без commerce → фразы. «Без commerce» обязательно:
+#         у «сколько стоит» сигналы commerce + info_intent, фразовым минусом он быть не должен.
+INFO_SIGNALS = ("info_intent", "contacts", "action")
+COMMERCE_SIGNAL = "commerce"
 # INFO_GROUPS = ("info_intent",)   # ms_0.1
 GEO_GROUPS = ("geo",)
 
@@ -587,23 +592,39 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
             if t not in sel_toks:
                 sel_toks.append(t)
 
+    signals_of: dict[str, set] = {}
+    for t in ap.get("_l0_trace") or []:
+        if isinstance(t, dict) and t.get("keyword"):
+            signals_of[_norm(t["keyword"])] = set(t.get("signals") or [])
+
+    def is_info(k: str) -> bool:
+        g = group_of.get(_norm(k), "?")
+        if g in INFO_GROUPS:
+            return True
+        sg = signals_of.get(_norm(k), set())
+        return bool(sg & set(INFO_SIGNALS)) and COMMERCE_SIGNAL not in sg
+
     rest = [k for k in keywords if _norm(k) not in sel_norm]
     geo, info, other = [], [], []
     for k in rest:
         g = group_of.get(_norm(k), "?")
-        (geo if g in GEO_GROUPS else info if g in INFO_GROUPS else other).append(k)
+        (geo if g in GEO_GROUPS else info if is_info(k) else other).append(k)
 
-    # info → фразы (хвост без сида); фраза, целиком сидящая в выбранном ключе, — в шит
+    # info → фразы (хвост без сида). ms_0.3: шит пословный — хоть одно слово фразы совпадает по основе со словом
+    # выбранного ключа → фраза защищена («где купить» при выбранном «купить …»); фразовый минус режет коммерцию
+    # ms_0.1 (откат): защищалась только фраза, целиком сидящая в выбранном ключе
     phrases: dict[str, list[str]] = {}
     shielded: list[dict] = []
     no_minus: list[str] = []
     for k in info:
-        ph = " ".join(tail_tokens(k, seed_toks))
+        tt = tail_tokens(k, seed_toks)
+        ph = " ".join(tt)
         if not ph:
             no_minus.append(k)
             continue
-        hit = next((s for s in sel_keys if ph in _norm(s)), None)
-        if hit:
+        # слова короче 4 символов не защищают фразу: «для»/«в»/«от» из выбранных ключей шитили бы почти всё
+        hit = next((h for t in tt if len(t) >= 4 and (h := _stem_hit(t, sel_toks)) is not None), None)
+        if hit is not None:
             shielded.append({"word": ph, "kind": "phrase", "by": hit, "keys": [k]})
             continue
         phrases.setdefault(ph, []).append(k)
