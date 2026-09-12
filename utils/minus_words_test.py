@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.4"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.5"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,7 +497,7 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.4"
+BUILD_SEM = "ms_0.5"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
@@ -520,8 +520,12 @@ PRUNE_SEM_PROMPT = (
     "Характеристика или модель — минус только если она несовместима с товаром из запросов рекламодателя "
     "(другое напряжение, другой тип), а не просто в них не названа.\n"
     "У каждого слова дан пример запроса, в котором оно встречается, и число таких запросов. "
-    "Проверь по примеру: человек в этом запросе — не клиент этого рекламодателя. "
+    "Пример — только контекст, оценивается само слово: минус — слово, которое само делает запрос нецелевым. "
+    "Если запрос нецелевой из-за другого слова, это слово не минус. "
+    "Служебные слова (предлоги, союзы, частицы) и единицы измерения минусом не бывают.\n"
     "Слово, уточняющее тот же товар или услугу из запросов рекламодателя, не подходит.\n"
+    # ms_0.4 (откат): "Проверь по примеру: человек в этом запросе — не клиент этого рекламодателя." — модель
+    # помечала все слова нецелевого запроса: «от» из «от шуруповерта», «вольта» из «72 вольта»
     # ms_0.3 (откат): "Проверь каждое слово: запрос «{seed} + слово» реально набирают, и человек в нём — не клиент этого
     # рекламодателя." — без примера модель читала «24» из «хонда такт 24» как 24 вольта, «сколько» из «сколько стоит» как инфо
     "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
@@ -656,6 +660,16 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
         for v, u, _ in spec_pairs(tokens(k)):
             sel_specs.setdefault(u, set()).add(v)
 
+    # ms_0.5: единица измерения — слово, стоящее после числа хотя бы в двух ключах семантики с разными числами
+    # (48 вольта / 72 вольта, 50 кубов / 150 кубов). Сама единица минусом не бывает — минус несёт число;
+    # иначе «вольта» из «72 вольта» закрывало бы любой запрос с напряжением. Считается по всем VALID, не по выбору.
+    unit_vals: dict[str, set] = {}
+    for k in keywords:
+        for v, u, carrier in spec_pairs(tokens(k)):
+            if carrier == v:                     # только раздельные пары: у склеек 12v единица не токен
+                unit_vals.setdefault(u, set()).add(v)
+    units = [u for u, vs in unit_vals.items() if len(vs) >= 2]
+
     def wrong_spec(k: str) -> list[tuple[str, str]]:
         """[(токен-носитель, единица)] для пар ключа с чужим значением известной единицы"""
         bad = []
@@ -680,6 +694,12 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
                     e["keys"].append(k)
                 got = True
                 continue
+            unit = _stem_hit(t, units)
+            if unit is not None:
+                e = sh_words.setdefault(t, {"word": t, "kind": "unit", "by": f"единица: {unit} ({'/'.join(sorted(unit_vals[unit]))})", "keys": []})
+                if k not in e["keys"]:
+                    e["keys"].append(k)
+                continue
             hit = _stem_hit(t, sel_toks)
             if hit is not None:
                 e = sh_words.setdefault(t, {"word": t, "kind": "word", "by": hit, "keys": []})
@@ -701,6 +721,7 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
         "selected": sel_keys, "rest": rest, "geo": geo, "info": info, "other": other,
         "phrases": phrases, "candidates": cand, "shielded": shielded, "no_minus": no_minus,
         "spec": list(spec.values()), "sel_specs": {u: sorted(v) for u, v in sel_specs.items()},
+        "units": {u: sorted(unit_vals[u]) for u in units},
     }
 
 
@@ -742,7 +763,7 @@ async def run_semantics(req: SemReq) -> dict:
         "geo_dropped": len(s["geo"]), "info_keys": len(s["info"]), "info_phrases": len(info_phrases),
         "other_keys": len(s["other"]), "candidates": len(cand),
         "shielded": len(s["shielded"]), "no_minus": len(s["no_minus"]),
-        "spec_minus": len(s["spec"]), "sel_specs": s["sel_specs"],
+        "spec_minus": len(s["spec"]), "sel_specs": s["sel_specs"], "units": s["units"],
         "minus_words": len(minus_words), "removed_by_censor": len(removed),
         "total_cost": round(sum(c["cost"] for c in calls), 5),
         "total_wall": round(time.perf_counter() - t0, 2),
