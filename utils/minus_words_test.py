@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.8"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.9"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,7 +497,7 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.8"
+BUILD_SEM = "ms_0.9"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
@@ -525,7 +525,13 @@ PRUNE_SEM_PROMPT = (
     "Ниже пронумерованный список слов из других запросов по той же теме — кандидаты в минус-слова.\n"
     "Минус-слово исключает человека, который у этого рекламодателя не купит никогда. "
     "Не клиент: изучает тему или выбирает, ищет другое состояние товара, другой канал покупки, "
-    "чужой бренд, смежный товар или услугу. "
+    "смежный товар или услугу. "
+    # ms_0.9 (Andrew): «чужой бренд» распадается — бренд товара не из ассортимента минус всегда; бренд продавца минус
+    # только там, где у каждого продавца товар/услуга свои (цветы, перевозки); одинаковый товар у многих (техника) —
+    # клиент, сравнивающий цену. ms_0.8 (откат): в списке «не клиент» стояло просто «чужой бренд»
+    "Бренд товара, которого рекламодатель не продаёт, — минус. Название другого продавца или сети — минус, "
+    "только если товар или услуга у каждого продавца свои; если ищут тот же самый товар, который продают многие, "
+    "это клиент, сравнивающий цену. "
     "То, что слова нет в запросах рекламодателя, само по себе ничего не значит: "
     "уточнение того же товара или услуги (вид груза, вариант, синоним, цена) — клиент.\n"
     "Регион задаётся настройками кампании: города и области в запросах при оценке не учитывай.\n"
@@ -782,6 +788,19 @@ async def run_semantics(req: SemReq) -> dict:
 
     minus_words = [{"word": x["word"], "keys": x["keys"], "source": "spec", "unit": x["unit"]} for x in s["spec"]] \
                 + [{"word": w, "keys": cand[w], "source": "censor"} for w in words]
+    # ms_0.9: «перекрыто» — слово избыточно, если каждый его ключ содержит другое минус-слово (модель пометила не то
+    # слово нецелевого запроса: «оригинальный» при «зарядку/дисплей», «защитой» при «чехол»). Помечаем, не режем.
+    all_minus = {x["word"] for x in minus_words}
+    for x in minus_words:
+        others: set = set()
+        for k in x["keys"]:
+            kt = set(tokens(k)) & all_minus - {x["word"]}
+            if not kt:
+                others = set()
+                break
+            others |= kt
+        if others:
+            x["covered_by"] = sorted(others)
     info_phrases = [{"phrase": p, "keys": ks} for p, ks in s["phrases"].items()]
     stats = {
         "build": BUILD_SEM, "seed": seed, "region": region,
@@ -792,6 +811,7 @@ async def run_semantics(req: SemReq) -> dict:
         "shielded": len(s["shielded"]), "no_minus": len(s["no_minus"]),
         "spec_minus": len(s["spec"]), "sel_specs": s["sel_specs"], "units": s["units"],
         "minus_words": len(minus_words), "removed_by_censor": len(removed),
+        "covered": sum(1 for x in minus_words if x.get("covered_by")),
         "total_cost": round(sum(c["cost"] for c in calls), 5),
         "total_wall": round(time.perf_counter() - t0, 2),
         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
