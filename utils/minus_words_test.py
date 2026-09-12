@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.6"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.7"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,7 +497,7 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.6"
+BUILD_SEM = "ms_0.7"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
@@ -539,7 +539,12 @@ PRUNE_SEM_PROMPT = (
     # помечала все слова нецелевого запроса: «от» из «от шуруповерта», «вольта» из «72 вольта»
     # ms_0.3 (откат): "Проверь каждое слово: запрос «{seed} + слово» реально набирают, и человек в нём — не клиент этого
     # рекламодателя." — без примера модель читала «24» из «хонда такт 24» как 24 вольта, «сколько» из «сколько стоит» как инфо
-    "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
+    # ms_0.7: «ОСТАВИТЬ» — формулировка mw_1.3, где список изначально был минусами; здесь список — кандидаты, и модель
+    # на грузоперевозках отвечала номерами слов, которые оставить КЛЮЧАМИ (газель/отзывы/лицензия попали в «не минус»,
+    # стоимость/песка/фура — в минуса). Три прогона по этой нише были инвертированы.
+    # ms_0.6 (откат): "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров."
+    "Ничего не добавляй. Ответ: только номера слов, которые ты признаёшь МИНУС-словами, через запятую. "
+    "Если минус-слов нет — ответь 0. Ничего кроме номеров.\n\n{numbered}"
 )
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
@@ -757,12 +762,15 @@ async def run_semantics(req: SemReq) -> dict:
         cz = await call_model(req.censor, prompt, search=False, thinking=req.thinking)
         cz["role"] = "censor"
         calls.append(cz)
+        # ms_0.7: ответ — номера МИНУС-слов; «0» или нечисловой ответ → минусов от цензора нет (кандидаты в основном
+        # валид, fail-open «всё минус» из mw_1.3 здесь на неправильной стороне), ошибка в отчёте только при мусоре
         keep = parse_keep(cz["text"], len(words))
-        if keep is None:                                  # fail-open: список не трогаем, ошибка в отчёте
-            cz["error"] = (cz["error"] or "") + " | parse fail → list untouched"
-        else:
-            removed = [{"word": w, "keys": cand[w]} for i, w in enumerate(words) if (i + 1) not in keep]
-            words = [w for i, w in enumerate(words) if (i + 1) in keep]
+        if keep is None:
+            keep = set()
+            if not re.fullmatch(r"\s*0\s*\.?\s*", cz["text"] or ""):
+                cz["error"] = (cz["error"] or "") + " | parse fail → nothing minused"
+        removed = [{"word": w, "keys": cand[w]} for i, w in enumerate(words) if (i + 1) not in keep]
+        words = [w for i, w in enumerate(words) if (i + 1) in keep]
 
     minus_words = [{"word": x["word"], "keys": x["keys"], "source": "spec", "unit": x["unit"]} for x in s["spec"]] \
                 + [{"word": w, "keys": cand[w], "source": "censor"} for w in words]
