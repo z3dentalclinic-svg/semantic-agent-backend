@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.7"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.8"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,7 +497,7 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.7"
+BUILD_SEM = "ms_0.8"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
@@ -671,10 +671,18 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
     # ms_0.4: спецификация кодом — единица из выбранных ключей с другим значением в остатке → минус мимо цензора
     # (12 вольт выбрано → 48 вольт минус). Единица, которой в выбранных нет, не судится. Правило общее для любых
     # единиц (кубов, ah, тонн…) — режет ровно то, что не выбрано; собеседник должен отметить все свои значения.
+    # ms_0.8: числа сида пар не образуют — на «купить айфон 16» слово после «16» с любым другим числом рядом
+    #         становилось «единицей» (про, купить, бу, фокстрот, розовый): 256 уходил спец-минусом, бу/фокстрот защищались
+    seed_nums = {t for t in seed_toks if t.isdigit()}
     sel_specs: dict[str, set] = {}
+    sel_nums: set = set()                    # ms_0.8: число из любого выбранного ключа спец-минусом не бывает
     for k in sel_keys:
+        for t in tokens(k):
+            if t.isdigit():
+                sel_nums.add(t)
         for v, u, _ in spec_pairs(tokens(k)):
-            sel_specs.setdefault(u, set()).add(v)
+            if v not in seed_nums:
+                sel_specs.setdefault(u, set()).add(v)
 
     # ms_0.5: единица измерения — слово, стоящее после числа хотя бы в двух ключах семантики с разными числами
     # (48 вольта / 72 вольта, 50 кубов / 150 кубов). Сама единица минусом не бывает — минус несёт число;
@@ -682,7 +690,7 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
     unit_vals: dict[str, set] = {}
     for k in keywords:
         for v, u, carrier in spec_pairs(tokens(k)):
-            if carrier == v:                     # только раздельные пары: у склеек 12v единица не токен
+            if carrier == v and v not in seed_nums:   # только раздельные пары и не числа сида (ms_0.8)
                 unit_vals.setdefault(u, set()).add(v)
     units = [u for u, vs in unit_vals.items() if len(vs) >= 2]
 
@@ -691,7 +699,7 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
         bad = []
         for v, u, carrier in spec_pairs(tokens(k)):
             su = next((x for x in sel_specs if same_stem(u, x)), None)
-            if su is not None and v not in sel_specs[su]:
+            if su is not None and v not in sel_specs[su] and v not in sel_nums and v not in seed_nums:
                 bad.append((carrier, su))
         return bad
 
