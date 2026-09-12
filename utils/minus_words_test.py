@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.3"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.4"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,7 +497,7 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.3"
+BUILD_SEM = "ms_0.4"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
@@ -519,8 +519,11 @@ PRUNE_SEM_PROMPT = (
     "состояние товара, другой канал покупки, чужой бренд, смежный товар или услугу.\n"
     "Характеристика или модель — минус только если она несовместима с товаром из запросов рекламодателя "
     "(другое напряжение, другой тип), а не просто в них не названа.\n"
-    "Проверь каждое слово: запрос «{seed} + слово» реально набирают, и человек в нём — не клиент этого рекламодателя. "
+    "У каждого слова дан пример запроса, в котором оно встречается, и число таких запросов. "
+    "Проверь по примеру: человек в этом запросе — не клиент этого рекламодателя. "
     "Слово, уточняющее тот же товар или услугу из запросов рекламодателя, не подходит.\n"
+    # ms_0.3 (откат): "Проверь каждое слово: запрос «{seed} + слово» реально набирают, и человек в нём — не клиент этого
+    # рекламодателя." — без примера модель читала «24» из «хонда такт 24» как 24 вольта, «сколько» из «сколько стоит» как инфо
     "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
 )
 
@@ -558,6 +561,22 @@ def _stem_hit(t: str, pool: list[str]) -> str | None:
 
 def tail_tokens(keyword: str, seed_toks: list[str]) -> list[str]:
     return [t for t in tokens(keyword) if _stem_hit(t, seed_toks) is None]
+
+
+_GLUED = re.compile(r"^(\d+)([^\W\d_]+)$", re.UNICODE)   # 12v, 20ah, 7ач, 4т
+
+
+def spec_pairs(toks: list[str]) -> list[tuple[str, str, str]]:
+    """(значение, единица, токен-носитель) из последовательности токенов: «48 вольт» → ('48','вольт','48'),
+    «72v» → ('72','v','72v'). Число без единицы за ним («хонда такт 24») пары не даёт."""
+    out = []
+    for i, t in enumerate(toks):
+        m = _GLUED.match(t)
+        if m:
+            out.append((m.group(1), m.group(2), t))
+        elif t.isdigit() and i + 1 < len(toks) and not toks[i + 1][0].isdigit():
+            out.append((t, toks[i + 1], t))
+    return out
 
 
 def _norm(s: str) -> str:
@@ -629,13 +648,38 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
             continue
         phrases.setdefault(ph, []).append(k)
 
+    # ms_0.4: спецификация кодом — единица из выбранных ключей с другим значением в остатке → минус мимо цензора
+    # (12 вольт выбрано → 48 вольт минус). Единица, которой в выбранных нет, не судится. Правило общее для любых
+    # единиц (кубов, ah, тонн…) — режет ровно то, что не выбрано; собеседник должен отметить все свои значения.
+    sel_specs: dict[str, set] = {}
+    for k in sel_keys:
+        for v, u, _ in spec_pairs(tokens(k)):
+            sel_specs.setdefault(u, set()).add(v)
+
+    def wrong_spec(k: str) -> list[tuple[str, str]]:
+        """[(токен-носитель, единица)] для пар ключа с чужим значением известной единицы"""
+        bad = []
+        for v, u, carrier in spec_pairs(tokens(k)):
+            su = next((x for x in sel_specs if same_stem(u, x)), None)
+            if su is not None and v not in sel_specs[su]:
+                bad.append((carrier, su))
+        return bad
+
     # остальное → слова; шит по основе со словами выбранных ключей
     cand: dict[str, list[str]] = {}
     sh_words: dict[str, dict] = {}
+    spec: dict[str, dict] = {}
     for k in other:
         tt = tail_tokens(k, seed_toks)
         got = False
+        bad = dict(wrong_spec(k))
         for t in tt:
+            if t in bad:
+                e = spec.setdefault(t, {"word": t, "unit": bad[t], "keys": []})
+                if k not in e["keys"]:
+                    e["keys"].append(k)
+                got = True
+                continue
             hit = _stem_hit(t, sel_toks)
             if hit is not None:
                 e = sh_words.setdefault(t, {"word": t, "kind": "word", "by": hit, "keys": []})
@@ -649,11 +693,14 @@ def split_streams(ap: dict, selected: list[str]) -> dict:
         if not got:
             no_minus.append(k)
     shielded.extend(sh_words.values())
+    for w in spec:                       # число, ставшее минусом по спецификации, цензору не отдаём
+        cand.pop(w, None)
 
     return {
         "seed": seed, "keywords": keywords, "group_of": group_of,
         "selected": sel_keys, "rest": rest, "geo": geo, "info": info, "other": other,
         "phrases": phrases, "candidates": cand, "shielded": shielded, "no_minus": no_minus,
+        "spec": list(spec.values()), "sel_specs": {u: sorted(v) for u, v in sel_specs.items()},
     }
 
 
@@ -671,7 +718,8 @@ async def run_semantics(req: SemReq) -> dict:
     calls: list[dict] = []
     prompt = ""
     if req.run_censor and words:
-        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(words))
+        # ms_0.4: слово — пример запроса (число запросов); ms_0.3 (откат): f"{i+1}. {w}"
+        numbered = "\n".join(f"{i+1}. {w} — {cand[w][0]} ({len(cand[w])})" for i, w in enumerate(words))
         prompt = PRUNE_SEM_PROMPT.format(region=region or "не указан", seed=seed,
                                          selected="\n".join(s["selected"]) or "(пусто)", numbered=numbered)
         cz = await call_model(req.censor, prompt, search=False, thinking=req.thinking)
@@ -684,7 +732,8 @@ async def run_semantics(req: SemReq) -> dict:
             removed = [{"word": w, "keys": cand[w]} for i, w in enumerate(words) if (i + 1) not in keep]
             words = [w for i, w in enumerate(words) if (i + 1) in keep]
 
-    minus_words = [{"word": w, "keys": cand[w]} for w in words]
+    minus_words = [{"word": x["word"], "keys": x["keys"], "source": "spec", "unit": x["unit"]} for x in s["spec"]] \
+                + [{"word": w, "keys": cand[w], "source": "censor"} for w in words]
     info_phrases = [{"phrase": p, "keys": ks} for p, ks in s["phrases"].items()]
     stats = {
         "build": BUILD_SEM, "seed": seed, "region": region,
@@ -693,6 +742,7 @@ async def run_semantics(req: SemReq) -> dict:
         "geo_dropped": len(s["geo"]), "info_keys": len(s["info"]), "info_phrases": len(info_phrases),
         "other_keys": len(s["other"]), "candidates": len(cand),
         "shielded": len(s["shielded"]), "no_minus": len(s["no_minus"]),
+        "spec_minus": len(s["spec"]), "sel_specs": s["sel_specs"],
         "minus_words": len(minus_words), "removed_by_censor": len(removed),
         "total_cost": round(sum(c["cost"] for c in calls), 5),
         "total_wall": round(time.perf_counter() - t0, 2),
