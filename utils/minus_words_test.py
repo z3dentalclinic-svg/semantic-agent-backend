@@ -4,7 +4,8 @@ minus_words_test.py — стенд минус-слов. build: ms_0.1 (мину�
 ms_0.1 — вход: готовый autopilot JSON + ключи, ВЫБРАННЫЕ человеком для рекламы; из остатка кодом три потока
   (geo — выброс, info_intent — фразовые минуса, остальное — пословно → шит словами выбранных → цензор PRUNE_SEM).
   Полный пайплайн не гоняется. Старая цепочка на памяти моделей (mw_1.3) живёт рядом: /minus-test, /api/minus-test.
-  Эндпоинты: GET /minus-semantics (minus_semantics.html рядом), POST /api/minus-semantics, GET /api/minus-semantics/models
+  Эндпоинты: GET /minus-semantics (minus_semantics.html рядом), POST /api/minus-semantics, GET /api/minus-semantics/models,
+  POST /api/minus-wide (ms_0.11: семантика + старая цепочка одним списком, для autopilot.html)
 
 [MEM-MODE mw_1.3] ниже — описание старой цепочки:
 
@@ -484,7 +485,7 @@ async def run_minus(req: MinusReq) -> dict:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.10"
+BUILD_SEM = "ms_0.11"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
 # ms_0.10: contacts убран — L0 вешает contacts на «купить телефон айфон 16» (товар принят за номер телефона);
@@ -826,6 +827,83 @@ async def run_semantics(req: SemReq) -> dict:
             "raw": {f"{i+1}. {c.get('role', '?')} {c['model']}": c["text"] for i, c in enumerate(calls)}}
 
 
+# ══════════════════════════ ms_0.11: «минус широкий» = семантика + старая цепочка ══════════════════════════
+#
+# Для прода (autopilot.html): одна кнопка → оба модуля параллельно, один список. Слова старой цепочки (finder с
+# поиском → дополнители → фильтры → LLM-1 → цензор) проходят тот же шит по выбранным ключам: старая цепочка о выборе
+# не знает, а минус, стоящий в выбранном ключе, закрыл бы свой показ. Источник у слова: sem / wide / both.
+
+WIDE_CENSOR = "gemini-3.8-flash"   # Andrew 2026-09-13: 3.8 low в обеих цепочках
+
+
+class WideReq(BaseModel):
+    autopilot: dict
+    selected: list[str]
+    region: str = ""                # пусто → из JSON
+    country: str = "ua"
+    language: str = "ru"
+    censor: str = WIDE_CENSOR
+    thinking: str = "low"
+
+
+async def run_wide(req: WideReq) -> dict:
+    t0 = time.perf_counter()
+    ap = req.autopilot
+    cl = ap.get("clusters") or {}
+    region = req.region.strip() or cl.get("region") or (ap.get("_trace") or {}).get("country") or "Украина"
+    sem_req = SemReq(autopilot=ap, selected=req.selected, censor=req.censor, thinking=req.thinking, region=region)
+    old_req = MinusReq(seed=ap.get("seed", ""), region=region, censor=req.censor, relate_model=req.censor,
+                       thinking=req.thinking, country=req.country, language=req.language)
+    sem, old = await asyncio.gather(run_semantics(sem_req), run_minus(old_req))
+
+    sel_toks: list[str] = []
+    for k in req.selected:
+        for t in tokens(k):
+            if t not in sel_toks:
+                sel_toks.append(t)
+    seed_toks = tokens(clean_seed(ap.get("seed", "")))
+
+    merged: dict[str, dict] = {}
+    for x in sem["minus_words"]:
+        merged[x["word"]] = dict(x, source="sem")
+    wide_shielded: list[dict] = []
+    for w in old.get("list", []):
+        wt = tokens(w)
+        hit = next((h for t in wt if (h := _stem_hit(t, sel_toks)) is not None), None)
+        if hit is not None:
+            wide_shielded.append({"word": w, "by": hit})
+            continue
+        if all(_stem_hit(t, seed_toks) is not None for t in wt):   # слово сида — не минус
+            wide_shielded.append({"word": w, "by": "сид"})
+            continue
+        key = " ".join(wt)
+        if key in merged:
+            merged[key]["source"] = "both"
+        else:
+            merged[key] = {"word": key, "keys": [], "source": "wide"}
+    minus_words = list(merged.values())
+
+    ss, os_ = sem["stats"], old["stats"]
+    stats = {
+        "build": BUILD_SEM + "+" + BUILD, "seed": ap.get("seed", ""), "region": region,
+        "censor": req.censor, "thinking": req.thinking,
+        "minus_words": len(minus_words),
+        "from_sem": sum(1 for x in minus_words if x["source"] == "sem"),
+        "from_wide": sum(1 for x in minus_words if x["source"] == "wide"),
+        "both": sum(1 for x in minus_words if x["source"] == "both"),
+        "wide_shielded": len(wide_shielded), "info_phrases": len(sem["info_phrases"]),
+        "cost_sem": ss["total_cost"], "cost_wide": os_["total_cost"],
+        "total_cost": round(ss["total_cost"] + os_["total_cost"], 5),
+        "wall_sem": ss["total_wall"], "wall_wide": os_["total_wall"],
+        "total_wall": round(time.perf_counter() - t0, 2),
+        "sem": ss, "wide": os_,
+    }
+    return {"minus_words": minus_words, "info_phrases": sem["info_phrases"], "wide_shielded": wide_shielded,
+            "sem": {k: v for k, v in sem.items() if k not in ("minus_words", "info_phrases", "stats")},
+            "wide": {k: v for k, v in old.items() if k != "stats"},
+            "stats": stats}
+
+
 # ══════════════════════════ регистрация ══════════════════════════
 
 def register_minus_words_test(app: FastAPI) -> None:
@@ -846,6 +924,14 @@ def register_minus_words_test(app: FastAPI) -> None:
     @app.get("/api/minus-semantics/models")
     async def minus_semantics_models():
         return {"models": list(MODELS), "censor": DEFAULT_CENSOR_SEM, "build": BUILD_SEM}
+
+    @app.post("/api/minus-wide")
+    async def minus_wide_api(req: WideReq):
+        if req.censor not in MODELS:
+            return JSONResponse({"error": f"unknown model: {req.censor}"}, status_code=400)
+        if not req.autopilot.get("keywords"):
+            return JSONResponse({"error": "autopilot JSON без keywords"}, status_code=400)
+        return await run_wide(req)
 
     register_minus_words_test_mem(app)   # старая цепочка на памяти моделей — снова живая
 
