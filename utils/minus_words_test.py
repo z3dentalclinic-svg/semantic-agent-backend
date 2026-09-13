@@ -38,7 +38,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.9"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "ms_0.10"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -497,14 +497,16 @@ def clean_seed(seed: str) -> str:
 # 48/60/72В/электро — валид, для рекламодателя «Yamaha 12В гель» — минус (моделирование на JSON Andrew:
 # рамка от сида пропускала ~40 из ~75 минусов).
 
-BUILD_SEM = "ms_0.9"
+BUILD_SEM = "ms_0.10"
 DEFAULT_CENSOR_SEM = "gemini-3.8-flash"
 # ms_0.2: contacts («где находится») и action («своими руками») тоже фразами — пословно «где» блокировал «где купить»
-INFO_GROUPS = ("info_intent", "contacts", "action")   # группы L0 → фразовый поток
+# ms_0.10: contacts убран — L0 вешает contacts на «купить телефон айфон 16» (товар принят за номер телефона);
+#          «где находится» на АКБ идёт по info_intent. ms_0.9 (откат): INFO_GROUPS = ("info_intent", "contacts", "action")
+INFO_GROUPS = ("info_intent", "action")   # группы L0 → фразовый поток
 # ms_0.3: группа у ключа одна (бренд перебивает контакты → «где находится … хонда» попадал в brand и шёл пословно),
 #         поэтому смотрим ещё сигналы L0 из _l0_trace: инфо-сигнал без commerce → фразы. «Без commerce» обязательно:
 #         у «сколько стоит» сигналы commerce + info_intent, фразовым минусом он быть не должен.
-INFO_SIGNALS = ("info_intent", "contacts", "action")
+INFO_SIGNALS = ("info_intent", "action")   # ms_0.9 (откат): ("info_intent", "contacts", "action")
 COMMERCE_SIGNAL = "commerce"
 # INFO_GROUPS = ("info_intent",)   # ms_0.1
 GEO_GROUPS = ("geo",)
@@ -522,7 +524,11 @@ PRUNE_SEM_PROMPT = (
     "Регион: {region}. Тема: «{seed}».\n"
     "Запросы, по которым рекламодатель решил показываться, — они описывают, что он продаёт, "
     "но это не полный список его запросов:\n{selected}\n\n"
-    "Ниже пронумерованный список слов из других запросов по той же теме — кандидаты в минус-слова.\n"
+    "Ниже нумерованный список кандидатов из других запросов по той же теме: сначала отдельные слова, "
+    "затем фразы — хвосты запросов без темы. Фраза — минус, если запрос с ней целиком нецелевой.\n"
+    # ms_0.9 (откат): "Ниже пронумерованный список слов из других запросов по той же теме — кандидаты в минус-слова.\n"
+    # ms_0.10: фразы инфо-потока тоже судит цензор — на сиде «купить айфон 16» хвост «где» = «где купить айфон 16»,
+    #          клиент; L0 ставит info_intent, а «купить» в сиде для commerce-сигнала невидим (Andrew: «где купить» коммерция)
     "Минус-слово исключает человека, который у этого рекламодателя не купит никогда. "
     "Не клиент: изучает тему или выбирает, ищет другое состояние товара, другой канал покупки, "
     "смежный товар или услугу. "
@@ -532,6 +538,8 @@ PRUNE_SEM_PROMPT = (
     "Бренд товара, которого рекламодатель не продаёт, — минус. Название другого продавца или сети — минус, "
     "только если товар или услуга у каждого продавца свои; если ищут тот же самый товар, который продают многие, "
     "это клиент, сравнивающий цену. "
+    # ms_0.10: после правила продавцов модель признала олх/авито «тем же товаром у другого продавца»
+    "Площадки объявлений и б/у, где продают частники, — другой канал, минус. "
     "То, что слова нет в запросах рекламодателя, само по себе ничего не значит: "
     "уточнение того же товара или услуги (вид груза, вариант, синоним, цена) — клиент.\n"
     "Регион задаётся настройками кампании: города и области в запросах при оценке не учитывай.\n"
@@ -549,7 +557,7 @@ PRUNE_SEM_PROMPT = (
     # на грузоперевозках отвечала номерами слов, которые оставить КЛЮЧАМИ (газель/отзывы/лицензия попали в «не минус»,
     # стоимость/песка/фура — в минуса). Три прогона по этой нише были инвертированы.
     # ms_0.6 (откат): "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров."
-    "Ничего не добавляй. Ответ: только номера слов, которые ты признаёшь МИНУС-словами, через запятую. "
+    "Ничего не добавляй. Ответ: только номера слов и фраз, которые ты признаёшь МИНУСАМИ, через запятую. "
     "Если минус-слов нет — ответь 0. Ничего кроме номеров.\n\n{numbered}"
 )
 
@@ -765,12 +773,18 @@ async def run_semantics(req: SemReq) -> dict:
     cand = s["candidates"]
     words = list(cand)
 
+    phr = s["phrases"]
+    phrases = list(phr)
     removed: list[dict] = []
+    removed_phr: list[dict] = []
     calls: list[dict] = []
     prompt = ""
-    if req.run_censor and words:
+    if req.run_censor and (words or phrases):
         # ms_0.4: слово — пример запроса (число запросов); ms_0.3 (откат): f"{i+1}. {w}"
-        numbered = "\n".join(f"{i+1}. {w} — {cand[w][0]} ({len(cand[w])})" for i, w in enumerate(words))
+        # ms_0.10: одна нумерация — слова 1..N, фразы N+1..N+M; без цензора фразы остаются минусами кодом, как раньше
+        items = [(w, cand[w][0], len(cand[w])) for w in words] + [(f"«{p}»", phr[p][0], len(phr[p])) for p in phrases]
+        numbered = "\n".join(f"{i+1}. {w} — {ex} ({n})" for i, (w, ex, n) in enumerate(items))
+        n_words = len(words)
         prompt = PRUNE_SEM_PROMPT.format(region=region or "не указан", seed=seed,
                                          selected="\n".join(s["selected"]) or "(пусто)", numbered=numbered)
         cz = await call_model(req.censor, prompt, search=False, thinking=req.thinking)
@@ -778,13 +792,15 @@ async def run_semantics(req: SemReq) -> dict:
         calls.append(cz)
         # ms_0.7: ответ — номера МИНУС-слов; «0» или нечисловой ответ → минусов от цензора нет (кандидаты в основном
         # валид, fail-open «всё минус» из mw_1.3 здесь на неправильной стороне), ошибка в отчёте только при мусоре
-        keep = parse_keep(cz["text"], len(words))
+        keep = parse_keep(cz["text"], len(items))
         if keep is None:
             keep = set()
             if not re.fullmatch(r"\s*0\s*\.?\s*", cz["text"] or ""):
                 cz["error"] = (cz["error"] or "") + " | parse fail → nothing minused"
         removed = [{"word": w, "keys": cand[w]} for i, w in enumerate(words) if (i + 1) not in keep]
         words = [w for i, w in enumerate(words) if (i + 1) in keep]
+        removed_phr = [{"phrase": p, "keys": phr[p]} for i, p in enumerate(phrases) if (n_words + i + 1) not in keep]
+        phrases = [p for i, p in enumerate(phrases) if (n_words + i + 1) in keep]
 
     minus_words = [{"word": x["word"], "keys": x["keys"], "source": "spec", "unit": x["unit"]} for x in s["spec"]] \
                 + [{"word": w, "keys": cand[w], "source": "censor"} for w in words]
@@ -801,7 +817,7 @@ async def run_semantics(req: SemReq) -> dict:
             others |= kt
         if others:
             x["covered_by"] = sorted(others)
-    info_phrases = [{"phrase": p, "keys": ks} for p, ks in s["phrases"].items()]
+    info_phrases = [{"phrase": p, "keys": phr[p]} for p in phrases]
     stats = {
         "build": BUILD_SEM, "seed": seed, "region": region,
         "censor": req.censor if req.run_censor else None, "thinking": req.thinking,
@@ -811,12 +827,13 @@ async def run_semantics(req: SemReq) -> dict:
         "shielded": len(s["shielded"]), "no_minus": len(s["no_minus"]),
         "spec_minus": len(s["spec"]), "sel_specs": s["sel_specs"], "units": s["units"],
         "minus_words": len(minus_words), "removed_by_censor": len(removed),
+        "phrases_candidates": len(phr), "phrases_removed": len(removed_phr),
         "covered": sum(1 for x in minus_words if x.get("covered_by")),
         "total_cost": round(sum(c["cost"] for c in calls), 5),
         "total_wall": round(time.perf_counter() - t0, 2),
         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
     }
-    return {"minus_words": minus_words, "info_phrases": info_phrases, "removed": removed,
+    return {"minus_words": minus_words, "info_phrases": info_phrases, "removed": removed, "removed_phrases": removed_phr,
             "shielded": s["shielded"], "geo": s["geo"], "no_minus": s["no_minus"],
             "stats": stats, "prompt": prompt,
             "raw": {f"{i+1}. {c.get('role', '?')} {c['model']}": c["text"] for i, c in enumerate(calls)}}
