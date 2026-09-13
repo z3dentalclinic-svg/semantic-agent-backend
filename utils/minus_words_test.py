@@ -3,7 +3,7 @@ minus_words_test.py — стенд минус-слов. build: ms_0.1 (мину�
 
 ms_0.1 — вход: готовый autopilot JSON + ключи, ВЫБРАННЫЕ человеком для рекламы; из остатка кодом три потока
   (geo — выброс, info_intent — фразовые минуса, остальное — пословно → шит словами выбранных → цензор PRUNE_SEM).
-  Полный пайплайн не гоняется. Старая цепочка на памяти моделей (mw_1.3) закомментирована с меткой [MEM-MODE mw_1.3].
+  Полный пайплайн не гоняется. Старая цепочка на памяти моделей (mw_1.3) живёт рядом: /minus-test, /api/minus-test.
   Эндпоинты: GET /minus-semantics (minus_semantics.html рядом), POST /api/minus-semantics, GET /api/minus-semantics/models
 
 [MEM-MODE mw_1.3] ниже — описание старой цепочки:
@@ -20,7 +20,8 @@ ms_0.1 — вход: готовый autopilot JSON + ключи, ВЫБРАНН�
     register_minus_words_test(app)
 
 Эндпоинты:
-    [MEM-MODE mw_1.3] GET /minus-test, POST /api/minus-test — выключены в ms_0.1
+    GET  /minus-test          — HTML стенд (файл minus_test.html рядом)
+    POST /api/minus-test      — {"seed", "region", "finder", "extenders": [..], "thinking"}
 
 Ключи из окружения: GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY
 """
@@ -38,7 +39,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ms_0.10"   # [MEM-MODE mw_1.3] было: BUILD = "mw_1.3"
+BUILD = "mw_1.3"   # старый стенд; новая схема — BUILD_SEM
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out); поправь под актуальный прайс ───
 MODELS: dict[str, dict] = {
@@ -68,50 +69,46 @@ def region_code(region: str) -> str | None:
         return r.upper()
     return REGION_CODES.get(r)
 
-# ┌── [MEM-MODE mw_1.3] дефолты finder/extenders/censor — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# DEFAULT_FINDER = "gemini-3.7-flash"  # Luna «искал» без источников (0.7); Gemini 3.7 реально открывал страницы (0.4)
-# DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-luna"]  # порядок = порядок цепочки
-# DEFAULT_CENSOR = "gemini-3.7-flash"
-# └── [MEM-MODE mw_1.3] конец: дефолты finder/extenders/censor ──
-DEFAULT_CENSOR = "gemini-3.8-flash"   # ms_0.1: было gemini-3.7-flash
+DEFAULT_FINDER = "gemini-3.7-flash"  # Luna «искал» без источников (0.7); Gemini 3.7 реально открывал страницы (0.4)
+DEFAULT_EXTENDERS = ["gemini-3.7-flash", "claude-sonnet-4-6", "gpt-5.6-luna"]  # порядок = порядок цепочки
+DEFAULT_CENSOR = "gemini-3.7-flash"   # старый стенд, как было; новая схема — DEFAULT_CENSOR_SEM
+# DEFAULT_CENSOR = "gemini-3.8-flash"   # ms_0.1 – ms_0.10, пока старая цепочка была закомментирована
 
-# ┌── [MEM-MODE mw_1.3] промпты FINDER/EXTENDER/RELATE/PRUNE — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# # ─── промпты mw_0.7: широкая генерация (как в 0.5) + цензор (PRUNE из 0.6) ───
-# FINDER_PROMPT = (
-#     "Найди пожалуйста самый полный список минус слов для рекламы Google Ads для этого сида: «{seed}». "
-#     "Регион: {region}.\n"
-#     "Сделай один поиск в интернете и собери слова из найденных опубликованных списков. "
-#     "Ничего не придумывай сам: если слова нет в найденных источниках, не пиши его.\n"
-#     "Ответ: одно минус-слово на строку, без нумерации и пояснений."
-# )
-# EXTENDER_PROMPT = (
-#     "Вот список минус слов:\n{found}\n\n"
-#     "Вот сид: «{seed}»\nВот регион поиска: {region}\n"
-#     "Дополни этот список недостающими минус словами.\n"
-#     "Ответ: только новые слова, одно на строку, без нумерации и пояснений."
-# )
-# # mw_1.3: вопрос LLM-1 сменён с «уточнение/расширение» на реальную встречаемость запроса —
-# #         старый вопрос терял реальные минуса (симптомы/причины/фото/бесплатно), они не «уточняют» сид
-# RELATE_PROMPT = (
-#     "Сид: «{seed}». Регион: {region}.\n"
-#     "Ниже пронумерованный список слов. Для каждого слова ответь на вопрос: "
-#     "люди реально набирают в поиске запрос, в котором есть этот сид (или его часть) и это слово?\n"
-#     "Ответ: номера слов, для которых ДА, через запятую. Ничего кроме номеров.\n\n{numbered}"
-# )
-# # mw_1.1: определение клиента (разбор 28 ложных срезов Andrew → 4 типа, корень один — «клиент» читался как «в теме»).
-# #         Формулировка коммерческая; для инфо-сидов Andrew ожидает другую историю — пока так.
-# PRUNE_PROMPT = (
-#     "Регион: {region}. Фраза: «{seed}».\n"
-#     "Ниже пронумерованный список слов-кандидатов в минус-слова для рекламы по этой фразе.\n"
-#     "Клиент — человек, который прямо сейчас покупает новый товар или заказывает услугу по сиду у этого "
-#     "рекламодателя. Не клиент: изучает тему или выбирает, ищет другое состояние товара, другой канал покупки, "
-#     "смежный товар или услугу.\n"
-#     "Проверь каждое слово: запрос «{seed} + слово» реально набирают, и человек в нём — не клиент. "
-#     "Слово, уточняющее или выбирающее тот же новый товар или услугу у этого рекламодателя, не подходит.\n"
-#     "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
-# )
-# # GEN_PROMPT из 0.6 (узкий генератор) снят — точность без широты; см. git-историю для отката
-# └── [MEM-MODE mw_1.3] конец: промпты FINDER/EXTENDER/RELATE/PRUNE ──
+# ─── промпты mw_0.7: широкая генерация (как в 0.5) + цензор (PRUNE из 0.6) ───
+FINDER_PROMPT = (
+    "Найди пожалуйста самый полный список минус слов для рекламы Google Ads для этого сида: «{seed}». "
+    "Регион: {region}.\n"
+    "Сделай один поиск в интернете и собери слова из найденных опубликованных списков. "
+    "Ничего не придумывай сам: если слова нет в найденных источниках, не пиши его.\n"
+    "Ответ: одно минус-слово на строку, без нумерации и пояснений."
+)
+EXTENDER_PROMPT = (
+    "Вот список минус слов:\n{found}\n\n"
+    "Вот сид: «{seed}»\nВот регион поиска: {region}\n"
+    "Дополни этот список недостающими минус словами.\n"
+    "Ответ: только новые слова, одно на строку, без нумерации и пояснений."
+)
+# mw_1.3: вопрос LLM-1 сменён с «уточнение/расширение» на реальную встречаемость запроса —
+#         старый вопрос терял реальные минуса (симптомы/причины/фото/бесплатно), они не «уточняют» сид
+RELATE_PROMPT = (
+    "Сид: «{seed}». Регион: {region}.\n"
+    "Ниже пронумерованный список слов. Для каждого слова ответь на вопрос: "
+    "люди реально набирают в поиске запрос, в котором есть этот сид (или его часть) и это слово?\n"
+    "Ответ: номера слов, для которых ДА, через запятую. Ничего кроме номеров.\n\n{numbered}"
+)
+# mw_1.1: определение клиента (разбор 28 ложных срезов Andrew → 4 типа, корень один — «клиент» читался как «в теме»).
+#         Формулировка коммерческая; для инфо-сидов Andrew ожидает другую историю — пока так.
+PRUNE_PROMPT = (
+    "Регион: {region}. Фраза: «{seed}».\n"
+    "Ниже пронумерованный список слов-кандидатов в минус-слова для рекламы по этой фразе.\n"
+    "Клиент — человек, который прямо сейчас покупает новый товар или заказывает услугу по сиду у этого "
+    "рекламодателя. Не клиент: изучает тему или выбирает, ищет другое состояние товара, другой канал покупки, "
+    "смежный товар или услугу.\n"
+    "Проверь каждое слово: запрос «{seed} + слово» реально набирают, и человек в нём — не клиент. "
+    "Слово, уточняющее или выбирающее тот же новый товар или услугу у этого рекламодателя, не подходит.\n"
+    "Ничего не добавляй. Ответ: номера слов, которые ОСТАВИТЬ, через запятую. Ничего кроме номеров.\n\n{numbered}"
+)
+# GEN_PROMPT из 0.6 (узкий генератор) снят — точность без широты; см. git-историю для отката
 
 
 # ══════════════════════════ вызовы вендоров ══════════════════════════
@@ -263,22 +260,20 @@ async def call_model(model: str, prompt: str, *, search: bool, thinking: str, co
 
 # ══════════════════════════ разбор и слияние ══════════════════════════
 
-# ┌── [MEM-MODE mw_1.3] parse_list (разбор списков генератора) — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# _STRIP = re.compile(r"^[\s\-\*\•\d\.\)\]]+|[\s\-\*\•]+$")
-#
-#
-# def parse_list(text: str) -> list[str]:
-#     out, seen = [], set()
-#     for line in text.splitlines():
-#         w = _STRIP.sub("", line).strip().strip('"«»').lower()
-#         if not w or len(w) > 60 or ":" in w and len(w.split()) > 4:
-#             continue
-#         w = re.sub(r"\s+", " ", w)
-#         if w not in seen:
-#             seen.add(w)
-#             out.append(w)
-#     return out
-# └── [MEM-MODE mw_1.3] конец: parse_list (разбор списков генератора) ──
+_STRIP = re.compile(r"^[\s\-\*\•\d\.\)\]]+|[\s\-\*\•]+$")
+
+
+def parse_list(text: str) -> list[str]:
+    out, seen = [], set()
+    for line in text.splitlines():
+        w = _STRIP.sub("", line).strip().strip('"«»').lower()
+        if not w or len(w) > 60 or ":" in w and len(w.split()) > 4:
+            continue
+        w = re.sub(r"\s+", " ", w)
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
 
 
 _NUMS = re.compile(r"\d+")
@@ -293,84 +288,78 @@ def parse_keep(text: str, n: int) -> set[int] | None:
     return nums
 
 
-# ┌── [MEM-MODE mw_1.3] merge (слияние стадий генератора) — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# def merge(stages: list[tuple[str, list[str]]]) -> list[dict]:
-#     """stages: [(model, слова, которые эта модель ДОБАВИЛА)] в порядке цепочки"""
-#     rows, seen = [], set()
-#     for i, (model, ws) in enumerate(stages):
-#         for w in ws:
-#             if w in seen:
-#                 continue
-#             seen.add(w)
-#             rows.append({"word": w, "stage": i + 1, "by": model})
-#     return rows
-# └── [MEM-MODE mw_1.3] конец: merge (слияние стадий генератора) ──
+def merge(stages: list[tuple[str, list[str]]]) -> list[dict]:
+    """stages: [(model, слова, которые эта модель ДОБАВИЛА)] в порядке цепочки"""
+    rows, seen = [], set()
+    for i, (model, ws) in enumerate(stages):
+        for w in ws:
+            if w in seen:
+                continue
+            seen.add(w)
+            rows.append({"word": w, "stage": i + 1, "by": model})
+    return rows
 
 
-# ┌── [MEM-MODE mw_1.3] run_parser_filters (бесплатные фильтры над «сид + слово») — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# # ══════════════════════════ фильтры парсера (без LLM) над фразами «сид + слово» ══════════════════════════
-#
-# def run_parser_filters(words: list[str], seed: str, country: str, language: str, filters: str) -> dict:
-#     """Синхронно: main.apply_filters_traced над фразами. Возвращает раскладку по словам."""
-#     import main as _main                                     # lazy: main импортирует этот модуль
-#
-#     def norm(t: str) -> str:
-#         return re.sub(r"\s+", " ", str(t).lower()).strip()
-#
-#     phrases = {norm(f"{seed} {w}"): w for w in words}
-#     result = {"seed": seed, "method": "minus-test", "keywords": list(phrases), "anchors": [],
-#               "count": len(phrases), "anchors_count": 0}
-#     l2_config = _main._build_l2_config(None, None, None)
-#     result = _main.apply_filters_traced(result, seed=seed, country=country, method="minus-test",
-#                                         language=language, enabled_filters=filters, l2_config=l2_config)
-#
-#     def _kw(k):  # ключ может быть str или {"query": ...}
-#         return norm(k if isinstance(k, str) else k.get("query", ""))
-#
-#     valid = [phrases[_kw(k)] for k in result.get("keywords", []) if _kw(k) in phrases]
-#     grey = [phrases[_kw(k)] for k in result.get("keywords_grey", []) if _kw(k) in phrases]
-#     blocked = (result.get("_trace") or {}).get("blocked_keywords", {}) or {}
-#     trash: list[dict] = []
-#     seen = set(valid) | set(grey)
-#     for ph, info in blocked.items():
-#         w = phrases.get(norm(ph))
-#         if w and w not in seen:
-#             seen.add(w)
-#             trash.append({"word": w, "by": info.get("blocked_by", "?"), "reason": info.get("reason", "")})
-#     for a in result.get("anchors", []):                     # то, что не попало в blocked_keywords трейсера
-#         ph = a if isinstance(a, str) else a.get("query", a.get("keyword", ""))
-#         w = phrases.get(norm(ph))
-#         if w and w not in seen:
-#             seen.add(w)
-#             trash.append({"word": w, "by": (a.get("anchor_reason", "anchor") if isinstance(a, dict) else "anchor"), "reason": ""})
-#     for w in words:                                         # на всякий случай — ничего не терять
-#         if w not in seen:
-#             trash.append({"word": w, "by": "unknown", "reason": "не найдено ни в одном ведре"})
-#     by_filter: dict[str, int] = {}
-#     for t in trash:
-#         by_filter[t["by"]] = by_filter.get(t["by"], 0) + 1
-#     return {"valid": valid, "grey": grey, "trash": trash, "by_filter": by_filter,
-#             "timings": result.get("_filter_timings", {})}
-# └── [MEM-MODE mw_1.3] конец: run_parser_filters (бесплатные фильтры над «сид + слово») ──
+# ══════════════════════════ фильтры парсера (без LLM) над фразами «сид + слово» ══════════════════════════
+
+def run_parser_filters(words: list[str], seed: str, country: str, language: str, filters: str) -> dict:
+    """Синхронно: main.apply_filters_traced над фразами. Возвращает раскладку по словам."""
+    import main as _main                                     # lazy: main импортирует этот модуль
+
+    def norm(t: str) -> str:
+        return re.sub(r"\s+", " ", str(t).lower()).strip()
+
+    phrases = {norm(f"{seed} {w}"): w for w in words}
+    result = {"seed": seed, "method": "minus-test", "keywords": list(phrases), "anchors": [],
+              "count": len(phrases), "anchors_count": 0}
+    l2_config = _main._build_l2_config(None, None, None)
+    result = _main.apply_filters_traced(result, seed=seed, country=country, method="minus-test",
+                                        language=language, enabled_filters=filters, l2_config=l2_config)
+
+    def _kw(k):  # ключ может быть str или {"query": ...}
+        return norm(k if isinstance(k, str) else k.get("query", ""))
+
+    valid = [phrases[_kw(k)] for k in result.get("keywords", []) if _kw(k) in phrases]
+    grey = [phrases[_kw(k)] for k in result.get("keywords_grey", []) if _kw(k) in phrases]
+    blocked = (result.get("_trace") or {}).get("blocked_keywords", {}) or {}
+    trash: list[dict] = []
+    seen = set(valid) | set(grey)
+    for ph, info in blocked.items():
+        w = phrases.get(norm(ph))
+        if w and w not in seen:
+            seen.add(w)
+            trash.append({"word": w, "by": info.get("blocked_by", "?"), "reason": info.get("reason", "")})
+    for a in result.get("anchors", []):                     # то, что не попало в blocked_keywords трейсера
+        ph = a if isinstance(a, str) else a.get("query", a.get("keyword", ""))
+        w = phrases.get(norm(ph))
+        if w and w not in seen:
+            seen.add(w)
+            trash.append({"word": w, "by": (a.get("anchor_reason", "anchor") if isinstance(a, dict) else "anchor"), "reason": ""})
+    for w in words:                                         # на всякий случай — ничего не терять
+        if w not in seen:
+            trash.append({"word": w, "by": "unknown", "reason": "не найдено ни в одном ведре"})
+    by_filter: dict[str, int] = {}
+    for t in trash:
+        by_filter[t["by"]] = by_filter.get(t["by"], 0) + 1
+    return {"valid": valid, "grey": grey, "trash": trash, "by_filter": by_filter,
+            "timings": result.get("_filter_timings", {})}
 
 
 # ══════════════════════════ конвейер ══════════════════════════
 
-# ┌── [MEM-MODE mw_1.3] MinusReq (запрос старого стенда) — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# class MinusReq(BaseModel):
-#     seed: str
-#     region: str = "Украина"
-#     finder: str = DEFAULT_FINDER
-#     extenders: list[str] = DEFAULT_EXTENDERS
-#     censor: str = DEFAULT_CENSOR
-#     thinking: str = "low"          # off | low | medium | high
-#     filters: str = "pre,geo,bpf,l0,l15v2,l2"   # бесплатные фильтры парсера над фразами «сид + слово»; "" = выкл
-#     country: str = "ua"
-#     language: str = "ru"
-#     run_relate: bool = True        # LLM-1: слово — уточнение/расширение сида? нет → мусор
-#     relate_model: str = DEFAULT_CENSOR
-#     run_censor: bool = True        # LLM-2: среди уточнений — что минус (PRUNE)
-# └── [MEM-MODE mw_1.3] конец: MinusReq (запрос старого стенда) ──
+class MinusReq(BaseModel):
+    seed: str
+    region: str = "Украина"
+    finder: str = DEFAULT_FINDER
+    extenders: list[str] = DEFAULT_EXTENDERS
+    censor: str = DEFAULT_CENSOR
+    thinking: str = "low"          # off | low | medium | high
+    filters: str = "pre,geo,bpf,l0,l15v2,l2"   # бесплатные фильтры парсера над фразами «сид + слово»; "" = выкл
+    country: str = "ua"
+    language: str = "ru"
+    run_relate: bool = True        # LLM-1: слово — уточнение/расширение сида? нет → мусор
+    relate_model: str = DEFAULT_CENSOR
+    run_censor: bool = True        # LLM-2: среди уточнений — что минус (PRUNE)
 
 
 _SEED_JUNK = re.compile(r"^[\s\d\.\)\-•*]+")
@@ -381,106 +370,104 @@ def clean_seed(seed: str) -> str:
     return re.sub(r"\s+", " ", _SEED_JUNK.sub("", seed)).strip()
 
 
-# ┌── [MEM-MODE mw_1.3] run_minus (конвейер finder → дополнители → фильтры → LLM-1 → цензор) — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# async def run_minus(req: MinusReq) -> dict:
-#     t0 = time.perf_counter()
-#     seed = clean_seed(req.seed)
-#
-#     # 1. finder — единственный вызов с поиском (принудительный у OpenAI, страна из региона)
-#     finder = await call_model(req.finder, FINDER_PROMPT.format(seed=seed, region=req.region),
-#                               search=True, thinking=req.thinking, country=region_code(req.region))
-#     finder["role"] = "finder"
-#     current = parse_list(finder["text"])
-#     stages: list[tuple[str, list[str]]] = [(finder["model"], list(current))]
-#     calls = [finder]
-#
-#     # 2-4. цепочка «дополни»: каждый получает список, дополненный предыдущим
-#     for m in req.extenders:
-#         prompt = EXTENDER_PROMPT.format(found="\n".join(current) or "(пусто)", seed=seed, region=req.region)
-#         r = await call_model(m, prompt, search=False, thinking=req.thinking)
-#         r["role"] = "extend"
-#         calls.append(r)
-#         added = [w for w in parse_list(r["text"]) if w not in set(current)]
-#         stages.append((m, added))
-#         current = current + added
-#     before_filters = list(current)
-#
-#     # 5. бесплатные фильтры парсера над фразами «сид + слово»
-#     filt: dict = {"valid": current, "grey": [], "trash": [], "by_filter": {}, "timings": {}, "error": None}
-#     if req.filters.strip():
-#         t1 = time.perf_counter()
-#         try:
-#             filt = await asyncio.to_thread(run_parser_filters, current, seed, req.country, req.language, req.filters)
-#             filt["error"] = None
-#         except Exception as e:  # noqa: BLE001
-#             filt["error"] = f"{type(e).__name__}: {e}"
-#         filt["wall"] = round(time.perf_counter() - t1, 2)
-#         mapped = filt["valid"] + filt["grey"]
-#         unknown_all = filt["trash"] and all(t["by"] == "unknown" for t in filt["trash"]) and not mapped
-#         if unknown_all:                                   # сопоставление фраза→слово не сработало → fail-open
-#             filt["error"] = (filt.get("error") or "") + " | mapping fail → list untouched"
-#             filt["trash"], filt["by_filter"] = [], {}
-#             filt["valid"] = list(current)
-#         else:
-#             current = mapped                              # в цензор/итог идёт всё, что не TRASH
-#
-#     # 6. LLM-1 — «уточнение/расширение сида?»: нет → мусор
-#     unrelated: list[dict] = []
-#     if req.run_relate and current:
-#         numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
-#         rl = await call_model(req.relate_model, RELATE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
-#                               search=False, thinking=req.thinking)
-#         rl["role"] = "relate"
-#         calls.append(rl)
-#         keep = parse_keep(rl["text"], len(current))
-#         if keep is None:
-#             rl["error"] = (rl["error"] or "") + " | parse fail → list untouched"
-#         else:
-#             unrelated = [{"word": w, "by": rl["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
-#             current = [w for i, w in enumerate(current) if (i + 1) in keep]
-#     after_relate = list(current)
-#
-#     # 7. LLM-2 — цензор среди уточнений: что минус (только удаление)
-#     removed: list[dict] = []
-#     if req.run_censor and current:
-#         numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
-#         cz = await call_model(req.censor, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
-#                               search=False, thinking=req.thinking)
-#         cz["role"] = "censor"
-#         calls.append(cz)
-#         keep = parse_keep(cz["text"], len(current))
-#         if keep is None:                          # fail-open
-#             cz["error"] = (cz["error"] or "") + " | parse fail → list untouched"
-#         else:
-#             removed = [{"word": w, "by": cz["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
-#             current = [w for i, w in enumerate(current) if (i + 1) in keep]
-#
-#     origin = {w: (m, i + 1) for i, (m, ws) in enumerate(stages) for w in ws}
-#     rows = [{"word": w, "stage": origin[w][1], "by": origin[w][0]} for w in current]
-#     stats = {
-#         "build": BUILD,
-#         "seed": seed, "region": req.region, "thinking": req.thinking,
-#         "total_cost": round(sum(c["cost"] for c in calls), 5),
-#         "total_wall": round(time.perf_counter() - t0, 2),
-#         "finder_count": len(stages[0][1]),
-#         "added_by_stage": {m: len(ws) for m, ws in stages[1:]},
-#         "before_filters": len(before_filters),
-#         "filters": {"valid": len(filt["valid"]), "grey": len(filt["grey"]), "trash": len(filt["trash"]),
-#                     "by_filter": filt["by_filter"], "wall": filt.get("wall"), "error": filt.get("error"),
-#                     "timings": filt.get("timings", {})},
-#         "unrelated_by_llm1": len(unrelated),
-#         "after_relate": len(after_relate),
-#         "removed_by_censor": len(removed),
-#         "final_count": len(current),
-#         "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
-#     }
-#     grey_set = set(filt["grey"])
-#     for r in rows:
-#         r["bucket"] = "grey" if r["word"] in grey_set else "valid"
-#     return {"rows": rows, "list": current, "removed": removed, "unrelated": unrelated, "trash": filt["trash"],
-#             "stats": stats,
-#             "raw": {f"{i+1}. {c.get('role', 'gen')} {c['model']}": c["text"] for i, c in enumerate(calls)}}
-# └── [MEM-MODE mw_1.3] конец: run_minus (конвейер finder → дополнители → фильтры → LLM-1 → цензор) ──
+async def run_minus(req: MinusReq) -> dict:
+    t0 = time.perf_counter()
+    seed = clean_seed(req.seed)
+
+    # 1. finder — единственный вызов с поиском (принудительный у OpenAI, страна из региона)
+    finder = await call_model(req.finder, FINDER_PROMPT.format(seed=seed, region=req.region),
+                              search=True, thinking=req.thinking, country=region_code(req.region))
+    finder["role"] = "finder"
+    current = parse_list(finder["text"])
+    stages: list[tuple[str, list[str]]] = [(finder["model"], list(current))]
+    calls = [finder]
+
+    # 2-4. цепочка «дополни»: каждый получает список, дополненный предыдущим
+    for m in req.extenders:
+        prompt = EXTENDER_PROMPT.format(found="\n".join(current) or "(пусто)", seed=seed, region=req.region)
+        r = await call_model(m, prompt, search=False, thinking=req.thinking)
+        r["role"] = "extend"
+        calls.append(r)
+        added = [w for w in parse_list(r["text"]) if w not in set(current)]
+        stages.append((m, added))
+        current = current + added
+    before_filters = list(current)
+
+    # 5. бесплатные фильтры парсера над фразами «сид + слово»
+    filt: dict = {"valid": current, "grey": [], "trash": [], "by_filter": {}, "timings": {}, "error": None}
+    if req.filters.strip():
+        t1 = time.perf_counter()
+        try:
+            filt = await asyncio.to_thread(run_parser_filters, current, seed, req.country, req.language, req.filters)
+            filt["error"] = None
+        except Exception as e:  # noqa: BLE001
+            filt["error"] = f"{type(e).__name__}: {e}"
+        filt["wall"] = round(time.perf_counter() - t1, 2)
+        mapped = filt["valid"] + filt["grey"]
+        unknown_all = filt["trash"] and all(t["by"] == "unknown" for t in filt["trash"]) and not mapped
+        if unknown_all:                                   # сопоставление фраза→слово не сработало → fail-open
+            filt["error"] = (filt.get("error") or "") + " | mapping fail → list untouched"
+            filt["trash"], filt["by_filter"] = [], {}
+            filt["valid"] = list(current)
+        else:
+            current = mapped                              # в цензор/итог идёт всё, что не TRASH
+
+    # 6. LLM-1 — «уточнение/расширение сида?»: нет → мусор
+    unrelated: list[dict] = []
+    if req.run_relate and current:
+        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
+        rl = await call_model(req.relate_model, RELATE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
+                              search=False, thinking=req.thinking)
+        rl["role"] = "relate"
+        calls.append(rl)
+        keep = parse_keep(rl["text"], len(current))
+        if keep is None:
+            rl["error"] = (rl["error"] or "") + " | parse fail → list untouched"
+        else:
+            unrelated = [{"word": w, "by": rl["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
+            current = [w for i, w in enumerate(current) if (i + 1) in keep]
+    after_relate = list(current)
+
+    # 7. LLM-2 — цензор среди уточнений: что минус (только удаление)
+    removed: list[dict] = []
+    if req.run_censor and current:
+        numbered = "\n".join(f"{i+1}. {w}" for i, w in enumerate(current))
+        cz = await call_model(req.censor, PRUNE_PROMPT.format(seed=seed, region=req.region, numbered=numbered),
+                              search=False, thinking=req.thinking)
+        cz["role"] = "censor"
+        calls.append(cz)
+        keep = parse_keep(cz["text"], len(current))
+        if keep is None:                          # fail-open
+            cz["error"] = (cz["error"] or "") + " | parse fail → list untouched"
+        else:
+            removed = [{"word": w, "by": cz["model"]} for i, w in enumerate(current) if (i + 1) not in keep]
+            current = [w for i, w in enumerate(current) if (i + 1) in keep]
+
+    origin = {w: (m, i + 1) for i, (m, ws) in enumerate(stages) for w in ws}
+    rows = [{"word": w, "stage": origin[w][1], "by": origin[w][0]} for w in current]
+    stats = {
+        "build": BUILD,
+        "seed": seed, "region": req.region, "thinking": req.thinking,
+        "total_cost": round(sum(c["cost"] for c in calls), 5),
+        "total_wall": round(time.perf_counter() - t0, 2),
+        "finder_count": len(stages[0][1]),
+        "added_by_stage": {m: len(ws) for m, ws in stages[1:]},
+        "before_filters": len(before_filters),
+        "filters": {"valid": len(filt["valid"]), "grey": len(filt["grey"]), "trash": len(filt["trash"]),
+                    "by_filter": filt["by_filter"], "wall": filt.get("wall"), "error": filt.get("error"),
+                    "timings": filt.get("timings", {})},
+        "unrelated_by_llm1": len(unrelated),
+        "after_relate": len(after_relate),
+        "removed_by_censor": len(removed),
+        "final_count": len(current),
+        "calls": [{k: v for k, v in c.items() if k != "text"} for c in calls],
+    }
+    grey_set = set(filt["grey"])
+    for r in rows:
+        r["bucket"] = "grey" if r["word"] in grey_set else "valid"
+    return {"rows": rows, "list": current, "removed": removed, "unrelated": unrelated, "trash": filt["trash"],
+            "stats": stats,
+            "raw": {f"{i+1}. {c.get('role', 'gen')} {c['model']}": c["text"] for i, c in enumerate(calls)}}
 
 
 # ══════════════════════════ ms_0.1: минуса из своей семантики ══════════════════════════
@@ -860,24 +847,25 @@ def register_minus_words_test(app: FastAPI) -> None:
     async def minus_semantics_models():
         return {"models": list(MODELS), "censor": DEFAULT_CENSOR_SEM, "build": BUILD_SEM}
 
+    register_minus_words_test_mem(app)   # старая цепочка на памяти моделей — снова живая
 
-# ┌── [MEM-MODE mw_1.3] register_minus_words_test (старые роуты /minus-test, /api/minus-test) — закомментировано в ms_0.1 (готовая цепочка на памяти моделей, совместить позже) ──
-# def register_minus_words_test(app: FastAPI) -> None:
-#     html_path = Path(__file__).with_name("minus_test.html")
-#
-#     @app.get("/minus-test", response_class=HTMLResponse)
-#     async def minus_page():
-#         return html_path.read_text(encoding="utf-8")
-#
-#     @app.post("/api/minus-test")
-#     async def minus_api(req: MinusReq):
-#         unknown = [m for m in [req.finder, *req.extenders, req.censor] if m not in MODELS]
-#         if unknown:
-#             return JSONResponse({"error": f"unknown models: {unknown}"}, status_code=400)
-#         return await run_minus(req)
-#
-#     @app.get("/api/minus-test/models")
-#     async def minus_models():
-#         return {"models": list(MODELS), "finder": DEFAULT_FINDER, "extenders": DEFAULT_EXTENDERS,
-#                 "censor": DEFAULT_CENSOR, "build": BUILD}
-# └── [MEM-MODE mw_1.3] конец: register_minus_words_test (старые роуты /minus-test, /api/minus-test) ──
+
+def register_minus_words_test_mem(app: FastAPI) -> None:
+    """[MEM-MODE mw_1.3] старые роуты /minus-test, /api/minus-test — вызывается из register_minus_words_test"""
+    html_path = Path(__file__).with_name("minus_test.html")
+
+    @app.get("/minus-test", response_class=HTMLResponse)
+    async def minus_page():
+        return html_path.read_text(encoding="utf-8")
+
+    @app.post("/api/minus-test")
+    async def minus_api(req: MinusReq):
+        unknown = [m for m in [req.finder, *req.extenders, req.censor] if m not in MODELS]
+        if unknown:
+            return JSONResponse({"error": f"unknown models: {unknown}"}, status_code=400)
+        return await run_minus(req)
+
+    @app.get("/api/minus-test/models")
+    async def minus_models():
+        return {"models": list(MODELS), "finder": DEFAULT_FINDER, "extenders": DEFAULT_EXTENDERS,
+                "censor": DEFAULT_CENSOR, "build": BUILD}
