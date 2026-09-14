@@ -129,6 +129,10 @@ except ImportError:
     from minus_words_test import register_minus_words_test          # файл в корне
 register_minus_words_test(app)
 
+# --- Карта интентов (im_0.1): конвейер Gemini → Claude → GPT по VALID, /api/intent-map. Модуль самодостаточен. ---
+from utils.intent_map import router as intent_map_router
+app.include_router(intent_map_router)
+
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
 #     """
