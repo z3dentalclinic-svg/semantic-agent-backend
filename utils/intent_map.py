@@ -17,6 +17,12 @@ im_0.2 — стадия A (Andrew, 2026-09-14): унифицированный �
   в той же JSON-структуре, код сливает. Ошибка/непарс прохода не роняет цепочку.
   Промпты не содержат слов ниши — ниша заполняет абстракции сама (правило «алгоритм, не списки»).
 
+im_0.3 (Andrew, 2026-09-14): один язык (из формы), размножение только по каноническому имени варианта
+  (написания не размножаются), реальные ключи VALID раскладываются моделью по под-группам (номера),
+  якорь предмета + верификатор: шаблон без слова предмета в группе без ключей → бинарный вопрос
+  gemini-lite ×3 (большинство), 0 → строка удаляется молча (без блока аудита — решение принимает модуль).
+  Написания — только формы имени; коды/версии/комплектации — признаки. Потолок размножения → предупреждение.
+
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
 Модуль самодостаточен: свой реестр моделей и свои вызовы вендоров (НЕ импортирует minus_words_test —
@@ -24,6 +30,7 @@ im_0.1 — плоский формат «интент | примеры» — б�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -34,13 +41,14 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.2"
+BUILD = "im_0.3"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini",    "price": (0.75, 3.75)},   # вводная цена до 31.12.2026, потом 1.5/7.5
     "claude-sonnet-5":  {"vendor": "anthropic", "price": (2.0, 10.0)},
     "gpt-5.6-sol":      {"vendor": "openai",    "price": (4.0, 20.0)},
+    "gemini-3.1-flash-lite": {"vendor": "gemini", "price": (0.10, 0.40)},   # верификатор
 }
 
 # Конвейер: порядок = порядок проходов. thinking: off | low | medium | high
@@ -51,9 +59,12 @@ CHAIN: list[tuple[str, str]] = [
     ("gpt-5.6-sol",      "medium"),
 ]
 
+VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
+VERIFY_VOTES = 3                                              # вызовов на голосование, большинство
+
 HTTP_TIMEOUT = 240
 ANTHROPIC_MAX_TOKENS = 16000   # общий лимит thinking + ответ (адаптивный режим 5-й серии)
-MAX_EXPANDED = 5000            # потолок размноженных интентов (защита от взрыва осей)
+MAX_EXPANDED = 20000           # потолок размноженных интентов — только предупреждение в stats.capped
 
 TYPES = ("коммерческий", "информационный", "навигационный", "инструмент", "сравнение", "локальный")
 
@@ -61,32 +72,35 @@ TYPES = ("коммерческий", "информационный", "навиг
 FRAMEWORK = (
     "Определи:\n"
     "1. Предмет сида — объект или услуга. Если слово сида совпадает с названием бренда или модели — "
-    "это бренд, не нарицательное слово.\n"
+    "это бренд, не нарицательное слово. Укажи написания предмета, которыми его набирают в поиске.\n"
     "2. Варианты предмета — на что предмет делится у покупателя (модели, виды услуги, типы товара, направления). "
-    "Для каждого — варианты написания, которыми люди его набирают (кириллица, латиница, разговорное).\n"
+    "Для каждого — написания того же имени, которыми его набирают (кириллица, латиница, разговорное), в порядке "
+    "употребимости в поиске. Коды, версии, поколения и комплектации — это не написания, а признаки.\n"
     "3. Признаки вариантов — что внутри варианта меняет выбор (поколение, версия, размер, объём, год, класс). "
     "Признак привязан к своему варианту; если у признака есть период — укажи.\n"
     "4. Этапы пути клиента — сквозные темы, одинаковые для всех вариантов (выбор, цена, оформление, доставка, "
     "проверка, оплата, риски, сервис, сравнение и другие, характерные для этой темы).\n"
-    "5. Города региона и языки поиска региона.\n\n"
+    "5. Города региона.\n\n"
     "Интенты записывай группами: макро-группа → под-группа → шаблоны запросов. В шаблонах используй плейсхолдеры "
     "{variant} (вариант предмета), {attr} (признак варианта), {city} (город) там, где запрос повторяется для каждого "
-    "значения оси; шаблон без плейсхолдеров — обычный запрос. Шаблоны — реальная поисковая речь, как люди набирают. "
-    "Если в регионе несколько языков поиска — шаблоны на каждом.\n"
-    "Для каждой под-группы: тип (" + " / ".join(TYPES) + ") и scope: \"variant\" — содержание зависит от варианта "
-    "предмета, \"common\" — общий этап, одинаковый для всех вариантов.\n"
+    "значения оси; шаблон без плейсхолдеров — обычный запрос. Шаблоны — реальная поисковая речь, как люди набирают, "
+    "только на языке {language}. Каждый шаблон — запрос человека, который решает задачу сида, в контексте сида; "
+    "запрос про другой предмет или без связи с сидом не годится.\n"
+    "Для каждой под-группы: тип (" + " / ".join(TYPES) + "), scope: \"variant\" — содержание зависит от варианта "
+    "предмета, \"common\" — общий этап, одинаковый для всех вариантов, и keys — номера ключевых слов из списка, "
+    "которые относятся к этой под-группе (ключ относится к одной под-группе; если ни один — пустой список).\n"
 )
 JSON_SHAPE = (
-    '{"subject": "...", "subject_is_brand": true,\n'
+    '{"subject": "...", "subject_is_brand": true, "subject_aliases": ["..."],\n'
     ' "variants": [{"name": "...", "aliases": ["..."], "attrs": [{"name": "...", "period": "..."}]}],\n'
-    ' "cities": ["..."], "languages": ["..."],\n'
-    ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "templates": ["..."]}]}'
+    ' "cities": ["..."],\n'
+    ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "templates": ["..."]}]}'
 )
 FIRST_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
     "Ниже ключевые слова, собранные из подсказок Google по этому сиду.\n\n"
     "Задача — полная карта поисковых интентов по этой теме: по ключам плюс из твоей базы знаний (то, чего в ключах нет). "
-    "Работай в реалиях региона: местные термины, правила, каналы покупки, все языки поиска региона.\n\n"
+    "Работай в реалиях региона: местные термины, правила, каналы покупки.\n\n"
     + FRAMEWORK +
     "\nОтвет — только JSON без пояснений:\n" + JSON_SHAPE + "\n\n"
     "Ключевые слова:\n{keys}"
@@ -94,15 +108,23 @@ FIRST_PROMPT = (
 EXTEND_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
     "Ниже ключевые слова, собранные из подсказок Google по этому сиду, и уже составленная карта интентов по этой теме.\n\n"
-    "Расширь карту: добавь то, чего в ней нет — варианты предмета, признаки вариантов, города, языки, под-группы "
-    "и шаблоны запросов; из ключей и из твоей базы знаний в реалиях региона (местные термины, правила, каналы покупки, "
-    "все языки поиска региона).\n\n"
+    "Расширь карту: добавь то, чего в ней нет — написания предмета, варианты предмета, признаки вариантов, города, "
+    "под-группы и шаблоны запросов; из ключей и из твоей базы знаний в реалиях региона (местные термины, правила, "
+    "каналы покупки). Ключи, которые ещё не отнесены ни к одной под-группе, отнеси к существующей или новой.\n\n"
     + FRAMEWORK +
     "\nОтвет — только JSON той же структуры и ТОЛЬКО с добавлениями: новые варианты целиком; новые написания и признаки — "
-    "под именем существующего варианта; новые шаблоны — под существующими macro и sub; новые под-группы целиком. "
+    "под именем существующего варианта; новые шаблоны и номера ключей — под существующими macro и sub; новые под-группы целиком. "
     "Пустые списки допустимы. Если добавить нечего — {}.\n" + JSON_SHAPE + "\n\n"
     "Ключевые слова:\n{keys}\n\n"
     "Текущая карта:\n{map}"
+)
+# Верификатор потока «без якоря» — бинарный вопрос в духе кросс-промпта relevant_search (отношение к сиду, не слова)
+VERIFY_PROMPT = (
+    "Сид: «{seed}». Регион: {region}.\n"
+    "Ниже пронумерованные поисковые запросы. Для каждого ответь на вопрос: это запрос человека, который решает "
+    "ту же задачу, что человек с сидом, на любом этапе его пути (выбор, покупка, оформление, доставка, проверка, "
+    "оплата, сервис)? Запрос про другую тему или другую задачу — нет.\n"
+    "Ответ: номера запросов, для которых ДА, через запятую. Ничего кроме номеров.\n\n{numbered}"
 )
 
 
@@ -199,7 +221,7 @@ async def call_model(model: str, prompt: str, thinking: str) -> dict:
 # ══════════════════════════ разбор JSON и слияние карты ══════════════════════════
 
 _WS = re.compile(r"\s+")
-_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "languages": 0, "groups": 0, "templates": 0}
+_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "groups": 0, "templates": 0, "keys": 0}
 
 
 def _norm(s) -> str:
@@ -226,23 +248,31 @@ def parse_json(text: str) -> dict | None:
 
 
 def empty_map() -> dict:
-    return {"subject": "", "subject_is_brand": None, "variants": [], "cities": [], "languages": [], "groups": []}
+    return {"subject": "", "subject_is_brand": None, "subject_aliases": [], "variants": [], "cities": [], "groups": []}
 
 
 def _as_list(x) -> list:
     return x if isinstance(x, list) else ([] if x is None else [x])
 
 
-def merge_map(cur: dict, add: dict, stage: int, model: str) -> dict:
+def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | None = None) -> dict:
     """Сливает ответ прохода в карту. Дедуп: варианты по имени/написанию, признаки внутри варианта,
-    города, языки, группы по (macro, sub), шаблоны внутри группы. Возвращает счётчики добавленного."""
+    города, группы по (macro, sub), шаблоны внутри группы; ключи по номерам, ключ — в одну группу (первое
+    отнесение выигрывает). Возвращает счётчики добавленного."""
     c = dict(_EMPTY_COUNTS)
     if not isinstance(add, dict):
         return c
+    keys = keys or []
     if not cur["subject"] and _clean(add.get("subject")):
         cur["subject"] = _clean(add.get("subject"))
     if cur["subject_is_brand"] is None and isinstance(add.get("subject_is_brand"), bool):
         cur["subject_is_brand"] = add["subject_is_brand"]
+    have_sa = {_norm(x) for x in cur["subject_aliases"]} | {_norm(cur["subject"])}
+    for x in _as_list(add.get("subject_aliases")):
+        xs = _clean(x)
+        if xs and _norm(xs) not in have_sa:
+            have_sa.add(_norm(xs))
+            cur["subject_aliases"].append(xs)
 
     # варианты предмета: ключ = любое из написаний
     name_index: dict[str, dict] = {}
@@ -282,7 +312,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str) -> dict:
             v["attrs"].append({"name": an, "period": _clean(ar.get("period")), "stage": stage, "by": model})
             c["attrs"] += 1
 
-    for key in ("cities", "languages"):
+    for key in ("cities",):
         have = {_norm(x) for x in cur[key]}
         for x in _as_list(add.get(key)):
             xs = _clean(x)
@@ -293,6 +323,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str) -> dict:
 
     # группы: ключ (macro, sub)
     gindex = {(_norm(g["macro"]), _norm(g["sub"])): g for g in cur["groups"]}
+    assigned = {_norm(k) for g in cur["groups"] for k in g["keys"]}
     for raw in _as_list(add.get("groups")):
         if not isinstance(raw, dict):
             continue
@@ -306,7 +337,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str) -> dict:
             typ = _norm(raw.get("type"))
             g = {"macro": macro, "sub": sub, "type": typ if typ in TYPES else (typ or "информационный"),
                  "scope": "common" if _norm(raw.get("scope")) == "common" else "variant",
-                 "templates": [], "stage": stage, "by": model}
+                 "templates": [], "keys": [], "stage": stage, "by": model}
             cur["groups"].append(g)
             gindex[(_norm(macro), _norm(sub))] = g
             c["groups"] += 1
@@ -317,27 +348,135 @@ def merge_map(cur: dict, add: dict, stage: int, model: str) -> dict:
                 have_t.add(_norm(ts))
                 g["templates"].append({"t": ts, "stage": stage, "by": model})
                 c["templates"] += 1
+        for n in _as_list(raw.get("keys")):
+            try:
+                idx = int(n)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= idx <= len(keys) and _norm(keys[idx - 1]) not in assigned:
+                assigned.add(_norm(keys[idx - 1]))
+                g["keys"].append(keys[idx - 1])
+                c["keys"] += 1
     return c
 
 
-def map_for_prompt(cur: dict) -> str:
-    """Карта в компактном JSON для промпта расширения (без служебных stage/by)."""
+def map_for_prompt(cur: dict, keys_index: dict[str, int] | None = None) -> str:
+    """Карта в компактном JSON для промпта расширения (без служебных stage/by); ключи — номерами списка."""
     slim = {
-        "subject": cur["subject"], "subject_is_brand": cur["subject_is_brand"],
+        "subject": cur["subject"], "subject_is_brand": cur["subject_is_brand"], "subject_aliases": cur["subject_aliases"],
         "variants": [{"name": v["name"], "aliases": v["aliases"],
                       "attrs": [{"name": a["name"], "period": a["period"]} for a in v["attrs"]]} for v in cur["variants"]],
-        "cities": cur["cities"], "languages": cur["languages"],
+        "cities": cur["cities"],
         "groups": [{"macro": g["macro"], "sub": g["sub"], "type": g["type"], "scope": g["scope"],
+                    "keys": [keys_index.get(_norm(k), 0) for k in g["keys"]] if keys_index else [],
                     "templates": [t["t"] for t in g["templates"]]} for g in cur["groups"]],
     }
     return json.dumps(slim, ensure_ascii=False)
 
 
+# ══════════════════════════ якорь предмета + верификатор ══════════════════════════
+
+try:
+    import pymorphy3
+    _MORPH = pymorphy3.MorphAnalyzer()
+except Exception:  # noqa: BLE001 — без pymorphy: префиксное совпадение (словоформа = форма + ≤2 символа)
+    _MORPH = None
+
+_TOK = re.compile(r"\w+")
+_CYR = re.compile(r"[а-яёіїєґ]")
+
+
+def _lemma(tok: str) -> str:
+    if _MORPH is not None and _CYR.search(tok):
+        return _MORPH.parse(tok)[0].normal_form
+    return tok
+
+
+def _lemmas(s: str) -> list[str]:
+    return [_lemma(t) for t in _TOK.findall(_norm(s))]
+
+
+def anchor_forms(cur: dict) -> list[list[str]]:
+    """Все написания предмета и вариантов из самой карты (леммами) — списков в коде нет."""
+    forms = [cur["subject"]] + cur["subject_aliases"]
+    for v in cur["variants"]:
+        forms += [v["name"]] + v["aliases"]
+    out, seen = [], set()
+    for f in forms:
+        lem = _lemmas(f)
+        if lem and tuple(lem) not in seen:
+            seen.add(tuple(lem))
+            out.append(lem)
+    return out
+
+
+def _tok_match(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if _MORPH is None:   # префиксный запасной вариант: джип → джипа/джипов, но не джипами
+        return len(a) >= 3 and b.startswith(a) and len(b) - len(a) <= 2
+    return False
+
+
+def has_anchor(template: str, forms: list[list[str]]) -> bool:
+    """Предмет назван: плейсхолдер варианта или последовательность лемм одного из написаний внутри шаблона."""
+    if "{variant}" in template:
+        return True
+    tl = _lemmas(template)
+    for f in forms:
+        n = len(f)
+        for i in range(len(tl) - n + 1):
+            if all(_tok_match(f[j], tl[i + j]) for j in range(n)):
+                return True
+    return False
+
+
+_NUMS = re.compile(r"\d+")
+
+
+def parse_yes(text: str, n: int) -> set[int] | None:
+    """Номера «ДА» (1-based). None = ответ не разобран → голос не считается."""
+    nums = {int(x) for x in _NUMS.findall(text)}
+    nums = {x for x in nums if 1 <= x <= n}
+    return nums if nums or _norm(text) in ("", "нет", "none", "0") else None
+
+
+async def verify_templates(seed: str, region: str, items: list[str]) -> tuple[set[int], dict]:
+    """Поток «без якоря»: VERIFY_VOTES параллельных вызовов, большинство. Ошибки/непарс — fail-open по этому голосу;
+    если ни один голос не разобран — оставляем всё. → (индексы оставить, stats)."""
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(items))
+    prompt = _fill(VERIFY_PROMPT, seed=seed, region=region, numbered=numbered)
+    model, thinking = VERIFY
+    t0 = time.perf_counter()
+    calls = await asyncio.gather(*[call_model(model, prompt, thinking) for _ in range(VERIFY_VOTES)])
+    votes: list[set[int]] = []
+    for r in calls:
+        if r["error"]:
+            continue
+        yes = parse_yes(r["text"], len(items))
+        if yes is not None:
+            votes.append({i - 1 for i in yes})
+    if not votes:
+        keep = set(range(len(items)))
+    else:
+        need = len(votes) // 2 + 1
+        keep = {i for i in range(len(items)) if sum(i in v for v in votes) >= need}
+    st = {"stage": "verify", "model": model, "thinking": thinking, "candidates": len(items), "kept": len(keep),
+          "cut": len(items) - len(keep), "votes_valid": len(votes),
+          "in": sum(r["in"] for r in calls), "out": sum(r["out"] for r in calls),
+          "cost": round(sum(r["cost"] for r in calls), 5), "wall": round(time.perf_counter() - t0, 2),
+          "error": (None if votes else ("; ".join(r["error"] for r in calls if r["error"]) or "все голоса не разобраны")),
+          "vote_errors": [r["error"] for r in calls if r["error"]],
+          "cut_items": [items[i] for i in range(len(items)) if i not in keep]}
+    return keep, st
+
+
 # ══════════════════════════ размножение шаблонов по осям (код) ══════════════════════════
 
 def expand_map(cur: dict) -> tuple[list[dict], bool]:
-    """Шаблон × оси → интенты. {variant} — каждое написание каждого варианта; {attr} — признаки своего варианта
-    (вариант без признаков шаблон пропускает); {city} — каждый город. Дедуп по тексту. → (интенты, упёрлись в потолок)."""
+    """Шаблон × оси → интенты. {variant} — каноническое имя варианта (написания НЕ размножаются, im_0.3);
+    {attr} — признаки своего варианта (вариант без признаков шаблон пропускает); {city} — каждый город.
+    Дедуп по тексту. → (интенты, упёрлись в потолок)."""
     out, seen = [], set()
     variants = cur["variants"] or []
     cities = cur["cities"] or []
@@ -347,7 +486,8 @@ def expand_map(cur: dict) -> tuple[list[dict], bool]:
             need_v, need_a, need_c = "{variant}" in t, "{attr}" in t, "{city}" in t
             v_iter: list[tuple[dict | None, str]]
             if need_v or need_a:
-                v_iter = [(v, form) for v in variants for form in [v["name"]] + v["aliases"]]
+                v_iter = [(v, v["name"]) for v in variants]
+                # im_0.2: [(v, form) for v in variants for form in [v["name"]] + v["aliases"]] — взрыв ×8, Andrew: написания не размножать
                 if not v_iter:
                     continue
             else:
@@ -400,21 +540,22 @@ async def run_intent_map(req: IntentReq) -> dict:
     seed = _WS.sub(" ", req.seed.strip())
     keys = _kw_strings(req.keywords)
     region = req.country.strip() + (f" / {req.city.strip()}" if req.city.strip() else "")
-    ctx = {"seed": seed, "region": region or "не указан", "language": req.language or "не указан",
-           "keys": "\n".join(keys)}
+    ctx = {"seed": seed, "region": region or "не указан", "language": req.language or "ru",
+           "keys": "\n".join(f"{i + 1}. {k}" for i, k in enumerate(keys))}
+    keys_index = {_norm(k): i + 1 for i, k in enumerate(keys)}
 
     cur = empty_map()
     stages: list[dict] = []
     for i, (model, thinking) in enumerate(CHAIN, start=1):
         # пустая карта (первый проход или упавший первый проход) → полное построение
         mode = "build" if not cur["groups"] else "extend"
-        prompt = _fill(FIRST_PROMPT, **ctx) if mode == "build" else _fill(EXTEND_PROMPT, **ctx, map=map_for_prompt(cur))
+        prompt = _fill(FIRST_PROMPT, **ctx) if mode == "build" else _fill(EXTEND_PROMPT, **ctx, map=map_for_prompt(cur, keys_index))
         r = await call_model(model, prompt, thinking)
         err = r["error"]
         parsed = parse_json(r["text"]) if not err else None
         if not err and parsed is None:
             err = "parse: ответ не JSON"
-        counts = merge_map(cur, parsed, i, model) if parsed is not None else dict(_EMPTY_COUNTS)
+        counts = merge_map(cur, parsed, i, model, keys) if parsed is not None else dict(_EMPTY_COUNTS)
         stages.append({
             "stage": i, "model": model, "thinking": thinking, "mode": mode,
             "added": counts, "groups_after": len(cur["groups"]),
@@ -422,6 +563,27 @@ async def run_intent_map(req: IntentReq) -> dict:
             "in": r["in"], "out": r["out"], "think": r["think"], "cost": r["cost"], "wall": r["wall"],
             "error": err, "raw": r["text"],
         })
+
+    # ── якорь предмета: шаблон без слова предмета в группе без ключей → верификатор; 0 → удаляется
+    forms = anchor_forms(cur)
+    candidates: list[tuple[dict, dict]] = []
+    n_anchor = n_keybacked = 0
+    for g in cur["groups"]:
+        for t in g["templates"]:
+            if has_anchor(t["t"], forms):
+                n_anchor += 1
+            elif g["keys"]:
+                n_keybacked += 1
+            else:
+                candidates.append((g, t))
+    verify_stats = None
+    if candidates:
+        keep, verify_stats = await verify_templates(seed, ctx["region"], [t["t"] for _, t in candidates])
+        drop = {id(t) for i, (_, t) in enumerate(candidates) if i not in keep}
+        for g in cur["groups"]:
+            g["templates"] = [t for t in g["templates"] if id(t) not in drop]
+        cur["groups"] = [g for g in cur["groups"] if g["templates"] or g["keys"]]
+        stages.append(verify_stats)
 
     intents, capped = expand_map(cur)
     total_cost = round(sum(s["cost"] for s in stages), 5)
@@ -435,7 +597,10 @@ async def run_intent_map(req: IntentReq) -> dict:
             "templates": sum(len(g["templates"]) for g in cur["groups"]),
             "variants": len(cur["variants"]),
             "attrs": sum(len(v["attrs"]) for v in cur["variants"]),
-            "cities": len(cur["cities"]), "languages": len(cur["languages"]),
+            "cities": len(cur["cities"]),
+            "keys_assigned": sum(len(g["keys"]) for g in cur["groups"]),
+            "anchor": n_anchor, "key_backed": n_keybacked,
+            "verified": (verify_stats or {}).get("kept", 0), "cut": (verify_stats or {}).get("cut", 0),
             "intents_total": len(intents), "capped": capped,
             "total_cost": total_cost, "total_wall": round(time.perf_counter() - t0, 2),
             "errors": [s["model"] for s in stages if s["error"]],
