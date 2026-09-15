@@ -33,8 +33,14 @@ im_0.5 (Andrew, 2026-09-15): подстановка городов отключ�
   города остаются осью данных для serviceArea); один запрос на под-группу; Claude и GPT — thinking low
   (medium: долго, добавляет мало), Gemini medium.
 
-im_0.6 (Andrew, 2026-09-16): поле notes — «особенности ниши/региона» от специалиста (необязательное), подмешивается
-  в промпты всех проходов как контекст; GPT-проход — gpt-5.6-terra вместо sol (в 2 раза дешевле).
+im_0.6 (2026-09-16): GPT-проход — gpt-5.6-terra вместо sol (в 2 раза дешевле). Параметр notes оставлен необязательным
+  для внутренних экспериментов — в форме поля нет (Andrew: сеошники напишут бред).
+im_0.7 (Andrew, 2026-09-16): особенности ниши и региона — шестой пункт каркаса и поле specifics в JSON, чек-лист для
+  проходов 2–3 по образцу journey: модель обязана перечислить их сама и закрыть под-группами.
+im_0.8 (Andrew, 2026-09-16): GPT-проход — gpt-5.6-luna low (Terra: 98 с, беднее Sol; Sol low: 41 с); проход расширения
+  режется на параллельные части: часть 0 — оси (написания, варианты, признаки, города, неотнесённые ключи, новые пункты
+  чек-листа), части 1..N — доли чек-листа journey+specifics, каждая закрывает только свои пункты. Слияние кодом.
+  Конвейер между моделями по-прежнему строгий; параллель только внутри одного прохода. Число частей — в CHAIN.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -54,7 +60,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.6"
+BUILD = "im_0.8"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -66,12 +72,12 @@ MODELS: dict[str, dict] = {
     "gemini-3.1-flash-lite": {"vendor": "gemini", "price": (0.10, 0.40)},   # верификатор
 }
 
-# Конвейер: порядок = порядок проходов. thinking: off | low | medium | high
-# Andrew 2026-09-14: старт medium на всех трёх; после живого прогона — A/B low vs medium на одном VALID.
-CHAIN: list[tuple[str, str]] = [
-    ("gemini-3.8-flash", "medium"),
-    ("claude-sonnet-5",  "low"),      # im_0.5: было medium — 36 с, +15 запросов
-    ("gpt-5.6-terra",    "low"),      # im_0.6: было gpt-5.6-sol low (41 с, $0.077); im_0.5: sol medium — 106 с, 73% цены
+# Конвейер: порядок = порядок проходов. thinking: off | low | medium | high; третье число — на сколько параллельных
+# частей резать проход расширения (1 = один вызов; для первого прохода не применяется).
+CHAIN: list[tuple[str, str, int]] = [
+    ("gemini-3.8-flash", "medium", 1),
+    ("claude-sonnet-5",  "low",    1),   # im_0.5: было medium — 36 с, +15 запросов; low 7.7 с — резать незачем
+    ("gpt-5.6-luna",     "low",    4),   # im_0.8: было terra low (98 с) ← sol low (41 с) ← sol medium (106 с)
 ]
 
 VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
@@ -95,7 +101,10 @@ FRAMEWORK = (
     "Признак привязан к своему варианту; если у признака есть период — укажи.\n"
     "4. Этапы пути клиента (journey) — сквозные темы, одинаковые для всех вариантов (выбор, цена, оформление, "
     "доставка, проверка, оплата, риски, сервис, сравнение и другие, характерные для этой темы). Перечисли этапы списком.\n"
-    "5. Города региона.\n\n"
+    "5. Города региона.\n"
+    "6. Особенности ниши и региона (specifics) — местные термины и сленг; законы, льготы и ограничения; сегменты "
+    "покупателей (частные, бизнес, оптовые); сезонность и поводы; локальные каналы и площадки. Перечисли списком — "
+    "это то, чего нет в ключах, но что ищут люди в этом регионе по этой теме; каждую особенность закрой под-группой.\n\n"
     "Интенты записывай группами: макро-группа → под-группа → один запрос, самый типичный для этой под-группы. "
     "Запрос — реальная поисковая речь, как люди набирают, только на языке {language}; без шаблонов и подстановочных "
     "скобок. Если под-группа повторяется для каждого варианта предмета, пиши запрос с предметом сида (код сам "
@@ -108,7 +117,7 @@ FRAMEWORK = (
 JSON_SHAPE = (
     '{"subject": "...", "subject_is_brand": true, "subject_aliases": ["..."],\n'
     ' "variants": [{"name": "...", "aliases": ["..."], "attrs": [{"name": "...", "period": "..."}]}],\n'
-    ' "journey": ["..."], "cities": ["..."],\n'
+    ' "journey": ["..."], "specifics": ["..."], "cities": ["..."],\n'
     ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "queries": ["..."]}]}'
 )
 FIRST_PROMPT = (
@@ -123,11 +132,7 @@ FIRST_PROMPT = (
 EXTEND_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
     "Ниже ключевые слова, собранные из подсказок Google по этому сиду, и уже составленная карта интентов по этой теме.\n\n"
-    "Расширь карту: добавь то, чего в ней нет — написания предмета, варианты предмета, признаки вариантов, города, "
-    "этапы пути клиента, под-группы и запросы; из ключей и из твоей базы знаний в реалиях региона (местные термины, "
-    "правила, каналы покупки). Пройди по списку journey как по чек-листу: каждый этап должен быть закрыт хотя бы одной "
-    "под-группой — незакрытые этапы закрой, отсутствующие этапы добавь. Ключи, которые ещё не отнесены ни к одной "
-    "под-группе, отнеси к существующей или новой.\n\n"
+    "{task}\n\n"
     + FRAMEWORK +
     "\nОтвет — только JSON той же структуры и ТОЛЬКО с добавлениями: новые варианты целиком; новые написания и признаки — "
     "под именем существующего варианта; номера ключей — под существующими macro и sub; новые под-группы целиком, по одному запросу. "
@@ -135,6 +140,26 @@ EXTEND_PROMPT = (
     "Ключевые слова:\n{keys}\n\n"
     "Текущая карта:\n{map}"
 )
+# im_0.8: задание части прохода расширения — вставляется в EXTEND_PROMPT вместо общего задания
+EXTEND_TASK_ALL = (
+    "Расширь карту: добавь то, чего в ней нет — написания предмета, варианты предмета, признаки вариантов, города, "
+    "этапы пути клиента, особенности ниши и региона, под-группы и запросы; из ключей и из твоей базы знаний. "
+    "Пройди по спискам journey и specifics как по чек-листу: каждый этап и каждая особенность должны быть закрыты "
+    "хотя бы одной под-группой — незакрытые закрой, отсутствующие добавь в списки. Ключи, которые ещё не отнесены "
+    "ни к одной под-группе, отнеси к существующей или новой."
+)
+EXTEND_TASK_AXES = (
+    "Твоя часть работы — оси карты: дополни написания предмета, варианты предмета и их написания, признаки вариантов, "
+    "города региона; ключи, которые ещё не отнесены ни к одной под-группе, отнеси к существующей или новой. "
+    "Если в списках journey или specifics не хватает этапов или особенностей — добавь их и закрой каждый добавленный "
+    "пункт под-группой. Существующие пункты чек-листа не трогай — ими заняты другие части."
+)
+EXTEND_TASK_PART = (
+    "Твоя часть работы — только эти пункты чек-листа:\n{items}\n"
+    "Для каждого проверь, закрыт ли он под-группой в текущей карте; незакрытые закрой новыми под-группами "
+    "(по одному запросу). Другие пункты, оси и ключи не трогай — ими заняты другие части."
+)
+
 # Верификатор потока «без якоря» — бинарный вопрос в духе кросс-промпта relevant_search (отношение к сиду, не слова)
 VERIFY_PROMPT = (
     "Сид: «{seed}». Регион: {region}.\n"
@@ -238,7 +263,7 @@ async def call_model(model: str, prompt: str, thinking: str) -> dict:
 # ══════════════════════════ разбор JSON и слияние карты ══════════════════════════
 
 _WS = re.compile(r"\s+")
-_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "journey": 0, "groups": 0, "queries": 0, "keys": 0}
+_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "journey": 0, "specifics": 0, "groups": 0, "queries": 0, "keys": 0}
 
 
 def _norm(s) -> str:
@@ -265,7 +290,7 @@ def parse_json(text: str) -> dict | None:
 
 
 def empty_map() -> dict:
-    return {"subject": "", "subject_is_brand": None, "subject_aliases": [], "variants": [], "journey": [], "cities": [], "groups": []}
+    return {"subject": "", "subject_is_brand": None, "subject_aliases": [], "variants": [], "journey": [], "specifics": [], "cities": [], "groups": []}
 
 
 def _as_list(x) -> list:
@@ -329,7 +354,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
             v["attrs"].append({"name": an, "period": _clean(ar.get("period")), "stage": stage, "by": model})
             c["attrs"] += 1
 
-    for key in ("cities", "journey"):
+    for key in ("cities", "journey", "specifics"):
         have = {_norm(x) for x in cur[key]}
         for x in _as_list(add.get(key)):
             xs = _clean(x)
@@ -384,7 +409,7 @@ def map_for_prompt(cur: dict, keys_index: dict[str, int] | None = None) -> str:
         "subject": cur["subject"], "subject_is_brand": cur["subject_is_brand"], "subject_aliases": cur["subject_aliases"],
         "variants": [{"name": v["name"], "aliases": v["aliases"],
                       "attrs": [{"name": a["name"], "period": a["period"]} for a in v["attrs"]]} for v in cur["variants"]],
-        "journey": cur["journey"], "cities": cur["cities"],
+        "journey": cur["journey"], "specifics": cur["specifics"], "cities": cur["cities"],
         "groups": [{"macro": g["macro"], "sub": g["sub"], "type": g["type"], "scope": g["scope"],
                     "keys": [keys_index.get(_norm(k), 0) for k in g["keys"]] if keys_index else [],
                     "queries": [q["q"] for q in g["queries"]]} for g in cur["groups"]],
@@ -583,6 +608,24 @@ def _kw_strings(keywords: list) -> list[str]:
     return out
 
 
+def extend_prompts(ctx: dict, cur: dict, keys_index: dict[str, int], chunks: int) -> list[str]:
+    """Промпты прохода расширения. chunks<=1 или короткий чек-лист → один общий вызов;
+    иначе часть 0 — оси, части 1..N — доли чек-листа journey+specifics по порядку."""
+    mp = map_for_prompt(cur, keys_index)
+    checklist = list(cur["journey"]) + list(cur["specifics"])
+    n_parts = max(1, chunks - 1)
+    if chunks <= 1 or len(checklist) < 2 * n_parts:
+        return [_fill(EXTEND_PROMPT, **ctx, map=mp, task=EXTEND_TASK_ALL)]
+    prompts = [_fill(EXTEND_PROMPT, **ctx, map=mp, task=EXTEND_TASK_AXES)]
+    size = -(-len(checklist) // n_parts)   # потолок деления
+    for k in range(n_parts):
+        part = checklist[k * size:(k + 1) * size]
+        if part:
+            items = "\n".join(f"- {x}" for x in part)
+            prompts.append(_fill(EXTEND_PROMPT, **ctx, map=mp, task=_fill(EXTEND_TASK_PART, items=items)))
+    return prompts
+
+
 async def run_intent_map(req: IntentReq) -> dict:
     t0 = time.perf_counter()
     seed = _WS.sub(" ", req.seed.strip())
@@ -596,22 +639,39 @@ async def run_intent_map(req: IntentReq) -> dict:
 
     cur = empty_map()
     stages: list[dict] = []
-    for i, (model, thinking) in enumerate(CHAIN, start=1):
-        # пустая карта (первый проход или упавший первый проход) → полное построение
+    for i, (model, thinking, chunks) in enumerate(CHAIN, start=1):
+        # пустая карта (первый проход или упавший первый проход) → полное построение одним вызовом
         mode = "build" if not cur["groups"] else "extend"
-        prompt = _fill(FIRST_PROMPT, **ctx) if mode == "build" else _fill(EXTEND_PROMPT, **ctx, map=map_for_prompt(cur, keys_index))
-        r = await call_model(model, prompt, thinking)
-        err = r["error"]
-        parsed = parse_json(r["text"]) if not err else None
-        if not err and parsed is None:
-            err = "parse: ответ не JSON"
-        counts = merge_map(cur, parsed, i, model, keys) if parsed is not None else dict(_EMPTY_COUNTS)
+        if mode == "build":
+            prompts = [_fill(FIRST_PROMPT, **ctx)]
+        else:
+            prompts = extend_prompts(ctx, cur, keys_index, chunks)
+        t_st = time.perf_counter()
+        results = await asyncio.gather(*[call_model(model, p, thinking) for p in prompts])
+        counts = dict(_EMPTY_COUNTS)
+        chunk_stats, errors, raws = [], [], []
+        for r in results:   # слияние строго по порядку частей — детерминизм при дублях
+            err = r["error"]
+            parsed = parse_json(r["text"]) if not err else None
+            if not err and parsed is None:
+                err = "parse: ответ не JSON"
+            c = merge_map(cur, parsed, i, model, keys) if parsed is not None else dict(_EMPTY_COUNTS)
+            for k in counts:
+                counts[k] += c[k]
+            chunk_stats.append({"in": r["in"], "out": r["out"], "cost": r["cost"], "wall": r["wall"], "error": err, "added": c})
+            if err:
+                errors.append(err)
+            raws.append(r["text"])
         stages.append({
-            "stage": i, "model": model, "thinking": thinking, "mode": mode,
+            "stage": i, "model": model, "thinking": thinking, "mode": mode, "chunks": len(prompts),
             "added": counts, "groups_after": len(cur["groups"]),
             "queries_after": sum(len(g["queries"]) for g in cur["groups"]),
-            "in": r["in"], "out": r["out"], "think": r["think"], "cost": r["cost"], "wall": r["wall"],
-            "error": err, "raw": r["text"],
+            "in": sum(r["in"] for r in results), "out": sum(r["out"] for r in results),
+            "think": sum(r["think"] for r in results), "cost": round(sum(r["cost"] for r in results), 5),
+            "wall": round(time.perf_counter() - t_st, 2),
+            "error": ("; ".join(errors) if len(errors) == len(results) else None),   # ошибка прохода = упали все части
+            "chunk_errors": errors, "chunk_stats": chunk_stats,
+            "raw": ("\n\n───── часть ─────\n\n".join(raws) if len(raws) > 1 else raws[0]),
         })
 
     # ── якорь предмета: шаблон без слова предмета в группе без ключей → верификатор; 0 → удаляется
@@ -645,7 +705,7 @@ async def run_intent_map(req: IntentReq) -> dict:
         "stats": {
             "groups": len(cur["groups"]),
             "queries": sum(len(g["queries"]) for g in cur["groups"]),
-            "journey": len(cur["journey"]),
+            "journey": len(cur["journey"]), "specifics": len(cur["specifics"]),
             "variants": len(cur["variants"]),
             "attrs": sum(len(v["attrs"]) for v in cur["variants"]),
             "cities": len(cur["cities"]),
@@ -674,7 +734,7 @@ async def intent_map_endpoint(req: IntentReq):
 
 @router.get("/api/intent-map/models")
 async def intent_map_models():
-    return {"chain": [{"model": m, "thinking": t, "price": MODELS[m]["price"]} for m, t in CHAIN], "build": BUILD}
+    return {"chain": [{"model": m, "thinking": t, "chunks": c, "price": MODELS[m]["price"]} for m, t, c in CHAIN], "build": BUILD}
 
 
 # ══════════════════════════ im_0.1 — плоский формат (точка отката, не вызывается) ══════════════════════════
