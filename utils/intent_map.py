@@ -23,6 +23,12 @@ im_0.3 (Andrew, 2026-09-14): один язык (из формы), размнож
   gemini-lite ×3 (большинство), 0 → строка удаляется молча (без блока аудита — решение принимает модуль).
   Написания — только формы имени; коды/версии/комплектации — признаки. Потолок размножения → предупреждение.
 
+im_0.4 (Andrew, 2026-09-15): плейсхолдеров нет — модель пишет только реальные запросы. Размножение = подстановка
+  кодом: в под-группе scope=variant место, где назван предмет (леммы, как в якоре), заменяется на каноническое
+  имя каждого варианта (запрос, где вариант уже назван, не размножается); запрос с городом из оси — по остальным
+  городам. Признаки не размножаются (ось данных). journey — этапы пути клиента как чек-лист для проходов 2–3.
+  Тип не из шкалы → «информационный».
+
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
 Модуль самодостаточен: свой реестр моделей и свои вызовы вендоров (НЕ импортирует minus_words_test —
@@ -41,7 +47,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.3"
+BUILD = "im_0.4"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -78,14 +84,14 @@ FRAMEWORK = (
     "употребимости в поиске. Коды, версии, поколения и комплектации — это не написания, а признаки.\n"
     "3. Признаки вариантов — что внутри варианта меняет выбор (поколение, версия, размер, объём, год, класс). "
     "Признак привязан к своему варианту; если у признака есть период — укажи.\n"
-    "4. Этапы пути клиента — сквозные темы, одинаковые для всех вариантов (выбор, цена, оформление, доставка, "
-    "проверка, оплата, риски, сервис, сравнение и другие, характерные для этой темы).\n"
+    "4. Этапы пути клиента (journey) — сквозные темы, одинаковые для всех вариантов (выбор, цена, оформление, "
+    "доставка, проверка, оплата, риски, сервис, сравнение и другие, характерные для этой темы). Перечисли этапы списком.\n"
     "5. Города региона.\n\n"
-    "Интенты записывай группами: макро-группа → под-группа → шаблоны запросов. В шаблонах используй плейсхолдеры "
-    "{variant} (вариант предмета), {attr} (признак варианта), {city} (город) там, где запрос повторяется для каждого "
-    "значения оси; шаблон без плейсхолдеров — обычный запрос. Шаблоны — реальная поисковая речь, как люди набирают, "
-    "только на языке {language}. Каждый шаблон — запрос человека, который решает задачу сида, в контексте сида; "
-    "запрос про другой предмет или без связи с сидом не годится.\n"
+    "Интенты записывай группами: макро-группа → под-группа → запросы. Запросы — реальная поисковая речь, как люди "
+    "набирают, только на языке {language}; без шаблонов и подстановочных скобок. Запрос, повторяющийся для каждого "
+    "варианта предмета, пиши один раз с предметом сида (код сам подставит варианты); запрос, повторяющийся для "
+    "каждого города, пиши один раз с одним городом. Каждый запрос — запрос человека, который решает задачу сида, "
+    "в контексте сида; запрос про другой предмет или без связи с сидом не годится.\n"
     "Для каждой под-группы: тип (" + " / ".join(TYPES) + "), scope: \"variant\" — содержание зависит от варианта "
     "предмета, \"common\" — общий этап, одинаковый для всех вариантов, и keys — номера ключевых слов из списка, "
     "которые относятся к этой под-группе (ключ относится к одной под-группе; если ни один — пустой список).\n"
@@ -93,8 +99,8 @@ FRAMEWORK = (
 JSON_SHAPE = (
     '{"subject": "...", "subject_is_brand": true, "subject_aliases": ["..."],\n'
     ' "variants": [{"name": "...", "aliases": ["..."], "attrs": [{"name": "...", "period": "..."}]}],\n'
-    ' "cities": ["..."],\n'
-    ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "templates": ["..."]}]}'
+    ' "journey": ["..."], "cities": ["..."],\n'
+    ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "queries": ["..."]}]}'
 )
 FIRST_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
@@ -109,11 +115,13 @@ EXTEND_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
     "Ниже ключевые слова, собранные из подсказок Google по этому сиду, и уже составленная карта интентов по этой теме.\n\n"
     "Расширь карту: добавь то, чего в ней нет — написания предмета, варианты предмета, признаки вариантов, города, "
-    "под-группы и шаблоны запросов; из ключей и из твоей базы знаний в реалиях региона (местные термины, правила, "
-    "каналы покупки). Ключи, которые ещё не отнесены ни к одной под-группе, отнеси к существующей или новой.\n\n"
+    "этапы пути клиента, под-группы и запросы; из ключей и из твоей базы знаний в реалиях региона (местные термины, "
+    "правила, каналы покупки). Пройди по списку journey как по чек-листу: каждый этап должен быть закрыт хотя бы одной "
+    "под-группой — незакрытые этапы закрой, отсутствующие этапы добавь. Ключи, которые ещё не отнесены ни к одной "
+    "под-группе, отнеси к существующей или новой.\n\n"
     + FRAMEWORK +
     "\nОтвет — только JSON той же структуры и ТОЛЬКО с добавлениями: новые варианты целиком; новые написания и признаки — "
-    "под именем существующего варианта; новые шаблоны и номера ключей — под существующими macro и sub; новые под-группы целиком. "
+    "под именем существующего варианта; новые запросы и номера ключей — под существующими macro и sub; новые под-группы целиком. "
     "Пустые списки допустимы. Если добавить нечего — {}.\n" + JSON_SHAPE + "\n\n"
     "Ключевые слова:\n{keys}\n\n"
     "Текущая карта:\n{map}"
@@ -221,7 +229,7 @@ async def call_model(model: str, prompt: str, thinking: str) -> dict:
 # ══════════════════════════ разбор JSON и слияние карты ══════════════════════════
 
 _WS = re.compile(r"\s+")
-_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "groups": 0, "templates": 0, "keys": 0}
+_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "journey": 0, "groups": 0, "queries": 0, "keys": 0}
 
 
 def _norm(s) -> str:
@@ -248,7 +256,7 @@ def parse_json(text: str) -> dict | None:
 
 
 def empty_map() -> dict:
-    return {"subject": "", "subject_is_brand": None, "subject_aliases": [], "variants": [], "cities": [], "groups": []}
+    return {"subject": "", "subject_is_brand": None, "subject_aliases": [], "variants": [], "journey": [], "cities": [], "groups": []}
 
 
 def _as_list(x) -> list:
@@ -312,7 +320,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
             v["attrs"].append({"name": an, "period": _clean(ar.get("period")), "stage": stage, "by": model})
             c["attrs"] += 1
 
-    for key in ("cities",):
+    for key in ("cities", "journey"):
         have = {_norm(x) for x in cur[key]}
         for x in _as_list(add.get(key)):
             xs = _clean(x)
@@ -335,19 +343,20 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
         g = gindex.get((_norm(macro), _norm(sub)))
         if g is None:
             typ = _norm(raw.get("type"))
-            g = {"macro": macro, "sub": sub, "type": typ if typ in TYPES else (typ or "информационный"),
+            g = {"macro": macro, "sub": sub, "type": typ if typ in TYPES else "информационный",   # im_0.4: не из шкалы → информационный
                  "scope": "common" if _norm(raw.get("scope")) == "common" else "variant",
-                 "templates": [], "keys": [], "stage": stage, "by": model}
+                 "queries": [], "keys": [], "stage": stage, "by": model}
             cur["groups"].append(g)
             gindex[(_norm(macro), _norm(sub))] = g
             c["groups"] += 1
-        have_t = {_norm(t["t"]) for t in g["templates"]}
-        for t in _as_list(raw.get("templates")):
-            ts = _clean(t)
-            if ts and _norm(ts) not in have_t:
-                have_t.add(_norm(ts))
-                g["templates"].append({"t": ts, "stage": stage, "by": model})
-                c["templates"] += 1
+        have_q = {_norm(q["q"]) for q in g["queries"]}
+        for q in _as_list(raw.get("queries")) + _as_list(raw.get("templates")):   # templates — совместимость с ответом старого формата
+            qs = _clean(q).replace("{variant}", cur["subject"]).replace("{city}", cur["cities"][0] if cur["cities"] else "").replace("{attr}", "")
+            qs = _WS.sub(" ", qs).strip()
+            if qs and _norm(qs) not in have_q:
+                have_q.add(_norm(qs))
+                g["queries"].append({"q": qs, "stage": stage, "by": model})
+                c["queries"] += 1
         for n in _as_list(raw.get("keys")):
             try:
                 idx = int(n)
@@ -366,10 +375,10 @@ def map_for_prompt(cur: dict, keys_index: dict[str, int] | None = None) -> str:
         "subject": cur["subject"], "subject_is_brand": cur["subject_is_brand"], "subject_aliases": cur["subject_aliases"],
         "variants": [{"name": v["name"], "aliases": v["aliases"],
                       "attrs": [{"name": a["name"], "period": a["period"]} for a in v["attrs"]]} for v in cur["variants"]],
-        "cities": cur["cities"],
+        "journey": cur["journey"], "cities": cur["cities"],
         "groups": [{"macro": g["macro"], "sub": g["sub"], "type": g["type"], "scope": g["scope"],
                     "keys": [keys_index.get(_norm(k), 0) for k in g["keys"]] if keys_index else [],
-                    "templates": [t["t"] for t in g["templates"]]} for g in cur["groups"]],
+                    "queries": [q["q"] for q in g["queries"]]} for g in cur["groups"]],
     }
     return json.dumps(slim, ensure_ascii=False)
 
@@ -418,17 +427,32 @@ def _tok_match(a: str, b: str) -> bool:
     return False
 
 
-def has_anchor(template: str, forms: list[list[str]]) -> bool:
-    """Предмет назван: плейсхолдер варианта или последовательность лемм одного из написаний внутри шаблона."""
-    if "{variant}" in template:
-        return True
-    tl = _lemmas(template)
-    for f in forms:
+def _form_lists(names: list[str]) -> list[list[str]]:
+    out, seen = [], set()
+    for f in names:
+        lem = _lemmas(f)
+        if lem and tuple(lem) not in seen:
+            seen.add(tuple(lem))
+            out.append(lem)
+    return out
+
+
+def find_span(text: str, forms: list[list[str]]) -> tuple[int, int] | None:
+    """Первое вхождение любого из написаний (леммами) — как срез символов исходной строки.
+    Формы пробуются от короткой к длинной: «jeep» раньше «jeep usa», чтобы подстановка не съедала контекст."""
+    toks = list(_TOK.finditer(_norm(text)))
+    tl = [_lemma(m.group()) for m in toks]
+    for f in sorted(forms, key=len):
         n = len(f)
         for i in range(len(tl) - n + 1):
             if all(_tok_match(f[j], tl[i + j]) for j in range(n)):
-                return True
-    return False
+                return toks[i].start(), toks[i + n - 1].end()
+    return None
+
+
+def has_anchor(query: str, forms: list[list[str]]) -> bool:
+    """Предмет назван: последовательность лемм одного из написаний внутри запроса."""
+    return find_span(query, forms) is not None
 
 
 _NUMS = re.compile(r"\d+")
@@ -474,43 +498,55 @@ async def verify_templates(seed: str, region: str, items: list[str]) -> tuple[se
 # ══════════════════════════ размножение шаблонов по осям (код) ══════════════════════════
 
 def expand_map(cur: dict) -> tuple[list[dict], bool]:
-    """Шаблон × оси → интенты. {variant} — каноническое имя варианта (написания НЕ размножаются, im_0.3);
-    {attr} — признаки своего варианта (вариант без признаков шаблон пропускает); {city} — каждый город.
-    Дедуп по тексту. → (интенты, упёрлись в потолок)."""
+    """Подстановка по осям (im_0.4). scope=variant: место предмета в запросе → каноническое имя каждого варианта;
+    запрос, где вариант уже назван, не размножается. Город из оси в запросе → каждый другой город.
+    Признаки не размножаются. Дедуп по тексту. → (интенты, упёрлись в потолок)."""
     out, seen = [], set()
-    variants = cur["variants"] or []
+    subj_forms = _form_lists([cur["subject"]] + cur["subject_aliases"])
+    var_forms = _form_lists([n for v in cur["variants"] for n in [v["name"]] + v["aliases"]])
     cities = cur["cities"] or []
+    city_forms = [(c, _form_lists([c])) for c in cities]
+
+    def _norm_text(t: str) -> str:
+        return _WS.sub(" ", t).strip()
+
     for g in cur["groups"]:
-        for tpl in g["templates"]:
-            t = tpl["t"]
-            need_v, need_a, need_c = "{variant}" in t, "{attr}" in t, "{city}" in t
-            v_iter: list[tuple[dict | None, str]]
-            if need_v or need_a:
-                v_iter = [(v, v["name"]) for v in variants]
-                # im_0.2: [(v, form) for v in variants for form in [v["name"]] + v["aliases"]] — взрыв ×8, Andrew: написания не размножать
-                if not v_iter:
+        for qd in g["queries"]:
+            q = qd["q"]
+            base = _norm(q)   # подстановка идёт в нормализованной строке (find_span считает срез по ней)
+            # ── вариант
+            rows: list[tuple[str, str]] = [(base, "")]
+            if g["scope"] == "variant" and cur["variants"] and find_span(base, var_forms) is None:
+                span = find_span(base, subj_forms)
+                if span is not None:
+                    a, b = span
+                    rows = [(_norm_text(base[:a] + v["name"] + base[b:]), v["name"]) for v in cur["variants"]]
+            # ── город
+            rows2: list[tuple[str, str, str]] = []
+            for text, vname in rows:
+                cspan, cname = None, ""
+                for c, cf in city_forms:
+                    cspan = find_span(text, cf)
+                    if cspan is not None:
+                        cname = c
+                        break
+                # город в косвенном падеже («в одессе») не размножаем — подстановка именительного дала бы «в Одесса»
+                if cspan is None or text[cspan[0]:cspan[1]] != _norm(cname):
+                    rows2.append((text, vname, cname if cspan is not None else ""))
+                else:
+                    a, b = cspan
+                    for c in cities:
+                        rows2.append((_norm_text(text[:a] + c + text[b:]), vname, c))
+            for text, vname, cname in rows2:
+                k = _norm(text)
+                if not text or k in seen:
                     continue
-            else:
-                v_iter = [(None, "")]
-            c_iter = cities if need_c else [""]
-            if need_c and not c_iter:
-                continue
-            for v, form in v_iter:
-                a_iter = [a["name"] for a in v["attrs"]] if (need_a and v) else [""]
-                if need_a and not a_iter:
-                    continue
-                for attr in a_iter:
-                    for city in c_iter:
-                        s = t.replace("{variant}", form).replace("{attr}", attr).replace("{city}", city)
-                        s = _WS.sub(" ", s).strip()
-                        if not s or _norm(s) in seen:
-                            continue
-                        seen.add(_norm(s))
-                        out.append({"intent": s, "macro": g["macro"], "sub": g["sub"], "type": g["type"],
-                                    "scope": g["scope"], "template": t, "variant": v["name"] if v else "",
-                                    "attr": attr, "city": city, "stage": tpl["stage"], "by": tpl["by"]})
-                        if len(out) >= MAX_EXPANDED:
-                            return out, True
+                seen.add(k)
+                out.append({"intent": text, "macro": g["macro"], "sub": g["sub"], "type": g["type"],
+                            "scope": g["scope"], "source": q, "variant": vname, "city": cname,
+                            "stage": qd["stage"], "by": qd["by"]})
+                if len(out) >= MAX_EXPANDED:
+                    return out, True
     return out, False
 
 
@@ -559,7 +595,7 @@ async def run_intent_map(req: IntentReq) -> dict:
         stages.append({
             "stage": i, "model": model, "thinking": thinking, "mode": mode,
             "added": counts, "groups_after": len(cur["groups"]),
-            "templates_after": sum(len(g["templates"]) for g in cur["groups"]),
+            "queries_after": sum(len(g["queries"]) for g in cur["groups"]),
             "in": r["in"], "out": r["out"], "think": r["think"], "cost": r["cost"], "wall": r["wall"],
             "error": err, "raw": r["text"],
         })
@@ -569,8 +605,8 @@ async def run_intent_map(req: IntentReq) -> dict:
     candidates: list[tuple[dict, dict]] = []
     n_anchor = n_keybacked = 0
     for g in cur["groups"]:
-        for t in g["templates"]:
-            if has_anchor(t["t"], forms):
+        for t in g["queries"]:
+            if has_anchor(t["q"], forms):
                 n_anchor += 1
             elif g["keys"]:
                 n_keybacked += 1
@@ -578,11 +614,11 @@ async def run_intent_map(req: IntentReq) -> dict:
                 candidates.append((g, t))
     verify_stats = None
     if candidates:
-        keep, verify_stats = await verify_templates(seed, ctx["region"], [t["t"] for _, t in candidates])
+        keep, verify_stats = await verify_templates(seed, ctx["region"], [t["q"] for _, t in candidates])
         drop = {id(t) for i, (_, t) in enumerate(candidates) if i not in keep}
         for g in cur["groups"]:
-            g["templates"] = [t for t in g["templates"] if id(t) not in drop]
-        cur["groups"] = [g for g in cur["groups"] if g["templates"] or g["keys"]]
+            g["queries"] = [t for t in g["queries"] if id(t) not in drop]
+        cur["groups"] = [g for g in cur["groups"] if g["queries"] or g["keys"]]
         stages.append(verify_stats)
 
     intents, capped = expand_map(cur)
@@ -594,7 +630,8 @@ async def run_intent_map(req: IntentReq) -> dict:
         "stages": stages,
         "stats": {
             "groups": len(cur["groups"]),
-            "templates": sum(len(g["templates"]) for g in cur["groups"]),
+            "queries": sum(len(g["queries"]) for g in cur["groups"]),
+            "journey": len(cur["journey"]),
             "variants": len(cur["variants"]),
             "attrs": sum(len(v["attrs"]) for v in cur["variants"]),
             "cities": len(cur["cities"]),
