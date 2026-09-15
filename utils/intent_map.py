@@ -33,6 +33,9 @@ im_0.5 (Andrew, 2026-09-15): подстановка городов отключ�
   города остаются осью данных для serviceArea); один запрос на под-группу; Claude и GPT — thinking low
   (medium: долго, добавляет мало), Gemini medium.
 
+im_0.6 (Andrew, 2026-09-16): поле notes — «особенности ниши/региона» от специалиста (необязательное), подмешивается
+  в промпты всех проходов как контекст; GPT-проход — gpt-5.6-terra вместо sol (в 2 раза дешевле).
+
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
 Модуль самодостаточен: свой реестр моделей и свои вызовы вендоров (НЕ импортирует minus_words_test —
@@ -51,13 +54,15 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.5"
+BUILD = "im_0.6"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini",    "price": (0.75, 3.75)},   # вводная цена до 31.12.2026, потом 1.5/7.5
     "claude-sonnet-5":  {"vendor": "anthropic", "price": (2.0, 10.0)},
-    "gpt-5.6-sol":      {"vendor": "openai",    "price": (4.0, 20.0)},
+    "gpt-5.6-sol":      {"vendor": "openai",    "price": (4.0, 20.0)},    # акция до 21.11.2026, потом 5/30
+    "gpt-5.6-terra":    {"vendor": "openai",    "price": (2.0, 12.0)},
+    "gpt-5.6-luna":     {"vendor": "openai",    "price": (0.20, 1.20)},   # кандидат на A/B
     "gemini-3.1-flash-lite": {"vendor": "gemini", "price": (0.10, 0.40)},   # верификатор
 }
 
@@ -66,7 +71,7 @@ MODELS: dict[str, dict] = {
 CHAIN: list[tuple[str, str]] = [
     ("gemini-3.8-flash", "medium"),
     ("claude-sonnet-5",  "low"),      # im_0.5: было medium — 36 с, +15 запросов
-    ("gpt-5.6-sol",      "low"),      # im_0.5: было medium — 106 с, 73% цены
+    ("gpt-5.6-terra",    "low"),      # im_0.6: было gpt-5.6-sol low (41 с, $0.077); im_0.5: sol medium — 106 с, 73% цены
 ]
 
 VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
@@ -107,7 +112,7 @@ JSON_SHAPE = (
     ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "queries": ["..."]}]}'
 )
 FIRST_PROMPT = (
-    "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
+    "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
     "Ниже ключевые слова, собранные из подсказок Google по этому сиду.\n\n"
     "Задача — полная карта поисковых интентов по этой теме: по ключам плюс из твоей базы знаний (то, чего в ключах нет). "
     "Работай в реалиях региона: местные термины, правила, каналы покупки.\n\n"
@@ -116,7 +121,7 @@ FIRST_PROMPT = (
     "Ключевые слова:\n{keys}"
 )
 EXTEND_PROMPT = (
-    "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
+    "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
     "Ниже ключевые слова, собранные из подсказок Google по этому сиду, и уже составленная карта интентов по этой теме.\n\n"
     "Расширь карту: добавь то, чего в ней нет — написания предмета, варианты предмета, признаки вариантов, города, "
     "этапы пути клиента, под-группы и запросы; из ключей и из твоей базы знаний в реалиях региона (местные термины, "
@@ -564,6 +569,7 @@ class IntentReq(BaseModel):
     country: str = ""
     language: str = ""
     city: str = ""
+    notes: str = ""          # im_0.6: особенности ниши/региона от специалиста — контекст для моделей
 
 
 def _kw_strings(keywords: list) -> list[str]:
@@ -582,7 +588,9 @@ async def run_intent_map(req: IntentReq) -> dict:
     seed = _WS.sub(" ", req.seed.strip())
     keys = _kw_strings(req.keywords)
     region = req.country.strip() + (f" / {req.city.strip()}" if req.city.strip() else "")
+    notes = _WS.sub(" ", req.notes.strip())
     ctx = {"seed": seed, "region": region or "не указан", "language": req.language or "ru",
+           "notes": (f"\nОсобенности ниши и региона от специалиста (учитывай при построении карты): {notes}" if notes else ""),
            "keys": "\n".join(f"{i + 1}. {k}" for i, k in enumerate(keys))}
     keys_index = {_norm(k): i + 1 for i, k in enumerate(keys)}
 
@@ -630,7 +638,7 @@ async def run_intent_map(req: IntentReq) -> dict:
     intents, capped = expand_map(cur)
     total_cost = round(sum(s["cost"] for s in stages), 5)
     return {
-        "seed": seed, "region": region, "language": req.language, "keywords_in": len(keys),
+        "seed": seed, "region": region, "language": req.language, "notes": notes, "keywords_in": len(keys),
         "map": cur,
         "intents": intents,
         "stages": stages,
