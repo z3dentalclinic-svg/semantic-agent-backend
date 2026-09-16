@@ -41,6 +41,8 @@ im_0.8 (Andrew, 2026-09-16): GPT-проход — gpt-5.6-luna low (Terra: 98 с
   режется на параллельные части: часть 0 — оси (написания, варианты, признаки, города, неотнесённые ключи, новые пункты
   чек-листа), части 1..N — доли чек-листа journey+specifics, каждая закрывает только свои пункты. Слияние кодом.
   Конвейер между моделями по-прежнему строгий; параллель только внутри одного прохода. Число частей — в CHAIN.
+im_0.9 (2026-09-16): у признака поле kind (поколение / двигатель / комплектация / другое) — нужно карте контента
+  (content_map.py) для страниц по поколениям. Поле добавлено, контракт не менялся.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -60,7 +62,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.8"
+BUILD = "im_0.9"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -98,7 +100,8 @@ FRAMEWORK = (
     "Для каждого — написания того же имени, которыми его набирают (кириллица, латиница, разговорное), в порядке "
     "употребимости в поиске. Коды, версии, поколения и комплектации — это не написания, а признаки.\n"
     "3. Признаки вариантов — что внутри варианта меняет выбор (поколение, версия, размер, объём, год, класс). "
-    "Признак привязан к своему варианту; если у признака есть период — укажи.\n"
+    "Признак привязан к своему варианту; если у признака есть период — укажи; вид признака (kind): "
+    "поколение / двигатель / комплектация / другое.\n"
     "4. Этапы пути клиента (journey) — сквозные темы, одинаковые для всех вариантов (выбор, цена, оформление, "
     "доставка, проверка, оплата, риски, сервис, сравнение и другие, характерные для этой темы). Перечисли этапы списком.\n"
     "5. Города региона.\n"
@@ -116,7 +119,7 @@ FRAMEWORK = (
 )
 JSON_SHAPE = (
     '{"subject": "...", "subject_is_brand": true, "subject_aliases": ["..."],\n'
-    ' "variants": [{"name": "...", "aliases": ["..."], "attrs": [{"name": "...", "period": "..."}]}],\n'
+    ' "variants": [{"name": "...", "aliases": ["..."], "attrs": [{"name": "...", "period": "...", "kind": "поколение"}]}],\n'
     ' "journey": ["..."], "specifics": ["..."], "cities": ["..."],\n'
     ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "queries": ["..."]}]}'
 )
@@ -351,7 +354,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
             if _norm(an) in have_attrs:
                 continue
             have_attrs.add(_norm(an))
-            v["attrs"].append({"name": an, "period": _clean(ar.get("period")), "stage": stage, "by": model})
+            v["attrs"].append({"name": an, "period": _clean(ar.get("period")), "kind": _norm(ar.get("kind")), "stage": stage, "by": model})
             c["attrs"] += 1
 
     for key in ("cities", "journey", "specifics"):
@@ -408,7 +411,7 @@ def map_for_prompt(cur: dict, keys_index: dict[str, int] | None = None) -> str:
     slim = {
         "subject": cur["subject"], "subject_is_brand": cur["subject_is_brand"], "subject_aliases": cur["subject_aliases"],
         "variants": [{"name": v["name"], "aliases": v["aliases"],
-                      "attrs": [{"name": a["name"], "period": a["period"]} for a in v["attrs"]]} for v in cur["variants"]],
+                      "attrs": [{"name": a["name"], "period": a["period"], "kind": a.get("kind", "")} for a in v["attrs"]]} for v in cur["variants"]],
         "journey": cur["journey"], "specifics": cur["specifics"], "cities": cur["cities"],
         "groups": [{"macro": g["macro"], "sub": g["sub"], "type": g["type"], "scope": g["scope"],
                     "keys": [keys_index.get(_norm(k), 0) for k in g["keys"]] if keys_index else [],
