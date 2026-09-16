@@ -133,6 +133,10 @@ register_minus_words_test(app)
 from utils.intent_map import router as intent_map_router
 app.include_router(intent_map_router)
 
+# --- Карта контента (cm_0.1): дерево страниц из карты интентов по правилам Andrew, /api/content-map. Модуль самодостаточен. ---
+from utils.content_map import router as content_map_router
+app.include_router(content_map_router)
+
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
 #     """
