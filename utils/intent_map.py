@@ -55,11 +55,22 @@ im_0.13 (Andrew, 2026-09-19): часть вариантов — без приз�
   признаки легаси-вариантов не нужны — одна страница по правилу 1).
 im_0.14 (Andrew, 2026-09-19): часть вариантов — только варианты с реальным спросом в регионе (Sol добавлял исторические
   модели без спроса: CJ 1954, Comanche, Jeepster Commando).
+im_0.15 (Andrew, 2026-09-20): второй проход Claude → deepseek-flash low (Claude 20 с и $0.03 за 6–9 под-групп);
+  новый вендор deepseek (Chat Completions, reasoning_effort, ключ DEEPSEEK_API_KEY). Sol в части вариантов —
+  решение после замера: если DeepSeek даёт легаси-варианты сам, Sol убирается.
+im_0.16 (Andrew, 2026-09-20): оптимизация ввода/вывода по методике L3:
+  (1) порядок промпта — общий текст (сид, ключи, карта, каркас) первым, задание последним → части одного прохода
+      делят кэшируемый префикс (OpenAI / Gemini / DeepSeek кэшируют автоматически);
+  (2) ответ моделей — строчный формат вместо JSON (одна строка на запись, поля через « | »), ~⅓ меньше выходных
+      токенов; карта в промпт тоже строчная; JSON принимается как запасной вариант разбора (parse_json);
+  (3) часть вариантов — reasoning_effort minimal (откат на low при 400).
+  JSON-формат im_0.2–0.15 — закомментирован (JSON_SHAPE_OLD, FIRST/EXTEND_PROMPT_JSON) как точка отката.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
 Модуль самодостаточен: свой реестр моделей и свои вызовы вендоров (НЕ импортирует minus_words_test —
-правится отдельно, не ломая другие модули). Ключи из окружения: GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY.
+правится отдельно, не ломая другие модули). Ключи из окружения: GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,
+DEEPSEEK_API_KEY.
 """
 from __future__ import annotations
 
@@ -74,7 +85,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.14"
+BUILD = "im_0.16"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -84,19 +95,20 @@ MODELS: dict[str, dict] = {
     "gpt-5.6-terra":    {"vendor": "openai",    "price": (2.0, 12.0)},
     "gpt-5.6-luna":     {"vendor": "openai",    "price": (0.20, 1.20)},   # кандидат на A/B
     "gemini-3.1-flash-lite": {"vendor": "gemini", "price": (0.10, 0.40)},   # верификатор
+    "deepseek-flash":   {"vendor": "deepseek",  "price": (0.30, 1.20)},   # V4.1 Flash, пиковая цена; вне пика вдвое дешевле
 }
 
 # Конвейер: порядок = порядок проходов. thinking: off | low | medium | high; третье число — на сколько параллельных
 # частей резать проход расширения (1 = один вызов; для первого прохода не применяется).
 CHAIN: list[tuple[str, str, int]] = [
     ("gemini-3.8-flash", "medium", 1),
-    ("claude-sonnet-5",  "low",    1),   # im_0.5: было medium — 36 с, +15 запросов; low 7.7 с — резать незачем
+    ("deepseek-flash",   "low",    1),   # im_0.15: было claude-sonnet-5 low (8–21 с, $0.02–0.03, 6–9 под-групп)
     ("gpt-5.6-luna",     "low",    5),   # im_0.12: 5 = варианты (Sol) + оси (Luna) + 3 части чек-листа; im_0.8: 4 части Luna
 ]
 # im_0.10/0.12: модель для части 0 (варианты предмета и их написания) прохода, если он разрезан на части.
 # Ключ — модель прохода из CHAIN; нет записи → часть 0 идёт на модель прохода.
 AXES_MODEL: dict[str, tuple[str, str]] = {
-    "gpt-5.6-luna": ("gpt-5.6-sol", "low"),
+    "gpt-5.6-luna": ("gpt-5.6-sol", "minimal"),   # im_0.16: было low; minimal — без рассуждения, откат на low при 400
 }
 
 VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
@@ -130,9 +142,9 @@ FRAMEWORK = (
     "скобок. Если под-группа повторяется для каждого варианта предмета, пиши запрос с предметом сида (код сам "
     "подставит варианты). Запрос — запрос человека, который решает задачу сида, в контексте сида; запрос про "
     "другой предмет или без связи с сидом не годится.\n"
-    "Для каждой под-группы: тип (" + " / ".join(TYPES) + "), scope: \"variant\" — содержание зависит от варианта "
-    "предмета, \"common\" — общий этап, одинаковый для всех вариантов, и keys — номера ключевых слов из списка, "
-    "которые относятся к этой под-группе (ключ относится к одной под-группе; если ни один — пустой список).\n"
+    "Для каждой под-группы: тип (" + " / ".join(TYPES) + "), scope: variant — содержание зависит от варианта "
+    "предмета, common — общий этап, одинаковый для всех вариантов, и ключи — номера ключевых слов из списка, "
+    "которые относятся к этой под-группе (ключ относится к одной под-группе; если ни один — «нет»).\n"
 )
 JSON_SHAPE = (
     '{"subject": "...", "subject_is_brand": true, "subject_aliases": ["..."],\n'
@@ -140,46 +152,72 @@ JSON_SHAPE = (
     ' "journey": ["..."], "specifics": ["..."], "cities": ["..."],\n'
     ' "groups": [{"macro": "...", "sub": "...", "type": "...", "scope": "variant", "keys": [1, 5], "queries": ["..."]}]}'
 )
+# im_0.16: строчный формат ответа (вместо JSON) — одна запись на строку, поля через « | », списки через «; »
+LINE_FORMAT = (
+    "Формат ответа — только такие строки, без JSON, без пояснений, без пустых значений:\n"
+    "предмет: <название> | бренд: да/нет | написания: <написание>; <написание>\n"
+    "вариант: <название> | написания: <написание>; <написание> | признаки: <признак> (<вид>, <период>); <признак> (<вид>)\n"
+    "этап: <этап пути клиента>\n"
+    "особенность: <особенность ниши или региона>\n"
+    "город: <город>; <город>; <город>\n"
+    "группа: <макро-группа> > <под-группа> | <тип> | variant или common | ключи: 1, 5 | запрос: <запрос>\n"
+    "Строк «вариант», «этап», «особенность», «группа» — столько, сколько записей; «ключи:» — номера из списка "
+    "ключевых слов или «нет»."
+)
 FIRST_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
-    "Ниже ключевые слова, собранные из подсказок Google по этому сиду.\n\n"
+    "Ключевые слова, собранные из подсказок Google по этому сиду:\n{keys}\n\n"
+    + FRAMEWORK + "\n" + LINE_FORMAT + "\n\n"
     "Задача — полная карта поисковых интентов по этой теме: по ключам плюс из твоей базы знаний (то, чего в ключах нет). "
-    "Работай в реалиях региона: местные термины, правила, каналы покупки.\n\n"
-    + FRAMEWORK +
-    "\nОтвет — только JSON без пояснений:\n" + JSON_SHAPE + "\n\n"
-    "Ключевые слова:\n{keys}"
+    "Работай в реалиях региона: местные термины, правила, каналы покупки. Ответ — строки формата выше."
 )
 EXTEND_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
-    "Ниже ключевые слова, собранные из подсказок Google по этому сиду, и уже составленная карта интентов по этой теме.\n\n"
-    "{task}\n\n"
-    + FRAMEWORK +
-    "\nОтвет — только JSON той же структуры и ТОЛЬКО с добавлениями: новые варианты целиком; новые написания и признаки — "
-    "под именем существующего варианта; номера ключей — под существующими macro и sub; новые под-группы целиком, по одному запросу. "
-    "Пустые списки допустимы. Если добавить нечего — {}.\n" + JSON_SHAPE + "\n\n"
-    "Ключевые слова:\n{keys}\n\n"
-    "Текущая карта:\n{map}"
+    "Ключевые слова, собранные из подсказок Google по этому сиду:\n{keys}\n\n"
+    "Текущая карта интентов (тот же формат, что и для ответа):\n{map}\n\n"
+    + FRAMEWORK + "\n" + LINE_FORMAT + "\n"
+    "Отвечай ТОЛЬКО добавлениями: новые варианты целиком; новые написания и признаки — строкой «вариант:» с именем "
+    "существующего варианта и только новыми значениями; номера ключей — строкой «группа:» с существующими макро и "
+    "под-группой; новые под-группы целиком, по одному запросу. Если добавить нечего — одно слово: нет.\n\n"
+    "{task}"
 )
+# ── im_0.2–0.15 (откат): JSON-формат, задание в середине промпта
+# JSON_SHAPE_OLD = JSON_SHAPE
+# FIRST_PROMPT_JSON = (
+#     "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
+#     "Ниже ключевые слова, собранные из подсказок Google по этому сиду.\n\n"
+#     "Задача — полная карта поисковых интентов по этой теме: по ключам плюс из твоей базы знаний (то, чего в ключах нет). "
+#     "Работай в реалиях региона: местные термины, правила, каналы покупки.\n\n"
+#     + FRAMEWORK + "\nОтвет — только JSON без пояснений:\n" + JSON_SHAPE + "\n\nКлючевые слова:\n{keys}"
+# )
+# EXTEND_PROMPT_JSON = (
+#     "Сид: «{seed}». Регион: {region}. Язык: {language}.{notes}\n"
+#     "Ниже ключевые слова, собранные из подсказок Google по этому сиду, и уже составленная карта интентов по этой теме.\n\n"
+#     "{task}\n\n" + FRAMEWORK +
+#     "\nОтвет — только JSON той же структуры и ТОЛЬКО с добавлениями: новые варианты целиком; новые написания и признаки — "
+#     "под именем существующего варианта; номера ключей — под существующими macro и sub; новые под-группы целиком, по одному запросу. "
+#     "Пустые списки допустимы. Если добавить нечего — {}.\n" + JSON_SHAPE + "\n\nКлючевые слова:\n{keys}\n\nТекущая карта:\n{map}"
+# )
 # im_0.8: задание части прохода расширения — вставляется в EXTEND_PROMPT вместо общего задания
 EXTEND_TASK_ALL = (
     "Расширь карту: добавь то, чего в ней нет — написания предмета, варианты предмета, признаки вариантов, города, "
     "этапы пути клиента, особенности ниши и региона, под-группы и запросы; из ключей и из твоей базы знаний. "
-    "Пройди по спискам journey и specifics как по чек-листу: каждый этап и каждая особенность должны быть закрыты "
+    "Пройди по спискам этапов и особенностей как по чек-листу: каждый этап и каждая особенность должны быть закрыты "
     "хотя бы одной под-группой — незакрытые закрой, отсутствующие добавь в списки. Ключи, которые ещё не отнесены "
     "ни к одной под-группе, отнеси к существующей или новой."
 )
 EXTEND_TASK_VARIANTS = (
     "Твоя часть работы — только варианты предмета: каких вариантов (моделей, видов, типов, направлений) не хватает "
-    "в списке variants — добавь только те, которые люди в этом регионе реально ищут сейчас; снятые с производства "
-    "или исторические без текущего спроса не нужны. У каждого — написания, которыми его набирают; attrs у новых "
-    "вариантов оставь пустым. "
-    "Признаки, города, под-группы, этапы и особенности не добавляй — ими заняты другие части; groups оставь пустым."
+    "в списке вариантов — добавь только те, которые люди в этом регионе реально ищут сейчас; снятые с производства "
+    "или исторические без текущего спроса не нужны. У каждого — написания, которыми его набирают; признаки у новых "
+    "вариантов не пиши. "
+    "Признаки, города, под-группы, этапы и особенности не добавляй — ими заняты другие части."
 )
 EXTEND_TASK_AXES = (
     "Твоя часть работы — оси карты: дополни написания предмета, написания и признаки существующих вариантов, "
     "города региона; ключи, которые ещё не отнесены ни к одной под-группе, отнеси к существующей или новой. "
-    "Если в списках journey или specifics не хватает этапов или особенностей — добавь их и закрой каждый добавленный "
-    "пункт под-группой. Существующие пункты чек-листа и новые варианты не трогай — ими заняты другие части."
+    "Если в списках этапов или особенностей не хватает пунктов — добавь их и закрой каждый добавленный пункт "
+    "под-группой. Существующие пункты чек-листа и новые варианты не трогай — ими заняты другие части."
 )
 # im_0.11 (откат): части чек-листа с правом добавлять недостающие пункты — давали 4+2+0 под-групп, объём не переносится
 EXTEND_TASK_PART = (
@@ -234,6 +272,11 @@ async def _call_openai(model: str, prompt: str, thinking: str) -> dict:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
         r = await c.post("https://api.openai.com/v1/responses",
                          headers={"Authorization": f"Bearer {key}"}, json=body)
+        if r.status_code == 400 and thinking not in ("off", "low", "medium", "high"):
+            # im_0.16: модель не принимает этот уровень (minimal/none) — повтор на low
+            body["reasoning"] = {"effort": "low"}
+            r = await c.post("https://api.openai.com/v1/responses",
+                             headers={"Authorization": f"Bearer {key}"}, json=body)
         r.raise_for_status()
         d = r.json()
     text = ""
@@ -270,7 +313,28 @@ async def _call_anthropic(model: str, prompt: str, thinking: str) -> dict:
     return {"text": text, "in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0), "think": 0}
 
 
-_CALLERS = {"gemini": _call_gemini, "openai": _call_openai, "anthropic": _call_anthropic}
+async def _call_deepseek(model: str, prompt: str, thinking: str) -> dict:
+    # Chat Completions, OpenAI-совместимый. reasoning_effort: low | high | max (medium у DeepSeek = high).
+    # completion_tokens включает reasoning; reasoning_tokens — справочно из completion_tokens_details.
+    key = os.environ["DEEPSEEK_API_KEY"]
+    body: dict = {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False}
+    if thinking == "off":
+        body["thinking"] = {"type": "disabled"}
+    else:
+        body["thinking"] = {"type": "enabled"}
+        body["reasoning_effort"] = {"low": "low", "medium": "high", "high": "high"}.get(thinking, "low")
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
+        r = await c.post("https://api.deepseek.com/chat/completions",
+                         headers={"Authorization": f"Bearer {key}"}, json=body)
+        r.raise_for_status()
+        d = r.json()
+    text = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    u = d.get("usage", {})
+    return {"text": text, "in": u.get("prompt_tokens", 0), "out": u.get("completion_tokens", 0),
+            "think": u.get("completion_tokens_details", {}).get("reasoning_tokens", 0)}
+
+
+_CALLERS = {"gemini": _call_gemini, "openai": _call_openai, "anthropic": _call_anthropic, "deepseek": _call_deepseek}
 
 
 async def call_model(model: str, prompt: str, thinking: str) -> dict:
@@ -315,6 +379,84 @@ def parse_json(text: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return d if isinstance(d, dict) else None
+
+
+_ATTR_RE = re.compile(r"^(.*?)\s*\(([^()]*)\)\s*$")
+
+
+def _split(s: str, sep: str = ";") -> list[str]:
+    return [x.strip() for x in s.split(sep) if x.strip() and _norm(x) != "нет"]
+
+
+def parse_lines(text: str) -> dict | None:
+    """Строчный формат (im_0.16) → структура как у JSON-ответа (для merge_map). None = ни одной записи."""
+    out = {"variants": [], "journey": [], "specifics": [], "cities": [], "groups": []}
+    found = False
+    for raw in text.splitlines():
+        line = raw.strip().strip("`").lstrip("-*• ").strip()
+        if not line or ":" not in line:
+            continue
+        head, _, rest = line.partition(":")
+        key = _norm(head)
+        fields = [f.strip() for f in rest.split("|")]
+        named = {}
+        for f in fields[1:]:
+            k, _, v = f.partition(":")
+            named[_norm(k)] = v.strip()
+        first = fields[0].strip() if fields else ""
+        if key == "предмет":
+            out["subject"] = first
+            brand = _norm(named.get("бренд", ""))
+            if brand in ("да", "yes", "true"):
+                out["subject_is_brand"] = True
+            elif brand in ("нет", "no", "false"):
+                out["subject_is_brand"] = False
+            out["subject_aliases"] = _split(named.get("написания", ""))
+            found = True
+        elif key == "вариант":
+            attrs = []
+            for a in _split(named.get("признаки", "")):
+                m = _ATTR_RE.match(a)
+                if m:
+                    inner = [x.strip() for x in m.group(2).split(",")]
+                    attrs.append({"name": m.group(1).strip(), "kind": inner[0] if inner else "",
+                                  "period": ", ".join(inner[1:]) if len(inner) > 1 else ""})
+                else:
+                    attrs.append({"name": a, "kind": "", "period": ""})
+            out["variants"].append({"name": first, "aliases": _split(named.get("написания", "")), "attrs": attrs})
+            found = True
+        elif key in ("этап", "journey"):
+            out["journey"] += _split(rest) if ";" in rest else ([rest.strip()] if rest.strip() else [])
+            found = True
+        elif key in ("особенность", "specifics"):
+            out["specifics"] += _split(rest) if ";" in rest else ([rest.strip()] if rest.strip() else [])
+            found = True
+        elif key in ("город", "города", "cities"):
+            out["cities"] += _split(rest)
+            found = True
+        elif key in ("группа", "group"):
+            macro, _, sub = first.partition(">")
+            if not sub:
+                macro, _, sub = first.partition("→")
+            typ = fields[1].strip() if len(fields) > 1 else ""
+            scope = fields[2].strip() if len(fields) > 2 else ""
+            keys = [k for k in re.split(r"[,\s]+", named.get("ключи", "")) if k.isdigit()]
+            query = named.get("запрос", "")
+            out["groups"].append({"macro": macro.strip(), "sub": sub.strip(), "type": typ, "scope": scope,
+                                  "keys": [int(k) for k in keys], "queries": [query] if query else []})
+            found = True
+    return out if found else None
+
+
+def parse_answer(text: str) -> dict | None:
+    """Разбор ответа прохода: строчный формат, запасной — JSON. «нет»/пусто → {} (добавить нечего)."""
+    t = text.strip()
+    if _norm(t.strip("`")) in ("", "нет"):
+        return {}
+    parsed = parse_lines(t)
+    if parsed is not None:
+        return parsed
+    return parse_json(t)
 
 
 def empty_map() -> dict:
@@ -432,7 +574,25 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
 
 
 def map_for_prompt(cur: dict, keys_index: dict[str, int] | None = None) -> str:
-    """Карта в компактном JSON для промпта расширения (без служебных stage/by); ключи — номерами списка."""
+    """Карта в строчном формате для промпта расширения (im_0.16); ключи — номерами списка."""
+    lines = [f"предмет: {cur['subject']} | бренд: {'да' if cur['subject_is_brand'] else 'нет'} | "
+             f"написания: {'; '.join(cur['subject_aliases']) or 'нет'}"]
+    for v in cur["variants"]:
+        attrs = "; ".join(f"{a['name']} ({a.get('kind') or 'другое'}{', ' + a['period'] if a['period'] else ''})" for a in v["attrs"])
+        lines.append(f"вариант: {v['name']} | написания: {'; '.join(v['aliases']) or 'нет'} | признаки: {attrs or 'нет'}")
+    lines += [f"этап: {x}" for x in cur["journey"]]
+    lines += [f"особенность: {x}" for x in cur["specifics"]]
+    if cur["cities"]:
+        lines.append("город: " + "; ".join(cur["cities"]))
+    for g in cur["groups"]:
+        ks = ", ".join(str(keys_index.get(_norm(k), 0)) for k in g["keys"]) if (keys_index and g["keys"]) else "нет"
+        q = g["queries"][0]["q"] if g["queries"] else ""
+        lines.append(f"группа: {g['macro']} > {g['sub']} | {g['type']} | {g['scope']} | ключи: {ks} | запрос: {q}")
+    return "\n".join(lines)
+
+
+def map_for_prompt_json(cur: dict, keys_index: dict[str, int] | None = None) -> str:
+    """im_0.2–0.15 (откат): карта в компактном JSON."""
     slim = {
         "subject": cur["subject"], "subject_is_brand": cur["subject_is_brand"], "subject_aliases": cur["subject_aliases"],
         "variants": [{"name": v["name"], "aliases": v["aliases"],
@@ -684,9 +844,9 @@ async def run_intent_map(req: IntentReq) -> dict:
         chunk_stats, errors, raws = [], [], []
         for r in results:   # слияние строго по порядку частей — детерминизм при дублях
             err = r["error"]
-            parsed = parse_json(r["text"]) if not err else None
+            parsed = parse_answer(r["text"]) if not err else None
             if not err and parsed is None:
-                err = "parse: ответ не JSON"
+                err = "parse: ответ не разобран (ни строки формата, ни JSON)"
             c = merge_map(cur, parsed, i, model, keys) if parsed is not None else dict(_EMPTY_COUNTS)
             for k in counts:
                 counts[k] += c[k]
