@@ -80,6 +80,10 @@ im_0.21 (Andrew, 2026-09-20): часть «недостающее» — толь
   (хвост особенностей раздувался на обоих сидах: jeep 43, часы 24 с «местным сленгом часовщиков»).
 im_0.22 (2026-09-20): парсер — у строк этап/особенность/город берётся только первое поле до «|»; если модель дописала
   в такую строку поля группы («… | тип | scope | ключи: | запрос: …»), из хвоста собирается под-группа.
+im_0.23 (Andrew, 2026-09-20, регрессия «курсы английского киев»): дедуп по смыслу в слиянии — этап / особенность /
+  название под-группы с долей общих лемм ≥ SIM_THR к существующему = тот же пункт; запрос, совпадающий по леммам
+  с запросом любой группы, второй раз не добавляется, группа с таким единственным запросом не создаётся.
+  Причина: DeepSeek без thinking переписывает существующее другими словами (три группы на один запрос).
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -100,7 +104,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.22"
+BUILD = "im_0.23"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -382,7 +386,38 @@ async def call_model(model: str, prompt: str, thinking: str) -> dict:
 # ══════════════════════════ разбор JSON и слияние карты ══════════════════════════
 
 _WS = re.compile(r"\s+")
-_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "journey": 0, "specifics": 0, "groups": 0, "queries": 0, "keys": 0}
+_EMPTY_COUNTS = {"variants": 0, "aliases": 0, "attrs": 0, "cities": 0, "journey": 0, "specifics": 0, "groups": 0, "queries": 0, "keys": 0, "dups": 0}
+SIM_THR = 0.6     # im_0.23: Жаккар по леммам — названия под-групп («ремонт часов» ≠ «ремонт часов после падения» = 0.5)
+OVERLAP_THR = 0.6  # im_0.23: коэффициент перекрытия |A∩B|/min — этапы и особенности (чек-лист, ложное слияние безвредно)
+
+
+def _lemset(s: str) -> frozenset:
+    """Множество лемм длиной ≥ 3 (предлоги и союзы отпадают) — для сравнения по смыслу."""
+    return frozenset(t for t in _lemmas(s) if len(t) >= 3)
+
+
+def _jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _overlap(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _find_similar(text: str, pool: list, thr: float = SIM_THR, measure: str = "jaccard") -> int:
+    """Индекс элемента pool (список (lemset, obj)), похожего на text по леммам, иначе -1. Точное совпадение — тоже."""
+    ls = _lemset(text)
+    fn = _overlap if measure == "overlap" else _jaccard
+    best, best_i = 0.0, -1
+    for i, (pl, _) in enumerate(pool):
+        j = 1.0 if pl == ls and ls else fn(ls, pl)
+        if j > best:
+            best, best_i = j, i
+    return best_i if best >= thr else -1
 
 
 def _norm(s) -> str:
@@ -558,7 +593,7 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
             v["attrs"].append({"name": an, "period": _clean(ar.get("period")), "kind": _norm(ar.get("kind")), "stage": stage, "by": model})
             c["attrs"] += 1
 
-    for key in ("cities", "journey", "specifics"):
+    for key in ("cities",):
         have = {_norm(x) for x in cur[key]}
         for x in _as_list(add.get(key)):
             xs = _clean(x)
@@ -566,9 +601,23 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
                 have.add(_norm(xs))
                 cur[key].append(xs)
                 c[key] += 1
+    for key in ("journey", "specifics"):   # im_0.23: дедуп по смыслу
+        pool = [(_lemset(x), x) for x in cur[key]]
+        for x in _as_list(add.get(key)):
+            xs = _clean(x)
+            if not xs:
+                continue
+            if _find_similar(xs, pool, OVERLAP_THR, "overlap") >= 0:
+                c["dups"] += 1
+                continue
+            pool.append((_lemset(xs), xs))
+            cur[key].append(xs)
+            c[key] += 1
 
-    # группы: ключ (macro, sub)
+    # группы: ключ (macro, sub); im_0.23 — иначе похожее название под-группы или тот же запрос (по леммам) → та же группа
     gindex = {(_norm(g["macro"]), _norm(g["sub"])): g for g in cur["groups"]}
+    sub_pool = [(_lemset(g["sub"]), g) for g in cur["groups"]]
+    q_pool = [(_lemset(q["q"]), g) for g in cur["groups"] for q in g["queries"]]
     assigned = {_norm(k) for g in cur["groups"] for k in g["keys"]}
     for raw in _as_list(add.get("groups")):
         if not isinstance(raw, dict):
@@ -578,7 +627,25 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
             continue
         sub = sub or macro
         macro = macro or sub
+        new_qs = []
+        for q in _as_list(raw.get("queries")) + _as_list(raw.get("templates")):   # templates — совместимость с ответом старого формата
+            qs = _clean(q).replace("{variant}", cur["subject"]).replace("{city}", cur["cities"][0] if cur["cities"] else "").replace("{attr}", "")
+            qs = _WS.sub(" ", qs).strip()
+            if qs:
+                new_qs.append(qs)
         g = gindex.get((_norm(macro), _norm(sub)))
+        if g is None:
+            i = _find_similar(sub, sub_pool)
+            if i >= 0:
+                g = sub_pool[i][1]
+                c["dups"] += 1
+        if g is None:
+            for qs in new_qs:
+                i = _find_similar(qs, q_pool, 0.8)
+                if i >= 0:
+                    g = q_pool[i][1]
+                    c["dups"] += 1
+                    break
         if g is None:
             typ = _norm(raw.get("type"))
             g = {"macro": macro, "sub": sub, "type": typ if typ in TYPES else "информационный",   # im_0.4: не из шкалы → информационный
@@ -586,15 +653,14 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
                  "queries": [], "keys": [], "stage": stage, "by": model}
             cur["groups"].append(g)
             gindex[(_norm(macro), _norm(sub))] = g
+            sub_pool.append((_lemset(sub), g))
             c["groups"] += 1
-        have_q = {_norm(q["q"]) for q in g["queries"]}
-        for q in _as_list(raw.get("queries")) + _as_list(raw.get("templates")):   # templates — совместимость с ответом старого формата
-            qs = _clean(q).replace("{variant}", cur["subject"]).replace("{city}", cur["cities"][0] if cur["cities"] else "").replace("{attr}", "")
-            qs = _WS.sub(" ", qs).strip()
-            if qs and _norm(qs) not in have_q:
-                have_q.add(_norm(qs))
-                g["queries"].append({"q": qs, "stage": stage, "by": model})
-                c["queries"] += 1
+        for qs in new_qs:
+            if _find_similar(qs, q_pool, 0.8) >= 0:
+                continue
+            q_pool.append((_lemset(qs), g))
+            g["queries"].append({"q": qs, "stage": stage, "by": model})
+            c["queries"] += 1
         for n in _as_list(raw.get("keys")):
             try:
                 idx = int(n)
