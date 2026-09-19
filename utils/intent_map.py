@@ -84,6 +84,8 @@ im_0.23 (Andrew, 2026-09-20, регрессия «курсы английско�
   название под-группы с долей общих лемм ≥ SIM_THR к существующему = тот же пункт; запрос, совпадающий по леммам
   с запросом любой группы, второй раз не добавляется, группа с таким единственным запросом не создаётся.
   Причина: DeepSeek без thinking переписывает существующее другими словами (три группы на один запрос).
+im_0.24 (2026-09-20): сходство запросов считается без лемм предмета и его написаний — иначе леммы сида дают 0.8
+  любой паре («… киев записаться» ≈ «… киев недорого», 46 ключей в одной группе); точные дубли — по строке.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -104,7 +106,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.23"
+BUILD = "im_0.24"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -408,12 +410,15 @@ def _overlap(a: frozenset, b: frozenset) -> float:
     return len(a & b) / min(len(a), len(b))
 
 
-def _find_similar(text: str, pool: list, thr: float = SIM_THR, measure: str = "jaccard") -> int:
-    """Индекс элемента pool (список (lemset, obj)), похожего на text по леммам, иначе -1. Точное совпадение — тоже."""
-    ls = _lemset(text)
+def _find_similar(text: str, pool: list, thr: float = SIM_THR, measure: str = "jaccard",
+                  drop: frozenset = frozenset()) -> int:
+    """Индекс элемента pool (список (lemset, obj)), похожего на text по леммам, иначе -1.
+    drop — леммы, исключаемые из сравнения (предмет сида: иначе они дают высокое сходство любой паре)."""
+    ls = _lemset(text) - drop
     fn = _overlap if measure == "overlap" else _jaccard
     best, best_i = 0.0, -1
     for i, (pl, _) in enumerate(pool):
+        pl = pl - drop
         j = 1.0 if pl == ls and ls else fn(ls, pl)
         if j > best:
             best, best_i = j, i
@@ -618,6 +623,8 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
     gindex = {(_norm(g["macro"]), _norm(g["sub"])): g for g in cur["groups"]}
     sub_pool = [(_lemset(g["sub"]), g) for g in cur["groups"]]
     q_pool = [(_lemset(q["q"]), g) for g in cur["groups"] for q in g["queries"]]
+    q_exact = {_norm(q["q"]): g for g in cur["groups"] for q in g["queries"]}
+    seed_lem = _lemset(" ".join([cur["subject"]] + cur["subject_aliases"]))   # im_0.24: вычитаются из сравнения запросов
     assigned = {_norm(k) for g in cur["groups"] for k in g["keys"]}
     for raw in _as_list(add.get("groups")):
         if not isinstance(raw, dict):
@@ -641,7 +648,11 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
                 c["dups"] += 1
         if g is None:
             for qs in new_qs:
-                i = _find_similar(qs, q_pool, 0.8)
+                if _norm(qs) in q_exact:
+                    g = q_exact[_norm(qs)]
+                    c["dups"] += 1
+                    break
+                i = _find_similar(qs, q_pool, 0.8, drop=seed_lem)
                 if i >= 0:
                     g = q_pool[i][1]
                     c["dups"] += 1
@@ -656,9 +667,10 @@ def merge_map(cur: dict, add: dict, stage: int, model: str, keys: list[str] | No
             sub_pool.append((_lemset(sub), g))
             c["groups"] += 1
         for qs in new_qs:
-            if _find_similar(qs, q_pool, 0.8) >= 0:
+            if _norm(qs) in q_exact or _find_similar(qs, q_pool, 0.8, drop=seed_lem) >= 0:
                 continue
             q_pool.append((_lemset(qs), g))
+            q_exact[_norm(qs)] = g
             g["queries"].append({"q": qs, "stage": stage, "by": model})
             c["queries"] += 1
         for n in _as_list(raw.get("keys")):
