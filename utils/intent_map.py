@@ -67,6 +67,8 @@ im_0.16 (Andrew, 2026-09-20): оптимизация ввода/вывода п�
   JSON-формат im_0.2–0.15 — закомментирован (JSON_SHAPE_OLD, FIRST/EXTEND_PROMPT_JSON) как точка отката.
 im_0.17 (Andrew, 2026-09-20): DeepSeek без thinking (на low 11.8k из 14.9k токенов было рассуждение, 58 с; ответ 3.1k —
   32 под-группы, 4 легаси-варианта); Sol из части вариантов убран — легаси даёт DeepSeek, часть 0 на Luna.
+im_0.18 (2026-09-20): DeepSeek режется на 5 частей, как Luna (без thinking он пишет 7.2k токенов / 63 под-группы за 26 с —
+  объём, не задержка).
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -87,7 +89,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.17"
+BUILD = "im_0.18"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -104,7 +106,7 @@ MODELS: dict[str, dict] = {
 # частей резать проход расширения (1 = один вызов; для первого прохода не применяется).
 CHAIN: list[tuple[str, str, int]] = [
     ("gemini-3.8-flash", "medium", 1),
-    ("deepseek-flash",   "off",    1),   # im_0.17: было low (58 с, 79% токенов — рассуждение); im_0.15: claude-sonnet-5 low
+    ("deepseek-flash",   "off",    5),   # im_0.18: 5 частей (один вызов — 26 с, 7.2k токенов); im_0.17: off; im_0.15: claude low
     ("gpt-5.6-luna",     "low",    5),   # im_0.12: 5 = варианты (Sol) + оси (Luna) + 3 части чек-листа; im_0.8: 4 части Luna
 ]
 # im_0.10/0.12: модель для части 0 (варианты предмета и их написания) прохода, если он разрезан на части.
