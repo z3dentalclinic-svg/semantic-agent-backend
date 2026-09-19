@@ -65,6 +65,8 @@ im_0.16 (Andrew, 2026-09-20): оптимизация ввода/вывода п�
       токенов; карта в промпт тоже строчная; JSON принимается как запасной вариант разбора (parse_json);
   (3) часть вариантов — reasoning_effort minimal (откат на low при 400).
   JSON-формат im_0.2–0.15 — закомментирован (JSON_SHAPE_OLD, FIRST/EXTEND_PROMPT_JSON) как точка отката.
+im_0.17 (Andrew, 2026-09-20): DeepSeek без thinking (на low 11.8k из 14.9k токенов было рассуждение, 58 с; ответ 3.1k —
+  32 под-группы, 4 легаси-варианта); Sol из части вариантов убран — легаси даёт DeepSeek, часть 0 на Luna.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -85,7 +87,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.16"
+BUILD = "im_0.17"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -102,13 +104,14 @@ MODELS: dict[str, dict] = {
 # частей резать проход расширения (1 = один вызов; для первого прохода не применяется).
 CHAIN: list[tuple[str, str, int]] = [
     ("gemini-3.8-flash", "medium", 1),
-    ("deepseek-flash",   "low",    1),   # im_0.15: было claude-sonnet-5 low (8–21 с, $0.02–0.03, 6–9 под-групп)
+    ("deepseek-flash",   "off",    1),   # im_0.17: было low (58 с, 79% токенов — рассуждение); im_0.15: claude-sonnet-5 low
     ("gpt-5.6-luna",     "low",    5),   # im_0.12: 5 = варианты (Sol) + оси (Luna) + 3 части чек-листа; im_0.8: 4 части Luna
 ]
 # im_0.10/0.12: модель для части 0 (варианты предмета и их написания) прохода, если он разрезан на части.
 # Ключ — модель прохода из CHAIN; нет записи → часть 0 идёт на модель прохода.
 AXES_MODEL: dict[str, tuple[str, str]] = {
-    "gpt-5.6-luna": ("gpt-5.6-sol", "minimal"),   # im_0.16: было low; minimal — без рассуждения, откат на low при 400
+    # im_0.17: Sol убран — легаси-варианты даёт DeepSeek на втором проходе; часть 0 идёт на модель прохода (Luna)
+    # "gpt-5.6-luna": ("gpt-5.6-sol", "minimal"),   # im_0.16: minimal 12.9 с / 1 вариант; im_0.10–0.15: low 16–26 с
 }
 
 VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
