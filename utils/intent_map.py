@@ -78,6 +78,8 @@ im_0.20 (Andrew, 2026-09-20, регрессия «ремонт швейцарс�
   часть вариантов у DeepSeek → Luna low через AXES_MODEL (DeepSeek без thinking дал 70 «вариантов» одного шаблона).
 im_0.21 (Andrew, 2026-09-20): часть «недостающее» — только пункты с реальным поисковым спросом, без дублей по смыслу
   (хвост особенностей раздувался на обоих сидах: jeep 43, часы 24 с «местным сленгом часовщиков»).
+im_0.22 (2026-09-20): парсер — у строк этап/особенность/город берётся только первое поле до «|»; если модель дописала
+  в такую строку поля группы («… | тип | scope | ключи: | запрос: …»), из хвоста собирается под-группа.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -98,7 +100,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.21"
+BUILD = "im_0.22"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -450,14 +452,21 @@ def parse_lines(text: str) -> dict | None:
                     attrs.append({"name": a, "kind": "", "period": ""})
             out["variants"].append({"name": first, "aliases": _split(named.get("написания", "")), "attrs": attrs})
             found = True
-        elif key in ("этап", "journey"):
-            out["journey"] += _split(rest) if ";" in rest else ([rest.strip()] if rest.strip() else [])
-            found = True
-        elif key in ("особенность", "specifics"):
-            out["specifics"] += _split(rest) if ";" in rest else ([rest.strip()] if rest.strip() else [])
+        elif key in ("этап", "journey", "особенность", "specifics"):
+            # im_0.22: только первое поле; хвост с «запрос:» → под-группа (модель склеила пункт и его закрытие)
+            target = "journey" if key in ("этап", "journey") else "specifics"
+            item = first
+            out[target] += _split(item) if ";" in item else ([item] if item else [])
+            if named.get("запрос"):
+                typ = next((f for f in fields[1:] if _norm(f) in TYPES), "")
+                scope = next((_norm(f) for f in fields[1:] if _norm(f) in ("variant", "common")), "")
+                keys = [k for k in re.split(r"[,\s]+", named.get("ключи", "")) if k.isdigit()]
+                out["groups"].append({"macro": "Путь клиента" if target == "journey" else "Особенности ниши",
+                                      "sub": item, "type": typ, "scope": scope,
+                                      "keys": [int(k) for k in keys], "queries": [named["запрос"]]})
             found = True
         elif key in ("город", "города", "cities"):
-            out["cities"] += _split(rest)
+            out["cities"] += _split(first)
             found = True
         elif key in ("группа", "group"):
             macro, _, sub = first.partition(">")
