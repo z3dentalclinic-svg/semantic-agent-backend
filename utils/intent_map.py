@@ -86,6 +86,10 @@ im_0.23 (Andrew, 2026-09-20, регрессия «курсы английско�
   Причина: DeepSeek без thinking переписывает существующее другими словами (три группы на один запрос).
 im_0.24 (2026-09-20): сходство запросов считается без лемм предмета и его написаний — иначе леммы сида дают 0.8
   любой паре («… киев записаться» ≈ «… киев недорого», 46 ключей в одной группе); точные дубли — по строке.
+im_0.25 (Andrew, 2026-09-20, регрессия «доставка цветов»): PART_MODEL вместо AXES_MODEL — у DeepSeek на Luna low идут
+  обе свободные части: 0 (варианты) и 2 (недостающее). DeepSeek без thinking на свободном перечислении уходит
+  вразнос (часы: 70 вариантов; цветы: 64 особенности «в тюрьму и СИЗО», «на яхту», 331 повтор); на осях и чек-листе
+  он быстр и точен.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -106,7 +110,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.24"
+BUILD = "im_0.25"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -126,13 +130,14 @@ CHAIN: list[tuple[str, str, int]] = [
     ("deepseek-flash",   "off",    6),   # im_0.19: 6 = варианты + оси + недостающее + 3 чек-листа; im_0.18: 5; im_0.17: один вызов 26 с
     ("gpt-5.6-luna",     "low",    6),   # im_0.19: 6; im_0.12: 5 = варианты (Sol) + оси (Luna) + 3 части чек-листа
 ]
-# im_0.10/0.12: модель для части 0 (варианты предмета и их написания) прохода, если он разрезан на части.
-# Ключ — модель прохода из CHAIN; нет записи → часть 0 идёт на модель прохода.
-AXES_MODEL: dict[str, tuple[str, str]] = {
-    "deepseek-flash": ("gpt-5.6-luna", "low"),   # im_0.20: DeepSeek без thinking — 70 «вариантов» одного шаблона на часах
-    # im_0.17: Sol убран — легаси-варианты даёт DeepSeek на втором проходе; часть 0 идёт на модель прохода (Luna)
-    # "gpt-5.6-luna": ("gpt-5.6-sol", "minimal"),   # im_0.16: minimal 12.9 с / 1 вариант; im_0.10–0.15: low 16–26 с
+# im_0.25: переопределение модели по частям прохода расширения: {модель прохода: {номер части: (модель, thinking)}}.
+# Части: 0 — варианты, 1 — оси, 2 — недостающие этапы/особенности, 3.. — чек-лист. Нет записи → модель прохода.
+PART_MODEL: dict[str, dict[int, tuple[str, str]]] = {
+    "deepseek-flash": {0: ("gpt-5.6-luna", "low"),    # im_0.20: DeepSeek без thinking — 70 «вариантов» на часах
+                       2: ("gpt-5.6-luna", "low")},   # im_0.25: DeepSeek без thinking — 64 особенности на цветах
 }
+# im_0.10–0.24 (откат): AXES_MODEL = {"deepseek-flash": ("gpt-5.6-luna", "low")} — только часть 0
+# im_0.17: Sol убран — легаси-варианты даёт DeepSeek/Luna; im_0.16: "gpt-5.6-luna": ("gpt-5.6-sol", "minimal")
 
 VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
 VERIFY_VOTES = 3                                              # вызовов на голосование, большинство
@@ -949,9 +954,9 @@ async def run_intent_map(req: IntentReq) -> dict:
         else:
             prompts = extend_prompts(ctx, cur, keys_index, chunks)
         t_st = time.perf_counter()
-        # im_0.10/0.12: часть 0 (варианты) — на AXES_MODEL, остальные части — на модель прохода
-        ax_model, ax_thinking = AXES_MODEL.get(model, (model, thinking)) if len(prompts) > 1 else (model, thinking)
-        results = await asyncio.gather(*[call_model(ax_model if k == 0 else model, p, ax_thinking if k == 0 else thinking)
+        # im_0.25: модель части — по PART_MODEL (только когда проход разрезан), иначе модель прохода
+        overrides = PART_MODEL.get(model, {}) if len(prompts) > 1 else {}
+        results = await asyncio.gather(*[call_model(*overrides.get(k, (model, thinking))[:1], p, overrides.get(k, (model, thinking))[1])
                                          for k, p in enumerate(prompts)])
         counts = dict(_EMPTY_COUNTS)
         chunk_stats, errors, raws = [], [], []
@@ -1039,7 +1044,8 @@ async def intent_map_endpoint(req: IntentReq):
 
 @router.get("/api/intent-map/models")
 async def intent_map_models():
-    return {"chain": [{"model": m, "thinking": t, "chunks": c, "axes_model": AXES_MODEL.get(m, (m, t))[0],
+    return {"chain": [{"model": m, "thinking": t, "chunks": c,
+                       "part_model": {str(k): v[0] for k, v in PART_MODEL.get(m, {}).items()},
                        "price": MODELS[m]["price"]} for m, t, c in CHAIN], "build": BUILD}
 
 
