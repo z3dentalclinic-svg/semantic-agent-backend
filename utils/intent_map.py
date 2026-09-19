@@ -43,6 +43,8 @@ im_0.8 (Andrew, 2026-09-16): GPT-проход — gpt-5.6-luna low (Terra: 98 с
   Конвейер между моделями по-прежнему строгий; параллель только внутри одного прохода. Число частей — в CHAIN.
 im_0.9 (2026-09-16): у признака поле kind (поколение / двигатель / комплектация / другое) — нужно карте контента
   (content_map.py) для страниц по поколениям. Поле добавлено, контракт не менялся.
+im_0.10 (Andrew, 2026-09-19): ось-часть (часть 0) прохода расширения может идти на другую модель — AXES_MODEL в CHAIN:
+  Luna не добавляет варианты (Liberty, Commander, Wagoneer терялись), Sol на короткой ось-части стоит копейки.
 
 im_0.1 — плоский формат «интент | примеры» — блок сохранён внизу файла как точка отката.
 
@@ -62,7 +64,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "im_0.9"
+BUILD = "im_0.10"
 
 # ─── реестр моделей: цена $ за 1M токенов (in, out). Правка цен — только здесь. ───
 MODELS: dict[str, dict] = {
@@ -81,6 +83,11 @@ CHAIN: list[tuple[str, str, int]] = [
     ("claude-sonnet-5",  "low",    1),   # im_0.5: было medium — 36 с, +15 запросов; low 7.7 с — резать незачем
     ("gpt-5.6-luna",     "low",    4),   # im_0.8: было terra low (98 с) ← sol low (41 с) ← sol medium (106 с)
 ]
+# im_0.10: модель для ось-части (часть 0: варианты, признаки, написания, города, неотнесённые ключи) прохода,
+# если он разрезан на части. Ключ — модель прохода из CHAIN; нет записи → ось-часть идёт на модель прохода.
+AXES_MODEL: dict[str, tuple[str, str]] = {
+    "gpt-5.6-luna": ("gpt-5.6-sol", "low"),
+}
 
 VERIFY: tuple[str, str] = ("gemini-3.1-flash-lite", "low")   # верификатор потока «без якоря»
 VERIFY_VOTES = 3                                              # вызовов на голосование, большинство
@@ -650,7 +657,10 @@ async def run_intent_map(req: IntentReq) -> dict:
         else:
             prompts = extend_prompts(ctx, cur, keys_index, chunks)
         t_st = time.perf_counter()
-        results = await asyncio.gather(*[call_model(model, p, thinking) for p in prompts])
+        # im_0.10: часть 0 (оси) — на AXES_MODEL, остальные части — на модель прохода
+        ax_model, ax_thinking = AXES_MODEL.get(model, (model, thinking)) if len(prompts) > 1 else (model, thinking)
+        results = await asyncio.gather(*[call_model(ax_model if k == 0 else model, p, ax_thinking if k == 0 else thinking)
+                                         for k, p in enumerate(prompts)])
         counts = dict(_EMPTY_COUNTS)
         chunk_stats, errors, raws = [], [], []
         for r in results:   # слияние строго по порядку частей — детерминизм при дублях
@@ -661,7 +671,7 @@ async def run_intent_map(req: IntentReq) -> dict:
             c = merge_map(cur, parsed, i, model, keys) if parsed is not None else dict(_EMPTY_COUNTS)
             for k in counts:
                 counts[k] += c[k]
-            chunk_stats.append({"in": r["in"], "out": r["out"], "cost": r["cost"], "wall": r["wall"], "error": err, "added": c})
+            chunk_stats.append({"model": r["model"], "in": r["in"], "out": r["out"], "cost": r["cost"], "wall": r["wall"], "error": err, "added": c})
             if err:
                 errors.append(err)
             raws.append(r["text"])
@@ -737,7 +747,8 @@ async def intent_map_endpoint(req: IntentReq):
 
 @router.get("/api/intent-map/models")
 async def intent_map_models():
-    return {"chain": [{"model": m, "thinking": t, "chunks": c, "price": MODELS[m]["price"]} for m, t, c in CHAIN], "build": BUILD}
+    return {"chain": [{"model": m, "thinking": t, "chunks": c, "axes_model": AXES_MODEL.get(m, (m, t))[0],
+                       "price": MODELS[m]["price"]} for m, t, c in CHAIN], "build": BUILD}
 
 
 # ══════════════════════════ im_0.1 — плоский формат (точка отката, не вызывается) ══════════════════════════
