@@ -26,6 +26,14 @@ cm_0.2 (Andrew, 2026-09-17): под-группы с общим спросом п
   одиночная под-группа без ключей — не страница, присоединяется к соседней по этапу (в промпт передаётся число ключей);
   легаси-вариант: не волна 1; волна 3 только без ключей, с ключами — волна 2.
 
+cm_0.3 (Andrew, 2026-09-20, регрессия «ремонт швейцарских часов»): маршрут под-группы до слияния тем:
+  (1) под-группа, в названии или запросе которой стоит имя ровно одного варианта, — страница варианта независимо от scope
+      (были пары «механические часы» вариант + «Ремонт механических часов» генерик с одним слагом);
+  (2) под-группы типа «локальный» → один локальный узел (город с наибольшим числом ключей), остальные города — serviceArea;
+      (были страницы Днепр/Одесса/Запорожье по одному ключу);
+  (3) под-группы типа «навигационный» → хаб (были страницы чужих мастерских);
+  волна 3 — страницы вариантов без единого ключа; слаги без коллизий.
+
 Модуль самодостаточен (не импортирует intent_map.py и minus_words_test.py).
 """
 from __future__ import annotations
@@ -41,7 +49,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "cm_0.2"
+BUILD = "cm_0.3"
 
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini", "price": (0.75, 3.75)},
@@ -287,10 +295,14 @@ def resolve_generation(text: str, variant: dict, entry: dict) -> str:
     return entry["default"]
 
 
-async def consolidate(seed: str, region: str, language: str, groups: list[dict], m: dict) -> tuple[dict | None, dict]:
-    """Один вызов модели: common-подгруппы → страницы (слияние дублей), слаги. → (parsed|None, stats)."""
+async def consolidate(seed: str, region: str, language: str, groups: list[dict], m: dict,
+                      eligible: list[int] | None = None) -> tuple[dict | None, dict]:
+    """Один вызов модели: common-подгруппы → страницы (слияние дублей), слаги. → (parsed|None, stats).
+    eligible — индексы групп, которые идут в промпт (cm_0.3: без вариантных, локальных и навигационных)."""
     lines = []
     for i, g in enumerate(groups):
+        if eligible is not None and i not in eligible:
+            continue
         q = g["queries"][0]["q"] if g.get("queries") else ""
         lines.append(f"{i + 1}. [{g.get('type', '')}, {len(g.get('keys', []))} кл.] {g['macro']} → {g['sub']}: {q}")
     names = [m.get("subject") or seed] + [v["name"] for v in m.get("variants", [])]
@@ -317,8 +329,8 @@ def waves(nodes: list[dict], vindex: dict) -> None:
     top = max(1, int(len(ranked) * WAVE_TOP_SHARE))
     for k, n in enumerate(ranked):
         legacy = n["id"] in legacy_nodes or n["parent"] in legacy_nodes
-        if n["count"] <= WAVE_LOW_COUNT or (legacy and n["keys"] == 0):
-            n["wave"] = 3
+        if n["count"] <= WAVE_LOW_COUNT or (legacy and n["keys"] == 0) or (n["kind"] in ("variant", "generation") and n["keys"] == 0):
+            n["wave"] = 3   # cm_0.3: вариант без единого ключа — только знания моделей
         elif k < top and not legacy:          # cm_0.2: легаси не выше волны 2
             n["wave"] = 1
         else:
@@ -341,9 +353,35 @@ async def run_content_map(req: ContentReq) -> dict:
     variants_by_name = {_norm(v["name"]): v for v in m.get("variants", [])}
     var_forms_all = _forms([n for v in m.get("variants", []) for n in [v["name"]] + v.get("aliases", [])])
 
-    # ── темы генериков и сравнений — модель; fail-open: каждая common-подгруппа = страница
-    common_idx = [i for i, g in enumerate(groups) if g.get("scope") == "common" or _norm(g.get("type")) == "сравнение"]
-    parsed, st = await consolidate(seed, req.region, req.language, groups, m)
+    # ── cm_0.3: маршрут под-группы до слияния тем
+    cities = m.get("cities", [])
+    city_forms = [(c, _forms([c])) for c in cities]
+    # имя варианта в под-группе ищем по различающим леммам (имя варианта минус леммы предмета), порядок слов не важен:
+    # «механические швейцарские часы» → {механический} — совпадёт и с «ремонт швейцарских механических часов»
+    subj_lem = set(_lemmas(m.get("subject") or seed)) | set(_lemmas(seed))
+    variant_forms = []
+    for v in m.get("variants", []):
+        dls = [set(_lemmas(n)) - subj_lem for n in [v["name"]] + v.get("aliases", [])]
+        variant_forms.append((v["name"], [d for d in dls if d]))
+    route: dict[int, str] = {}          # gi → variant | local | nav | common
+    group_variant: dict[int, str] = {}  # gi → имя варианта (правило 1)
+    group_city: dict[int, str] = {}     # gi → город (правило 2)
+    for gi, g in enumerate(groups):
+        typ = _norm(g.get("type"))
+        probe = g["sub"] + " " + (g["queries"][0]["q"] if g.get("queries") else "")
+        probe_lem = set(_lemmas(probe))
+        named = [name for name, dls in variant_forms if any(d <= probe_lem for d in dls)]
+        if len(named) == 1 and typ != "сравнение":
+            route[gi], group_variant[gi] = "variant", named[0]
+        elif typ == "локальный":
+            route[gi] = "local"
+            group_city[gi] = next((c for c, cf in city_forms if contains(probe, cf)), "")
+        elif typ == "навигационный":
+            route[gi] = "nav"
+        else:
+            route[gi] = "common"
+    common_idx = [gi for gi, r in route.items() if r == "common"]
+    parsed, st = await consolidate(seed, req.region, req.language, groups, m, eligible=common_idx)
     by_hub = nodes[0]
     group_node: dict[int, str] = {}
     slugs: dict[str, str] = {}
@@ -365,7 +403,7 @@ async def run_content_map(req: ContentReq) -> dict:
                     gi = int(n) - 1
                 except (TypeError, ValueError):
                     continue
-                if 0 <= gi < len(groups) and gi not in group_node:
+                if 0 <= gi < len(groups) and gi not in group_node and route.get(gi) == "common":
                     group_node[gi] = nid
                     members.append(gi)
             if members:
@@ -380,6 +418,22 @@ async def run_content_map(req: ContentReq) -> dict:
             kind = "compare" if _norm(g.get("type")) == "сравнение" else "generic"
             nodes.append(_node(nid, kind, g["sub"], "hub", groups=[f"{g['macro']} → {g['sub']}"]))
             group_node[gi] = nid
+    # ── cm_0.3, правило 2: один локальный узел; город — с наибольшим числом ключей среди локальных групп
+    local_idx = [gi for gi, r in route.items() if r == "local"]
+    if local_idx:
+        by_city: dict[str, int] = {}
+        for gi in local_idx:
+            c = group_city.get(gi) or ""
+            by_city[c] = by_city.get(c, 0) + len(groups[gi].get("keys", [])) + 1
+        top_city = max(by_city, key=by_city.get) if by_city else ""
+        top_city = top_city or (cities[0] if cities else "")
+        subj = m.get("subject") or seed
+        nd = _node("local", "generic", f"{subj}: {top_city}" if top_city else subj, "hub", cities=cities,
+                   groups=[f"{groups[gi]['macro']} → {groups[gi]['sub']}" for gi in local_idx])
+        nd["local"] = True
+        nodes.append(nd)
+        for gi in local_idx:
+            group_node[gi] = "local"
     by_id = {n["id"]: n for n in nodes}
 
     # ── слаги
@@ -394,6 +448,16 @@ async def run_content_map(req: ContentReq) -> dict:
         else:
             n["slug"] = slugs.get(_norm(n["name"])) or slugify(n["name"])
     by_id["hub"]["slug"] = slugs.get(_norm(m.get("subject") or seed)) or by_id["hub"]["slug"] or slugify(seed)
+    if "local" in by_id:
+        by_id["local"]["slug"] = by_id["hub"]["slug"] + "-" + slugify(by_id["local"]["name"].split(": ")[-1])
+    seen_slugs: dict[str, int] = {}                       # cm_0.3: без коллизий слагов
+    for n in nodes:
+        base = n["slug"]
+        if base in seen_slugs:
+            seen_slugs[base] += 1
+            n["slug"] = f"{base}-{seen_slugs[base]}"
+        else:
+            seen_slugs[base] = 1
 
     # ── распределение: интенты (размноженные запросы) и реальные ключи
     assign: list[dict] = []
@@ -403,8 +467,15 @@ async def run_content_map(req: ContentReq) -> dict:
         g = groups[gi] if gi is not None else None
         scope = g.get("scope") if g else "common"
         gtype = _norm(g.get("type")) if g else ""
+        r = route.get(gi, "common") if gi is not None else "common"
         nid = None
-        if gi is not None and (scope == "common" or gtype == "сравнение"):
+        if r == "nav":
+            nid = "hub"                                    # cm_0.3, правило 3: навигационные → хаб
+        elif r == "local":
+            nid = "local"                                  # cm_0.3, правило 2: локальные → один локальный узел
+        elif r == "variant":
+            variant_name = variant_name or group_variant.get(gi, "")   # cm_0.3, правило 1
+        elif gi is not None and (scope == "common" or gtype == "сравнение"):
             nid = group_node.get(gi)                       # правило 2: общий этап / сравнение → генерик, даже с вариантом
         if nid is None:
             vn = _norm(variant_name)
@@ -438,11 +509,9 @@ async def run_content_map(req: ContentReq) -> dict:
         place(x.get("intent", ""), gi, x.get("variant", ""), f"проход {x.get('stage', '')}", x.get("macro", ""),
               x.get("sub", ""), x.get("type", ""))
 
-    # ── правило 3: города → serviceArea на узлах локальных под-групп
-    cities = m.get("cities", [])
-    for n in nodes:
-        if any(_norm(t) == "локальный" for t in (groups[gi].get("type", "") for gi in group_node if group_node[gi] == n["id"])):
-            n["cities"] = cities
+    # ── правило 3: города → serviceArea (cm_0.3: у локального узла; без локальных групп — у хаба)
+    if "local" not in by_id and cities:
+        by_id["hub"]["cities"] = cities
 
     # ── узлы без единого интента — не страницы
     nodes = [n for n in nodes if n["kind"] in ("hub", "variant", "generation") or n["count"] > 0]
