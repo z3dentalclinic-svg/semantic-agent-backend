@@ -22,6 +22,10 @@ POST /api/content-map
 Модель (один вызов) нужна только для того, что кодом не сделать: слить дубли под-групп с разных проходов в темы
 страниц, дать страницам имена и url-слаги. Падение вызова → fail-open: каждая common-подгруппа = своя страница.
 
+cm_0.2 (Andrew, 2026-09-17): под-группы с общим спросом по предмету (запрос ≈ сид) → хаб (kind=hub в ответе модели);
+  одиночная под-группа без ключей — не страница, присоединяется к соседней по этапу (в промпт передаётся число ключей);
+  легаси-вариант: не волна 1; волна 3 только без ключей, с ключами — волна 2.
+
 Модуль самодостаточен (не импортирует intent_map.py и minus_words_test.py).
 """
 from __future__ import annotations
@@ -37,7 +41,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "cm_0.1"
+BUILD = "cm_0.2"
 
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini", "price": (0.75, 3.75)},
@@ -52,10 +56,14 @@ CONSOLIDATE_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
     "Ниже под-группы карты поисковых интентов по этой теме. У каждой — номер, тип и один типичный запрос.\n\n"
     "Собери из них страницы сайта. Одна страница = одна тема, которую раскрывает отдельная статья или раздел; "
-    "под-группы об одном и том же (в том числе дубли с разными названиями) — на одну страницу. Под-группы типа "
-    "«сравнение» — отдельные страницы сравнений (kind = compare), остальные — kind = generic. Каждая под-группа "
-    "должна попасть ровно на одну страницу. Название страницы — короткое, на языке {language}; slug — латиницей, "
-    "через дефис.\n"
+    "под-группы об одном и том же (в том числе дубли с разными названиями) — на одну страницу. "
+    "Под-группы с общим спросом по предмету сида (запрос — это сам сид или сид плюс «купить», «цена», «под ключ» "
+    "и подобное без отдельной темы) — это главная страница: kind = hub, одна на всю карту. "
+    "Под-группы типа «сравнение» — страницы сравнений (kind = compare), остальные — kind = generic. "
+    "У каждой под-группы указано число реальных ключей (кл.): под-группа с 0 ключей и без соседей по теме — не "
+    "отдельная страница, присоедини её к ближайшей по этапу пути клиента; отдельная страница — там, где есть ключи "
+    "или несколько под-групп одной темы. Каждая под-группа должна попасть ровно на одну страницу. "
+    "Название страницы — короткое, на языке {language}; slug — латиницей, через дефис.\n"
     "Отдельно дай слаги (латиницей, через дефис) для предмета сида, вариантов и поколений из списка ниже.\n\n"
     "Ответ — только JSON:\n"
     '{{"pages": [{{"name": "...", "slug": "...", "kind": "generic", "groups": [1, 5]}}],\n'
@@ -284,7 +292,7 @@ async def consolidate(seed: str, region: str, language: str, groups: list[dict],
     lines = []
     for i, g in enumerate(groups):
         q = g["queries"][0]["q"] if g.get("queries") else ""
-        lines.append(f"{i + 1}. [{g.get('type', '')}] {g['macro']} → {g['sub']}: {q}")
+        lines.append(f"{i + 1}. [{g.get('type', '')}, {len(g.get('keys', []))} кл.] {g['macro']} → {g['sub']}: {q}")
     names = [m.get("subject") or seed] + [v["name"] for v in m.get("variants", [])]
     for v in m.get("variants", []):
         names += [f"{v['name']} {g['name']}" for g in generations(v)]
@@ -308,9 +316,10 @@ def waves(nodes: list[dict], vindex: dict) -> None:
     ranked = sorted(leaves, key=lambda n: (n["keys"], n["count"]), reverse=True)   # реальные ключи — главный сигнал спроса
     top = max(1, int(len(ranked) * WAVE_TOP_SHARE))
     for k, n in enumerate(ranked):
-        if n["count"] <= WAVE_LOW_COUNT or n["id"] in legacy_nodes or n["parent"] in legacy_nodes:
+        legacy = n["id"] in legacy_nodes or n["parent"] in legacy_nodes
+        if n["count"] <= WAVE_LOW_COUNT or (legacy and n["keys"] == 0):
             n["wave"] = 3
-        elif k < top:
+        elif k < top and not legacy:          # cm_0.2: легаси не выше волны 2
             n["wave"] = 1
         else:
             n["wave"] = 2
@@ -335,6 +344,7 @@ async def run_content_map(req: ContentReq) -> dict:
     # ── темы генериков и сравнений — модель; fail-open: каждая common-подгруппа = страница
     common_idx = [i for i, g in enumerate(groups) if g.get("scope") == "common" or _norm(g.get("type")) == "сравнение"]
     parsed, st = await consolidate(seed, req.region, req.language, groups, m)
+    by_hub = nodes[0]
     group_node: dict[int, str] = {}
     slugs: dict[str, str] = {}
     if parsed:
@@ -342,9 +352,13 @@ async def run_content_map(req: ContentReq) -> dict:
         for p_i, pg in enumerate(parsed.get("pages") or []):
             if not isinstance(pg, dict):
                 continue
-            kind = "compare" if _norm(pg.get("kind")) == "compare" else "generic"
-            nid = f"p{p_i}"
-            nd = _node(nid, kind, str(pg.get("name") or f"Страница {p_i + 1}"), "hub", slug=str(pg.get("slug") or ""))
+            kind = _norm(pg.get("kind"))
+            kind = kind if kind in ("compare", "hub") else "generic"
+            if kind == "hub":                                   # cm_0.2: общий спрос по предмету → хаб
+                nd, nid = by_hub, "hub"
+            else:
+                nid = f"p{p_i}"
+                nd = _node(nid, kind, str(pg.get("name") or f"Страница {p_i + 1}"), "hub", slug=str(pg.get("slug") or ""))
             members = []
             for n in pg.get("groups") or []:
                 try:
@@ -355,8 +369,9 @@ async def run_content_map(req: ContentReq) -> dict:
                     group_node[gi] = nid
                     members.append(gi)
             if members:
-                nd["groups"] = [f"{groups[gi]['macro']} → {groups[gi]['sub']}" for gi in members]
-                nodes.append(nd)
+                nd["groups"] = nd.get("groups", []) + [f"{groups[gi]['macro']} → {groups[gi]['sub']}" for gi in members]
+                if kind != "hub":
+                    nodes.append(nd)
     # под-группы, которые модель не разложила (или вызов упал) — каждая своей страницей
     for gi in common_idx:
         if gi not in group_node:
