@@ -33,6 +33,8 @@ cm_0.3 (Andrew, 2026-09-20, регрессия «ремонт швейцарск
       (были страницы Днепр/Одесса/Запорожье по одному ключу);
   (3) под-группы типа «навигационный» → хаб (были страницы чужих мастерских);
   волна 3 — страницы вариантов без единого ключа; слаги без коллизий.
+cm_0.4 (2026-09-20): имя варианта в под-группе — по половине различающих лемм («золотые и ювелирные часы» ↔
+  под-группа «Золотые»), а не по всем.
 
 Модуль самодостаточен (не импортирует intent_map.py и minus_words_test.py).
 """
@@ -49,7 +51,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "cm_0.3"
+BUILD = "cm_0.4"
 
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini", "price": (0.75, 3.75)},
@@ -370,7 +372,8 @@ async def run_content_map(req: ContentReq) -> dict:
         typ = _norm(g.get("type"))
         probe = g["sub"] + " " + (g["queries"][0]["q"] if g.get("queries") else "")
         probe_lem = set(_lemmas(probe))
-        named = [name for name, dls in variant_forms if any(d <= probe_lem for d in dls)]
+        named = [name for name, dls in variant_forms
+                 if any(len(d & probe_lem) * 2 >= len(d) for d in dls)]   # cm_0.4: ≥ половины различающих лемм
         if len(named) == 1 and typ != "сравнение":
             route[gi], group_variant[gi] = "variant", named[0]
         elif typ == "локальный":
