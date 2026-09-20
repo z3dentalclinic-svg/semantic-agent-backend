@@ -137,6 +137,10 @@ app.include_router(intent_map_router)
 from utils.content_map import router as content_map_router
 app.include_router(content_map_router)
 
+# --- Портрет клиента (cp_0.1): таблица портрета из карты интентов, один вызов Gemini, /api/client-portrait. Модуль самодостаточен. ---
+from utils.client_portrait import router as client_portrait_router
+app.include_router(client_portrait_router)
+
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
 #     """
