@@ -35,6 +35,10 @@ cm_0.3 (Andrew, 2026-09-20, регрессия «ремонт швейцарск
   волна 3 — страницы вариантов без единого ключа; слаги без коллизий.
 cm_0.4 (2026-09-20): имя варианта в под-группе — по половине различающих лемм («золотые и ювелирные часы» ↔
   под-группа «Золотые»), а не по всем.
+cm_0.5 (2026-09-20): при совпадении нескольких вариантов берётся вариант с наибольшей долей совпавших лемм
+  («Электронные и смарт-часы» ↔ варианты «электронные часы» и «смарт-часы» уходили в общие темы); при равенстве
+  группа всё равно вариантная, а конкретный вариант определяется по тексту каждого ключа/запроса. Леммы предмета
+  вычитаются по общему префиксу («час» ↔ «часы» у pymorphy — разные леммы).
 
 Модуль самодостаточен (не импортирует intent_map.py и minus_words_test.py).
 """
@@ -51,7 +55,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "cm_0.4"
+BUILD = "cm_0.5"
 
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini", "price": (0.75, 3.75)},
@@ -360,11 +364,28 @@ async def run_content_map(req: ContentReq) -> dict:
     city_forms = [(c, _forms([c])) for c in cities]
     # имя варианта в под-группе ищем по различающим леммам (имя варианта минус леммы предмета), порядок слов не важен:
     # «механические швейцарские часы» → {механический} — совпадёт и с «ремонт швейцарских механических часов»
-    subj_lem = set(_lemmas(m.get("subject") or seed)) | set(_lemmas(seed))
+    subj_lem = set(_lemmas(m.get("subject") or seed)) | set(_lemmas(seed)) \
+        | {x for a in m.get("subject_aliases", []) for x in _lemmas(a)}   # и написания предмета («джип»)
+
+    def _subject_like(lem: str) -> bool:   # «часы» ↔ «час»: общий префикс ≥ 3 символов
+        return any(len(x) >= 3 and (lem.startswith(x) or x.startswith(lem)) for x in subj_lem)
+
     variant_forms = []
     for v in m.get("variants", []):
-        dls = [set(_lemmas(n)) - subj_lem for n in [v["name"]] + v.get("aliases", [])]
+        dls = [{x for x in _lemmas(n) if len(x) >= 3 and not _subject_like(x)} for n in [v["name"]] + v.get("aliases", [])]
         variant_forms.append((v["name"], [d for d in dls if d]))
+
+    def detect_variant(text: str) -> str:
+        """Вариант, названный в тексте: лучший по доле различающих лемм (≥ 0.5), единственный лучший; иначе ''."""
+        lem = set(_lemmas(text))
+        sc = []
+        for name, dls in variant_forms:
+            best = max(((len(d & lem) / len(d), len(d & lem)) for d in dls), default=(0.0, 0))
+            if best[0] >= 0.5:
+                sc.append((best, name))
+        sc.sort(reverse=True)
+        top = [n for b, n in sc if b == sc[0][0]] if sc else []
+        return top[0] if len(top) == 1 else ""
     route: dict[int, str] = {}          # gi → variant | local | nav | common
     group_variant: dict[int, str] = {}  # gi → имя варианта (правило 1)
     group_city: dict[int, str] = {}     # gi → город (правило 2)
@@ -372,10 +393,16 @@ async def run_content_map(req: ContentReq) -> dict:
         typ = _norm(g.get("type"))
         probe = g["sub"] + " " + (g["queries"][0]["q"] if g.get("queries") else "")
         probe_lem = set(_lemmas(probe))
-        named = [name for name, dls in variant_forms
-                 if any(len(d & probe_lem) * 2 >= len(d) for d in dls)]   # cm_0.4: ≥ половины различающих лемм
-        if len(named) == 1 and typ != "сравнение":
-            route[gi], group_variant[gi] = "variant", named[0]
+        scored = []                                      # cm_0.4: ≥ половины различающих лемм; cm_0.5: лучший по доле
+        for name, dls in variant_forms:
+            best = max(((len(d & probe_lem) / len(d), len(d & probe_lem)) for d in dls), default=(0.0, 0))
+            if best[0] >= 0.5:
+                scored.append((best, name))
+        scored.sort(reverse=True)
+        named = [n for sc, n in scored if sc == scored[0][0]] if scored else []
+        if named and typ != "сравнение":
+            route[gi] = "variant"
+            group_variant[gi] = named[0] if len(named) == 1 else ""   # несколько — вариант по тексту каждого ключа
         elif typ == "локальный":
             route[gi] = "local"
             group_city[gi] = next((c for c, cf in city_forms if contains(probe, cf)), "")
@@ -483,11 +510,10 @@ async def run_content_map(req: ContentReq) -> dict:
         if nid is None:
             vn = _norm(variant_name)
             entry = vindex.get(vn)
-            if entry is None:                               # вариант не передан — ищем в тексте
-                for name, e in vindex.items():
-                    if contains(text, _forms([name])):
-                        entry, vn = e, name
-                        break
+            if entry is None:                               # вариант не передан — ищем в тексте (cm_0.5: по леммам)
+                dv = detect_variant(text)
+                if dv:
+                    entry, vn = vindex.get(_norm(dv)), _norm(dv)
             if entry is not None:
                 v = variants_by_name.get(_norm(m["variants"][int(entry["node"][1:])]["name"]))
                 nid = resolve_generation(text, v, entry)  # правило 1: поколение по имени/году, иначе текущее
@@ -505,8 +531,7 @@ async def run_content_map(req: ContentReq) -> dict:
 
     for gi, g in enumerate(groups):
         for k in g.get("keys", []):
-            vn = next((name for name in vindex if contains(k, _forms([name]))), "")
-            place(k, gi, vn, "key", g["macro"], g["sub"], g.get("type", ""))
+            place(k, gi, detect_variant(k), "key", g["macro"], g["sub"], g.get("type", ""))
     for x in intents:
         gi = group_index.get((_norm(x.get("macro")), _norm(x.get("sub"))))
         place(x.get("intent", ""), gi, x.get("variant", ""), f"проход {x.get('stage', '')}", x.get("macro", ""),
