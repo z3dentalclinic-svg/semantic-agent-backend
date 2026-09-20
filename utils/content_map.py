@@ -39,6 +39,10 @@ cm_0.5 (2026-09-20): при совпадении нескольких вариа
   («Электронные и смарт-часы» ↔ варианты «электронные часы» и «смарт-часы» уходили в общие темы); при равенстве
   группа всё равно вариантная, а конкретный вариант определяется по тексту каждого ключа/запроса. Леммы предмета
   вычитаются по общему префиксу («час» ↔ «часы» у pymorphy — разные леммы).
+cm_0.6 (Andrew, 2026-09-20, регрессия «доставка цветов»): локальность — по содержанию (город из оси в названии или
+  запросе под-группы), не по типу; город с ключами ≥ LOCAL_MIN_KEYS получает свою страницу, остальные — serviceArea
+  (на хабе или, если страниц городов нет, на одном локальном узле с городом-лидером). Часы → только Киев; jeep → ни
+  одного города; цветы → 10–12 городов. (cm_0.3: один локальный узел по типу «локальный» — «Каменское» на 160 интентов.)
 
 Модуль самодостаточен (не импортирует intent_map.py и minus_words_test.py).
 """
@@ -55,7 +59,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-BUILD = "cm_0.5"
+BUILD = "cm_0.6"
 
 MODELS: dict[str, dict] = {
     "gemini-3.8-flash": {"vendor": "gemini", "price": (0.75, 3.75)},
@@ -65,6 +69,7 @@ CONSOLIDATE: tuple[str, str] = ("gemini-3.8-flash", "low")   # слияние т
 HTTP_TIMEOUT = 180
 WAVE_TOP_SHARE = 1 / 3      # доля узлов (по счёту) в волне 1
 WAVE_LOW_COUNT = 2          # счёт ≤ этого → волна 3
+LOCAL_MIN_KEYS = 5          # cm_0.6: город со столькими ключами получает свою страницу
 
 CONSOLIDATE_PROMPT = (
     "Сид: «{seed}». Регион: {region}. Язык: {language}.\n"
@@ -400,12 +405,13 @@ async def run_content_map(req: ContentReq) -> dict:
                 scored.append((best, name))
         scored.sort(reverse=True)
         named = [n for sc, n in scored if sc == scored[0][0]] if scored else []
+        city_named = next((c for c, cf in city_forms if contains(probe, cf)), "")
         if named and typ != "сравнение":
             route[gi] = "variant"
             group_variant[gi] = named[0] if len(named) == 1 else ""   # несколько — вариант по тексту каждого ключа
-        elif typ == "локальный":
+        elif city_named or typ == "локальный":                       # cm_0.6: локальность по содержанию
             route[gi] = "local"
-            group_city[gi] = next((c for c, cf in city_forms if contains(probe, cf)), "")
+            group_city[gi] = city_named
         elif typ == "навигационный":
             route[gi] = "nav"
         else:
@@ -448,22 +454,40 @@ async def run_content_map(req: ContentReq) -> dict:
             kind = "compare" if _norm(g.get("type")) == "сравнение" else "generic"
             nodes.append(_node(nid, kind, g["sub"], "hub", groups=[f"{g['macro']} → {g['sub']}"]))
             group_node[gi] = nid
-    # ── cm_0.3, правило 2: один локальный узел; город — с наибольшим числом ключей среди локальных групп
+    # ── cm_0.6, правило 3 по спросу: ключи по городам (город ключа — по тексту, иначе город группы)
     local_idx = [gi for gi, r in route.items() if r == "local"]
-    if local_idx:
-        by_city: dict[str, int] = {}
-        for gi in local_idx:
-            c = group_city.get(gi) or ""
-            by_city[c] = by_city.get(c, 0) + len(groups[gi].get("keys", [])) + 1
-        top_city = max(by_city, key=by_city.get) if by_city else ""
+    subj = m.get("subject") or seed
+    city_keys: dict[str, int] = {}
+    key_city: dict[tuple[int, str], str] = {}
+    for gi in local_idx:
+        per_group: dict[str, int] = {}
+        for k in groups[gi].get("keys", []):
+            c = next((c for c, cf in city_forms if contains(k, cf)), "")   # город только из текста ключа
+            key_city[(gi, _norm(k))] = c
+            if c:
+                city_keys[c] = city_keys.get(c, 0) + 1
+                per_group[c] = per_group.get(c, 0) + 1
+        if per_group:                                                        # город группы — самый частый среди её ключей
+            group_city[gi] = max(per_group, key=per_group.get)
+    city_node: dict[str, str] = {}
+    for c, n_keys in sorted(city_keys.items(), key=lambda x: -x[1]):
+        if c and n_keys >= LOCAL_MIN_KEYS:
+            nid = f"city{len(city_node)}"
+            nodes.append(_node(nid, "generic", f"{subj}: {c}", "hub", local=True, city=c))
+            city_node[c] = nid
+    rest_cities = [c for c in cities if c not in city_node]
+    if local_idx and not city_node:
+        # ни один город не дотянул до порога → один локальный узел с городом-лидером, остальные — serviceArea
+        top_city = max(city_keys, key=city_keys.get) if city_keys else ""
         top_city = top_city or (cities[0] if cities else "")
-        subj = m.get("subject") or seed
-        nd = _node("local", "generic", f"{subj}: {top_city}" if top_city else subj, "hub", cities=cities,
-                   groups=[f"{groups[gi]['macro']} → {groups[gi]['sub']}" for gi in local_idx])
-        nd["local"] = True
-        nodes.append(nd)
-        for gi in local_idx:
-            group_node[gi] = "local"
+        nodes.append(_node("local", "generic", f"{subj}: {top_city}" if top_city else subj, "hub",
+                           cities=[c for c in cities if c != top_city], local=True, city=top_city))
+        city_node[top_city] = "local"
+    for gi in local_idx:   # группа целиком → страница её города; города без страницы → хаб (serviceArea)
+        group_node[gi] = city_node.get(group_city.get(gi, ""), "local" if "local" in city_node.values() else "hub")
+        by = next((n for n in nodes if n["id"] == group_node[gi]), None)
+        if by is not None:
+            by.setdefault("groups", []).append(f"{groups[gi]['macro']} → {groups[gi]['sub']}")
     by_id = {n["id"]: n for n in nodes}
 
     # ── слаги
@@ -478,8 +502,9 @@ async def run_content_map(req: ContentReq) -> dict:
         else:
             n["slug"] = slugs.get(_norm(n["name"])) or slugify(n["name"])
     by_id["hub"]["slug"] = slugs.get(_norm(m.get("subject") or seed)) or by_id["hub"]["slug"] or slugify(seed)
-    if "local" in by_id:
-        by_id["local"]["slug"] = by_id["hub"]["slug"] + "-" + slugify(by_id["local"]["name"].split(": ")[-1])
+    for n in nodes:
+        if n.get("local"):
+            n["slug"] = by_id["hub"]["slug"] + "-" + slugify(n.get("city") or n["name"].split(": ")[-1])
     seen_slugs: dict[str, int] = {}                       # cm_0.3: без коллизий слагов
     for n in nodes:
         base = n["slug"]
@@ -501,8 +526,11 @@ async def run_content_map(req: ContentReq) -> dict:
         nid = None
         if r == "nav":
             nid = "hub"                                    # cm_0.3, правило 3: навигационные → хаб
-        elif r == "local":
-            nid = "local"                                  # cm_0.3, правило 2: локальные → один локальный узел
+        elif r == "local":                                 # cm_0.6: страница города по спросу; без города или ниже порога → хаб
+            c = key_city.get((gi, _norm(text)))
+            if c is None:
+                c = next((c for c, cf in city_forms if contains(text, cf)), "")
+            nid = city_node.get(c) or ("local" if "local" in city_node.values() else "hub")
         elif r == "variant":
             variant_name = variant_name or group_variant.get(gi, "")   # cm_0.3, правило 1
         elif gi is not None and (scope == "common" or gtype == "сравнение"):
@@ -537,9 +565,9 @@ async def run_content_map(req: ContentReq) -> dict:
         place(x.get("intent", ""), gi, x.get("variant", ""), f"проход {x.get('stage', '')}", x.get("macro", ""),
               x.get("sub", ""), x.get("type", ""))
 
-    # ── правило 3: города → serviceArea (cm_0.3: у локального узла; без локальных групп — у хаба)
-    if "local" not in by_id and cities:
-        by_id["hub"]["cities"] = cities
+    # ── правило 3: города без своей страницы → serviceArea на хабе (cm_0.6); один локальный узел несёт их сам
+    if "local" not in by_id and rest_cities:
+        by_id["hub"]["cities"] = rest_cities
 
     # ── узлы без единого интента — не страницы
     nodes = [n for n in nodes if n["kind"] in ("hub", "variant", "generation") or n["count"] > 0]
