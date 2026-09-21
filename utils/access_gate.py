@@ -68,7 +68,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ag_0.3"   # ag_0.1 — суточные лимиты; ag_0.2 — только баланс + наценка + очистка ответов; ag_0.3 — тестер напрямую
+BUILD = "ag_0.4"   # ag_0.1 суточные лимиты; ag_0.2 баланс + наценка + очистка; ag_0.3 тестер напрямую; ag_0.4 утечки тарифов/провайдера/build
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -403,8 +403,15 @@ def extract_cost(path: str, d) -> Optional[float]:
 
 _COST_KEY = re.compile(r"(^|_)cost(_|$)", re.I)             # cost, cost_usd, total_cost, cost_cross, l3_cost_usd, _cost_usd
 _MODEL_KEY = re.compile(r"^(model|models|by)$|(^|_)model(_|$)", re.I)
-_DROP_KEY = re.compile(r"^(stages|stage|raw|chunk_stats|chunk_errors|by|model|models|in|out|think|price|prices|"
-                       r"prompt_chars)$|token|thinking|effort|budget|temperature|(^|_)model(_|$)", re.I)
+# ag_0.3 (точка отката):
+# _DROP_KEY = re.compile(r"^(stages|stage|raw|chunk_stats|chunk_errors|by|model|models|in|out|think|price|prices|"
+#                        r"prompt_chars)$|token|thinking|effort|budget|temperature|(^|_)model(_|$)", re.I)
+# ag_0.4: живой прогон тестера показал в l2_5_stats / l3_stats price_in / price_out (реальные тарифы за 1M — по ним
+# угадывается модель и обратно считается наценка), provider ("openai") и build с названием промпта → режем всё с price/
+# provider/build/prompt/classification; last_cost/cost_* остаются под _COST_KEY (масштабируются).
+_DROP_KEY = re.compile(r"^(stages|stage|raw|chunk_stats|chunk_errors|by|model|models|in|out|think|prompt_chars|"
+                       r"classification)$|token|thinking|effort|budget|temperature|price|provider|(^|_)build(_|$)|prompt|"
+                       r"(^|_)model(_|$)", re.I)
 _seen_models: set = set()      # названия моделей, встреченные в любых ответах процесса (в т.ч. владельца) — для замены в строках
 _seen_lock = threading.Lock()
 
@@ -741,7 +748,7 @@ async def access_me(request: Request):
     out = {"gate": True, "role": u["role"], "name": u["name"], "enabled": bool(u["enabled"]), "lockdown": lockdown()}
     if u["role"] == "tester":                                      # тестеру — только баланс в его ценах
         out.update(balance_of(u)); out["min_balance"] = MIN_BALANCE
-    elif u["role"] == "super":
+    else:                                                          # супер и владелец — реальный расход за сегодня
         out["today"] = usage_today(u["id"])
     return out
 
