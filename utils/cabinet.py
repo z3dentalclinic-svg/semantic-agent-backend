@@ -43,7 +43,7 @@ from pydantic import BaseModel
 
 from utils import access_gate as gate
 
-BUILD = "cab_0.1"
+BUILD = "cab_0.1.1"   # 0.1.1: path операции в ops_detail (app.html: минус широкий/из семантики при открытии прогона)
 
 # ─── настройки ───
 MAX_DEPTH = 3                       # проект → папка → подпапка
@@ -381,7 +381,7 @@ async def cab_run(request: Request, run_id: str):
     if not r:
         return JSONResponse({"error": "Прогон не найден", "code": "not_found"}, status_code=404)
     out = _run_row(r)
-    out["ops_detail"] = db.q("SELECT op, ts, status, cost, charged FROM run_ops WHERE run_id = ? ORDER BY ts", (r["id"],))
+    out["ops_detail"] = db.q("SELECT op, path, ts, status, cost, charged FROM run_ops WHERE run_id = ? ORDER BY ts", (r["id"],))
     if u["role"] == "tester":
         for o in out["ops_detail"]:
             o.pop("cost", None)
