@@ -68,7 +68,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ag_0.4"   # ag_0.1 суточные лимиты; ag_0.2 баланс + наценка + очистка; ag_0.3 тестер напрямую; ag_0.4 утечки тарифов/провайдера/build
+BUILD = "ag_0.5"   # ag_0.2 баланс+наценка+очистка; ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки ответов + /cabinet/ для тестера
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -82,7 +82,11 @@ MIN_BALANCE = {"/api/light-search": 0.10, "/api/relevant-search": 0.25}   # по
 RUN_FOLLOW_PATHS = ("/api/apply-filters", "/api/test-clustering")         # шаги прямого конвейера после парсинга
 RUN_GRACE_SEC = 900               # окно после принятого запуска, в котором шаги конвейера идут и при балансе ≤ 0
 RUN_START_PATHS = ("/api/light-search", "/api/relevant-search")          # начало прогона по сиду = «запуск»
-OWNER_ONLY_PREFIXES = ("/access/admin/", "/debug/", "/api/trace/toggle")
+OWNER_ONLY_PREFIXES = ("/access/admin/", "/cabinet/admin/", "/debug/", "/api/trace/toggle")
+TESTER_PREFIXES = ("/api/", "/cabinet/")                                  # ag_0.5: тестеру доступен и личный кабинет
+# ag_0.5: хуки на ответы /api/* — cabinet.py подписывается и сохраняет прогоны. Вызов: hook(ctx) где ctx =
+# {"user", "method", "path", "query", "headers", "status", "data", "cost", "charged"}; исключения хука глушатся.
+RESPONSE_HOOKS: list = []
 OPEN_PATHS = {"/", "/favicon.ico"}                                        # "/" — под проверку живости Render
 OPEN_PREFIXES = ("/access/",)                                             # кроме /access/admin/ (OWNER_ONLY выше)
 LOCKDOWN_OPEN = ("/access/health", "/access/owner-login", "/access/owner-cookie")   # при рубильнике: живость + вход владельца
@@ -319,8 +323,8 @@ def check_access(u: Optional[dict], method: str, path: str) -> Optional[tuple]:
         return 403, "owner_only", "Только для владельца"
     if u["role"] == "super":
         return None                                           # без лимитов (решение Andrew), расходы считаются
-    if not path.startswith("/api/"):
-        return 403, "api_only", "Тестеру доступен только /api/"
+    if not any(path.startswith(p) for p in TESTER_PREFIXES):
+        return 403, "api_only", "Тестеру доступны только /api/ и /cabinet/"
     # ag_0.1 (точка отката): суточные лимиты
     # lim, today = user_limits(u), usage_today(u["id"])
     # if path in RUN_START_PATHS and today["runs"] >= lim["daily_runs"]:
@@ -500,6 +504,19 @@ def _query_seed(scope) -> str:
     return (parse_qs(scope.get("query_string", b"").decode("latin-1")).get("seed") or [""])[0]
 
 
+def _run_hooks(user, scope, headers, status, data, cost, charged):
+    if not RESPONSE_HOOKS:
+        return
+    ctx = {"user": user, "method": scope["method"], "path": scope["path"],
+           "query": scope.get("query_string", b"").decode("latin-1"), "headers": headers,
+           "status": status, "data": data, "cost": cost, "charged": charged}
+    for h in RESPONSE_HOOKS:
+        try:
+            h(ctx)
+        except Exception:  # noqa: BLE001 — хук не должен ломать ответ
+            pass
+
+
 _CORS = [(b"access-control-allow-origin", b"*")]    # ворота стоят снаружи CORSMiddleware — отказ должен читаться из file://
 
 
@@ -536,7 +553,7 @@ class AccessGateMiddleware:
         if not meter:                                                 # /access/*, страницы — без учёта и без очереди
             return await self.app(scope, receive, send)
         if user["role"] == "tester":
-            return await self._serve_tester(scope, receive, send, user, method, path)
+            return await self._serve_tester(scope, receive, send, user, method, path, headers)
 
         # владелец / супер: ответ уходит как есть и сразу, копия — только для подсчёта реальной цены
         t0 = time.perf_counter()
@@ -566,11 +583,12 @@ class AccessGateMiddleware:
                     cost = extract_cost(path, d)
                     if isinstance(d, dict) and isinstance(d.get("seed"), str):
                         seed = d["seed"]
+                    _run_hooks(user, scope, headers, box["status"], d, cost, 0.0)
                 except Exception:  # noqa: BLE001
                     pass
             self._safe_record(user, method, path, box["status"], cost, 0.0, t0, seed or _query_seed(scope))
 
-    async def _serve_tester(self, scope, receive, send, user, method, path):
+    async def _serve_tester(self, scope, receive, send, user, method, path, headers):
         """Тестер: один платный запрос одновременно; JSON-ответ придерживается целиком, очищается и уходит одной частью."""
         uid = user["id"]
         with _active_lock:
@@ -615,6 +633,7 @@ class AccessGateMiddleware:
                 if isinstance(d, dict) and isinstance(d.get("seed"), str):
                     box["seed"] = d["seed"]
                 body = json.dumps(scrub_for_tester(d), ensure_ascii=False).encode("utf-8")
+                box["data"] = d
             except Exception:  # noqa: BLE001 — разобрать не вышло: реальные цены и модели могли бы утечь → не отдаём
                 box["failed"] = True
                 return await self._fail_closed(send, box)
@@ -630,6 +649,8 @@ class AccessGateMiddleware:
                 _active.discard(uid)
             cost = box["cost"]
             charged = round(cost * PRICE_MULT, 6) if cost else 0.0
+            if box.get("data") is not None:
+                _run_hooks(user, scope, headers, box["status"], box["data"], cost, charged)
             self._safe_record(user, method, path, box["status"], cost, charged, t0, box["seed"] or _query_seed(scope))
 
     @staticmethod
