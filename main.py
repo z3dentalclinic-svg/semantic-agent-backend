@@ -2225,3 +2225,9 @@ def unload_models():
         "freed_mb": round(mem_before - mem_after, 1),
         "freed_components": freed,
     }
+
+
+# --- Ворота доступа (ag_0.2): владелец / 4 суперпользователя без лимитов / тестеры по инвайтам с балансом. ПОСЛЕДНИМ в файле. ---
+# Пока в окружении нет ACCESS_OWNER_KEY — ворота выключены, сервер работает как раньше. Модуль самодостаточен.
+from utils.access_gate import install_access_gate
+install_access_gate(app)
