@@ -44,6 +44,10 @@ ag_0.2 (Andrew, 2026-09-20) — модель «только баланс», та
     тестера — ответ НЕ отдаётся (закрыто по умолчанию). Владелец и суперпользователи получают ответы как есть.
   • интерфейсы работают с диска (file://): токен только заголовком, cookie — лишь для страниц самого сервера.
   Суточные лимиты ag_0.1 (TESTER_DAILY_RUNS / TESTER_DAILY_COST / GLOBAL_DAILY_COST) закомментированы — точка отката.
+
+ag_0.3 (Andrew, 2026-09-21): тестера владелец создаёт напрямую, как суперпользователя (/access/admin/tester → токен
+  показан один раз, баланс TESTER_START_CREDIT), без обмена инвайт-кода — «отослал ключ, человек сразу работает».
+  Инвайты остаются для будущей самостоятельной регистрации на сайте; место тестера считается общее: тестеры + коды ≤ 15.
 """
 from __future__ import annotations
 
@@ -64,7 +68,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ag_0.2"   # ag_0.1 — суточные лимиты; ag_0.2 — только баланс + наценка + очистка ответов
+BUILD = "ag_0.3"   # ag_0.1 — суточные лимиты; ag_0.2 — только баланс + наценка + очистка ответов; ag_0.3 — тестер напрямую
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -883,6 +887,37 @@ async def admin_super(req: SuperReq, request: Request):
                    (name, (req.email or "").strip()[:120], (req.note or "")[:200], _sha(token), _now()))
     audit("owner", "super_create", str(uid), name, _ip(request))
     return {"id": uid, "token": token, "note": "Токен показывается один раз — передайте его человеку сейчас"}
+
+
+class TesterReq(BaseModel):
+    name: str
+    email: str = ""
+    note: str = ""
+
+
+@router.post("/access/admin/tester")
+async def admin_tester(req: TesterReq, request: Request):
+    """Тестер напрямую: токен показан один раз, баланс стартовый. Место общее с инвайт-кодами."""
+    err = _owner_or_error(request)
+    if err:
+        return err
+    name = (req.name or "").strip()[:80]
+    if not name:
+        return JSONResponse({"error": "Укажите имя", "code": "no_name"}, status_code=400)
+    with db.lock:
+        testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester'")["n"]
+        pending = db.one("SELECT COUNT(*) AS n FROM invites WHERE used_by IS NULL AND revoked = 0")["n"]
+        if testers + pending >= MAX_TESTERS:
+            return JSONResponse({"error": f"Мест нет: тестеров {testers} + неиспользованных кодов {pending} = лимит "
+                                          f"{MAX_TESTERS}", "code": "no_room"}, status_code=409)
+        token = _new_token()
+        uid = db.x("INSERT INTO users(role, name, email, note, token_hash, created_at, credit) "
+                   "VALUES ('tester',?,?,?,?,?,?)",
+                   (name, (req.email or "").strip()[:120], (req.note or "")[:200], _sha(token), _now(),
+                    TESTER_START_CREDIT))
+    audit("owner", "tester_create", str(uid), name, _ip(request))
+    return {"id": uid, "token": token, "balance": TESTER_START_CREDIT,
+            "note": "Токен показывается один раз — передайте его человеку сейчас"}
 
 
 def _get_user(uid: int) -> Optional[dict]:
