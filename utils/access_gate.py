@@ -68,7 +68,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ag_0.5"   # ag_0.2 баланс+наценка+очистка; ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки ответов + /cabinet/ для тестера
+BUILD = "ag_0.6"   # ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -87,6 +87,15 @@ TESTER_PREFIXES = ("/api/", "/cabinet/")                                  # ag_0
 # ag_0.5: хуки на ответы /api/* — cabinet.py подписывается и сохраняет прогоны. Вызов: hook(ctx) где ctx =
 # {"user", "method", "path", "query", "headers", "status", "data", "cost", "charged"}; исключения хука глушатся.
 RESPONSE_HOOKS: list = []
+# ag_0.6 (Andrew): очередь запусков. Общее состояние сервера (parser.tracer, пул прокси, CPU) не терпит двух конвейеров
+# одновременно; вызовы моделей ничего общего не трогают. Два ряда: конвейер — 1 одновременно, модели — 3. Касается всех
+# ролей (владельца тоже — трассировка общая). Ожидание пишется в usage.queue_ms — по нему считаем нагрузку 15 человек.
+LANES = {"pipeline": 1, "models": 3}
+LANE_OF = {"/api/light-search": "pipeline", "/api/relevant-search": "pipeline", "/api/apply-filters": "pipeline",
+           "/api/test-clustering": "pipeline", "/api/minus-semantics": "pipeline", "/api/minus-wide": "pipeline",
+           "/api/suffix-map": "pipeline", "/api/prefix-map": "pipeline", "/api/infix-map": "pipeline",
+           "/api/intent-map": "models", "/api/content-map": "models", "/api/client-portrait": "models"}
+QUEUE_MAX_WAIT = 600              # с; дольше — 503 «сервер занят»
 OPEN_PATHS = {"/", "/favicon.ico"}                                        # "/" — под проверку живости Render
 OPEN_PREFIXES = ("/access/",)                                             # кроме /access/admin/ (OWNER_ONLY выше)
 LOCKDOWN_OPEN = ("/access/health", "/access/owner-login", "/access/owner-cookie")   # при рубильнике: живость + вход владельца
@@ -148,7 +157,7 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT NOT NULL,
   method TEXT NOT NULL, path TEXT NOT NULL, status INTEGER NOT NULL, cost REAL, wall_ms INTEGER, seed TEXT,
-  charged REAL NOT NULL DEFAULT 0);
+  charged REAL NOT NULL DEFAULT 0, queue_ms INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS usage_user_ts ON usage(user_id, ts);
 CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
 CREATE TABLE IF NOT EXISTS audit (
@@ -179,7 +188,8 @@ class _DB:
                 pass
             self.conn.executescript(_SCHEMA)
             for table, col, ddl in (("users", "credit", "credit REAL NOT NULL DEFAULT 0"),       # база от ag_0.1 → ag_0.2
-                                    ("usage", "charged", "charged REAL NOT NULL DEFAULT 0")):
+                                    ("usage", "charged", "charged REAL NOT NULL DEFAULT 0"),
+                                    ("usage", "queue_ms", "queue_ms INTEGER NOT NULL DEFAULT 0")):
                 cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if col not in cols:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
@@ -487,6 +497,78 @@ def scrub_for_tester(d):
     return _scrub(d, models)
 
 
+# ══════════════════════════ очередь запусков (ag_0.6) ══════════════════════════
+import asyncio
+from collections import deque
+
+
+class QueueTimeout(Exception):
+    pass
+
+
+class _Lane:
+    """Без asyncio-примитивов: они привязаны к loop, а TestClient крутит loop на запрос. Ожидание — опрос раз в 50 мс
+    под threading.Lock; на проде (uvicorn, один loop) это та же FIFO-очередь."""
+
+    def __init__(self, cap):
+        self.cap, self.active, self.waiting = cap, 0, deque()
+
+
+_qlock = threading.Lock()
+_lanes = {name: _Lane(cap) for name, cap in LANES.items()}
+_tickets: dict = {}          # user_id → текущий билет {"lane", "t0", "started", "path", "uid"}
+_last_wait: dict = {}        # user_id → {"lane", "waited_ms", "ts", "path"}
+QUEUE_POLL = 0.05
+
+
+async def lane_acquire(lane: str, uid: int, path: str) -> dict:
+    L = _lanes[lane]
+    t = {"lane": lane, "t0": time.perf_counter(), "started": None, "path": path, "uid": uid}
+    with _qlock:
+        L.waiting.append(t); _tickets[uid] = t
+    try:
+        while True:
+            with _qlock:
+                if L.active < L.cap and L.waiting and L.waiting[0] is t:
+                    L.waiting.popleft(); L.active += 1; t["started"] = time.perf_counter()
+                    return t
+            if time.perf_counter() - t["t0"] > QUEUE_MAX_WAIT:
+                raise QueueTimeout()
+            await asyncio.sleep(QUEUE_POLL)
+    except BaseException:
+        with _qlock:
+            if t in L.waiting:
+                L.waiting.remove(t)
+            _tickets.pop(uid, None)
+        raise
+
+
+async def lane_release(t: dict):
+    L = _lanes[t["lane"]]
+    waited = int(((t["started"] or time.perf_counter()) - t["t0"]) * 1000)
+    with _qlock:
+        _last_wait[t["uid"]] = {"lane": t["lane"], "waited_ms": waited, "ts": _now(), "path": t["path"]}
+        _tickets.pop(t["uid"], None)
+        L.active -= 1
+
+
+def queue_state(uid: Optional[int] = None) -> dict:
+    lanes = {n: {"cap": L.cap, "active": L.active, "waiting": len(L.waiting)} for n, L in _lanes.items()}
+    out = {"lanes": lanes}
+    if uid is not None:
+        t = _tickets.get(uid)
+        if t:
+            L = _lanes[t["lane"]]
+            pos = next((i for i, x in enumerate(L.waiting) if x is t), -1)
+            out["mine"] = {"lane": t["lane"], "path": t["path"], "state": "active" if t["started"] else "waiting",
+                           "position": pos + 1 if pos >= 0 else 0, "waited_ms": int(((t["started"] or time.perf_counter()) - t["t0"]) * 1000),
+                           "active_ms": int((time.perf_counter() - t["started"]) * 1000) if t["started"] else 0}
+        else:
+            out["mine"] = None
+        out["last"] = _last_wait.get(uid)
+    return out
+
+
 # ══════════════════════════ ворота (чистый ASGI: не буферизует ответ, не мешает долгим запросам) ══════════════════════════
 
 _active: set = set()            # тестеры с идущим платным запросом (в памяти процесса; сервер — один процесс)
@@ -498,6 +580,12 @@ def _ctype(message) -> bytes:
         if k.lower() == b"content-type":
             return v
     return b""
+
+
+def _waited(ticket) -> int:
+    if not ticket or not ticket.get("started"):
+        return 0
+    return int((ticket["started"] - ticket["t0"]) * 1000)
 
 
 def _query_seed(scope) -> str:
@@ -558,6 +646,14 @@ class AccessGateMiddleware:
         # владелец / супер: ответ уходит как есть и сразу, копия — только для подсчёта реальной цены
         t0 = time.perf_counter()
         box = {"status": 500, "json": False, "chunks": [], "size": 0, "overflow": False}
+        lane = LANE_OF.get(path)
+        ticket = None
+        if lane:
+            try:
+                ticket = await lane_acquire(lane, user["id"], path)
+            except QueueTimeout:
+                self._safe_record(user, method, path, 503, None, 0.0, t0, _query_seed(scope))
+                return await self._reject(scope, receive, send, 503, "queue_timeout", "Сервер занят, очередь не продвинулась за 10 минут — попробуйте позже")
 
         async def send_wrap(message):
             if message["type"] == "http.response.start":
@@ -575,6 +671,8 @@ class AccessGateMiddleware:
         try:
             await self.app(scope, receive, send_wrap)
         finally:
+            if ticket:
+                await lane_release(ticket)
             cost, seed = None, ""
             if box["json"] and not box["overflow"] and box["chunks"]:
                 try:
@@ -586,7 +684,8 @@ class AccessGateMiddleware:
                     _run_hooks(user, scope, headers, box["status"], d, cost, 0.0)
                 except Exception:  # noqa: BLE001
                     pass
-            self._safe_record(user, method, path, box["status"], cost, 0.0, t0, seed or _query_seed(scope))
+            self._safe_record(user, method, path, box["status"], cost, 0.0, t0, seed or _query_seed(scope),
+                              _waited(ticket))
 
     async def _serve_tester(self, scope, receive, send, user, method, path, headers):
         """Тестер: один платный запрос одновременно; JSON-ответ придерживается целиком, очищается и уходит одной частью."""
@@ -604,6 +703,16 @@ class AccessGateMiddleware:
         t0 = time.perf_counter()
         box = {"status": 500, "start": None, "json": False, "chunks": [], "size": 0, "failed": False,
                "cost": None, "seed": ""}
+        lane = LANE_OF.get(path)
+        ticket = None
+        if lane:
+            try:
+                ticket = await lane_acquire(lane, uid, path)
+            except QueueTimeout:
+                with _active_lock:
+                    _active.discard(uid)
+                self._safe_record(user, method, path, 503, None, 0.0, t0, _query_seed(scope))
+                return await self._reject(scope, receive, send, 503, "queue_timeout", "Сервер занят, очередь не продвинулась за 10 минут — попробуйте позже")
 
         async def send_wrap(message):
             if message["type"] == "http.response.start":
@@ -645,13 +754,16 @@ class AccessGateMiddleware:
         try:
             await self.app(scope, receive, send_wrap)
         finally:
+            if ticket:
+                await lane_release(ticket)
             with _active_lock:
                 _active.discard(uid)
             cost = box["cost"]
             charged = round(cost * PRICE_MULT, 6) if cost else 0.0
             if box.get("data") is not None:
                 _run_hooks(user, scope, headers, box["status"], box["data"], cost, charged)
-            self._safe_record(user, method, path, box["status"], cost, charged, t0, box["seed"] or _query_seed(scope))
+            self._safe_record(user, method, path, box["status"], cost, charged, t0, box["seed"] or _query_seed(scope),
+                              _waited(ticket))
 
     @staticmethod
     async def _fail_closed(send, box):
@@ -663,18 +775,19 @@ class AccessGateMiddleware:
                     + _CORS})
         await send({"type": "http.response.body", "body": body, "more_body": False})
 
-    def _safe_record(self, user, method, path, status, cost, charged, t0, seed):
+    def _safe_record(self, user, method, path, status, cost, charged, t0, seed, queue_ms=0):
         try:
-            self._record(user, method, path, status, cost, charged, int((time.perf_counter() - t0) * 1000), seed)
+            self._record(user, method, path, status, cost, charged, int((time.perf_counter() - t0) * 1000), seed, queue_ms)
         except Exception:  # noqa: BLE001 — учёт не должен ронять ответ
             pass
 
     @staticmethod
-    def _record(user, method, path, status, cost, charged, wall_ms, seed):
+    def _record(user, method, path, status, cost, charged, wall_ms, seed, queue_ms=0):
         now = _now()
-        db.x("INSERT INTO usage(ts, user_id, role, method, path, status, cost, wall_ms, seed, charged) "
-             "VALUES (?,?,?,?,?,?,?,?,?,?)",
-             (now, user["id"], user["role"], method, path[:200], status, cost, wall_ms, (seed or "")[:200], charged))
+        db.x("INSERT INTO usage(ts, user_id, role, method, path, status, cost, wall_ms, seed, charged, queue_ms) "
+             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             (now, user["id"], user["role"], method, path[:200], status, cost, wall_ms - queue_ms, (seed or "")[:200],
+              charged, queue_ms))   # wall_ms — чистое время работы, без очереди
         if user["id"]:
             db.x("UPDATE users SET last_seen = ? WHERE id = ?", (now, user["id"]))
 
@@ -759,6 +872,17 @@ async def access_activate(req: ActivateReq, request: Request):
             "min_balance": MIN_BALANCE, "note": "Токен показывается один раз — сохраните его"}
 
 
+@router.get("/access/queue")
+async def access_queue(request: Request):
+    """Состояние очереди и место текущего пользователя — app.html опрашивает во время долгого запроса."""
+    if not gate_on():
+        return {"gate": False}
+    u, _ = identify(_hdrs(request))
+    if not u:
+        return JSONResponse({"error": "Нужен токен доступа", "code": "no_token"}, status_code=401)
+    return queue_state(u["id"])
+
+
 @router.get("/access/me")
 async def access_me(request: Request):
     if not gate_on():
@@ -838,7 +962,17 @@ async def admin_overview(request: Request):
     all_today = db.one("SELECT COALESCE(SUM(cost),0) AS cost FROM usage WHERE ts >= ?", (_day_start(),))["cost"]
     all_total = db.one("SELECT COALESCE(SUM(cost),0) AS cost FROM usage")["cost"]
     charged_total = db.one("SELECT COALESCE(SUM(charged),0) AS c FROM usage")["c"]
-    return {"gate": True, "lockdown": lockdown(), "build": BUILD, "db": db.path,
+    d0 = _day_start()
+    qstat = {}
+    for lane, paths in (("pipeline", [p for p, l in LANE_OF.items() if l == "pipeline"]),
+                        ("models", [p for p, l in LANE_OF.items() if l == "models"])):
+        marks = ",".join("?" * len(paths))
+        r = db.one(f"SELECT COUNT(*) AS n, SUM(CASE WHEN queue_ms > 0 THEN 1 ELSE 0 END) AS waited, "
+                   f"COALESCE(AVG(queue_ms),0) AS avg_ms, COALESCE(MAX(queue_ms),0) AS max_ms, COALESCE(AVG(wall_ms),0) AS avg_wall "
+                   f"FROM usage WHERE ts >= ? AND status < 400 AND path IN ({marks})", (d0, *paths))
+        qstat[lane] = {"requests": r["n"], "waited": r["waited"] or 0, "avg_queue_ms": int(r["avg_ms"]), "max_queue_ms": int(r["max_ms"]),
+                       "avg_work_ms": int(r["avg_wall"]), "cap": LANES[lane]}
+    return {"gate": True, "lockdown": lockdown(), "build": BUILD, "db": db.path, "queue_today": qstat, "queue_now": queue_state()["lanes"],
             "owner_key_short": len(owner_key()) < 32,
             "defaults": {"max_supers": MAX_SUPERS, "max_testers": MAX_TESTERS, "tester_start_credit": TESTER_START_CREDIT,
                          "price_mult": PRICE_MULT, "min_balance": MIN_BALANCE},
