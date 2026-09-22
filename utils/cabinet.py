@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import httpx
 import os
 import re
 import secrets
@@ -43,7 +44,7 @@ from pydantic import BaseModel
 
 from utils import access_gate as gate
 
-BUILD = "cab_0.1.1"   # 0.1.1: path операции в ops_detail (app.html: минус широкий/из семантики при открытии прогона)
+BUILD = "cab_0.2"   # 0.1.1: path операции в ops_detail; 0.2: валюта показа (USD/EUR/UAH/PLN/GBP), курс раз в 12 ч
 
 # ─── настройки ───
 MAX_DEPTH = 3                       # проект → папка → подпапка
@@ -53,6 +54,10 @@ LANGUAGES = [("ru", "Русский", True), ("uk", "Українська", Fals
              ("de", "Deutsch", False), ("es", "Español", False), ("fr", "Français", False), ("it", "Italiano", False),
              ("tr", "Türkçe", False), ("pt", "Português", False)]
 THEMES = ("light", "dark")
+CURRENCIES = ("USD", "EUR", "UAH", "PLN", "GBP")            # только показ; баланс и списания всегда в USD
+RATES_URL = "https://open.er-api.com/v6/latest/USD"        # бесплатно, без ключа; при недоступности — запасные курсы
+RATES_FALLBACK = {"USD": 1.0, "EUR": 0.92, "UAH": 41.5, "PLN": 3.95, "GBP": 0.78}
+RATES_TTL = 12 * 3600
 # путь → операция в истории; None = не сохранять (служебные)
 OPS = {"/api/light-search": "parse", "/api/relevant-search": "parse", "/api/suffix-map": "parse", "/api/prefix-map": "parse",
        "/api/infix-map": "parse", "/api/apply-filters": "filters", "/api/test-clustering": "clusters",
@@ -86,7 +91,7 @@ CREATE TABLE IF NOT EXISTS topup_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount REAL NOT NULL, note TEXT NOT NULL DEFAULT '',
   ts INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'new');
 CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, language TEXT NOT NULL DEFAULT 'ru',
-  theme TEXT NOT NULL DEFAULT 'light', last_project INTEGER);
+  theme TEXT NOT NULL DEFAULT 'light', last_project INTEGER, currency TEXT NOT NULL DEFAULT 'USD');
 CREATE TABLE IF NOT EXISTS referrals (user_id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS referral_uses (
   id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, invited_id INTEGER NOT NULL, ts INTEGER NOT NULL,
@@ -111,6 +116,9 @@ class _DB:
             except sqlite3.DatabaseError:
                 pass
             self.conn.executescript(_SCHEMA)
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(settings)").fetchall()}   # база cab_0.1 → 0.2
+            if "currency" not in cols:
+                self.conn.execute("ALTER TABLE settings ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'")
             self.path = path
 
     def q(self, sql, args=()):
@@ -256,8 +264,31 @@ def _depth_of(uid: int, pid: Optional[int]) -> int:
 
 
 def _settings(uid: int) -> dict:
-    s = db.one("SELECT * FROM settings WHERE user_id = ?", (uid,)) or {"language": "ru", "theme": "light", "last_project": None}
-    return {"language": s["language"], "theme": s["theme"], "last_project": s["last_project"]}
+    s = db.one("SELECT * FROM settings WHERE user_id = ?", (uid,)) or {"language": "ru", "theme": "light", "last_project": None,
+                                                                      "currency": "USD"}
+    return {"language": s["language"], "theme": s["theme"], "last_project": s["last_project"], "currency": s.get("currency") or "USD"}
+
+
+_rates_cache = {"ts": 0, "rates": dict(RATES_FALLBACK), "date": "", "source": "fallback"}
+_rates_lock = threading.Lock()
+
+
+def get_rates() -> dict:
+    """Курсы к доллару для показа. Обновление раз в RATES_TTL; при сбое сети — прежние или запасные."""
+    with _rates_lock:
+        if time.time() - _rates_cache["ts"] < RATES_TTL:
+            return dict(_rates_cache)
+        try:
+            r = httpx.get(RATES_URL, timeout=6)
+            d = r.json()
+            src = d.get("rates") or {}
+            rates = {c: float(src.get(c, RATES_FALLBACK[c])) for c in CURRENCIES}
+            rates["USD"] = 1.0
+            _rates_cache.update({"ts": time.time(), "rates": rates, "date": (d.get("time_last_update_utc") or "")[:16],
+                                 "source": "open.er-api.com"})
+        except Exception:  # noqa: BLE001
+            _rates_cache["ts"] = time.time() - RATES_TTL + 600    # не долбить сеть: следующая попытка через 10 минут
+        return dict(_rates_cache)
 
 
 def _referral(uid: int) -> dict:
@@ -293,6 +324,7 @@ async def cab_overview(request: Request):
     uid = u["id"]
     out = {"build": BUILD, "role": u["role"], "name": u["name"], "id": uid, "settings": _settings(uid),
            "languages": [{"code": c, "name": n, "active": a} for c, n, a in LANGUAGES], "themes": list(THEMES),
+           "currencies": list(CURRENCIES), "rates": {k: v for k, v in get_rates().items() if k != "ts"},
            "projects": _tree(uid), "referral": _referral(uid), "price_guide": PRICE_GUIDE,
            "runs_total": db.one("SELECT COUNT(*) AS n FROM runs WHERE user_id = ? AND deleted = 0", (uid,))["n"]}
     if u["role"] == "tester":
@@ -530,6 +562,7 @@ async def cab_project_delete(request: Request, pid: int):
 class SettingsReq(BaseModel):
     language: Optional[str] = None
     theme: Optional[str] = None
+    currency: Optional[str] = None
     last_project: Optional[int] = None   # -1 = «Без проекта»
 
 
@@ -549,6 +582,10 @@ async def cab_settings(request: Request, req: SettingsReq):
         if req.theme not in THEMES:
             return JSONResponse({"error": "Неизвестная схема", "code": "bad_theme"}, status_code=400)
         cur["theme"] = req.theme
+    if req.currency is not None:
+        if req.currency not in CURRENCIES:
+            return JSONResponse({"error": "Неизвестная валюта", "code": "bad_currency"}, status_code=400)
+        cur["currency"] = req.currency
     if req.last_project is not None:
         if req.last_project < 0:
             cur["last_project"] = None
@@ -556,9 +593,9 @@ async def cab_settings(request: Request, req: SettingsReq):
             if _project_ok(uid, req.last_project) is None:
                 return JSONResponse({"error": "Папка не найдена", "code": "bad_project"}, status_code=404)
             cur["last_project"] = req.last_project
-    db.x("INSERT INTO settings(user_id, language, theme, last_project) VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
-         "language = excluded.language, theme = excluded.theme, last_project = excluded.last_project",
-         (uid, cur["language"], cur["theme"], cur["last_project"]))
+    db.x("INSERT INTO settings(user_id, language, theme, last_project, currency) VALUES (?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+         "language = excluded.language, theme = excluded.theme, last_project = excluded.last_project, currency = excluded.currency",
+         (uid, cur["language"], cur["theme"], cur["last_project"], cur["currency"]))
     return {"ok": True, "settings": cur}
 
 
