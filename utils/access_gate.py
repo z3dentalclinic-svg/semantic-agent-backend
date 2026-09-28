@@ -68,7 +68,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ag_0.6"   # ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
+BUILD = "ag_0.6.1"   # ag_0.6.1 маска моделей без ключа "by" (слова сида и имена фильтров → «llm»); ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -416,7 +416,11 @@ def extract_cost(path: str, d) -> Optional[float]:
 # ══════════════════════════ ответ для тестера: цены × наценка, внутренности вырезаны ══════════════════════════
 
 _COST_KEY = re.compile(r"(^|_)cost(_|$)", re.I)             # cost, cost_usd, total_cost, cost_cross, l3_cost_usd, _cost_usd
-_MODEL_KEY = re.compile(r"^(model|models|by)$|(^|_)model(_|$)", re.I)
+# ag_0.6 (точка отката): "by" в других модулях — не модель: причина среза (blocked_by: l0_filter…), слово-щит минусов
+# (слова сида: «индукционные», «печи», «для»), «сид»/«anchor» → попадали в общий _seen_models и маскировались в «llm» у всех
+# тестеров во всех ответах. Значения под "by" по-прежнему вырезаются из ответа (_DROP_KEY), просто не считаются моделями.
+# _MODEL_KEY = re.compile(r"^(model|models|by)$|(^|_)model(_|$)", re.I)
+_MODEL_KEY = re.compile(r"^(model|models)$|(^|_)model(_|$)", re.I)
 # ag_0.3 (точка отката):
 # _DROP_KEY = re.compile(r"^(stages|stage|raw|chunk_stats|chunk_errors|by|model|models|in|out|think|price|prices|"
 #                        r"prompt_chars)$|token|thinking|effort|budget|temperature|(^|_)model(_|$)", re.I)
