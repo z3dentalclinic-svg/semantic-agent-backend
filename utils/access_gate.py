@@ -48,6 +48,23 @@ ag_0.2 (Andrew, 2026-09-20) — модель «только баланс», та
 ag_0.3 (Andrew, 2026-09-21): тестера владелец создаёт напрямую, как суперпользователя (/access/admin/tester → токен
   показан один раз, баланс TESTER_START_CREDIT), без обмена инвайт-кода — «отослал ключ, человек сразу работает».
   Инвайты остаются для будущей самостоятельной регистрации на сайте; место тестера считается общее: тестеры + коды ≤ 15.
+
+ag_0.7 (Andrew, 2026-11-22) — вход через Google («как во всех сервисах»), решения Andrew:
+  • POST /access/google {credential} — подтверждение личности от кнопки «Sign in with Google» (ID-токен) проверяется
+    у Google (aud = наш GOOGLE_CLIENT_ID, выдан Google, не просрочен, почта подтверждена) → человеку выдаётся наш
+    обычный токен. Пароли не хранятся; от Google берётся только идентификатор аккаунта, почта и имя;
+  • пользователь из Google в базе — role 'tester' с пометкой origin = 'google': для ворот, кабинета и приложения он
+    ведёт себя как тестер (баланс, цена × PRICE_MULT, пороги запуска, очищенные ответы) — cabinet.py и app.html не
+    правятся. В лимит MAX_TESTERS (15) такие пользователи НЕ входят;
+  • стартовый кредит GOOGLE_START_CREDIT ($2) — один раз на Google-аккаунт, повторный вход ничего не добавляет;
+  • два счёта (Terms: возвращаются только внесённые деньги): users.bonus — подаренный кредит, users.credit — всё
+    зачисленное (подарок + внесённое). Кредит тратится первым: balance_of() отдаёт bonus_left и paid_left;
+  • потолок новых регистраций GOOGLE_DAILY_SIGNUPS в сутки (UTC) — защита от выкачивания стартовых денег;
+  • вход с нескольких устройств: таблица sessions (хэши токенов), до SESSION_MAX_PER_USER на человека, срок
+    SESSION_TTL_DAYS; POST /access/logout гасит текущую сессию; «Новый токен» в админке гасит все сессии человека;
+  • ключи владельца / суперов / тестеров работают как раньше.
+  Переменная GOOGLE_CLIENT_ID (Render → Environment) — Client ID из Google Cloud. ПОКА НЕ ЗАДАНА — вход через Google
+  выключен (/access/google отвечает 503), остальное работает как в ag_0.6.1. Откат = убрать переменную.
 """
 from __future__ import annotations
 
@@ -62,13 +79,17 @@ import threading
 import time
 from http.cookies import SimpleCookie
 from typing import Optional
-from urllib.parse import parse_qs
+# from urllib.parse import parse_qs          # ag_0.6.1 (точка отката)
+import urllib.error
+import urllib.request
+from urllib.parse import parse_qs, quote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-BUILD = "ag_0.6.1"   # ag_0.6.1 маска моделей без ключа "by" (слова сида и имена фильтров → «llm»); ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
+# BUILD = "ag_0.6.1"   # точка отката
+BUILD = "ag_0.7"   # ag_0.7 вход через Google (role tester + origin google, два счёта, сессии); ag_0.6.1 маска моделей без ключа "by" (слова сида и имена фильтров → «llm»); ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -78,6 +99,14 @@ MAX_TESTERS = 15                  # активированные тестеры 
 # GLOBAL_DAILY_COST = 25.0        # ag_0.1: общий дневной потолок тестеров — отменено
 TESTER_START_CREDIT = 20.0        # $ на балансе тестера при активации (в ценах с наценкой)
 PRICE_MULT = 2.5                  # списание с тестера = реальная цена × PRICE_MULT
+# ag_0.7: вход через Google
+GOOGLE_START_CREDIT = 2.0         # $ стартового кредита новому Google-аккаунту (один раз; не возвращается, тратится первым)
+GOOGLE_DAILY_SIGNUPS = 30         # новых регистраций через Google в сутки (UTC); сверх — «попробуйте завтра»
+SESSION_TTL_DAYS = 30             # срок жизни токена, выданного входом через Google
+SESSION_MAX_PER_USER = 5          # одновременных устройств на человека; старые сессии вытесняются
+GOOGLE_ISS = ("accounts.google.com", "https://accounts.google.com")
+GOOGLE_TOKENINFO = "https://oauth2.googleapis.com/tokeninfo?id_token="
+GOOGLE_TIMEOUT = 10               # с, запрос проверки к Google
 MIN_BALANCE = {"/api/light-search": 0.10, "/api/relevant-search": 0.25}   # порог запуска; прочие операции — баланс > 0
 RUN_FOLLOW_PATHS = ("/api/apply-filters", "/api/test-clustering")         # шаги прямого конвейера после парсинга
 RUN_GRACE_SEC = 900               # окно после принятого запуска, в котором шаги конвейера идут и при балансе ≤ 0
@@ -115,6 +144,10 @@ def gate_on() -> bool:
 
 def lockdown() -> bool:
     return (os.environ.get("ACCESS_LOCKDOWN") or "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def google_client_id() -> str:
+    return (os.environ.get("GOOGLE_CLIENT_ID") or "").strip()
 
 
 def open_paths() -> set:
@@ -160,6 +193,9 @@ CREATE TABLE IF NOT EXISTS usage (
   charged REAL NOT NULL DEFAULT 0, queue_ms INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS usage_user_ts ON usage(user_id, ts);
 CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '');
@@ -189,10 +225,15 @@ class _DB:
             self.conn.executescript(_SCHEMA)
             for table, col, ddl in (("users", "credit", "credit REAL NOT NULL DEFAULT 0"),       # база от ag_0.1 → ag_0.2
                                     ("usage", "charged", "charged REAL NOT NULL DEFAULT 0"),
-                                    ("usage", "queue_ms", "queue_ms INTEGER NOT NULL DEFAULT 0")):
+                                    ("usage", "queue_ms", "queue_ms INTEGER NOT NULL DEFAULT 0"),
+                                    ("users", "bonus", "bonus REAL NOT NULL DEFAULT 0"),            # ag_0.7
+                                    ("users", "origin", "origin TEXT NOT NULL DEFAULT ''"),
+                                    ("users", "google_sub", "google_sub TEXT NOT NULL DEFAULT ''")):
                 cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if col not in cols:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub ON users(google_sub) "
+                              "WHERE google_sub != ''")                # ag_0.7: один Google-аккаунт — один пользователь
             self.path = p
 
     def q(self, sql: str, args: tuple = ()) -> list:
@@ -275,7 +316,16 @@ def identify(headers: dict) -> tuple:
             return {"id": 0, "role": "owner", "name": "owner", "enabled": 1}, True
     tok = token or ck.get(COOKIE_TOKEN, "")
     if tok:
-        u = db.one("SELECT id, role, name, enabled, credit FROM users WHERE token_hash = ?", (_sha(tok),))
+        # ag_0.6.1 (точка отката):
+        # u = db.one("SELECT id, role, name, enabled, credit FROM users WHERE token_hash = ?", (_sha(tok),))
+        h = _sha(tok)
+        u = db.one("SELECT id, role, name, enabled, credit, bonus, origin FROM users WHERE token_hash = ?", (h,))
+        if u is None:                                             # ag_0.7: токен сессии входа через Google
+            s = db.one("SELECT user_id FROM sessions WHERE token_hash = ? AND created_at >= ?",
+                       (h, _now() - SESSION_TTL_DAYS * 86400))
+            if s:
+                u = db.one("SELECT id, role, name, enabled, credit, bonus, origin FROM users WHERE id = ?",
+                           (s["user_id"],))
         return u, True
     return None, False
 
@@ -294,7 +344,16 @@ def balance_of(u: dict) -> dict:
     """Баланс тестера в ценах с наценкой: пополнено − списано."""
     spent = db.one("SELECT COALESCE(SUM(charged),0) AS c FROM usage WHERE user_id = ?", (u["id"],))["c"]
     credit = u.get("credit") or 0.0
-    return {"credit": round(credit, 4), "spent": round(spent, 4), "balance": round(credit - spent, 4)}
+    # ag_0.6.1 (точка отката):
+    # return {"credit": round(credit, 4), "spent": round(spent, 4), "balance": round(credit - spent, 4)}
+    # ag_0.7: два счёта. bonus — подаренный кредит (входит в credit), тратится первым; paid_left — остаток внесённых
+    # денег, только он подлежит возврату (Terms).
+    bonus = u.get("bonus") or 0.0
+    balance = credit - spent
+    bonus_left = max(0.0, bonus - spent)
+    paid_left = max(0.0, balance - bonus_left)
+    return {"credit": round(credit, 4), "spent": round(spent, 4), "balance": round(balance, 4),
+            "bonus_left": round(bonus_left, 4), "paid_left": round(paid_left, 4)}
 
 
 def _in_run_grace(user_id: int) -> bool:
@@ -841,7 +900,10 @@ def _norm_code(code: str) -> str:
 
 @router.get("/access/health")
 async def access_health():
-    return {"ok": True, "gate": gate_on(), "lockdown": lockdown(), "build": BUILD}
+    # return {"ok": True, "gate": gate_on(), "lockdown": lockdown(), "build": BUILD}      # ag_0.6.1 (точка отката)
+    # ag_0.7: Client ID — публичное значение, страница берёт его отсюда для кнопки «Sign in with Google»
+    return {"ok": True, "gate": gate_on(), "lockdown": lockdown(), "build": BUILD,
+            "google": bool(gate_on() and google_client_id()), "google_client_id": google_client_id()}
 
 
 class ActivateReq(BaseModel):
@@ -897,9 +959,112 @@ async def access_me(request: Request):
     out = {"gate": True, "role": u["role"], "name": u["name"], "enabled": bool(u["enabled"]), "lockdown": lockdown()}
     if u["role"] == "tester":                                      # тестеру — только баланс в его ценах
         out.update(balance_of(u)); out["min_balance"] = MIN_BALANCE
+        out["origin"] = u.get("origin") or ""                      # ag_0.7: 'google' — вошёл через Google
     else:                                                          # супер и владелец — реальный расход за сегодня
         out["today"] = usage_today(u["id"])
     return out
+
+
+# ─── ag_0.7: вход через Google ───
+
+class GoogleReq(BaseModel):
+    credential: str                        # ID-токен от кнопки «Sign in with Google» (Google Identity Services)
+
+
+def _google_verify(credential: str) -> tuple:
+    """ID-токен → ({"sub", "email", "name"}, "") или (None, код отказа). Проверку подписи делает сам Google
+    (tokeninfo); мы сверяем, что токен выдан именно нашему приложению, выдан Google, не просрочен, почта подтверждена."""
+    try:
+        with urllib.request.urlopen(GOOGLE_TOKENINFO + quote(credential, safe=""), timeout=GOOGLE_TIMEOUT) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return None, ("bad_credential" if 400 <= e.code < 500 else "google_unreachable")
+    except Exception:  # noqa: BLE001 — сеть, таймаут, не JSON
+        return None, "google_unreachable"
+    if not isinstance(d, dict):
+        return None, "bad_credential"
+    cid = google_client_id()
+    if not cid or not _eq(str(d.get("aud") or ""), cid):              # токен выдан другому приложению
+        return None, "bad_credential"
+    if d.get("iss") not in GOOGLE_ISS:
+        return None, "bad_credential"
+    try:
+        if int(d.get("exp") or 0) <= _now():
+            return None, "bad_credential"
+    except (TypeError, ValueError):
+        return None, "bad_credential"
+    if str(d.get("email_verified")).lower() != "true":
+        return None, "email_unverified"
+    sub = str(d.get("sub") or "").strip()
+    if not sub:
+        return None, "bad_credential"
+    email = str(d.get("email") or "").strip()[:120]
+    name = (str(d.get("name") or "").strip() or email.split("@")[0])[:80]
+    return {"sub": sub, "email": email, "name": name}, ""
+
+
+@router.post("/access/google")
+async def access_google(req: GoogleReq, request: Request):
+    """Вход через Google: подтверждение личности → наш токен. Новому аккаунту — стартовый кредит (один раз)."""
+    if not gate_on():
+        return JSONResponse({"error": "Вход ещё не открыт", "code": "gate_off"}, status_code=503)
+    if not google_client_id():
+        return JSONResponse({"error": "Вход через Google не настроен", "code": "google_off"}, status_code=503)
+    ip = _ip(request)
+    if _fail_blocked(ip):
+        return JSONResponse({"error": "Слишком много попыток, подождите 10 минут", "code": "too_many"}, status_code=429)
+    cred = (req.credential or "").strip()
+    if not cred or len(cred) > 4096:
+        _fail_add(ip)
+        return JSONResponse({"error": "Нет подтверждения от Google", "code": "bad_credential"}, status_code=400)
+    info, code = await asyncio.to_thread(_google_verify, cred)        # сетевой вызов — не в основном потоке
+    if info is None:
+        if code == "google_unreachable":
+            return JSONResponse({"error": "Google не отвечает, попробуйте ещё раз", "code": code}, status_code=503)
+        _fail_add(ip)
+        audit("?", "google_fail", "", code, ip)
+        text = "Почта в Google-аккаунте не подтверждена" if code == "email_unverified" else "Google не подтвердил вход"
+        return JSONResponse({"error": text, "code": code}, status_code=403)
+    now = _now()
+    with db.lock:                                                      # поиск, создание и выдача токена — одним куском
+        u = db.one("SELECT * FROM users WHERE google_sub = ?", (info["sub"],))
+        created = False
+        if u is None:
+            today = db.one("SELECT COUNT(*) AS n FROM users WHERE origin = 'google' AND created_at >= ?",
+                           (_day_start(),))["n"]
+            if today >= GOOGLE_DAILY_SIGNUPS:
+                return JSONResponse({"error": "На сегодня регистрация закрыта, попробуйте завтра",
+                                     "code": "signups_closed"}, status_code=429)
+            uid = db.x("INSERT INTO users(role, name, email, token_hash, created_at, credit, bonus, origin, google_sub) "
+                       "VALUES ('tester',?,?,?,?,?,?,'google',?)",
+                       (info["name"], info["email"], _sha(_new_token()), now,      # token_hash — заглушка, вход по сессиям
+                        GOOGLE_START_CREDIT, GOOGLE_START_CREDIT, info["sub"]))
+            u = _get_user(uid)
+            created = True
+        elif not u["enabled"]:
+            return JSONResponse({"error": "Доступ отключён владельцем", "code": "disabled"}, status_code=403)
+        elif info["email"] and info["email"] != u["email"]:
+            db.x("UPDATE users SET email = ? WHERE id = ?", (info["email"], u["id"]))
+        token = _new_token()
+        db.x("INSERT INTO sessions(token_hash, user_id, created_at) VALUES (?,?,?)", (_sha(token), u["id"], now))
+        db.x("DELETE FROM sessions WHERE user_id = ? AND (created_at < ? OR token_hash NOT IN ("
+             "SELECT token_hash FROM sessions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?))",
+             (u["id"], now - SESSION_TTL_DAYS * 86400, u["id"], SESSION_MAX_PER_USER))
+        db.x("UPDATE users SET last_seen = ? WHERE id = ?", (now, u["id"]))
+    audit("tester:" + str(u["id"]), "google_signup" if created else "google_login", info["sub"], info["email"], ip)
+    out = {"token": token, "role": "tester", "origin": "google", "name": u["name"], "email": info["email"],
+           "new": created, "min_balance": MIN_BALANCE, "session_days": SESSION_TTL_DAYS}
+    out.update(balance_of(u))
+    return out
+
+
+@router.post("/access/logout")
+async def access_logout(request: Request):
+    """Выход: гасит сессию предъявленного токена (ключи владельца / суперов / тестеров не затрагивает)."""
+    tok = _token_from(_hdrs(request))
+    if tok:
+        db.x("DELETE FROM sessions WHERE token_hash = ?", (_sha(tok),))
+    return {"ok": True}
 
 
 class OwnerKeyReq(BaseModel):
@@ -949,6 +1114,7 @@ def _user_row(u: dict) -> dict:
     return {"id": u["id"], "role": u["role"], "name": u["name"], "email": u["email"], "note": u["note"],
             "enabled": bool(u["enabled"]), "created_at": u["created_at"], "last_seen": u["last_seen"],
             "invite_code": u["invite_code"], "today": usage_today(u["id"]),
+            "origin": u.get("origin") or "",                       # ag_0.7
             "cost_7d": round(agg["d7"], 5), "cost_total": round(agg["total"], 5), "requests_total": agg["requests"],
             "runs_total": runs["n"],
             # тестер: пополнено / списано (с наценкой) / остаток и маржа = списано − реальная цена
@@ -979,7 +1145,12 @@ async def admin_overview(request: Request):
     return {"gate": True, "lockdown": lockdown(), "build": BUILD, "db": db.path, "queue_today": qstat, "queue_now": queue_state()["lanes"],
             "owner_key_short": len(owner_key()) < 32,
             "defaults": {"max_supers": MAX_SUPERS, "max_testers": MAX_TESTERS, "tester_start_credit": TESTER_START_CREDIT,
-                         "price_mult": PRICE_MULT, "min_balance": MIN_BALANCE},
+                         "price_mult": PRICE_MULT, "min_balance": MIN_BALANCE,
+                         "google_start_credit": GOOGLE_START_CREDIT, "google_daily_signups": GOOGLE_DAILY_SIGNUPS},
+            "google": {"on": bool(google_client_id()),             # ag_0.7
+                       "users": db.one("SELECT COUNT(*) AS n FROM users WHERE origin = 'google'")["n"],
+                       "signups_today": db.one("SELECT COUNT(*) AS n FROM users WHERE origin = 'google' AND "
+                                               "created_at >= ?", (_day_start(),))["n"]},
             "spend": {"today_all": round(all_today, 5), "today_owner": owner_today["cost"],       # реальные цены
                       "total_all": round(all_total, 5), "charged_total": round(charged_total, 5)},
             "users": users,
@@ -997,7 +1168,8 @@ async def admin_invites(req: InvitesReq, request: Request):
     if err:
         return err
     with db.lock:
-        testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester'")["n"]
+        # testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester'")["n"]      # ag_0.6.1 (точка отката)
+        testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester' AND origin = ''")["n"]
         pending = db.one("SELECT COUNT(*) AS n FROM invites WHERE used_by IS NULL AND revoked = 0")["n"]
         room = MAX_TESTERS - testers - pending
         n = max(0, min(int(req.count or 0), room))
@@ -1071,7 +1243,8 @@ async def admin_tester(req: TesterReq, request: Request):
     if not name:
         return JSONResponse({"error": "Укажите имя", "code": "no_name"}, status_code=400)
     with db.lock:
-        testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester'")["n"]
+        # testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester'")["n"]      # ag_0.6.1 (точка отката)
+        testers = db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'tester' AND origin = ''")["n"]
         pending = db.one("SELECT COUNT(*) AS n FROM invites WHERE used_by IS NULL AND revoked = 0")["n"]
         if testers + pending >= MAX_TESTERS:
             return JSONResponse({"error": f"Мест нет: тестеров {testers} + неиспользованных кодов {pending} = лимит "
@@ -1121,6 +1294,7 @@ async def admin_user_reissue(uid: int, request: Request):
         return JSONResponse({"error": "Пользователь не найден", "code": "not_found"}, status_code=404)
     token = _new_token()
     db.x("UPDATE users SET token_hash = ? WHERE id = ?", (_sha(token), uid))
+    db.x("DELETE FROM sessions WHERE user_id = ?", (uid,))            # ag_0.7: гасим и сессии входа через Google
     audit("owner", "user_reissue", str(uid), "", _ip(request))
     return {"id": uid, "token": token, "note": "Токен показывается один раз"}
 
