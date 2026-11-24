@@ -2235,3 +2235,8 @@ install_access_gate(app)
 # --- Личный кабинет (cab_0.1): сохранённые прогоны, проекты-дерево, выписка, отзывы, заявки. После ворот. ---
 from utils.cabinet import install_cabinet
 install_cabinet(app)
+
+# --- Оплата и удаление аккаунта (pay_0.1): пополнение картой через Paddle, возврат остатка, настоящее удаление. После кабинета. ---
+# Пока в окружении нет PADDLE_CLIENT_TOKEN / PADDLE_WEBHOOK_SECRET / PADDLE_PRICES — оплата выключена, остальное как раньше.
+from utils.payments import install_payments
+install_payments(app)
