@@ -167,9 +167,13 @@ async def pay_config(request: Request):
     if err:
         return err
     on = enabled() and u["role"] == "tester"
+    refundable = 0.0                                              # сколько вернётся на карту при удалении аккаунта
+    if u["role"] == "tester":
+        with gate.db.lock:
+            refundable = round(sum(step["part"] for step in refund_plan(u["id"])), 2)
     return {"build": BUILD, "enabled": on, "client_token": client_token() if on else "", "sandbox": sandbox(),
             "packs": sorted(packs().keys()) if on else [], "refund_days": REFUND_DAYS,
-            "can_delete": u["role"] == "tester"}
+            "can_delete": u["role"] == "tester", "refundable": refundable}
 
 
 class StartReq(BaseModel):
