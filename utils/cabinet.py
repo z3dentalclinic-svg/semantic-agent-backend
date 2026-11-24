@@ -44,7 +44,8 @@ from pydantic import BaseModel
 
 from utils import access_gate as gate
 
-BUILD = "cab_0.2"   # 0.1.1: path операции в ops_detail; 0.2: валюта показа (USD/EUR/UAH/PLN/GBP), курс раз в 12 ч
+# BUILD = "cab_0.2"   # точка отката
+BUILD = "cab_0.3"   # 0.3: в выписке оплаты картой и возвраты (utils/payments.py); 0.1.1: path операции в ops_detail; 0.2: валюта показа (USD/EUR/UAH/PLN/GBP), курс раз в 12 ч
 
 # ─── настройки ───
 MAX_DEPTH = 3                       # проект → папка → подпапка
@@ -350,15 +351,23 @@ async def cab_ledger(request: Request, limit: int = 500):
     rows = []
     if u["role"] == "tester":
         full = gate.db.one("SELECT created_at, credit FROM users WHERE id = ?", (uid,))
-        topups = gate.db.q("SELECT ts, detail, action FROM audit WHERE action = 'user_topup' AND target = ?", (str(uid),))
+        # cab_0.2 (точка отката):
+        # topups = gate.db.q("SELECT ts, detail, action FROM audit WHERE action = 'user_topup' AND target = ?", (str(uid),))
+        # cab_0.3: в выписке — и оплаты картой (pay_topup), и возвраты на карту (pay_refund) из utils/payments.py
+        topups = gate.db.q("SELECT ts, detail, action FROM audit WHERE action IN ('user_topup', 'pay_topup', 'pay_refund') "
+                           "AND target = ?", (str(uid),))
         topped = sum(float(t["detail"] or 0) for t in topups)
         start = round((full["credit"] or 0) - topped, 4)
         if start:
             rows.append({"ts": full["created_at"], "kind": "credit", "amount": start, "title": "Стартовый баланс", "seed": ""})
         for t in topups:
             amt = float(t["detail"] or 0)
-            rows.append({"ts": t["ts"], "kind": "credit" if amt >= 0 else "debit", "amount": amt,
-                         "title": "Пополнение владельцем" if amt >= 0 else "Корректировка владельцем", "seed": ""})
+            # cab_0.2 (точка отката):
+            # rows.append({"ts": t["ts"], "kind": "credit" if amt >= 0 else "debit", "amount": amt,
+            #              "title": "Пополнение владельцем" if amt >= 0 else "Корректировка владельцем", "seed": ""})
+            title = ("Пополнение картой" if t["action"] == "pay_topup" else "Возврат на карту" if t["action"] == "pay_refund"
+                     else "Пополнение владельцем" if amt >= 0 else "Корректировка владельцем")
+            rows.append({"ts": t["ts"], "kind": "credit" if amt >= 0 else "debit", "amount": amt, "title": title, "seed": ""})
     usage = gate.db.q("SELECT ts, path, seed, cost, charged, status FROM usage WHERE user_id = ? AND status < 400 "
                       "AND (charged > 0 OR (cost IS NOT NULL AND cost > 0)) ORDER BY id DESC LIMIT ?", (uid, limit))
     for x in usage:

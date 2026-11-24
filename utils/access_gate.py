@@ -65,6 +65,10 @@ ag_0.7 (Andrew, 2026-11-22) — вход через Google («как во все
   • ключи владельца / суперов / тестеров работают как раньше.
   Переменная GOOGLE_CLIENT_ID (Render → Environment) — Client ID из Google Cloud. ПОКА НЕ ЗАДАНА — вход через Google
   выключен (/access/google отвечает 503), остальное работает как в ag_0.6.1. Откат = убрать переменную.
+
+ag_0.8 (Andrew, 2026-11-24) — удаление аккаунта (utils/payments.py): после удаления Google-аккаунта хранится
+  необратимый отпечаток его идентификатора (таблица deleted_accounts: sha256, без почты и имени). При повторной
+  регистрации того же Google-аккаунта человек входит как новый, но БЕЗ стартового кредита. Больше ничего не изменено.
 """
 from __future__ import annotations
 
@@ -89,7 +93,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 # BUILD = "ag_0.6.1"   # точка отката
-BUILD = "ag_0.7"   # ag_0.7 вход через Google (role tester + origin google, два счёта, сессии); ag_0.6.1 маска моделей без ключа "by" (слова сида и имена фильтров → «llm»); ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
+# BUILD = "ag_0.7"   # точка отката
+BUILD = "ag_0.8"   # ag_0.8 повторная регистрация удалённого Google-аккаунта — без стартового кредита (deleted_accounts); ag_0.7 вход через Google (role tester + origin google, два счёта, сессии); ag_0.6.1 маска моделей без ключа "by" (слова сида и имена фильтров → «llm»); ag_0.3 тестер напрямую; ag_0.4 утечки тарифов; ag_0.5 хуки + /cabinet/; ag_0.6 очередь запусков (ряды конвейер=1 / модели=3)
 
 # ─── настройки. Правка чисел — только здесь (лимиты тестера меняются и по каждому пользователю из админки). ───
 MAX_SUPERS = 4
@@ -199,6 +204,7 @@ CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS deleted_accounts (sub_hash TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL);
 """
 
 
@@ -1035,10 +1041,20 @@ async def access_google(req: GoogleReq, request: Request):
             if today >= GOOGLE_DAILY_SIGNUPS:
                 return JSONResponse({"error": "На сегодня регистрация закрыта, попробуйте завтра",
                                      "code": "signups_closed"}, status_code=429)
+            # ag_0.7 (точка отката):
+            # uid = db.x("INSERT INTO users(role, name, email, token_hash, created_at, credit, bonus, origin, google_sub) "
+            #            "VALUES ('tester',?,?,?,?,?,?,'google',?)",
+            #            (info["name"], info["email"], _sha(_new_token()), now,      # token_hash — заглушка, вход по сессиям
+            #             GOOGLE_START_CREDIT, GOOGLE_START_CREDIT, info["sub"]))
+            # ag_0.8: аккаунт с этим Google-идентификатором уже удаляли → стартовый кредит второй раз не даётся
+            # (Terms: один раз на человека). Отпечаток пишет payments.purge_user, формула та же.
+            start = GOOGLE_START_CREDIT
+            if db.one("SELECT sub_hash FROM deleted_accounts WHERE sub_hash = ?", (_sha("sa-deleted:" + info["sub"]),)):
+                start = 0.0
             uid = db.x("INSERT INTO users(role, name, email, token_hash, created_at, credit, bonus, origin, google_sub) "
                        "VALUES ('tester',?,?,?,?,?,?,'google',?)",
                        (info["name"], info["email"], _sha(_new_token()), now,      # token_hash — заглушка, вход по сессиям
-                        GOOGLE_START_CREDIT, GOOGLE_START_CREDIT, info["sub"]))
+                        start, start, info["sub"]))
             u = _get_user(uid)
             created = True
         elif not u["enabled"]:
