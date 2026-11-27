@@ -15,6 +15,8 @@ pay_0.1 (Andrew, 2026-11-24) — решения Andrew:
   • перед удалением неиспользованный остаток внесённых денег возвращается на карту (заявка на возврат в Paddle);
   • остаются только записи о платежах БЕЗ привязки к человеку (номер операции Paddle, сумма, дата) — для возвратов,
     споров по карте и учёта;
+  • pay_0.2 (Andrew, 2026-11-27): сумма пополнения произвольная, от $2.50 до $20 за один раз. Верхний предел —
+    решение Andrew: чтобы через сервис не было смысла прогонять деньги (оплатить и запросить возврат);
   • чтобы стартовые $2 нельзя было получать заново удалением и повторной регистрацией, после удаления Google-аккаунта
     хранится необратимый отпечаток его идентификатора (sha256, без почты и имени) — таблица deleted_accounts,
     проверяет её access_gate ag_0.8 при регистрации.
@@ -23,7 +25,9 @@ pay_0.1 (Andrew, 2026-11-24) — решения Andrew:
 работает по-старому (заявка владельцу); удаление аккаунта работает и без них. Откат = убрать переменные.
     PADDLE_CLIENT_TOKEN    клиентский токен Paddle (test_… — песочница, live_… — боевой). Не секрет, уходит в браузер.
     PADDLE_WEBHOOK_SECRET  секрет адреса уведомлений (pdl_ntfset_…) — им Paddle подписывает уведомления об оплате.
-    PADDLE_PRICES          «сумма:id цены» через запятую, например: 5:pri_aaa,10:pri_bbb,20:pri_ccc,50:pri_ddd
+    PADDLE_PRICES          pay_0.1 (точка отката): «сумма:id цены» через запятую — 5:pri_aaa,10:pri_bbb,20:pri_ccc,50:pri_ddd
+                           pay_0.2: ОДНА запись «цена единицы:id цены», например 0.5:pri_aaa — в Paddle заведена одна цена
+                           «$0.50 баланса», человек платит за нужное количество единиц (5 единиц = $2.50, 40 = $20).
     PADDLE_API_KEY         серверный ключ Paddle с правом adjustment.write — нужен только для возвратов. Без него
                            возврат не отправляется автоматически, а помечается «к возврату» — владелец видит список
                            в /cabinet/admin/pay и возвращает вручную в кабинете Paddle.
@@ -62,7 +66,8 @@ from pydantic import BaseModel
 from utils import access_gate as gate
 from utils import cabinet as cab
 
-BUILD = "pay_0.1"
+# BUILD = "pay_0.1"   # точка отката
+BUILD = "pay_0.2"   # 0.2: произвольная сумма пополнения от TOPUP_MIN до TOPUP_MAX вместо четырёх фиксированных
 
 # ─── настройки ───
 WEBHOOK_PATH = "/pay/webhook"        # открытый путь (без токена): Paddle приходит сюда сам, защита — подпись
@@ -70,7 +75,10 @@ TS_TOLERANCE = 300                   # с; уведомление старше �
 STARTED_TTL = 7 * 86400              # начатые и не оплаченные платежи старше — удаляются
 REFUND_DAYS = 14                     # срок возврата по Terms (показывается человеку)
 PADDLE_TIMEOUT = 20                  # с, запрос к Paddle
-MAX_QTY = 100                        # количество в одной покупке (Paddle по умолчанию допускает 1–100)
+# MAX_QTY = 100                      # pay_0.1 (точка отката): количество в одной покупке
+TOPUP_MIN = 2.5                      # $, минимум одного пополнения (решение Andrew 2026-11-27)
+TOPUP_MAX = 20.0                     # $, максимум одного пополнения (решение Andrew 2026-11-27)
+TOPUP_QUICK = (2.5, 5.0, 10.0, 20.0)  # быстрые кнопки в окне пополнения
 DELETE_WORD = "DELETE"               # слово подтверждения удаления (приложение шлёт его после ввода человеком)
 
 _SCHEMA = """
@@ -130,6 +138,24 @@ def packs() -> dict:
     return out
 
 
+def unit() -> tuple:
+    """pay_0.2: (цена единицы в $, id цены) — самая мелкая запись PADDLE_PRICES; (0, "") если не задано."""
+    pk = packs()
+    if not pk:
+        return 0.0, ""
+    a = min(pk)
+    return a, pk[a]
+
+
+def quantity_for(amount: float) -> int:
+    """Сколько единиц нужно на сумму; 0 — сумма вне пределов или не кратна цене единицы."""
+    a, _ = unit()
+    if not a or amount < TOPUP_MIN - 1e-9 or amount > TOPUP_MAX + 1e-9:
+        return 0
+    q = round(amount / a)
+    return q if abs(q * a - amount) < 0.005 else 0
+
+
 def enabled() -> bool:
     return bool(gate.gate_on() and client_token() and webhook_secret() and packs())
 
@@ -172,7 +198,9 @@ async def pay_config(request: Request):
         with gate.db.lock:
             refundable = round(sum(step["part"] for step in refund_plan(u["id"])), 2)
     return {"build": BUILD, "enabled": on, "client_token": client_token() if on else "", "sandbox": sandbox(),
-            "packs": sorted(packs().keys()) if on else [], "refund_days": REFUND_DAYS,
+            # pay_0.1 (точка отката): "packs": sorted(packs().keys()) if on else [],
+            "packs": [a for a in TOPUP_QUICK if quantity_for(a)] if on else [], "refund_days": REFUND_DAYS,
+            "min": TOPUP_MIN, "max": TOPUP_MAX, "step": unit()[0],
             "can_delete": u["role"] == "tester", "refundable": refundable}
 
 
@@ -188,15 +216,25 @@ async def pay_start(request: Request, req: StartReq):
         return err
     if not enabled():
         return _err("Оплата ещё не подключена", "pay_off", 503)
-    price = packs().get(float(req.amount))
-    if not price:
-        return _err("Такой суммы пополнения нет", "bad_amount", 400)
+    # pay_0.1 (точка отката):
+    # price = packs().get(float(req.amount))
+    # if not price:
+    #     return _err("Такой суммы пополнения нет", "bad_amount", 400)
+    step, price = unit()
+    qty = quantity_for(float(req.amount))
+    if not qty:
+        return _err(f"Сумма пополнения — от ${TOPUP_MIN:g} до ${TOPUP_MAX:g}, с шагом ${step:g}", "bad_amount", 400)
     ref = secrets.token_urlsafe(18)
     now = _now()
     gate.db.x("DELETE FROM payments WHERE status = 'started' AND created_at < ?", (now - STARTED_TTL,))
+    # pay_0.1 (точка отката): в amount писалась сумма пакета, количество всегда 1
+    # gate.db.x("INSERT INTO payments(ref, user_id, amount, price_id, created_at) VALUES (?,?,?,?,?)",
+    #           (ref, u["id"], float(req.amount), price, now))
+    # return {"ref": ref, "price_id": price, "amount": float(req.amount), "email": u.get("email") or ""}
+    # pay_0.2: до оплаты в amount лежит цена ЕДИНИЦЫ; при зачислении она умножается на оплаченное количество
     gate.db.x("INSERT INTO payments(ref, user_id, amount, price_id, created_at) VALUES (?,?,?,?,?)",
-              (ref, u["id"], float(req.amount), price, now))
-    return {"ref": ref, "price_id": price, "amount": float(req.amount), "email": u.get("email") or ""}
+              (ref, u["id"], step, price, now))
+    return {"ref": ref, "price_id": price, "quantity": qty, "amount": round(step * qty, 2), "email": u.get("email") or ""}
 
 
 @router.get("/cabinet/pay/status")
@@ -277,9 +315,11 @@ def _apply_completed(ev: dict) -> dict:
     now = _now()
     if event_id:
         gate.db.x("INSERT OR IGNORE INTO pay_events(event_id, ts) VALUES (?,?)", (event_id, now))
-    if qty < 1 or qty > MAX_QTY:
+    # pay_0.1 (точка отката): if qty < 1 or qty > MAX_QTY:
+    max_qty = round(TOPUP_MAX / p["amount"]) if p["amount"] else 0     # больше TOPUP_MAX за раз не зачисляется
+    if qty < 1 or qty > max_qty:
         gate.db.x("UPDATE payments SET status = 'mismatch', txn_id = ?, item_id = ?, currency = ?, line_total = ?, paid_at = ?, "
-                  "refund_note = 'цена в уведомлении не совпала с начатым платежом — проверить вручную в Paddle' WHERE id = ?",
+                  "refund_note = 'цена или количество в уведомлении вне допустимого — проверить вручную в Paddle' WHERE id = ?",
                   (txn, item_id, str(data.get("currency_code") or ""), line_total, now, p["id"]))
         gate.audit("paddle", "pay_mismatch", "", f"txn={txn}")
         return {"ok": True, "result": "mismatch"}
@@ -495,6 +535,6 @@ def install_payments(app):
         gate.db.conn.executescript(_SCHEMA)
     gate.OPEN_PATHS.add(WEBHOOK_PATH)
     app.include_router(router)
-    state = (("ВКЛЮЧЕНА, " + ("песочница" if sandbox() else "БОЕВОЙ режим") + f", суммы {sorted(packs().keys())}")
+    state = (("ВКЛЮЧЕНА, " + ("песочница" if sandbox() else "БОЕВОЙ режим") + f", единица ${unit()[0]:g}, пополнение ${TOPUP_MIN:g}–${TOPUP_MAX:g}")
              if enabled() else "ВЫКЛЮЧЕНА (нет PADDLE_CLIENT_TOKEN / PADDLE_WEBHOOK_SECRET / PADDLE_PRICES)")
     print(f"[payments {BUILD}] оплата {state}; автовозврат {'есть' if api_key() else 'нет (нет PADDLE_API_KEY)'}")
