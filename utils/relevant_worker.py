@@ -39,7 +39,8 @@ logger = logging.getLogger(__name__)
 # WORKER_BUILD = "relevant_worker 0.3 (+ cross L2.5: variant VALID vs original seed, 3.7-flash b512)"
 # WORKER_BUILD = "relevant_worker 0.4 (cross filter: own subject-criterion prompt)"
 # WORKER_BUILD = "relevant_worker 0.5 (+ input sanitizer; + /api/relevant-gen batch test)"
-WORKER_BUILD = "relevant_worker 0.6 (+ single-call multi-seed clustering after filters)"
+# WORKER_BUILD = "relevant_worker 0.6 (+ single-call multi-seed clustering after filters)"
+WORKER_BUILD = "relevant_worker 0.7 (+ Google planner ideas as a source, filtered with the original seed; planner metrics for VALID)"
 # Перекрёстный L2.5: VALID варианта прошёл цепочку со СВОИМ сидом, но исходного сида не видел —
 # «доставка букетов из конфет» валиден для сида «доставка букетов» и мусор для «доставка цветов».
 # Поэтому VALID каждого варианта дополнительно гонится через тот же L2.5 с ИСХОДНЫМ сидом.
@@ -105,6 +106,16 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
         from clustering_test.runner import run_clustering_multi   # мульти-сид кластеризация
     except ImportError:
         run_clustering_multi = None
+
+    # 0.7: планировщик ключевых слов Google (utils/keyword_planner.py). Нет файла или модуль не настроен
+    # (нет переменных GOOGLE_ADS_*) → источник не добавляется, поведение как в 0.6.
+    try:
+        from utils.keyword_planner import planner_ideas, planner_metrics, is_configured as planner_configured
+    except ImportError:
+        try:
+            from keyword_planner import planner_ideas, planner_metrics, is_configured as planner_configured
+        except ImportError:
+            planner_ideas = planner_metrics = planner_configured = None
 
     # Цепочки фильтров не пересекаются между собой (parser.tracer и
     # parser.skip_relevance_filter — глобальные), но перекрываются с парсингом следующего источника.
@@ -201,6 +212,7 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
         l2_pmi_valid: float = Query(None),
         l2_centroid_valid: float = Query(None),
         l2_centroid_trash: float = Query(None),
+        planner: bool = Query(True, description="0.7: идеи планировщика Google как источник (только при настроенном модуле)"),
     ):
         t_total = time.time()
         seed_in = " ".join(_sanitize_query(seed).split())
@@ -289,6 +301,29 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
             sources.append(entry)
             start_filter(entry, fresh, v_seed, cross_seed=seed_used)   # перекрёстный L2.5 с исходным сидом
         stages["variants_parse"] = round(time.time() - t0, 2)
+
+        # ── Этап 2б (0.7): идеи планировщика Google — ещё один источник ───
+        # Решение Andrew: идеи идут через всю цепочку наравне с подсказками, с ИСХОДНЫМ сидом
+        # (перекрёстный L2.5 не нужен — фильтр-сид и есть исходный). Ошибка Google прогон не роняет.
+        use_planner = bool(planner and do_filter and planner_ideas and planner_configured and planner_configured())
+        if use_planner:
+            t0 = time.time()
+            try:
+                pres = await planner_ideas(seed_used, country, language)
+            except Exception as e:
+                pres = {"error": str(e), "keywords": []}
+            if pres.get("error"):
+                logger.error(f"[RELEVANT] planner ideas error: {pres['error']}")
+                sources.append({"id": "planner", "query": seed_used, "error": pres["error"],
+                                "raw": 0, "new": 0, "wall": round(time.time() - t0, 2)})
+            else:
+                fresh = absorb(pres, "planner")
+                entry = {"id": "planner", "query": seed_used, "raw": len(pres.get("keywords") or []),
+                         "new": len(fresh), "wall": round(time.time() - t0, 2),
+                         "suffix": 0, "prefix": 0, "infix": 0}
+                sources.append(entry)
+                start_filter(entry, fresh, seed_used)
+            stages["planner_ideas"] = round(time.time() - t0, 2)
 
         merged = sorted(container.values(), key=lambda e: e["keyword"].lower())
         out = {
@@ -391,6 +426,49 @@ def register_relevant_worker(app, light_search_fn, filter_ctx=None):
                                  "cross_per_source": {k: v.get("cross_l2_5_stats") for k, v in per_source_stats.items()
                                                       if v.get("cross_l2_5_stats")}}
             out["l3_stats"] = {"cost_usd": round(cost3, 6), "per_source": {k: v["l3_stats"] for k, v in per_source_stats.items()}}
+
+            # ── 0.7: замер прошедших ключей планировщиком + сводка «что откуда пришло и где срезано» ──
+            if use_planner:
+                t0 = time.time()
+                src_map = out.get("keywords_sources") or {}
+
+                def _kw(x):
+                    return x if isinstance(x, str) else str(x.get("query", x.get("keyword", "")))
+
+                def _bucket(kw):
+                    ids = src_map.get(kw) or []
+                    if "planner" not in ids:
+                        return "parser"
+                    return "planner" if len(ids) == 1 else "both"
+
+                summary = {b: {"valid": 0, "grey": 0, "blocked": 0, "blocked_by": {}} for b in ("parser", "planner", "both")}
+                for kw in valid:
+                    summary[_bucket(_kw(kw))]["valid"] += 1
+                for kw in grey:
+                    summary[_bucket(_kw(kw))]["grey"] += 1
+                for kw, info in blocked_trace.items():
+                    b = summary[_bucket(kw)]
+                    b["blocked"] += 1
+                    layer = str(info.get("blocked_by") or "?") if isinstance(info, dict) else "?"
+                    b["blocked_by"][layer] = b["blocked_by"].get(layer, 0) + 1
+                    if isinstance(info, dict):
+                        info["source"] = src_map.get(kw) or []      # откуда пришёл срезанный ключ
+                try:
+                    met = await planner_metrics([_kw(k) for k in valid] + [_kw(k) for k in grey], country, language)
+                except Exception as e:
+                    met = {"error": str(e), "metrics": {}}
+                p_entry = next((e for e in sources if e["id"] == "planner"), {})
+                out["planner"] = {
+                    "ideas_total": p_entry.get("raw", 0),
+                    "ideas_new": p_entry.get("new", 0),              # идеи, которых не было у парсера
+                    "ideas_error": p_entry.get("error"),
+                    "by_source": summary,
+                    "metrics": met.get("metrics") or {},
+                    "metrics_error": met.get("error"),
+                    "metrics_stats": met.get("stats") or {},
+                    "currency": (met.get("stats") or {}).get("currency") or "",
+                }
+                stages["planner_metrics"] = round(time.time() - t0, 2)
 
         elapsed = round(time.time() - t_total, 2)
         out["elapsed_time"] = elapsed
