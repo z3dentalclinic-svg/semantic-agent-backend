@@ -141,6 +141,12 @@ app.include_router(content_map_router)
 from utils.client_portrait import router as client_portrait_router
 app.include_router(client_portrait_router)
 
+# --- Планировщик ключевых слов Google (kp_0.1): идеи как источник ключей + замер прошедших ключей,
+#     /api/keyword-ideas, /api/keyword-metrics, /api/keyword-planner/status. Без переменных GOOGLE_ADS_* модуль выключен. ---
+from utils.keyword_planner import (router as keyword_planner_router,
+                                   planner_before_filters, planner_after_filters)
+app.include_router(keyword_planner_router)
+
 # === ЗАКОММЕНТИРОВАНО: дубль geo/blacklist.py, используется импорт (строка 25) ===
 # def generate_geo_blacklist_full():
 #     """
@@ -1633,6 +1639,7 @@ class ApplyFiltersRequest(BaseModel):
     l2_centroid_trash: float = None
     l3_model: str = None      # ← модель L3 из UI (ключ реестра MODELS в l3_filter)
     l3_effort: str = None     # ← effort L3 из UI (low|medium|high)
+    planner: bool = True      # ← kp_0.1: добавлять идеи планировщика Google (работает только при настроенном модуле)
 
 
 @app.post("/api/apply-filters")
@@ -1642,12 +1649,25 @@ async def apply_filters_endpoint(req: ApplyFiltersRequest):
     Принимает: keywords[], seed, country, language, filters, L2 пороги.
     Возвращает: keywords (VALID), keywords_grey (GREY), anchors (TRASH), trace, timings.
     """
+    # kp_0.1: идеи планировщика Google добавляются к ключам парсера и идут через ту же цепочку.
+    # kp is None (модуль не настроен или planner=false) → ключи и ответ ровно как до модуля.
+    kp = await planner_before_filters(req.seed, req.keywords, req.country, req.language) if req.planner else None
+    keywords_in = kp["keywords"] if kp else req.keywords
+
+    # result = {                              # до kp_0.1 (точка отката)
+    #     "seed": req.seed,
+    #     "method": "apply-filters",
+    #     "keywords": req.keywords,
+    #     "anchors": [],
+    #     "count": len(req.keywords),
+    #     "anchors_count": 0,
+    # }
     result = {
         "seed": req.seed,
         "method": "apply-filters",
-        "keywords": req.keywords,
+        "keywords": keywords_in,
         "anchors": [],
-        "count": len(req.keywords),
+        "count": len(keywords_in),
         "anchors_count": 0,
     }
 
@@ -1666,6 +1686,14 @@ async def apply_filters_endpoint(req: ApplyFiltersRequest):
         l2_5_config=l2_5_config,
         l3_config=l3_config,
     )
+
+    if kp:   # kp_0.1: источники ключей, сводка по срезам, замер прошедших ключей
+        try:
+            result = await planner_after_filters(result, kp, req.country, req.language)
+        except Exception as e:
+            logger.error(f"[PLANNER] after-filters error: {e}")
+            if isinstance(result, dict):
+                result["planner"] = {"error": str(e)}
 
     return result
 
